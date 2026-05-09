@@ -2,7 +2,7 @@ END USER LICENSE AGREEMENT (EULA)
 
 IMPORTANT: READ THIS AGREEMENT CAREFULLY BEFORE INSTALLING OR USING THE SOFTWARE.
 
-This End User License Agreement ("Agreement") is a legal agreement between you (either an individual or a single entity, "End User") and "Halo Imagery", a sole proprietorship in Canada ("Licensor"), for the use of the software product "Halo Imagery CCR" ("Software").
+This End User License Agreement ("Agreement") is a legal agreement between you (either an individual or a single entity, "End User") and "FreeCCR", a sole proprietorship in Canada ("Licensor"), for the use of the software product "FreeCCR" ("Software").
 
 BY INSTALLING, COPYING, OR OTHERWISE USING THE SOFTWARE, YOU AGREE TO BE BOUND BY THE TERMS OF THIS AGREEMENT. IF YOU DO NOT AGREE TO THE TERMS OF THIS AGREEMENT, DO NOT INSTALL OR USE THE SOFTWARE.
 
@@ -37,11 +37,11 @@ TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL LICENSOR, I
 You agree to indemnify, defend, and hold harmless Licensor, its affiliates, officers, agents, and employees from and against any and all claims, damages, losses, liabilities, costs, or expenses (including reasonable attorneys' fees) arising out of or related to your use or misuse of the Software, violation of this Agreement, or violation of any rights of a third party.
 
 9. PRIVACY POLICY
-9.1 DATA COLLECTION: Halo Imagery CCR operates primarily as a local desktop application for photographic image processing. The Software may collect limited information including: (a) license activation data (email address, activation key, and unique instance identifier) for subscription verification; (b) technical diagnostic information such as operating system version, hardware specifications, and application performance metrics; (c) error logs and crash reports to improve RAW image processing algorithms; (d) usage statistics related to negative conversion, color correction, and batch processing features.
+9.1 DATA COLLECTION: FreeCCR operates primarily as a local desktop application for photographic image processing. The Software may collect limited information including: (a) license activation data (email address, activation key, and unique instance identifier) for subscription verification; (b) technical diagnostic information such as operating system version, hardware specifications, and application performance metrics; (c) error logs and crash reports to improve RAW image processing algorithms; (d) usage statistics related to negative conversion, color correction, and batch processing features.
 
 9.2 IMAGE DATA PRIVACY: Your photographic images and image metadata remain entirely on your local device. The Software does not upload, transmit, or store your images on external servers. All RAW file processing, negative conversion, color correction, thumbnail generation, and image exports are performed locally on your computer.
 
-9.3 LICENSE VERIFICATION: The Software connects to Licensor's activation servers (activation.haloimagery.com) solely for license validation and activation purposes. This connection transmits only your email address, license key, and a unique device identifier. No image data or image processing information is transmitted during license verification.
+9.3 LICENSE VERIFICATION: The Software connects to Licensor's activation servers (activation.freeccr.com) solely for license validation and activation purposes. This connection transmits only your email address, license key, and a unique device identifier. No image data or image processing information is transmitted during license verification.
 
 9.4 USE OF COLLECTED DATA: Information collected by the Software is used exclusively for: (a) verifying subscription status and preventing unauthorized use; (b) improving RAW image processing algorithms and negative conversion accuracy; (c) providing technical support for photography-specific workflows; (d) communicating software updates related to camera support and image processing improvements.
 
@@ -51,10 +51,10 @@ You agree to indemnify, defend, and hold harmless Licensor, its affiliates, offi
 
 9.7 NO TRACKING OR ANALYTICS: The Software does not use cookies, web tracking, behavioral analytics, or advertising technologies. No third-party analytics services monitor your image processing activities or photography workflows.
 
-9.8 OFFLINE OPERATION: Halo Imagery CCR is designed to function completely offline for all core photography features including RAW processing, negative conversion, color correction, and image export. Internet connectivity is required only for initial license activation and periodic license validation.
+9.8 OFFLINE OPERATION: FreeCCR is designed to function completely offline for all core photography features including RAW processing, negative conversion, color correction, and image export. Internet connectivity is required only for initial license activation and periodic license validation.
 
 10. REFUND POLICY
-10.1 SUBSCRIPTION-BASED SERVICE: Halo Imagery CCR operates on a subscription-based licensing model. All subscription fees are charged in advance for the selected subscription period (monthly, annual, or other available terms).
+10.1 SUBSCRIPTION-BASED SERVICE: FreeCCR operates on a subscription-based licensing model. All subscription fees are charged in advance for the selected subscription period (monthly, annual, or other available terms).
 
 10.2 NO REFUNDS FOR SUBSCRIPTION PERIODS: Due to the nature of software licensing and the immediate access provided upon subscription activation, all subscription payments are final and non-refundable. This includes partial refunds for unused portions of subscription periods.
 
@@ -87,4 +87,4 @@ This Agreement constitutes the entire agreement between you and Licensor regardi
 
 BY USING THE SOFTWARE, YOU ACKNOWLEDGE THAT YOU HAVE READ THIS AGREEMENT, UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS.
 
-Copyright © 2025 Halo Imagery. All rights reserved.
+Copyright © 2025 FreeCCR. All rights reserved.

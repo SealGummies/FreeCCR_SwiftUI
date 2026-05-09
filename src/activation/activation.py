@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
-SERVICE_NAME = "halo-ccr-client"
+SERVICE_NAME = "freeccr-client"
 ACTIVATION_KEY = "activation_key"
 COMMERCIAL_FLAG_KEY = "activation_type"  # New key for storing license type
 INSTANCE_ID_KEY = "instance_id"  # New key for storing instance id
@@ -18,7 +18,7 @@ INSTANCE_NAME_KEY = "instance_name"
 
 # Configuration for abstraction layer
 # Change this to your Fly.io app URL when deployed
-host = "activation.haloimagery.com"  # Your Fly.io deployment
+host = "activation.freeccr.com"  # Your Fly.io deployment
 # host = "localhost:8080"  # For local development
 
 # Offline usage configuration
@@ -196,11 +196,11 @@ def _get_app_data_dir() -> str:
     """Get the application data directory for storing verification files."""
     if os.name == 'nt':  # Windows
         app_data = os.environ.get('APPDATA', os.path.expanduser('~'))
-        return os.path.join(app_data, 'HaloImageryCCR')
+        return os.path.join(app_data, 'FreeCCR')
     elif hasattr(os, 'uname') and os.uname().sysname == 'Darwin':  # macOS
-        return os.path.join(os.path.expanduser('~/Library/Application Support'), 'HaloImageryCCR')
+        return os.path.join(os.path.expanduser('~/Library/Application Support'), 'FreeCCR')
     else:  # Linux and others
-        return os.path.join(os.path.expanduser('~/.local/share'), 'HaloImageryCCR')
+        return os.path.join(os.path.expanduser('~/.local/share'), 'FreeCCR')
 
 
 def _get_verification_file_path() -> str:

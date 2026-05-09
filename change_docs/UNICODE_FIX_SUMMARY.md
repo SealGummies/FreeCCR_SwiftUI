@@ -1,6 +1,6 @@
 # Unicode Character Support and Robust Image Loading Fix
 
-This document summarizes the changes made to fix Unicode character support and robust image loading in HaloImagery CCR, specifically for handling file paths containing Chinese, Japanese, or other non-ASCII characters, and for handling problematic image files.
+This document summarizes the changes made to fix Unicode character support and robust image loading in FreeCCR, specifically for handling file paths containing Chinese, Japanese, or other non-ASCII characters, and for handling problematic image files.
 
 ## Problem Description
 

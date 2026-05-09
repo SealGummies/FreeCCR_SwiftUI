@@ -7,7 +7,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon("./icons/haloimagery.png"))  # Set app icon for taskbar
-    print("Starting CCR Client...")
+    print("Starting FreeCCR...")
     window = MainWindow()
     print("MainWindow created, setting up UI...")
 

@@ -1,12 +1,12 @@
-# Getting Started with HaloImagery CCR
+# Getting Started with FreeCCR
 
-Welcome to **HaloImagery CCR** - a professional desktop application designed specifically for photographers who work with negative film scans and need fast, accurate, physics-based image conversion and color cast correction.
+Welcome to **FreeCCR** - a professional desktop application designed specifically for photographers who work with negative film scans and need fast, accurate, physics-based image conversion and color cast correction.
 
 ## Quick Start Guide
 
-### Step 1: Activate Your License
-When you first launch CCR, you'll be prompted to enter your activation key. 
-The evaluation version allows unlimited use of all features, though exported images will include a watermark. To remove the watermark and unlock full commercial use, please purchase a license.
+### Step 1: Launch FreeCCR
+FreeCCR launches without activation in this build.
+The evaluation version allows unlimited use of all features, though exported images will include a watermark.
 
 ### Step 2: Load Your Images
 - **File → Load Images from Folder** to batch load all images from a directory
@@ -56,15 +56,15 @@ The direct output of the images is scientific and color accurate, but you can al
 
 ### macOS
 1. Download the `.dmg` file for your Mac architecture:
-   - [Apple Silicon (M1/M2/M3/M4)](https://www.haloimagery.com/download)
-   - [Intel Macs](https://www.haloimagery.com/download)
-2. Open the `.dmg` file and drag HaloImagery CCR to Applications
+   - [Apple Silicon (M1/M2/M3/M4)](https://www.freeccr.com/download)
+   - [Intel Macs](https://www.freeccr.com/download)
+2. Open the `.dmg` file and drag FreeCCR to Applications
 3. Launch the application from Applications folder
 
 ### Windows
-1. Download the [Windows installer](https://www.haloimagery.com/download)
+1. Download the [Windows installer](https://www.freeccr.com/download)
 2. Run the installer and follow the setup wizard
-3. Launch HaloImagery CCR from the Desktop shortcut
+3. Launch FreeCCR from the Desktop shortcut
 
 ## Workflow Tips
 
@@ -115,15 +115,15 @@ A: CCR processes images at high quality. For faster preview, the app automatical
 
 ## Privacy & Data Security
 
-HaloImagery CCR prioritizes your privacy:
+FreeCCR prioritizes your privacy:
 - **All image processing happens locally** on your computer
 - **No images are uploaded** to external servers
-- **Minimal data collection** limited to license verification and technical diagnostics
+- **Minimal data collection** limited to technical diagnostics
 - **No tracking or analytics** of your photography workflow
-- **Offline operation** for all core features after initial activation
+- **Offline operation** for core features
 
 ## Support & Resources
-- **Email Support**: Contact us using https://www.haloimagery.com/contact
+- **Email Support**: Contact us using https://www.freeccr.com/contact
 - **Feature Requests**: We welcome feedback for improving CCR
 
 ## What's Next?
@@ -135,4 +135,4 @@ Once you're comfortable with the basics:
 
 ---
 
-**Ready to get started?** Download HaloImagery CCR today and transform your negative film scans into beautiful positive images with professional accuracy and control.
+**Ready to get started?** Download FreeCCR today and transform your negative film scans into beautiful positive images with professional accuracy and control.

@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for activation-svr-src on 2025-06-25T16:43:52-07:00
+# fly.toml app configuration file generated for freeccr-activation on 2025-06-25T16:43:52-07:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'activation-svr-src'
+app = 'freeccr-activation'
 primary_region = 'sea'
 
 [http_service]

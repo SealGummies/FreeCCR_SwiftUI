@@ -4,7 +4,7 @@ set -e
 
 SIGN_CERTIFICATE="Developer ID Application: Yindividual LLC (NW9XSB3U68)"
 
-APP_NAME="HaloImageryCCR"
+APP_NAME="FreeCCR"
 BUNDLE_DIR="${APP_NAME}.app"
 CONTENTS_DIR="${BUNDLE_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
@@ -15,10 +15,10 @@ ICON_SRC="src/icons/haloimagery_logo.icns"
 NUITKA_BIN="main.dist/main.bin"
 DMG_NAME="${APP_NAME}.dmg"
 DMG_TEMP_DIR="dmg_temp"
-LICENSE_FILE="LICENSES/license-HaloImageryCCR.txt"
+LICENSE_FILE="LICENSES/license-FreeCCR.txt"
 DMG_SETTINGS="macos_build_scripts/dmg_settings.py"
 
-echo "Building HaloImageryCCR with maximum compatibility..."
+echo "Building FreeCCR with maximum compatibility..."
 
 # Check Python deployment target
 PYTHON_DEPLOYMENT_TARGET=$(python -c "import sysconfig; print(sysconfig.get_config_var('MACOSX_DEPLOYMENT_TARGET') or 'None')")
@@ -87,7 +87,7 @@ python -m nuitka \
 
     # --macos-app-icon=src/icons/haloimagery_logo.icns \
     # --macos-create-app-bundle \
-    # --macos-app-name=HaloImageryCCR \
+    # --macos-app-name=FreeCCR \
     # --macos-sign-identity=auto \
     # --macos-sign-notarization \
     # --macos-app-version="$(git describe --tags)" \
@@ -270,10 +270,10 @@ rm -rf "$DMG_TEMP_DIR"
 
 # Check the resulting binary's deployment target
 # echo "Checking deployment target of the built binary..."
-# if [ -f "HaloImageryCCR.dist/HaloImageryCCR.bin" ]; then
-#     otool -l HaloImageryCCR.dist/HaloImageryCCR.bin | grep -A 3 LC_VERSION_MIN_MACOSX || echo "No deployment target found"
-# elif [ -f "HaloImageryCCR.app/Contents/MacOS/HaloImageryCCR" ]; then
-#     otool -l HaloImageryCCR.app/Contents/MacOS/HaloImageryCCR | grep -A 3 LC_VERSION_MIN_MACOSX || echo "No deployment target found"
+# if [ -f "FreeCCR.dist/FreeCCR.bin" ]; then
+#     otool -l FreeCCR.dist/FreeCCR.bin | grep -A 3 LC_VERSION_MIN_MACOSX || echo "No deployment target found"
+# elif [ -f "FreeCCR.app/Contents/MacOS/FreeCCR" ]; then
+#     otool -l FreeCCR.app/Contents/MacOS/FreeCCR | grep -A 3 LC_VERSION_MIN_MACOSX || echo "No deployment target found"
 # else
 #     echo "Could not find built binary to check"
 # fi

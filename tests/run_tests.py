@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test runner for HaloImageryCCR activation system tests.
+Test runner for FreeCCR activation system tests.
 Run this script to execute all activation-related tests.
 """
 
@@ -29,7 +29,7 @@ def run_test_file(test_file: str) -> bool:
 
 def main():
     """Run all activation tests."""
-    print("HaloImageryCCR Activation System Test Suite")
+    print("FreeCCR Activation System Test Suite")
     print("=" * 60)
     
     tests_dir = Path(__file__).parent

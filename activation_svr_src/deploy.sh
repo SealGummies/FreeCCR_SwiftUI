@@ -25,7 +25,7 @@ fly deploy
 
 # Check deployment status
 echo "✅ Deployment complete!"
-echo "🌐 Your activation server is available at: https://$(fly info --name activation-svr-src --json | jq -r '.Hostname')"
+echo "🌐 Your activation server is available at: https://$(fly info --name freeccr-activation --json | jq -r '.Hostname')"
 
 # Optional: Set secrets (uncomment and modify as needed)
 # echo "🔐 Setting secrets..."

@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-SIGN_CERTIFICATE="Apple Development: alinax@haloimagery.com"
+SIGN_CERTIFICATE="Apple Development: alinax@freeccr.com"
 
-APP_NAME="HaloImageryCCR"
+APP_NAME="FreeCCR"
 BUNDLE_DIR="${APP_NAME}.app"
 CONTENTS_DIR="${BUNDLE_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
@@ -13,7 +13,7 @@ ICON_SRC="src/icons/haloimagery_logo.icns"
 NUITKA_BIN="main.dist/main.bin"
 DMG_NAME="${APP_NAME}.dmg"
 DMG_TEMP_DIR="dmg_temp"
-LICENSE_FILE="LICENSES/license-HaloImageryCCR.txt"
+LICENSE_FILE="LICENSES/license-FreeCCR.txt"
 DMG_SETTINGS="macos_build_scripts/dmg_settings.py"
 
 # Clean previous bundle and temp

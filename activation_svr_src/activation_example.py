@@ -2,7 +2,7 @@ import keyring
 import requests
 import uuid
 
-SERVICE_NAME = "halo-ccr-client"
+SERVICE_NAME = "freeccr-client"
 ACTIVATION_KEY = "activation_key"
 COMMERCIAL_FLAG_KEY = "activation_type"  # New key for storing license type
 INSTANCE_ID_KEY = "instance_id"  # New key for storing instance id
@@ -11,7 +11,7 @@ INSTANCE_NAME_KEY = "instance_name"
 
 # Configuration for abstraction layer
 # Change this to your Fly.io app URL when deployed
-# host = "your-app-name.fly.dev"  # Your Fly.io deployment
+# host = "freeccr-activation.fly.dev"  # Your Fly.io deployment
 host = "localhost:8080"  # For local development
 
 # Alternatively, you can use environment variables for easier configuration

@@ -680,7 +680,7 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
             rgb_brightness_normalized = np.ascontiguousarray(rgb_brightness_normalized)
             
             # Add a watermark to the image
-            watermark_text = "HaloImagery CCR Unpaid Demo"
+            watermark_text = "FreeCCR Unpaid Demo"
             font = cv2.FONT_HERSHEY_SIMPLEX
             # Make font_scale so text height is about 1/10 of image height
             # At font_scale=1, text height is about 32 px, so scale accordingly

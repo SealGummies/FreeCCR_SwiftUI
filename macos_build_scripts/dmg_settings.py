@@ -1,14 +1,14 @@
 import os
 
 # Name of the mounted volume
-volume_name = "HaloImageryCCR"
+volume_name = "FreeCCR"
 
 # Path to the .app bundle (relative to the DMG build directory)
 applications_link = True  # This will create the Applications symlink
 
 # Icon locations in the DMG window
 icon_locations = {
-    "HaloImageryCCR.app": (200, 110),
+    "FreeCCR.app": (200, 110),
     "Applications": (500, 110),
 }
 
@@ -16,7 +16,7 @@ icon_locations = {
 background = "builtin-arrow"
 
 files = [
-    "HaloImageryCCR.app",
+    "FreeCCR.app",
 ]
 
 symlinks = { 'Applications': '/Applications' }
@@ -28,7 +28,7 @@ icon_size = 100
 license = {
     "default-language": "en_US",
     "licenses": {
-        "en_US": "license-HaloImageryCCR.txt"
+        "en_US": "license-FreeCCR.txt"
     }
 }
 # Window size and position

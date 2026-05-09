@@ -1,6 +1,6 @@
-# HaloImageryCCR Activation Tests
+# FreeCCR Activation Tests
 
-This directory contains tests for the HaloImageryCCR activation and licensing system.
+This directory contains tests for the FreeCCR activation and licensing system.
 
 ## Test Files
 

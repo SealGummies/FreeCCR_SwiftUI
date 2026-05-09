@@ -1,3 +1,3 @@
 """
-Test package for HaloImageryCCR activation system.
+Test package for FreeCCR activation system.
 """

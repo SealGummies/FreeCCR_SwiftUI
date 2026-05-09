@@ -28,7 +28,7 @@ build-windows: install-deps install-nuitka
 	MACOSX_DEPLOYMENT_TARGET=10.15 $(PYTHON) -m nuitka --mingw64 --clang --standalone --include-package=numpy --enable-plugin=pyside6 \
 	--include-data-dir=src/icons=icons --windows-icon-from-ico=src/icons/haloimagery_logo.ico \
 	--include-data-dir=LICENSES=LICENSES \
-	--windows-console-mode=attach --output-filename=HaloImageryCCR \
+	--windows-console-mode=attach --output-filename=FreeCCR \
 	src/main.py
 
 # Utility targets
@@ -38,5 +38,5 @@ check-compatibility:
 clean:
 	rm -rf __pycache__ build dist *.dist-info *.spec *.build
 	rm -rf main.build main.dist main.exe main.bin
-	rm -rf HaloImageryCCR.build HaloImageryCCR.dist HaloImageryCCR.exe HaloImageryCCR.bin
+	rm -rf FreeCCR.build FreeCCR.dist FreeCCR.exe FreeCCR.bin
 	rm -rf *.app *.dmg

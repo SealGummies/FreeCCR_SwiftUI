@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pytest-compatible tests for HaloImageryCCR activation system.
+pytest-compatible tests for FreeCCR activation system.
 Run with: pytest tests/test_pytest_activation.py -v
 """
 

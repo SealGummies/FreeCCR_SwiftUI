@@ -60,7 +60,7 @@ class ImageLoaderWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HaloImagery CCR")
+        self.setWindowTitle("FreeCCR")
         self.setGeometry(100, 100, 1860, 1080)
         app_icon = QIcon("./icons/haloimagery_logo.png")
         self.setWindowIcon(app_icon)
@@ -97,13 +97,13 @@ class MainWindow(QMainWindow):
         ccr_backend.software_activated = True
         _, license_type = validate_software()
         if license_type:
-            self.setWindowTitle(f"HaloImagery CCR - {license_type}")
+            self.setWindowTitle(f"FreeCCR - {license_type}")
 
     def closeEvent(self, event):
         reply = QMessageBox.question(
             self,
             "Confirm Exit",
-            "Are you sure you want to exit HaloImagery CCR?",
+            "Are you sure you want to exit FreeCCR?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -146,9 +146,9 @@ class MainWindow(QMainWindow):
     def show_about_dialog(self):
         QMessageBox.about(
             self,
-            "About HaloImagery CCR",
-            f"""<b>HaloImagery CCR</b><br>Version {VERSION}<br><br>Copyright © 2025 HaloImagery
-            <br>Website: <a href="https://www.haloimagery.com">www.haloimagery.com</a><br>
+            "About FreeCCR",
+            f"""<b>FreeCCR</b><br>Version {VERSION}<br><br>Copyright © 2025 FreeCCR
+            <br>Website: <a href="https://www.freeccr.com">www.freeccr.com</a><br>
             <br>Built along with PySide6 v6.7.1<br>
             <br>For more info, visit PySide6 on PyPI: https://pypi.org/project/PySide6/ <br>
             <br>For third-party licenses, see the Licenses section in the Help menu."""
@@ -283,12 +283,12 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def open_help_website(self):
-        webbrowser.open("https://www.haloimagery.com/help")
+        webbrowser.open("https://www.freeccr.com/help")
 
 class ActivationDialog(QDialog):
     def __init__(self, parent=None, allow_deactivate=False):
         super().__init__(parent)
-        self.setWindowTitle("Activate CCR Client")
+        self.setWindowTitle("Activate FreeCCR")
         self.setMinimumWidth(350)
         layout = QVBoxLayout(self)
         self.allow_deactivate = allow_deactivate
@@ -354,7 +354,7 @@ class ActivationDialog(QDialog):
                 self.key_input.clear()
                 self.email_input.clear()
                 ccr_backend.software_activated = False
-                self.setWindowTitle("Activate CCR Client")
+                self.setWindowTitle("Activate FreeCCR")
             else:
                 QMessageBox.warning(self, "Failed", "Failed to deactivate. Maybe already deactivated?")
             self.reject()
@@ -364,7 +364,7 @@ class ActivationDialog(QDialog):
         self.reject()
 
     def open_buy_page(self):
-        webbrowser.open("https://www.haloimagery.com/buy")
+        webbrowser.open("https://www.freeccr.com/buy")
 
     def closeEvent(self, event):
         if not self.allow_deactivate: #opening from within the app, skip the warning

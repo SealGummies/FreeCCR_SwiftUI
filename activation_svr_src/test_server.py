@@ -8,7 +8,7 @@ import requests
 import json
 
 # Test configuration
-SERVER_URL = "https://activation.haloimagery.com"  # Change to your server URL
+SERVER_URL = "https://activation.freeccr.com"  # Change to your server URL
 TEST_LICENSE_KEY = "test-key-123"
 TEST_EMAIL = "test@example.com"
 TEST_INSTANCE_NAME = "test-instance"

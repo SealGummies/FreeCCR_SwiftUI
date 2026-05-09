@@ -1,6 +1,6 @@
-# HaloImagery CCR
+# FreeCCR
 
-**HaloImagery CCR** is a cross-platform desktop application for batch image preview, selection, negative conversion, and color correction, supporting a wide range of RAW and standard image formats.
+**FreeCCR** is a cross-platform desktop application for batch image preview, selection, negative conversion, and color correction, supporting a wide range of RAW and standard image formats.
 
 ---
 
@@ -11,12 +11,13 @@
 - Batch image loading from folders or file selection
 - Image preview with color correction sliders
 - Modern, responsive UI built with PySide6 (Qt for Python)
+- Unlocked build: no activation or verification required
 
 ---
 
 ## Requirements
 
-- Python 3.11.0 (newer version failes to work with nuitka compiling)
+- Python 3.11.0 (newer versions fail with Nuitka compilation)
 
 ---
 
@@ -24,8 +25,8 @@
 
 1. **Clone the repository:**
     ```sh
-    git clone https://github.com/yourusername/haloimagery-ccr.git
-    cd haloimagery-ccr/src
+    git clone https://github.com/yourusername/freeccr.git
+    cd freeccr/src
     ```
 
 2. **Install dependencies:**
@@ -38,14 +39,14 @@
    ./build_exe.bat
    ```
 
+## Activation
+
+This build does not require activation. Startup verification and license checks are disabled.
+
 ## Releases
 
-https://s3.us-east-1.amazonaws.com/haloimagery.com/downloads/macos-arm64/HaloImageryCCR.dmg
+Release links are not published in this repository.
 
-https://s3.us-east-1.amazonaws.com/haloimagery.com/downloads/macos-x86_64/HaloImageryCCR.dmg
+## Notes
 
-https://s3.us-east-1.amazonaws.com/haloimagery.com/downloads/win-x86_64/HaloImageryCCR_Install_v1.0.0.exe
-
-## Test
-
-test key: 76B85B49-4A87-4E96-8B6F-FCAE2BF3F421
+- The previous activation test key is no longer needed.
