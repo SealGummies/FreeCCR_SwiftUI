@@ -47,6 +47,14 @@ This build does not require activation. Startup verification and license checks 
 
 Release links are not published in this repository.
 
+## License
+
+FreeCCR is licensed under the [GNU Affero General Public License v3.0](LICENSE) (**AGPL-3.0**). Like GPLv3, it is **copyleft**: if you distribute modified versions, you must license those changes under the same terms and provide corresponding source code.
+
+AGPL adds a **network use** rule: if you **run** a modified version as a **service** (including SaaS) so users interact with it **remotely over a network**, you must offer those users the corresponding source—including for code you only deploy on servers. (Plain GPLv3 does not impose that obligation for typical SaaS.)
+
+Bundled third-party libraries remain under their own licenses in [`LICENSES/`](LICENSES/).
+
 ## Notes
 
 - The previous activation test key is no longer needed.
