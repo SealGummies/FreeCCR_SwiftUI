@@ -1,0 +1,90 @@
+END USER LICENSE AGREEMENT (EULA)
+
+IMPORTANT: READ THIS AGREEMENT CAREFULLY BEFORE INSTALLING OR USING THE SOFTWARE.
+
+This End User License Agreement ("Agreement") is a legal agreement between you (either an individual or a single entity, "End User") and "Halo Imagery", a sole proprietorship in Canada ("Licensor"), for the use of the software product "Halo Imagery CCR" ("Software").
+
+BY INSTALLING, COPYING, OR OTHERWISE USING THE SOFTWARE, YOU AGREE TO BE BOUND BY THE TERMS OF THIS AGREEMENT. IF YOU DO NOT AGREE TO THE TERMS OF THIS AGREEMENT, DO NOT INSTALL OR USE THE SOFTWARE.
+
+1. LICENSE GRANT  
+Licensor grants you a limited, non-exclusive, non-transferable, revocable, subscription-based license to install and use one copy of the Software for your personal or internal business purposes, subject to the terms of this Agreement.
+
+1A. PERSONAL AND COMMERCIAL LICENSES  
+For the purposes of this Agreement, "personal use" is defined as use by an individual whose total gross income derived from photographic-related activities, including but not limited to photography, image editing, and related services, does not exceed $5,000 USD (or equivalent) in any calendar year. If your photographic-related income exceeds $5,000 USD per year, you are required to obtain and use a valid commercial license for the Software. Use of the Software under a personal license for commercial purposes beyond this threshold is strictly prohibited.
+
+2. RESTRICTIONS
+- You may not reverse engineer, decompile, disassemble, modify, adapt, translate, or otherwise attempt to derive the source code of the Software, except as expressly permitted by applicable law.
+- You may not redistribute, sublicense, rent, lease, lend, or otherwise make the Software available to any third party.
+- You may not use the Software for any purpose that is unlawful or prohibited by this Agreement.
+- Commercial use is permitted only under a valid subscription.
+
+3. OWNERSHIP AND INTELLECTUAL PROPERTY
+The Software is licensed, not sold. All rights, title, and interest in and to the Software, including all intellectual property rights, remain with Licensor and its suppliers. All rights not expressly granted are reserved by Licensor.
+
+4. UPDATES AND SUPPORT
+Licensor may, but is not obligated to, provide updates, upgrades, or support for the Software. Any updates provided will be governed by this Agreement unless accompanied by a separate license.
+
+5. TERMINATION
+This Agreement is effective until terminated. Your rights under this Agreement will terminate automatically without notice if you fail to comply with any term(s) of this Agreement. Upon termination, you must cease all use of the Software and destroy all copies.
+
+6. DISCLAIMER OF WARRANTIES
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. LICENSOR DOES NOT WARRANT THAT THE SOFTWARE WILL MEET YOUR REQUIREMENTS OR THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED OR ERROR-FREE.
+
+7. LIMITATION OF LIABILITY
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL LICENSOR, ITS AFFILIATES, OR ITS SUPPLIERS BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES WHATSOEVER (INCLUDING, WITHOUT LIMITATION, DAMAGES FOR LOSS OF PROFITS, LOSS OF DATA, BUSINESS INTERRUPTION, OR OTHER PECUNIARY LOSS) ARISING OUT OF THE USE OF OR INABILITY TO USE THE SOFTWARE, EVEN IF LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES. IN NO EVENT SHALL LICENSOR'S TOTAL LIABILITY TO YOU FOR ALL DAMAGES EXCEED THE AMOUNT PAID BY YOU FOR THE SOFTWARE.
+
+8. INDEMNIFICATION
+You agree to indemnify, defend, and hold harmless Licensor, its affiliates, officers, agents, and employees from and against any and all claims, damages, losses, liabilities, costs, or expenses (including reasonable attorneys' fees) arising out of or related to your use or misuse of the Software, violation of this Agreement, or violation of any rights of a third party.
+
+9. PRIVACY POLICY
+9.1 DATA COLLECTION: Halo Imagery CCR operates primarily as a local desktop application for photographic image processing. The Software may collect limited information including: (a) license activation data (email address, activation key, and unique instance identifier) for subscription verification; (b) technical diagnostic information such as operating system version, hardware specifications, and application performance metrics; (c) error logs and crash reports to improve RAW image processing algorithms; (d) usage statistics related to negative conversion, color correction, and batch processing features.
+
+9.2 IMAGE DATA PRIVACY: Your photographic images and image metadata remain entirely on your local device. The Software does not upload, transmit, or store your images on external servers. All RAW file processing, negative conversion, color correction, thumbnail generation, and image exports are performed locally on your computer.
+
+9.3 LICENSE VERIFICATION: The Software connects to Licensor's activation servers (activation.haloimagery.com) solely for license validation and activation purposes. This connection transmits only your email address, license key, and a unique device identifier. No image data or image processing information is transmitted during license verification.
+
+9.4 USE OF COLLECTED DATA: Information collected by the Software is used exclusively for: (a) verifying subscription status and preventing unauthorized use; (b) improving RAW image processing algorithms and negative conversion accuracy; (c) providing technical support for photography-specific workflows; (d) communicating software updates related to camera support and image processing improvements.
+
+9.5 DATA SHARING: Licensor does not sell, share, or disclose your photographic images or processing settings to any third parties. Technical diagnostic data may be shared with service providers who assist in software development under strict confidentiality agreements. Personal information may be disclosed only when required by law or to protect users' safety.
+
+9.6 LOCAL STORAGE: The Software stores application preferences, color correction settings, batch processing configurations, and licensing information locally on your device using secure system keychain storage (macOS) or equivalent secure storage mechanisms (Windows). These settings are not synchronized across devices or transmitted to external servers.
+
+9.7 NO TRACKING OR ANALYTICS: The Software does not use cookies, web tracking, behavioral analytics, or advertising technologies. No third-party analytics services monitor your image processing activities or photography workflows.
+
+9.8 OFFLINE OPERATION: Halo Imagery CCR is designed to function completely offline for all core photography features including RAW processing, negative conversion, color correction, and image export. Internet connectivity is required only for initial license activation and periodic license validation.
+
+10. REFUND POLICY
+10.1 SUBSCRIPTION-BASED SERVICE: Halo Imagery CCR operates on a subscription-based licensing model. All subscription fees are charged in advance for the selected subscription period (monthly, annual, or other available terms).
+
+10.2 NO REFUNDS FOR SUBSCRIPTION PERIODS: Due to the nature of software licensing and the immediate access provided upon subscription activation, all subscription payments are final and non-refundable. This includes partial refunds for unused portions of subscription periods.
+
+10.3 SUBSCRIPTION ACCESS CONTINUATION: Upon subscription cancellation or non-renewal, your access to the Software will continue until the end of your current paid subscription period. No pro-rated refunds will be provided for early cancellation or non-use during the remaining subscription term.
+
+10.4 TECHNICAL ISSUES: If you experience technical difficulties that prevent normal use of the Software, contact Licensor's support team for assistance. Licensor will make reasonable efforts to resolve technical issues, but such issues do not constitute grounds for refund of subscription fees.
+
+10.5 BILLING DISPUTES: Any billing disputes must be reported to Licensor within thirty (30) days of the charge in question. Disputes reported after this period may not be considered for resolution.
+
+10.6 AUTOMATIC RENEWAL: If your subscription includes automatic renewal, you may cancel future renewals at any time through your account settings or by contacting Licensor. Cancellation of automatic renewal does not entitle you to a refund of the current subscription period.
+
+10.7 LICENSE VIOLATIONS: Subscriptions terminated due to violations of this Agreement, including but not limited to unauthorized use, license sharing, or reverse engineering, are not eligible for any refund consideration.
+
+10.8 EXCEPTIONAL CIRCUMSTANCES: Licensor reserves the right to consider refund requests on a case-by-case basis in exceptional circumstances, such as duplicate charges or technical errors in billing. Such considerations are at Licensor's sole discretion and do not create an obligation for future similar considerations.
+
+11. THIRD-PARTY SOFTWARE
+This Software includes third-party components licensed under their respective open-source licenses. See the LICENSES folder for details. You agree to comply with all such licenses.
+
+12. EXPORT RESTRICTIONS
+You agree to comply with all applicable export laws and regulations. The Software may not be exported or re-exported to countries or persons prohibited under applicable export control laws.
+
+13. GOVERNING LAW AND JURISDICTION
+This Agreement shall be governed by and construed in accordance with the laws of the Province of [Your Province], and the federal laws of Canada applicable therein, without regard to its conflict of law provisions. Any legal action or proceeding arising under this Agreement will be brought exclusively in the courts located in [Your Province], Canada, and you hereby consent to the personal jurisdiction and venue therein.
+
+14. SEVERABILITY
+If any provision of this Agreement is held to be unenforceable, such provision shall be reformed only to the extent necessary to make it enforceable, and the remaining provisions will remain in full force and effect.
+
+15. ENTIRE AGREEMENT
+This Agreement constitutes the entire agreement between you and Licensor regarding the Software and supersedes all prior or contemporaneous understandings regarding such subject matter.
+
+BY USING THE SOFTWARE, YOU ACKNOWLEDGE THAT YOU HAVE READ THIS AGREEMENT, UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS.
+
+Copyright © 2025 Halo Imagery. All rights reserved.

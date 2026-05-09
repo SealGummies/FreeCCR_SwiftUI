@@ -1,0 +1,263 @@
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QListWidget, QListWidgetItem, QLabel, QDialog, QApplication, QPushButton, QMenu
+from PySide6.QtGui import QPixmap, QIcon, QTransform, QPainter
+from PySide6.QtCore import Qt, QSize, QTimer
+import os
+import logging
+import numpy as np
+from io import BytesIO
+from core.ccr_backend import ccr_backend  # <-- Add this import
+
+class LoadingDialog(QDialog):
+    def __init__(self, parent=None, cancel_callback=None):
+        super().__init__(parent)
+        self.setWindowTitle("Loading")
+        self.setModal(True)
+        self.setWindowModality(Qt.ApplicationModal)  # Block all input to the app
+        # Remove close, minimize, maximize buttons
+        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+        self.setFixedSize(400, 100)  # Wider and taller for button
+
+        layout = QVBoxLayout()
+        self.label = QLabel("Loading images, please wait")
+        self.label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.label)
+
+        # Add Cancel button
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setFixedWidth(100)
+        self.cancel_button.clicked.connect(self.on_cancel)
+        self.cancel_callback = cancel_callback
+        btn_layout = QVBoxLayout()
+        btn_layout.addWidget(self.cancel_button, alignment=Qt.AlignCenter)
+        layout.addLayout(btn_layout)
+
+        self.setLayout(layout)
+
+        self.dot_count = 0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_dots)
+        self.timer.start(400)  # Update every 400ms
+
+    def update_dots(self):
+        self.dot_count = (self.dot_count % 3) + 1  # Cycles 1, 2, 3
+        count = ccr_backend.get_image_count()  
+        total = ccr_backend.get_total_file_paths()  # Assuming this method exists
+        self.label.setText("Loading images, please wait" + "." * self.dot_count + f" ({count}/{total})")
+
+    def closeEvent(self, event):
+        # Prevent closing by user
+        event.ignore()
+
+    def reject(self):
+        # Prevent closing by Esc or other means
+        pass
+
+    def on_cancel(self):
+        # Stop timer and close dialog
+        self.timer.stop()
+        # Clear backend
+        
+        # Call any additional cancel logic if provided
+        if self.cancel_callback:
+            self.cancel_callback()
+        ccr_backend.clear()
+        self.accept()
+
+class ThumbnailList(QWidget):
+    def __init__(self, image_selected_callback):
+        super().__init__()
+        self.image_selected_callback = image_selected_callback
+        self.init_ui()
+        # Enable custom context menu
+        self.thumbnail_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.thumbnail_list.customContextMenuRequested.connect(self.show_context_menu)
+
+    def init_ui(self):
+        self.layout = QVBoxLayout()
+        self.thumbnail_list = QListWidget()
+        self.thumbnail_list.setViewMode(QListWidget.IconMode)
+        self.thumbnail_list.setSpacing(10)
+        self.thumbnail_list.setDragDropMode(QListWidget.NoDragDrop)
+        self.thumbnail_list.setResizeMode(QListWidget.Adjust)
+        self.thumbnail_list.setMovement(QListWidget.Static)
+        self.thumbnail_list.setWrapping(False)
+        self.thumbnail_list.setFlow(QListWidget.TopToBottom)
+        self.thumbnail_list.setFixedWidth(196)
+        self.thumbnail_list.setFocusPolicy(Qt.StrongFocus)  # <-- Ensure strong focus
+        self.thumbnail_list.setFocus()  # <-- Optionally set focus immediately
+        self.thumbnail_list.itemClicked.connect(self.on_thumbnail_clicked)
+        self.thumbnail_list.currentItemChanged.connect(self.on_current_item_changed)
+        self.layout.addWidget(self.thumbnail_list)
+
+        self.count_label = QLabel("Total: 0 image(s)")
+        self.count_label.setAlignment(Qt.AlignLeft)
+        self.layout.addWidget(self.count_label)
+
+        self.setLayout(self.layout)
+        
+        # Set initial hint since no images are loaded when program starts
+        # Use QTimer to ensure parent widgets are fully initialized
+        QTimer.singleShot(100, self.set_initial_hint)
+
+    def set_initial_hint(self):
+        """
+        Set the initial hint when the program starts with no images loaded.
+        """
+        try:
+            self.parent().parent().sliders_panel.set_hint("<b>Hint:</b><br>Use file menu to import folder or files.")
+        except AttributeError:
+            # In case the parent structure isn't ready yet, try again later
+            QTimer.singleShot(200, self.set_initial_hint)
+
+    def show_loading_dialog(self):
+        # Pass a callback to cancel the worker thread
+        def cancel_loading():
+            # Access the worker from the main window and call cancel
+            main_window = self.parent().parent()
+            if hasattr(main_window, 'worker'):
+                main_window.worker.cancel()
+        self.loading_dialog = LoadingDialog(self, cancel_callback=cancel_loading)
+        self.loading_dialog.show()
+        QApplication.processEvents()
+
+    def load_thumbnails(self):
+        self.thumbnail_list.clear()
+        image_count = ccr_backend.get_image_count()
+        logging.info(f"Loading {image_count} images from backend")
+        for idx in range(image_count):
+            thumbnail = ccr_backend.get_thumbnail_by_index(idx)
+            # Get filename for display
+            if idx < len(ccr_backend.file_paths):
+                filename = os.path.basename(ccr_backend.file_paths[idx])
+            else:
+                filename = ""
+            item = QListWidgetItem(filename)  # Set filename as item text
+            # Apply rotations and flips using PySide6 transformations
+            transformed_thumbnail = self.apply_frontend_transformations(thumbnail, idx)
+            icon = QIcon(transformed_thumbnail)
+            item.setIcon(icon)
+            item.setData(Qt.UserRole, idx)
+            self.thumbnail_list.addItem(item)
+            if idx % 5 == 0:
+                QApplication.processEvents()
+        self.thumbnail_list.setIconSize(QSize(156, 156))
+        self.count_label.setText(f"Total: {image_count} image(s)")
+        
+        # Set current index to 0 if there are items
+        if image_count > 0:
+            self.thumbnail_list.setCurrentRow(0)
+            self.parent().parent().image_preview.update_preview(0)
+            # Clear any existing hint when images are loaded
+            self.parent().parent().sliders_panel.clear_hint()
+        else:
+            # Set hint when no images are loaded
+            self.parent().parent().sliders_panel.set_hint("<b>Hint:</b><br>Use file menu to import folder or files.")
+
+        if hasattr(self, 'loading_dialog') and self.loading_dialog is not None:
+            self.loading_dialog.accept()  # Close the dialog
+
+    def update_thumbnail(self, idx):
+        thumbnail = ccr_backend.get_thumbnail_by_index(idx)
+        if thumbnail is not None:
+            item = self.thumbnail_list.item(idx)
+            if item:
+                # Apply rotations and flips using PySide6 transformations
+                transformed_thumbnail = self.apply_frontend_transformations(thumbnail, idx)
+                icon = QIcon(transformed_thumbnail)
+                item.setIcon(icon)
+                                                                                 
+    def update_all_thumbnails(self):
+        for idx in range(ccr_backend.get_image_count()):
+            self.update_thumbnail(idx)
+        
+    def on_thumbnail_clicked(self, item):
+        idx = item.data(Qt.UserRole)
+        self.parent().parent().image_preview.update_preview(idx)
+        self.parent().parent().sliders_panel.set_current_idx(idx)
+
+    def on_current_item_changed(self, current, previous):
+        if current:
+            idx = current.data(Qt.UserRole)
+            self.parent().parent().image_preview.update_preview(idx)
+            self.parent().parent().sliders_panel.set_current_idx(idx)
+            if previous:
+                prev_idx = previous.data(Qt.UserRole)
+                self.update_thumbnail(prev_idx)  # Update previous thumbnail
+            
+
+    def keyPressEvent(self, event):
+        # Allow up/down keys to move the selection
+        if event.key() in (Qt.Key_Up, Qt.Key_Down):
+            self.thumbnail_list.keyPressEvent(event)
+        else:
+            super().keyPressEvent(event)
+
+    def show_context_menu(self, pos):
+        item = self.thumbnail_list.itemAt(pos)
+        if item is not None:
+            menu = QMenu(self)
+            remove_action = menu.addAction("Remove from list")
+            action = menu.exec_(self.thumbnail_list.mapToGlobal(pos))
+            if action == remove_action:
+                idx = item.data(Qt.UserRole)
+                self.remove_image(idx)
+
+    def remove_image(self, idx):
+        # Remove from backend
+        ccr_backend.remove_image_by_index(idx)
+        # Reload thumbnails to update indices and UI
+        self.load_thumbnails()
+
+    def apply_frontend_transformations(self, thumbnail, idx):
+        """
+        Apply rotations and flips to the thumbnail using PySide6 transformations.
+        This only affects the visual display without modifying backend data.
+        """
+        # Get transformation settings from backend
+        rotation_angle = ccr_backend.get_image_rotation_by_index(idx)
+        horizontal_flip = ccr_backend.get_image_horizontal_flip_by_index(idx)
+        vertical_flip = ccr_backend.get_image_vertical_flip_by_index(idx)
+        
+        # Start with the original thumbnail
+        transformed_thumbnail = thumbnail
+        
+        # Apply flips first using QTransform
+        if horizontal_flip or vertical_flip:
+            transform = QTransform()
+            if horizontal_flip:
+                transform.scale(-1, 1)  # Horizontal flip
+            if vertical_flip:
+                transform.scale(1, -1)  # Vertical flip
+            transformed_thumbnail = transformed_thumbnail.transformed(transform)
+        
+        # Apply 90-degree rotations (but not fine angle rotation)
+        angle = rotation_angle % 360
+        if angle != 0:
+            transform = QTransform()
+            transform.rotate(angle)
+            transformed_thumbnail = transformed_thumbnail.transformed(transform)
+        
+        # Ensure the transformed thumbnail fits within the icon size (156x156)
+        # while maintaining aspect ratio to prevent overlapping
+        icon_size = 156
+        if transformed_thumbnail.width() > icon_size or transformed_thumbnail.height() > icon_size:
+            transformed_thumbnail = transformed_thumbnail.scaled(
+                icon_size, icon_size, 
+                Qt.KeepAspectRatio, 
+                Qt.SmoothTransformation
+            )
+        
+        # Create a centered thumbnail on a fixed-size canvas to ensure consistent spacing
+        canvas = QPixmap(icon_size, icon_size)
+        canvas.fill(Qt.transparent)  # Transparent background
+        
+        # Calculate position to center the thumbnail on the canvas
+        x_offset = (icon_size - transformed_thumbnail.width()) // 2
+        y_offset = (icon_size - transformed_thumbnail.height()) // 2
+        
+        # Draw the thumbnail centered on the canvas
+        painter = QPainter(canvas)
+        painter.drawPixmap(x_offset, y_offset, transformed_thumbnail)
+        painter.end()
+        
+        return canvas

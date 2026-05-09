@@ -1,0 +1,1466 @@
+import numpy as np
+import cv2
+import os
+import time
+import tifffile
+import gc
+
+# Try to import PyOpenCL, but handle gracefully if not available
+try:
+    import pyopencl as cl
+    import pyopencl.array as cl_array
+    OPENCL_AVAILABLE = True
+except ImportError:
+    print("PyOpenCL not available. GPU acceleration will be disabled.")
+    OPENCL_AVAILABLE = False
+    cl = None
+    cl_array = None
+
+# Global OpenCL cache
+_opencl_cache = {
+    'ctx': None,
+    'queue': None,
+    'program': None,
+    'kernel': None,
+    'device_name': None
+}
+
+def _initialize_opencl():
+    """
+    Initialize OpenCL environment and compile kernel once. Cache the results.
+    Returns True if successful, False otherwise.
+    """
+    global _opencl_cache
+    
+    # Check if PyOpenCL is available
+    if not OPENCL_AVAILABLE:
+        return False
+    
+    # Check if already initialized
+    if _opencl_cache['program'] is not None:
+        return True
+    
+    try:
+        # Setup OpenCL context and queue automatically
+        platforms = cl.get_platforms()
+        if not platforms:
+            print("No OpenCL platforms found")
+            return False
+        
+        # Use the first available platform and device
+        platform = platforms[0]
+        devices = platform.get_devices()
+        if not devices:
+            print("No OpenCL devices found")
+            return False
+        
+        device = devices[0]
+        ctx = cl.Context([device])
+        queue = cl.CommandQueue(ctx)
+        
+        # OpenCL kernel that exactly matches the CPU version logic
+        kernel_code = """
+        __kernel void adjust(
+            __global float *img,
+            __global float *params,
+            int n_pixels
+        ) {
+            int gid = get_global_id(0);
+            if (gid >= n_pixels) return;
+
+            float kelvin_shift = params[0];
+            float tint_shift = params[1];
+            float exposure = params[2];
+            float brightness = params[3];
+            float blackpoint = params[4];
+            float whitepoint = params[5];
+            float contrast = params[6];
+            float saturation = params[7];
+            float balance_factor = params[8];  // Global balance factor calculated on CPU
+
+            int idx = gid * 3;
+            float r = img[idx];
+            float g = img[idx+1];
+            float b = img[idx+2];
+
+            // Temperature and Tint (Lightroom-like perceptual adjustments)
+            if (kelvin_shift != 0.0f || tint_shift != 0.0f) {
+                // Calculate luminance for tone-aware masking
+                float img_norm_r = r / 65535.0f;
+                float img_norm_g = g / 65535.0f;
+                float img_norm_b = b / 65535.0f;
+                float luminance = img_norm_r * 0.299f + img_norm_g * 0.587f + img_norm_b * 0.114f;
+                
+                // Create smooth asymmetric tone-aware strength curve (Lightroom-like)
+                // Define strength levels for different tonal regions
+                float shadow_strength = 0.8f;      // 80% strength in shadows (0-30% luminance)
+                float midtone_strength = 1.0f;     // 100% strength in midtones (30-60% luminance)  
+                float highlight_strength = 0.25f;  // 25% strength in highlights (60-100% luminance)
+                
+                // Transition points
+                float shadow_to_mid = 0.3f;       // Shadows to midtones transition at 30% luminance
+                float mid_to_highlight = 0.6f;    // Midtones to highlights transition at 60% luminance
+                
+                // Create smooth asymmetric curve using sigmoid blending
+                float tone_curve;
+                
+                if (luminance <= shadow_to_mid) {
+                    // Shadow region (0-30%): smooth transition from 80% to 100%
+                    float shadow_progress = clamp(luminance / shadow_to_mid, 0.0f, 1.0f);
+                    tone_curve = shadow_strength + (midtone_strength - shadow_strength) * shadow_progress;
+                } else if (luminance <= mid_to_highlight) {
+                    // Midtone region (30-60%): stay at 100% strength
+                    tone_curve = midtone_strength;
+                } else {
+                    // Highlight region (60-100%): smooth sigmoid transition from 100% to 25%
+                    float highlight_progress = (luminance - mid_to_highlight) / (1.0f - mid_to_highlight);
+                    // Use sigmoid for smooth natural rolloff
+                    float sigmoid_factor = 1.0f / (1.0f + exp(-8.0f * (highlight_progress - 0.5f)));
+                    tone_curve = midtone_strength - (midtone_strength - highlight_strength) * sigmoid_factor;
+                }
+                
+                // Temperature (R/B scaling with logarithmic perceptual response)
+                if (kelvin_shift != 0.0f) {
+                    // Map slider values [-100, 100] to Kelvin temperatures [2000K, 8000K]
+                    // Neutral point (slider 0) = 5000K
+                    float neutral_kelvin = 5000.0f;
+                    float current_kelvin = neutral_kelvin + (kelvin_shift / 100.0f) * 3000.0f;
+                    
+                    // Calculate Kelvin delta from neutral
+                    float kelvin_delta = current_kelvin - neutral_kelvin;
+                    
+                    // Logarithmic scaling for Kelvin - stronger impact at low end
+                    float kelvin_abs = fabs(kelvin_delta);
+                    
+                    // Create logarithmic response curve based on actual Kelvin values
+                    float perceptual_scale = 0.0f;
+                    if (kelvin_abs > 0.0f) {
+                        // Normalize by the maximum possible delta (3000K)
+                        float normalized_delta = kelvin_abs / 3000.0f;
+                        float log_factor = log(1.0f + normalized_delta * 2.0f) / log(3.0f);  // Normalize to [0,1] range
+                        perceptual_scale = log_factor * sign(kelvin_delta) * 0.25f;  // Increased scale for visible effect
+                    }
+                    
+                    // Apply perceptual curve - more sensitive in midtones/skin tones
+                    // Create additional sensitivity curve for midtones
+                    float midtone_sensitivity = 1.0f + 0.3f * exp(-8.0f * pow(luminance - 0.4f, 2.0f));  // Peak at 40% luminance
+                    
+                    // Combine tone-aware masking with perceptual scaling and midtone sensitivity
+                    float effective_scale = perceptual_scale * tone_curve * midtone_sensitivity;
+                    
+                    float r_scale = 1.0f + effective_scale;
+                    float b_scale = 1.0f - effective_scale;
+                    
+                    r *= r_scale;  // R
+                    b *= b_scale;  // B
+                }
+
+                // Tint (G-M scaling with perceptual mapping and enhanced midtone sensitivity)
+                if (tint_shift != 0.0f) {
+                    // Use the global balance factor calculated on CPU for exact matching
+                    // This ensures identical results between CPU and OpenCL versions
+                    
+                    // Enhanced midtone and skin tone sensitivity for tint
+                    // Tint is most visible in skin tones and neutral areas
+                    float skin_tone_sensitivity = 1.0f + 0.5f * exp(-12.0f * pow(luminance - 0.35f, 2.0f));  // Peak at 35% luminance
+                    
+                    // Create perceptual tint curve - stronger response in certain ranges
+                    float tint_abs = fabs(tint_shift);
+                    float perceptual_tint = 0.0f;
+                    if (tint_abs > 0.0f) {
+                        // Sigmoid-like curve for tint perception
+                        perceptual_tint = tanh(tint_abs * 0.02f) * sign(tint_shift) * 0.12f;  // Increased scale for visible effect
+                    }
+                    
+                    // Apply perceptual tint with tone awareness, balance factor, and skin tone sensitivity
+                    float effective_tint = perceptual_tint * tone_curve * balance_factor * skin_tone_sensitivity;
+                    
+                    // Tint primarily affects green, with complementary adjustments to R/B
+                    float g_scale = 1.0f - effective_tint;  // Green channel (inverse of tint shift)
+                    float r_tint_scale = 1.0f + (0.3f * effective_tint);  // Slight red compensation
+                    float b_tint_scale = 1.0f + (0.3f * effective_tint);  // Slight blue compensation
+                    
+                    g *= g_scale;  // G
+                    r *= r_tint_scale;  // R  
+                    b *= b_tint_scale;  // B
+                }
+            }
+
+            // Exposure (Adobe-like, tone-aware to preserve highlights)
+            if (exposure != 0.0f) {
+                // Calculate luminance for tone-aware exposure mapping
+                float img_norm_r = r / 65535.0f;
+                float img_norm_g = g / 65535.0f;
+                float img_norm_b = b / 65535.0f;
+                float luminance = img_norm_r * 0.299f + img_norm_g * 0.587f + img_norm_b * 0.114f;
+                
+                // Create smooth, continuous tone-aware exposure curve
+                float transition_midpoint = 0.7f;    // Where the curve inflection point is (70% luminance)
+                float transition_width = 0.15f;      // Controls smoothness of transition
+                float min_strength = 0.03f;          // Minimum exposure effect in pure highlights (3%)
+                float max_strength = 1.0f;           // Maximum exposure effect in shadows/midtones
+                
+                // Smooth sigmoid-like curve for continuous transition
+                float exposure_curve = min_strength + (max_strength - min_strength) * (
+                    1.0f / (1.0f + exp((luminance - transition_midpoint) / transition_width))
+                );
+                
+                // Apply tone-aware exposure
+                float exposure_scale = exposure / 100.0f;
+                float exposure_factor = pow(2.0f, exposure_scale);  // Base exposure factor in stops
+                
+                // Create per-pixel exposure factors
+                float pixel_exposure_factor = 1.0f + (exposure_factor - 1.0f) * exposure_curve;
+                
+                r *= pixel_exposure_factor;
+                g *= pixel_exposure_factor;
+                b *= pixel_exposure_factor;
+            }
+            
+            // Brightness (Adobe-like: lift lower midtones, preserve highlights)
+            if (brightness != 0.0f) {
+                float img_norm_r = r / 65535.0f;
+                float img_norm_g = g / 65535.0f;
+                float img_norm_b = b / 65535.0f;
+                
+                float brightness_scale = brightness / 8.0f;   // -10.0 to +10.0 for -100 to +100
+                // The curve parameter: positive = lift, negative = compress
+                float curve = 1.0f - 0.3f * brightness_scale;  // 2.2 to 0.8 for -100 to +100
+                
+                // Use pow directly like CPU version, without fmax protection
+                img_norm_r = pow(img_norm_r, curve);
+                img_norm_g = pow(img_norm_g, curve);
+                img_norm_b = pow(img_norm_b, curve);
+                
+                r = img_norm_r * 65535.0f;
+                g = img_norm_g * 65535.0f;
+                b = img_norm_b * 65535.0f;
+            }
+
+            // Black/White point (Adobe-like: remap input range)
+            if (blackpoint != 0.0f || whitepoint != 0.0f) {
+                float img_norm_r = r / 65535.0f;
+                float img_norm_g = g / 65535.0f;
+                float img_norm_b = b / 65535.0f;
+                
+                // Map [-100, 100] to [0, 0.2] for black, [1, 0.8] for white
+                float black_clip = clamp(blackpoint, -100.0f, 100.0f) / 500.0f;  // -0.2 to +0.2
+                float white_clip = clamp(whitepoint, -100.0f, 100.0f) / 300.0f;  // -0.2 to +0.2
+                float black_val = 0.0f + black_clip;
+                float white_val = 1.0f - white_clip;
+                float range = white_val - black_val;
+                
+                // Piecewise linear remap
+                if (range > 1e-6f) {
+                    img_norm_r = clamp((img_norm_r - black_val) / range, 0.0f, 1.0f);
+                    img_norm_g = clamp((img_norm_g - black_val) / range, 0.0f, 1.0f);
+                    img_norm_b = clamp((img_norm_b - black_val) / range, 0.0f, 1.0f);
+                }
+                
+                r = img_norm_r * 65535.0f;
+                g = img_norm_g * 65535.0f;
+                b = img_norm_b * 65535.0f;
+            }
+            
+            // Contrast (continuous S-curve for both positive and negative)
+            if (contrast != 0.0f) {
+                float img_norm_r = r / 65535.0f;
+                float img_norm_g = g / 65535.0f;
+                float img_norm_b = b / 65535.0f;
+                
+                float midpoint = 0.5f;
+                // Map contrast [-100, 100] to k [-0.95, 0.95]
+                float k = clamp(contrast / 105.0f, -0.95f, 0.95f);
+                
+                // S-curve: compress for negative, expand for positive, fixed endpoints
+                img_norm_r = ((1.0f + k) * (img_norm_r - midpoint)) / (1.0f + k * fabs(img_norm_r - midpoint) * 2.0f) + midpoint;
+                img_norm_g = ((1.0f + k) * (img_norm_g - midpoint)) / (1.0f + k * fabs(img_norm_g - midpoint) * 2.0f) + midpoint;
+                img_norm_b = ((1.0f + k) * (img_norm_b - midpoint)) / (1.0f + k * fabs(img_norm_b - midpoint) * 2.0f) + midpoint;
+                
+                r = img_norm_r * 65535.0f;
+                g = img_norm_g * 65535.0f;
+                b = img_norm_b * 65535.0f;
+            }
+
+            // Mid-high tone weighted saturation adjustment
+            if (saturation != 0.0f) {
+                float img_norm_r = r / 65535.0f;
+                float img_norm_g = g / 65535.0f;
+                float img_norm_b = b / 65535.0f;
+                
+                // Convert RGB to grayscale using luminance weights
+                float gray = img_norm_r * 0.299f + img_norm_g * 0.587f + img_norm_b * 0.114f;
+                
+                // Create mid-high tone weighted curve: bell curve peaked at 65% luminance
+                // Using Gaussian-like curve: exp(-((luminance - 0.65) / 0.25)^2)
+                float luminance_offset = gray - 0.65f;
+                float mid_high_weight = exp(-(luminance_offset * luminance_offset) / (0.25f * 0.25f));
+                
+                // Create dynamic saturation factor based on mid-high tone weighting
+                // Maximum effect at 65% luminance, minimal effect in deep shadows/highlights
+                float min_saturation_factor = 0.2f;  // 20% of full saturation in extremes
+                float saturation_curve = min_saturation_factor + (1.0f - min_saturation_factor) * mid_high_weight;
+                
+                // Apply the mid-high tone weighted saturation scaling
+                float saturation_scale = 1.0f + (saturation / 100.0f);  // Base saturation scale
+                float dynamic_saturation_scale = 1.0f + (saturation_scale - 1.0f) * saturation_curve;
+                
+                // Blend between grayscale and original based on mid-high tone weighted saturation
+                img_norm_r = gray + dynamic_saturation_scale * (img_norm_r - gray);
+                img_norm_g = gray + dynamic_saturation_scale * (img_norm_g - gray);
+                img_norm_b = gray + dynamic_saturation_scale * (img_norm_b - gray);
+                
+                img_norm_r = clamp(img_norm_r, 0.0f, 1.0f);
+                img_norm_g = clamp(img_norm_g, 0.0f, 1.0f);
+                img_norm_b = clamp(img_norm_b, 0.0f, 1.0f);
+                
+                r = img_norm_r * 65535.0f;
+                g = img_norm_g * 65535.0f;
+                b = img_norm_b * 65535.0f;
+            }
+
+            // Final clamp and store results
+            r = clamp(r, 0.0f, 65535.0f);
+            g = clamp(g, 0.0f, 65535.0f);
+            b = clamp(b, 0.0f, 65535.0f);
+
+            img[idx] = r;
+            img[idx+1] = g;
+            img[idx+2] = b;
+        }
+        """
+
+        # Compile the program
+        program = cl.Program(ctx, kernel_code).build()
+        
+        # Create and cache the kernel
+        kernel = cl.Kernel(program, "adjust")
+        
+        # Cache everything
+        _opencl_cache['ctx'] = ctx
+        _opencl_cache['queue'] = queue
+        _opencl_cache['program'] = program
+        _opencl_cache['kernel'] = kernel
+        _opencl_cache['device_name'] = device.name
+        
+        print(f"OpenCL initialized successfully - Device: {device.name} on platform: {platform.name}")
+        return True
+        
+    except Exception as e:
+        print(f"OpenCL initialization failed: {e}")
+        return False
+
+
+def safe_unicode_path(file_path: str) -> str:
+    """
+    Ensure file path is properly encoded for Unicode support across different systems.
+    """
+    return os.path.normpath(file_path)
+
+
+def safe_cv2_imwrite(output_path: str, image: np.ndarray) -> bool:
+    """
+    Safe image writing that handles Unicode file paths.
+    """
+    output_path = safe_unicode_path(output_path)
+    try:
+        # Try normal cv2.imwrite first
+        success = cv2.imwrite(output_path, image)
+        if success:
+            return True
+        
+        # If that fails, try encoding to bytes and using alternative method
+        try:
+            # Get file extension
+            _, ext = os.path.splitext(output_path)
+            # Encode image to memory buffer
+            success, buffer = cv2.imencode(ext, image)
+            if success:
+                # Write buffer to file
+                with open(output_path, 'wb') as f:
+                    f.write(buffer.tobytes())
+                return True
+        except Exception as e:
+            print(f"Failed to write image with Unicode path handling: {output_path}, error: {e}")
+            return False
+            
+    except Exception as e:
+        print(f"Failed to write image: {output_path}, error: {e}")
+        return False
+    
+    return False
+
+
+def safe_tifffile_imwrite(output_path: str, image: np.ndarray, **kwargs) -> bool:
+    """
+    Safe TIFF writing that handles Unicode file paths.
+    """
+    output_path = safe_unicode_path(output_path)
+    try:
+        tifffile.imwrite(output_path, image, **kwargs)
+        return True
+    except Exception as e:
+        print(f"Failed to write TIFF image: {output_path}, error: {e}")
+        return False
+
+
+
+
+def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_out=False) -> np.ndarray:
+    """
+    Normalize and align the image using the CCR algorithm, using a reference rectangle
+    for percentile calculations instead of a crop factor.
+
+    Args:
+        ccr_image: CCRImage object
+
+    Returns:
+        np.ndarray: CCR-normalized and inverted image, dtype uint16
+    """
+    print("Starting CCR normalization...")
+    total_start_time = time.time()
+    
+    # Get the working image
+    step_start = time.time()
+    if output_path is not None: # this is for output
+        img = ccr_image.read_image(ccr_image.file_path,preview=False)
+    else:  # this is for processing
+        img = ccr_image.resized_raw
+    if img is None:
+        raise ValueError("CCRImage.resized_raw is None")
+    print(f"Image loading: {time.time() - step_start:.3f}s")
+
+    # Apply fine rotation rotation 
+    step_start = time.time()
+    fine_angle = ccr_image.fine_rotation_angle / 100.0
+    h_flip = ccr_image.horizontal_mirrored
+    v_flip = ccr_image.vertical_mirrored
+
+    # Center of rotation
+    h, w = img.shape[:2]
+    center = (w // 2, h // 2)
+
+    
+    if output_path is not None: # this is for output
+        img_ref = ccr_image.resize_image_to_max_pixel(img, 1080)
+    else:  # this is for processing
+        img_ref = ccr_image.resized_raw
+    
+    # fine Rotation
+    if fine_angle != 0:
+        center_ref = (img_ref.shape[1] // 2, img_ref.shape[0] // 2)
+        w_ref, h_ref = img_ref.shape[1], img_ref.shape[0]
+        rot_mat = cv2.getRotationMatrix2D(center_ref, -fine_angle, 1.0)
+        img_ref = cv2.warpAffine(img_ref, rot_mat, (w_ref, h_ref), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+        # Clean up rotation matrix as it's no longer needed
+        del rot_mat
+        # print(f"Rotated image by {angle} degrees")
+        # if output_path is not None: # this is for output
+        #     # when outputting rotate original image as well
+        #     rot_mat = cv2.getRotationMatrix2D(center, -angle, 1.0)
+        #     img = cv2.warpAffine(img, rot_mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+    print(f"Image setup and rotation: {time.time() - step_start:.3f}s")
+
+    # Reference frame
+    step_start = time.time()
+    reference_rect = ccr_image.reference_frame
+    if reference_rect is None:
+        raise ValueError("CCRImage.reference_frame is None")
+
+    mapped_rect = map_rect_to_original(
+        ccr_image.resized_raw.shape,
+        img_ref.shape,
+        reference_rect
+    )
+
+    x1, y1, x2, y2 = mapped_rect
+
+    img = img.astype(np.float32, copy=False)
+    ref_crop = img_ref[y1:y2, x1:x2]
+    print(f"Reference frame setup: {time.time() - step_start:.3f}s")
+
+    # # Show the image using matplotlib for debugging
+    # plt.figure(figsize=(8, 8))
+    # plt.imshow(to_8bit(ref_crop))
+    # plt.title("ref_crop")
+    # plt.axis('off')
+    # plt.show()
+
+    # Black/white point normalization per channel with three-segment linear compression
+    step_start = time.time()
+    norm = np.empty_like(img, dtype=np.float32)
+    norm_ref = np.empty_like(img_ref, dtype=np.float32)
+    for c in range(3):
+        ch_crop = ref_crop[..., c]
+        # Get percentiles for linear mapping with compressed extremes
+        p10 = np.percentile(ch_crop, 1)    # 1st percentile
+        p90 = np.percentile(ch_crop, 99)    # 99th percentile  
+        
+        ch_full = img[..., c]
+        ch_full_ref = img_ref[..., c]
+        
+        # Linear mapping: p10->6086, p90->43882:
+        # Formula: output = (input - p10) / (p90 - p10) * (43882 - 6086) + 6086
+        np.subtract(ch_full, p10, out=norm[..., c])
+        np.divide(norm[..., c], (p90 - p10), out=norm[..., c])
+        np.multiply(norm[..., c], (65535 - 8192), out=norm[..., c])
+        np.add(norm[..., c], 8192, out=norm[..., c])
+        np.clip(norm[..., c], 0, 65535, out=norm[..., c])
+
+        np.subtract(ch_full_ref, p10, out=norm_ref[..., c])
+        np.divide(norm_ref[..., c], (p90 - p10), out=norm_ref[..., c])
+        np.multiply(norm_ref[..., c], (65535 - 8192), out=norm_ref[..., c])
+        np.add(norm_ref[..., c], 8192, out=norm_ref[..., c])
+        np.clip(norm_ref[..., c], 0, 65535, out=norm_ref[..., c])
+    
+    # Clean up intermediate arrays
+    del ref_crop
+    print(f"BWPN: {time.time() - step_start:.3f}s")
+      # Optical density alignment (conservative optimization)
+    step_start = time.time()
+    ref_norm_crop = norm_ref[y1:y2, x1:x2]
+    np.add(ref_norm_crop, 1e-6, out=ref_norm_crop)
+    od_crop = -np.log10(ref_norm_crop / 65535.0)
+    mean_od_crop = np.mean(od_crop, axis=(0, 1))
+    target_mean_od = np.mean(mean_od_crop)
+    scaling_factors = target_mean_od / (mean_od_crop + 1e-12)  # Only add division by zero protection
+
+    # Apply scaling to full image (keep original approach)
+    norm_full = norm
+    np.add(norm_full, 1e-6, out=norm_full)
+    od_full = -np.log10(norm_full / 65535.0)
+    od_aligned_full = od_full * scaling_factors
+      # Clean up intermediate arrays
+    del ref_norm_crop, od_crop, mean_od_crop, scaling_factors, od_full
+    
+    np.power(10, -od_aligned_full, out=od_aligned_full)
+    od_aligned_full *= 65535.0
+    np.clip(od_aligned_full, 0, 65535, out=od_aligned_full)
+    rgb_aligned_full = od_aligned_full.astype(np.uint16, copy=False)
+
+    # Invert
+    rgb_inverted_full = 65535 - rgb_aligned_full
+    
+    # Clean up more intermediate arrays
+    del od_aligned_full, rgb_aligned_full, norm, norm_ref
+    print(f"ODAI: {time.time() - step_start:.3f}s")
+
+    # # --- Brightness normalization using grayscale ---
+    # # Convert to grayscale using standard luminance weights
+    # gray = np.dot(rgb_inverted_full[..., :3], [0.299, 0.587, 0.114])
+
+    # # Compute histogram and find the peak (mode)
+    # hist, bin_edges = np.histogram(gray, bins=256, range=(0, 65535))
+    # peak_bin = np.argmax(hist)
+    # peak_value = (bin_edges[peak_bin] + bin_edges[peak_bin + 1]) / 2.0
+
+    # # Target: map histogram peak to 55% of 65535
+    # target_peak = 0.55 * 65535
+
+    # # Compute scaling factor to map peak to target
+    # brightness_scale = target_peak / (peak_value + 1e-6)
+    # rgb_scaled = rgb_inverted_full * brightness_scale
+
+    # # Stretch so the brightest point reaches 65535
+    # max_scaled = np.max(rgb_scaled)
+    # if max_scaled > 0:
+    #     stretch_scale = 65535.0 / max_scaled
+    # else:
+    #     stretch_scale = 1.0    # rgb_brightness_normalized = np.clip(rgb_scaled * stretch_scale, 0, 65535).astype(np.uint16)    # Apply inverted gamma correction for inverted linear data
+    # Since we have inverted linear data, apply inverted gamma 1.5
+    rgb_norm = rgb_inverted_full.astype(np.float32) / 65535.0
+      # Apply inverted gamma 2.2 (use gamma = 2.2 for inverted image)
+    gamma_corrected = np.power(np.clip(rgb_norm, 0.0, 1.0), 1.0)
+    del rgb_norm
+
+    # Convert to LAB-like processing for saturation
+    # Calculate luminance using standard weights
+    luminance = np.dot(gamma_corrected[..., :3], [0.299, 0.587, 0.114])
+    luminance_expanded = np.expand_dims(luminance, axis=-1)
+    
+    # Create saturation curve that has minimal effect in shadows and stronger effect in midtones/highlights
+    # Using power curve: luminance^0.8 gives gentle increase from shadows to highlights
+    saturation_curve = np.power(luminance, 0.8)  # Smooth curve from 0 to 1
+    del luminance  # Clean up luminance as it's no longer needed
+    base_saturation = 1.15  # 15% maximum saturation increase
+
+    # Calculate dynamic saturation factor: minimal in shadows (1.02), full in highlights (1.12)
+    min_saturation = 1.00  # 2% minimum saturation in pure shadows
+    saturation_range = base_saturation - min_saturation  # 0.10 range
+    dynamic_saturation = min_saturation + saturation_range * saturation_curve
+    del saturation_curve
+    dynamic_saturation = np.expand_dims(dynamic_saturation, axis=-1)
+    
+    # Apply luminance-aware saturation by blending between grayscale and color
+    gamma_corrected = luminance_expanded + dynamic_saturation * (gamma_corrected - luminance_expanded)
+    del luminance_expanded, dynamic_saturation
+    gamma_corrected = np.clip(gamma_corrected, 0.0, 1.0)
+    
+    # Convert back to 16-bit and assign to rgb_brightness_normalized
+    # rgb_brightness_normalized = np.clip(gamma_corrected * 65535.0, 0, 65535).astype(np.uint16)
+
+        # Shadow-specific color correction: add warmth and green to dark shadows only
+    # Convert back to normalized for shadow correction
+    shadow_corrected = gamma_corrected
+    # Calculate luminance for curve-based shadow correction
+    shadow_luminance = np.dot(shadow_corrected[..., :3], [0.299, 0.587, 0.114])
+    
+    # Create smooth exponential curves that naturally target shadows
+    # These curves provide maximum effect in deep shadows and fade smoothly to highlights
+    
+    # Warmth curve: exponential decay from shadows (stronger effect in darker areas)
+    warmth_curve = np.exp(-shadow_luminance * 4.0)  # Exponential decay, strong in shadows
+    warmth_strength = 0.35 * warmth_curve  # 30% max correction in pure black
+    del warmth_curve  # Clean up as it's no longer needed
+    # Green tint curve: similar but with different decay rate for natural look
+    green_curve = np.exp(-shadow_luminance * 3.5)  # Slightly different curve shape
+    del shadow_luminance  # Clean up as it's no longer needed
+    green_strength = 0.15 * green_curve  # 12% max correction in pure black
+    del green_curve  # Clean up as it's no longer needed
+
+    # Apply corrections using smooth curves (no masks or conditionals)
+    shadow_corrected[..., 0] *= (1.0 + warmth_strength * 0.8)  # Red: moderate warmth boost
+    shadow_corrected[..., 1] *= (1.0 + green_strength)  # Green: boost to counter magenta
+    shadow_corrected[..., 2] *= (1.0 - warmth_strength)  # Blue: reduce to counter blue cast
+    del warmth_strength, green_strength  # Clean up as they're no longer needed
+    
+    # Convert back to 16-bit
+    rgb_brightness_normalized = np.clip(shadow_corrected * 65535.0, 0, 65535).astype(np.uint16)
+
+    del shadow_corrected, gamma_corrected  # Clean up as they're no longer needed
+
+    # Clean up rgb_inverted_full as it's no longer needed
+    del rgb_inverted_full
+    gc.collect
+    # --- End of brightness normalization ---
+
+    # --- apply user adjustments --- only when outputting
+    step_start = time.time()
+    if output_path is not None:  # this is for processing
+        rgb_brightness_normalized=ccr_image.apply_adjustments(rgb_brightness_normalized)
+    print(f"User adjustments: {time.time() - step_start:.3f}s")
+
+    # --- End of user adjustments ---
+
+    if output_path is not None:  # this is for output
+        step_start = time.time()
+        # Apply flips and rotation to rgb_brightness_normalized before export
+        if h_flip and v_flip:
+            rgb_brightness_normalized = cv2.flip(rgb_brightness_normalized, -1)
+        elif h_flip:
+            rgb_brightness_normalized = cv2.flip(rgb_brightness_normalized, 1)
+        elif v_flip:
+            rgb_brightness_normalized = cv2.flip(rgb_brightness_normalized, 0)
+
+        # --- ADD THIS BLOCK: rotate pixels for 90/180/270 degree rotation ---
+        angle = ccr_image.rotation_angle % 360
+        if angle == 90:
+            # Rotate 90 degrees clockwise
+            rgb_brightness_normalized = np.rot90(rgb_brightness_normalized, k=3)
+        elif angle == 180:
+            # Rotate 180 degrees
+            rgb_brightness_normalized = np.rot90(rgb_brightness_normalized, k=2)
+        elif angle == 270:
+            # Rotate 270 degrees clockwise (or 90 degrees CCW)
+            rgb_brightness_normalized = np.rot90(rgb_brightness_normalized, k=1)
+        # --- END BLOCK ---
+        print(rgb_brightness_normalized.shape)
+        print(f"Flips and rotation transforms: {time.time() - step_start:.3f}s")
+
+        final_mapped_rect = map_rect_to_original(
+                img_ref.shape,
+                rgb_brightness_normalized.shape,
+                reference_rect
+            )
+        x1, y1, x2, y2 = final_mapped_rect
+        del final_mapped_rect  # Clean up as it's no longer needed
+        step_start = time.time()
+        if water_mark:
+            # Ensure the array is contiguous for OpenCV
+            rgb_brightness_normalized = np.ascontiguousarray(rgb_brightness_normalized)
+            
+            # Add a watermark to the image
+            watermark_text = "HaloImagery CCR Unpaid Demo"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            # Make font_scale so text height is about 1/10 of image height
+            # At font_scale=1, text height is about 32 px, so scale accordingly
+            font_scale = rgb_brightness_normalized.shape[1] / (30 * 32)
+            font_thickness = max(3, int(font_scale * 2))
+            text_size = cv2.getTextSize(watermark_text, font, font_scale, font_thickness)[0]
+            text_x = int(x2 - text_size[0] - 10)
+            text_y = int(y2 - text_size[1] - 10)
+            cv2.putText(
+                rgb_brightness_normalized,
+                watermark_text,
+                (text_x, text_y),
+                font,
+                font_scale,
+                (30000, 30000, 30000),
+                font_thickness
+            )
+        print(f"Watermark: {time.time() - step_start:.3f}s")
+
+        print(f"Rotated image by {angle} degrees (no crop)")
+        step_start = time.time()
+        if output_path is not None: # this is for output
+            # when outputting rotate original image as well
+            h, w = rgb_brightness_normalized.shape[:2]
+            center = (w // 2, h // 2)
+            rot_mat = cv2.getRotationMatrix2D(center, -fine_angle, 1.0)
+            abs_cos = abs(rot_mat[0, 0])
+            abs_sin = abs(rot_mat[0, 1])
+            new_w = int(w * abs_cos + h * abs_sin)
+            new_h = int(h * abs_cos + w * abs_sin)
+            rot_mat[0, 2] += new_w / 2 - center[0]
+            rot_mat[1, 2] += new_h / 2 - center[1]
+            try:
+                rgb_brightness_normalized = cv2.warpAffine(
+                    rgb_brightness_normalized, rot_mat, (new_w, new_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0
+                )
+            except Exception as e:
+                print(f"Warning: warpAffine failed due to image size or memory error: {e}")
+            # Clean up rotation variables
+            del rot_mat, center, abs_cos, abs_sin
+        print(f"Final rotation: {time.time() - step_start:.3f}s")
+
+            # angle = ccr_image.rotation_angle
+            # if angle != 0:
+            #     rot_mat = cv2.getRotationMatrix2D(center, -angle, 1.0)
+            #     rgb_brightness_normalized = cv2.warpAffine(
+            #         rgb_brightness_normalized,
+            #         rot_mat,
+            #         (w, h),
+            #         flags=cv2.INTER_LINEAR,
+            #         borderMode=cv2.BORDER_CONSTANT,
+            #         borderValue=0
+            #     )
+
+        # Ensure output_path has proper extension and handle Unicode
+        step_start = time.time()
+        output_path = safe_unicode_path(output_path)
+        if jpg_out:
+            output_path = os.path.splitext(output_path)[0] + ".jpg"
+            # Convert to 8-bit for JPEG output
+            rgb_brightness_normalized_8 = to_8bit(rgb_brightness_normalized)
+            # Ensure output is RGB, not BGR
+            rgb_brightness_normalized_8 = cv2.cvtColor(rgb_brightness_normalized_8, cv2.COLOR_RGB2BGR)
+            success = safe_cv2_imwrite(output_path, rgb_brightness_normalized_8)
+            del rgb_brightness_normalized_8  # Clean up 8-bit copy
+            if success:
+                print(f"Normalized image saved to {output_path}")
+            else:
+                print(f"Failed to save normalized image to {output_path}")
+        else:
+            output_path = os.path.splitext(output_path)[0] + ".tiff"
+            success = safe_tifffile_imwrite(output_path, rgb_brightness_normalized, compression='deflate')
+            if success:
+                print(f"Normalized image saved to {output_path}")
+            else:
+                print(f"Failed to save normalized image to {output_path}")
+        print(f"File saving: {time.time() - step_start:.3f}s")
+        #debug ----------------------v
+
+        # img_disp = to_8bit(rgb_brightness_normalized)
+        # # Draw the mapped reference rectangle on the display
+        
+        # cv2.rectangle(img_disp, (x1, y1), (x2 - 1, y2 - 1), (0, 255, 0), 2)
+        # if img_disp.ndim == 2:
+        #     img_disp = cv2.cvtColor(img_disp, cv2.COLOR_GRAY2RGB)
+        # plt.figure(figsize=(8, 8))
+        # plt.imshow(img_disp)
+        # plt.title("CCR Normalized Image")
+        # plt.axis('off')
+        # plt.show()
+        total_elapsed = time.time() - total_start_time
+        print(f"TOTAL CCR normalization time: {total_elapsed:.3f}s")
+        gc.collect()
+        return None  # Return None for output processing
+
+    total_elapsed = time.time() - total_start_time
+    print(f"TOTAL CCR normalization time: {total_elapsed:.3f}s")
+    return rgb_brightness_normalized
+
+def to_8bit(img16: np.ndarray) -> np.ndarray:
+    # Clip to 16-bit range, then scale to 8-bit
+    img16 = np.clip(img16, 0, 65535)
+    img8 = (img16 / 257).astype(np.uint8)
+    return img8
+
+def auto_fine_angle(img16: np.ndarray, debug: bool = False) -> float:
+    """
+    Analyze a 16-bit image and estimate the rotation angle (in degrees)
+    needed to make the dominant horizontal lines horizontal.
+
+    Args:
+        img16 (np.ndarray): 16-bit input image (H, W) or (H, W, 3)
+        debug (bool): If True, show the most significant line on the image.
+
+    Returns:
+        float: Estimated rotation angle in degrees (positive = counterclockwise)
+    """
+    # Convert to 8-bit grayscale
+    if img16.ndim == 3:
+        gray = cv2.cvtColor((img16 / 257).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        img_rgb = cv2.cvtColor((img16 / 257).astype(np.uint8), cv2.COLOR_BGR2RGB)
+    else:
+        gray = (img16 / 257).astype(np.uint8)
+        img_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
+    # Edge detection
+    edges = cv2.Canny(gray, 160, 255, apertureSize=3)
+
+    # if debug:
+    #     plt.figure(figsize=(8, 8))
+    #     plt.imshow(edges, cmap='gray')
+    #     plt.title("Edge Detection")
+    #     plt.axis('off')
+    #     plt.show()
+
+    # Hough Line Transform
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=gray.shape[1] // 4, maxLineGap=20)
+    if lines is None:
+        if debug:
+            print("No lines detected.")
+        return 0.0
+
+    # Find the longest nearly-horizontal line
+    max_len = 0
+    best_angle = 0.0
+    best_line = None
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        dx = x2 - x1
+        dy = y2 - y1
+        length = np.hypot(dx, dy)
+        angle = np.degrees(np.arctan2(dy, dx))
+        # Consider lines within +/- 30 degrees of horizontal
+        if (abs(angle) < 30 or abs(angle) > 150) and length > max_len:
+            max_len = length
+            best_angle = angle
+            best_line = (x1, y1, x2, y2)
+
+    # if debug and best_line is not None:
+
+    #     img_debug = img_rgb.copy()
+    #     x1, y1, x2, y2 = best_line
+    #     # Draw the best line in red
+    #     cv2.line(img_debug, (x1, y1), (x2, y2), (255, 0, 0), 2)
+    #     plt.figure(figsize=(8, 8))
+    #     plt.imshow(img_debug)
+    #     plt.title(f"Longest horizontal-like line (angle={best_angle:.2f}°)")
+    #     plt.axis('off')
+    #     plt.show()
+
+    # The angle is relative to the x-axis; positive = counterclockwise
+    # Return negative to indicate the rotation needed to deskew
+    return -best_angle if best_line is not None else 0.0
+
+
+def auto_frame_v2(img16: np.ndarray, fine_rotation_angle: int, debug: bool = False) -> tuple:
+    """
+    Optimized auto_frame using white/black area masking and largest rectangle detection.
+    Based on the methodology from the POC notebook with improved workflow.
+    
+    Args:
+        img16 (np.ndarray): 16-bit input image (H, W) or (H, W, 3)
+        fine_rotation_angle (int): Fine rotation angle in hundredths of a degree
+        debug (bool): If True, show the detected frame on the image.
+        
+    Returns:
+        tuple: (x1, y1, x2, y2) coordinates of the reference frame rectangle.
+    """
+    original_shape = img16.shape
+    
+    # Step 1: Apply fine rotation
+    angle = fine_rotation_angle / 100.0
+    h, w = img16.shape[:2]
+    center = (w // 2, h // 2)
+    if angle != 0:
+        rot_mat = cv2.getRotationMatrix2D(center, -angle, 1.0)
+        img16 = cv2.warpAffine(img16, rot_mat, (w, h), flags=cv2.INTER_LINEAR, 
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    print(f"Rotated image by {angle} degrees, original shape: {original_shape}, new shape: {img16.shape}")
+
+    # Step 2: Create white area mask
+    def create_white_area_mask(image, threshold_percentile=95, min_brightness=0.9):
+        """Create a binary mask for white/bright areas in the image"""
+        if image.ndim == 3:
+            # Convert RGB to grayscale using luminance formula
+            gray = 0.2 * image[..., 0] + 0.3 * image[..., 1] + 0.5 * image[..., 2]
+        else:
+            gray = image.copy()
+        
+        # Normalize to 0-1 range
+        gray_norm = (gray - gray.min()) / (np.ptp(gray) + 1e-8)
+        
+        # Create binary mask for white areas
+        white_mask = gray_norm > min_brightness
+        return white_mask
+
+    # Step 3: Create black area mask  
+    def create_black_area_mask(image, red_weight=0.5, blue_weight=0.2, threshold=0.02):
+        """Create a binary mask for black/dark areas using red and blue channel weighted grayscale"""
+        if image.ndim == 3:
+            # Calculate green weight to ensure weights sum to 1
+            green_weight = 1.0 - red_weight - blue_weight
+            green_weight = max(0.0, green_weight)  # Ensure non-negative
+            
+            # Weighted grayscale conversion with all three channels
+            gray = (red_weight * image[..., 0] + 
+                   green_weight * image[..., 1] + 
+                   blue_weight * image[..., 2])
+        else:
+            gray = image.copy()
+        
+        # Normalize to 0-1 range
+        gray_norm = (gray - gray.min()) / (np.ptp(gray) + 1e-8)
+        
+        # Create binary mask for black areas
+        black_mask = gray_norm < threshold
+        return black_mask
+
+    # Step 4: Create combined mask
+    white_mask = create_white_area_mask(img16, min_brightness=0.9)
+    black_mask = create_black_area_mask(img16, red_weight=0.6, blue_weight=0.2, threshold=0.02)
+    
+    # Combine white and black masks using OR operation
+    combined_mask = np.logical_or(white_mask, black_mask)
+    
+    # Apply morphological operations to clean up the combined mask
+    kernel = np.ones((5, 5), np.uint8)
+    combined_mask_cleaned = cv2.morphologyEx(combined_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    combined_mask = combined_mask_cleaned.astype(bool)
+
+    # Step 5: Find largest non-masked rectangle using optimized histogram method
+    def find_largest_non_masked_rectangle(mask):
+        """Find the largest rectangle that contains only False values in a binary mask"""
+        # Invert mask so we're looking for areas with True values (non-masked areas)
+        inverted_mask = ~mask
+        
+        rows, cols = inverted_mask.shape
+        heights = np.zeros(cols, dtype=int)
+        max_area = 0
+        best_rect = (0, 0, 0, 0, 0)  # (top, left, height, width, area)
+        
+        for row in range(rows):
+            # Update heights histogram
+            for col in range(cols):
+                if inverted_mask[row, col]:
+                    heights[col] += 1
+                else:
+                    heights[col] = 0
+            
+            # Find largest rectangle in current histogram
+            stack = []
+            for col in range(cols + 1):
+                h = heights[col] if col < cols else 0
+                
+                while stack and heights[stack[-1]] > h:
+                    height = heights[stack.pop()]
+                    width = col if not stack else col - stack[-1] - 1
+                    area = height * width
+                    
+                    if area > max_area:
+                        max_area = area
+                        left = 0 if not stack else stack[-1] + 1
+                        top = row - height + 1
+                        best_rect = (top, left, height, width, area)
+                
+                stack.append(col)
+        
+        # Shrink the rectangle's long side by 2%, shrink both ends
+        # Also shrink the height side by 0.5%
+        top, left, height, width, area = best_rect
+        if height > width:
+            # Height is the long side
+            shrink_amount = int(height * 0.02)
+            height = max(1, height - 2 * shrink_amount)
+            top += shrink_amount
+            # Also shrink width by 0.5%
+            width_shrink = int(width * 0.01)
+            width = max(1, width - 2 * width_shrink)
+            left += width_shrink
+        else:
+            # Width is the long side  
+            shrink_amount = int(width * 0.02)
+            width = max(1, width - 2 * shrink_amount)
+            left += shrink_amount
+            # Also shrink height by 0.5%
+            height_shrink = int(height * 0.01)
+            height = max(1, height - 2 * height_shrink)
+            top += height_shrink
+        
+        area = height * width
+        best_rect = (top, left, height, width, area)
+        
+        return best_rect
+
+    # Find the largest valid rectangle
+    top, left, rect_height, rect_width, area = find_largest_non_masked_rectangle(combined_mask)
+    
+    if rect_height == 0 or rect_width == 0:
+        # fallback: whole image
+        print("Warning: No valid rectangle found, using whole image")
+        return map_rect_to_original(img16.shape, original_shape, (0, 0, w, h))
+    
+    # Convert to x1, y1, x2, y2 format
+    x1, y1 = left, top
+    x2, y2 = left + rect_width, top + rect_height
+    
+    # Add small padding if possible
+    padding = 2
+    x1 = max(0, x1 - padding)
+    y1 = max(0, y1 - padding)
+    x2 = min(w, x2 + padding)
+    y2 = min(h, y2 + padding)
+    
+    # Map the rectangle back to original image size
+    final_rect = map_rect_to_original(img16.shape, original_shape, (x1, y1, x2, y2))
+    
+    print(f"Detected rectangle: {rect_width}x{rect_height} (area: {area} pixels, "
+          f"{area/(h*w)*100:.2f}% of image)")
+    
+    # Debug visualization (if enabled)
+    # if debug:
+    #     img_disp = to_8bit(img16)
+    #     if img_disp.ndim == 2:
+    #         img_disp = cv2.cvtColor(img_disp, cv2.COLOR_GRAY2RGB)
+    #     cv2.rectangle(img_disp, (x1, y1), (x2 - 1, y2 - 1), (0, 255, 0), 2)
+    #     plt.figure(figsize=(8, 8))
+    #     plt.imshow(img_disp)
+    #     plt.title("auto_frame_v2: Final Cropping Box")
+    #     plt.axis('off')
+    #     plt.show()
+    
+    return final_rect
+
+def auto_frame(img16: np.ndarray, fine_rotation_angle: int, debug: bool = False) -> tuple:
+    """
+    Automatically determine the reference frame for an image by detecting the largest rectangle,
+    excluding pure black and pure white areas.
+
+    Args:
+        img16 (np.ndarray): 16-bit input image (H, W) or (H, W, 3)
+        fine_rotation_angle (int): Fine rotation angle in hundredths of a degree
+        debug (bool): If True, show the detected frame on the image.
+
+    Returns:
+        tuple: (x1, y1, x2, y2) coordinates of the reference frame rectangle.
+    """
+    # Apply fine rotation
+    angle = fine_rotation_angle / 100.0
+    h, w = img16.shape[:2]
+    center = (w // 2, h // 2)
+    if angle != 0:
+        rot_mat = cv2.getRotationMatrix2D(center, -angle, 1.0)
+        img16 = cv2.warpAffine(img16, rot_mat, (w, h), flags=cv2.INTER_LINEAR,  borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+
+    img8 = to_8bit(img16)
+
+    # Select only black and white pixels
+    if img8.ndim == 3:
+        img_hsv = cv2.cvtColor(img8, cv2.COLOR_BGR2HSV)
+        v = img_hsv[..., 2]
+        s = img_hsv[..., 1]
+        black_mask = v < 40
+        white_mask = (v > 240) & (s < 30)
+        bw_mask = (black_mask | white_mask).astype(np.uint8)
+    else:
+        black_mask = img8 < 50
+        white_mask = img8 > 240
+        bw_mask = (black_mask | white_mask).astype(np.uint8)
+
+
+    # if debug:
+    #     plt.figure(figsize=(8, 8))
+    #     plt.imshow(bw_mask, cmap='gray')
+    #     plt.title("Inverted BW Mask (Content Region)")
+    #     plt.axis('off')
+    #     plt.show()
+    # Morphological closing to connect black and white regions
+    kernel = np.ones((301, 301), np.uint8)
+    bw_mask_closed = cv2.morphologyEx(bw_mask, cv2.MORPH_CLOSE, kernel)
+
+    # Invert the mask to get the content region
+    content_mask = 1 - bw_mask_closed
+
+
+
+    # Find largest connected component in the content mask
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(content_mask, connectivity=8)
+    if num_labels <= 1:
+        # Only background found
+        return (0, 0, img8.shape[1], img8.shape[0])
+    # Ignore label 0 (background), find largest
+    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    x = stats[largest_label, cv2.CC_STAT_LEFT]
+    y = stats[largest_label, cv2.CC_STAT_TOP]
+    w = stats[largest_label, cv2.CC_STAT_WIDTH]
+    h = stats[largest_label, cv2.CC_STAT_HEIGHT]
+    x1, y1, x2, y2 = x, y, x + w, y + h
+
+    # if debug:
+    #     img_debug = img8.copy()
+    #     if img_debug.ndim == 2:
+    #         img_debug = cv2.cvtColor(img_debug, cv2.COLOR_GRAY2RGB)
+    #     cv2.rectangle(img_debug, (x1, y1), (x2 - 1, y2 - 1), (255, 0, 0), 2)
+    #     plt.figure(figsize=(8, 8))
+    #     plt.imshow(img_debug)
+    #     plt.title("Detected Largest Valid Rectangle")
+    #     plt.axis('off')
+    #     plt.show()
+
+    return (x1, y1, x2, y2)
+
+def map_rect_to_original(resized_shape, original_shape, rect):
+    """
+    Map rectangle coordinates from resized image to original image size.
+
+    Args:
+        resized_shape (tuple): (height, width) of resized image
+        original_shape (tuple): (height, width) of original image
+        rect (tuple): (x1, y1, x2, y2) in resized image
+
+    Returns:
+        tuple: (x1, y1, x2, y2) mapped to original image coordinates (rounded to int)
+    """
+    rh, rw = resized_shape[:2]
+    oh, ow = original_shape[:2]
+    x1, y1, x2, y2 = rect
+
+    scale_x = ow / rw
+    scale_y = oh / rh
+
+    x1o = int(round(x1 * scale_x))
+    y1o = int(round(y1 * scale_y))
+    x2o = int(round(x2 * scale_x))
+    y2o = int(round(y2 * scale_y))
+    return (x1o, y1o, x2o, y2o)
+
+
+def adjust_image(
+    img16: np.ndarray,
+    kelvin_shift: float = 0.0,
+    tint_shift: float = 0.0,
+    exposure: float = 0.0,
+    brightness: float = 0.0,
+    blackpoint: float = 0.0,
+    whitepoint: float = 0.0,
+    contrast: float = 0.0,
+    saturation: float = 0.0,
+    tint_balance_factor: float = 1.0
+) -> np.ndarray:
+    """
+    Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, contrast, and saturation adjustments
+    to a 16-bit image. All input factors are in range [-100, 100], 0 = no change.
+    Returns a 16-bit image.
+    """
+    img = img16.astype(np.float32)
+
+    # Map input factors from [-100, 100] to useful ranges
+    kelvin_scale = 0.003 * kelvin_shift      # -1.0 to +1.0
+    tint_scale = 0.002 * tint_shift          # -1.0 to +1.0
+    exposure_scale = exposure / 100.0        # -2.0 to +2.0 stops
+    brightness_scale = brightness / 8.0   # -1.0 to +1.0 (fraction of 65535)
+    blackpoint_scale = 1.0 - (blackpoint / 100.0)    # -1.0 to +1.0 (fraction of 65535)
+    whitepoint_scale = 1.0 + (whitepoint / 100.0)  # 0.0 to 2.0 (scaling factor)
+    contrast_scale = 1.0 + (contrast / 100.0)      # 0.0 to 2.0
+    saturation_scale = 1.0 + (saturation / 100.0)  # 0.0 to 2.0
+
+    # Temperature and Tint (Lightroom-like perceptual adjustments)
+    if kelvin_shift != 0.0 or tint_shift != 0.0:
+        # Calculate luminance for tone-aware masking
+        img_norm = img / 65535.0
+        luminance = np.dot(img_norm[..., :3], [0.299, 0.587, 0.114])
+        
+        # Create smooth asymmetric tone-aware strength curve (Lightroom-like)
+        # Shadows get strong effect, midtones get maximum effect, highlights get minimal effect
+        # Using piecewise smooth curves for natural transitions
+        
+        # Define strength levels for different tonal regions
+        shadow_strength = 0.8      # 80% strength in shadows (0-30% luminance)
+        midtone_strength = 1.0     # 100% strength in midtones (30-60% luminance)  
+        highlight_strength = 0.25  # 25% strength in highlights (60-100% luminance)
+        
+        # Transition points
+        shadow_to_mid = 0.3       # Shadows to midtones transition at 30% luminance
+        mid_to_highlight = 0.6    # Midtones to highlights transition at 60% luminance
+        
+        # Create smooth asymmetric curve using sigmoid blending
+        tone_curve = np.zeros_like(luminance)
+        
+        # Shadow region (0-30%): smooth transition from 80% to 100%
+        shadow_mask = luminance <= shadow_to_mid
+        shadow_progress = np.clip(luminance[shadow_mask] / shadow_to_mid, 0, 1)
+        tone_curve[shadow_mask] = shadow_strength + (midtone_strength - shadow_strength) * shadow_progress
+        
+        # Midtone region (30-60%): stay at 100% strength
+        midtone_mask = (luminance > shadow_to_mid) & (luminance <= mid_to_highlight)
+        tone_curve[midtone_mask] = midtone_strength
+        
+        # Highlight region (60-100%): smooth sigmoid transition from 100% to 25%
+        highlight_mask = luminance > mid_to_highlight
+        highlight_progress = (luminance[highlight_mask] - mid_to_highlight) / (1.0 - mid_to_highlight)
+        # Use sigmoid for smooth natural rolloff
+        sigmoid_factor = 1.0 / (1.0 + np.exp(-8 * (highlight_progress - 0.5)))
+        tone_curve[highlight_mask] = midtone_strength - (midtone_strength - highlight_strength) * sigmoid_factor
+        
+        # Expand tone_curve to match image dimensions for broadcasting
+        tone_curve = np.expand_dims(tone_curve, axis=-1)
+        
+        # Temperature (R/B scaling with logarithmic perceptual response)
+        if kelvin_shift != 0.0:
+            # Map slider values [-100, 100] to Kelvin temperatures [2000K, 8000K]
+            # Neutral point (slider 0) = 5000K
+            neutral_kelvin = 5000.0
+            if kelvin_shift > 0:
+                # Positive shift: 0 to +100 maps to 5000K to 8000K
+                current_kelvin = neutral_kelvin + (kelvin_shift / 100.0) * 3000.0
+            else:
+                # Negative shift: -100 to 0 maps to 2000K to 5000K
+                current_kelvin = neutral_kelvin + (kelvin_shift / 100.0) * 3000.0
+            
+            # Calculate Kelvin delta from neutral
+            kelvin_delta = current_kelvin - neutral_kelvin
+            
+            # Logarithmic scaling for Kelvin - stronger impact at low end
+            # Simulate the fact that 3000K->4000K has more visual impact than 7000K->8000K
+            kelvin_abs = abs(kelvin_delta)
+            
+            # Create logarithmic response curve based on actual Kelvin values
+            if kelvin_abs > 0:
+                # Use the Kelvin delta for logarithmic scaling
+                # Normalize by the maximum possible delta (3000K)
+                normalized_delta = kelvin_abs / 3000.0
+                log_factor = np.log(1 + normalized_delta * 2) / np.log(3)  # Normalize to [0,1] range
+                perceptual_scale = log_factor * np.sign(kelvin_delta) * 0.25  # Increased scale for visible effect
+            else:
+                perceptual_scale = 0.0
+            
+            # Apply perceptual curve - more sensitive in midtones/skin tones
+            # Create additional sensitivity curve for midtones
+            midtone_sensitivity = 1.0 + 0.3 * np.exp(-8 * (luminance - 0.4)**2)  # Peak at 40% luminance
+            midtone_sensitivity = np.expand_dims(midtone_sensitivity, axis=-1)
+            
+            # Combine tone-aware masking with perceptual scaling and midtone sensitivity
+            effective_scale = perceptual_scale * tone_curve[..., 0] * midtone_sensitivity[..., 0]
+            
+            r_scale = 1.0 + effective_scale
+            b_scale = 1.0 - effective_scale
+            
+            img[..., 0] *= r_scale  # R
+            img[..., 2] *= b_scale  # B
+
+        # Tint (G-M scaling with perceptual mapping and enhanced midtone sensitivity)
+        if tint_shift != 0.0:
+            # Perceptual mapping for tint - non-linear response based on existing color balance
+            # Tint impact varies with the current white balance state
+            
+            # Use pre-calculated balance factor instead of calculating it here
+            balance_factor = tint_balance_factor
+            
+            # Enhanced midtone and skin tone sensitivity for tint
+            # Tint is most visible in skin tones and neutral areas
+            skin_tone_sensitivity = 1.0 + 0.5 * np.exp(-12 * (luminance - 0.35)**2)  # Peak at 35% luminance
+            skin_tone_sensitivity = np.expand_dims(skin_tone_sensitivity, axis=-1)
+            
+            # Create perceptual tint curve - stronger response in certain ranges
+            tint_abs = abs(tint_shift)
+            if tint_abs > 0:
+                # Sigmoid-like curve for tint perception
+                perceptual_tint = np.tanh(tint_abs * 0.02) * np.sign(tint_shift) * 0.12  # Increased scale for visible effect
+            else:
+                perceptual_tint = 0.0
+            
+            # Apply perceptual tint with tone awareness, balance factor, and skin tone sensitivity
+            effective_tint = perceptual_tint * tone_curve[..., 0] * balance_factor * skin_tone_sensitivity[..., 0]
+            
+            # Tint primarily affects green, with complementary adjustments to R/B
+            g_scale = 1.0 - effective_tint  # Green channel (inverse of tint shift)
+            r_scale = 1.0 + (0.3 * effective_tint)  # Slight red compensation
+            b_scale = 1.0 + (0.3 * effective_tint)  # Slight blue compensation
+            
+            img[..., 1] *= g_scale  # G
+            img[..., 0] *= r_scale  # R  
+            img[..., 2] *= b_scale  # B
+
+    # Exposure (Adobe-like, tone-aware to preserve highlights)
+    if exposure != 0.0:
+        # Calculate luminance for tone-aware exposure mapping
+        img_norm = img / 65535.0
+        luminance = np.dot(img_norm[..., :3], [0.299, 0.587, 0.114])
+        
+        # Create smooth, continuous tone-aware exposure curve
+        # Full effect in shadows/midtones, smoothly reduced effect in highlights
+        # Using a smooth sigmoid-like transition instead of sharp cutoff
+        transition_midpoint = 0.7    # Where the curve inflection point is (70% luminance)
+        transition_width = 0.15      # Controls smoothness of transition
+        min_strength = 0.03          # Minimum exposure effect in pure highlights (15%)
+        max_strength = 1.0           # Maximum exposure effect in shadows/midtones
+        
+        # Smooth sigmoid-like curve for continuous transition
+        # Formula: strength = min + (max-min) * (1 / (1 + exp((lum - mid) / width)))
+        exposure_curve = min_strength + (max_strength - min_strength) * (
+            1.0 / (1.0 + np.exp((luminance - transition_midpoint) / transition_width))
+        )
+        
+        # Expand curve to match image dimensions
+        exposure_curve = np.expand_dims(exposure_curve, axis=-1)
+        
+        # Apply tone-aware exposure
+        exposure_factor = 2 ** exposure_scale  # Base exposure factor in stops
+        
+        # Create per-pixel exposure factors
+        pixel_exposure_factors = 1.0 + (exposure_factor - 1.0) * exposure_curve
+        
+        img *= pixel_exposure_factors
+    
+    # Brightness (Adobe-like: lift lower midtones, preserve highlights)
+    if brightness != 0.0:
+        img_norm = img / 65535.0
+        # The curve parameter: positive = lift, negative = compress
+        curve = 1.0 - 0.3 * brightness_scale  # 0.7 to 1.3 for -100 to +100
+        img_norm = np.power(img_norm, curve)
+        img = img_norm * 65535.0
+
+    # Black/White point (Adobe-like: remap input range)
+    if blackpoint != 0.0 or whitepoint != 0.0:
+        img_norm = img / 65535.0
+        # Map [-100, 100] to [0, 0.2] for black, [1, 0.8] for white
+        black_clip = np.clip(blackpoint, -100, 100) / 500.0  # -0.2 to +0.2
+        white_clip = np.clip(whitepoint, -100, 100) / 300.0  # -0.2 to +0.2
+        black_val = 0.0 + black_clip
+        white_val = 1.0 - white_clip
+        # Piecewise linear remap
+        img_norm = (img_norm - black_val) / (white_val - black_val)
+        img_norm = np.clip(img_norm, 0, 1)
+        img = img_norm * 65535.0
+    # Contrast (continuous S-curve for both positive and negative)
+    if contrast != 0.0:
+        img_norm = img / 65535.0
+        midpoint = 0.5
+        # Map contrast [-100, 100] to k [-0.95, 0.95]
+        k = np.clip(contrast / 105.0, -0.95, 0.95)
+        # S-curve: compress for negative, expand for positive, fixed endpoints
+        def s_curve(x, k):
+            return ((1 + k) * (x - midpoint)) / (1 + k * np.abs(x - midpoint) * 2) + midpoint
+        img_norm = s_curve(img_norm, k)
+        img = img_norm * 65535.0
+
+    # Mid-high tone weighted saturation adjustment
+    if saturation != 0.0:
+        img_norm = img / 65535.0
+        # Convert RGB to grayscale using luminance weights
+        gray = np.dot(img_norm[..., :3], [0.299, 0.587, 0.114])
+        gray_expanded = np.expand_dims(gray, axis=-1)
+        
+        # Create mid-high tone weighted curve: bell curve peaked at 65% luminance
+        # Using Gaussian-like curve: exp(-((luminance - 0.65) / 0.25)^2)
+        mid_high_weight = np.exp(-((gray - 0.65) / 0.25) ** 2)
+        
+        # Create dynamic saturation factor based on mid-high tone weighting
+        # Maximum effect at 65% luminance, minimal effect in deep shadows/highlights
+        min_saturation_factor = 0.2  # 20% of full saturation in extremes
+        saturation_curve = min_saturation_factor + (1.0 - min_saturation_factor) * mid_high_weight
+        
+        # Apply the mid-high tone weighted saturation scaling
+        dynamic_saturation_scale = 1.0 + (saturation_scale - 1.0) * saturation_curve
+        dynamic_saturation_scale = np.expand_dims(dynamic_saturation_scale, axis=-1)
+        
+        # Blend between grayscale and original based on mid-high tone weighted saturation
+        img_norm = gray_expanded + dynamic_saturation_scale * (img_norm - gray_expanded)
+        img_norm = np.clip(img_norm, 0, 1)
+        img = img_norm * 65535.0
+
+    img = np.clip(img, 0, 65535)
+    return img.astype(np.uint16)
+
+def adjust_image_opencl(
+    img16: np.ndarray,
+    kelvin_shift: float = 0.0,
+    tint_shift: float = 0.0,
+    exposure: float = 0.0,
+    brightness: float = 0.0,
+    blackpoint: float = 0.0,
+    whitepoint: float = 0.0,
+    contrast: float = 0.0,
+    saturation: float = 0.0,
+    tint_balance_factor: float = 1.0
+) -> np.ndarray:
+    """
+    GPU-accelerated (OpenCL) version of adjust_image.
+    Uses cached OpenCL context and compiled program for better performance.
+    """
+    global _opencl_cache
+    
+    # Initialize OpenCL if not already done
+    if not _initialize_opencl():
+        # Fallback to CPU version
+        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness, 
+                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor)
+
+    try:
+        # Use cached OpenCL objects
+        ctx = _opencl_cache['ctx']
+        queue = _opencl_cache['queue']
+        kernel = _opencl_cache['kernel']
+        
+        img = img16.astype(np.float32)
+        
+        # Use the pre-calculated balance factor instead of calculating it
+        balance_factor = tint_balance_factor
+        
+        img_flat = img.reshape(-1, 3)
+        img_buf = cl_array.to_device(queue, img_flat)
+
+        # Prepare parameters as numpy arrays - add balance_factor as 9th parameter
+        params = np.array([
+            kelvin_shift, tint_shift, exposure, brightness,
+            blackpoint, whitepoint, contrast, saturation, balance_factor
+        ], dtype=np.float32)
+
+        params_buf = cl_array.to_device(queue, params)
+
+        # Execute the pre-compiled kernel
+        n_pixels = img_flat.shape[0]
+        kernel(queue, (n_pixels,), None, img_buf.data, params_buf.data, np.int32(n_pixels))
+        
+        # Get results and reshape
+        result = img_buf.get().reshape(img.shape)
+        return np.clip(result, 0, 65535).astype(np.uint16)
+        
+    except Exception as e:
+        print(f"OpenCL processing failed: {e}")
+        # Fallback to CPU version
+        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness, 
+                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor)
+
+
+
+def cleanup_opencl():
+    """
+    Clean up OpenCL resources. Call this when shutting down the application.
+    """
+    global _opencl_cache
+    
+    if not OPENCL_AVAILABLE:
+        return
+    
+    try:
+        if _opencl_cache['queue'] is not None:
+            _opencl_cache['queue'].finish()
+        
+        # Reset all cached objects
+        _opencl_cache['ctx'] = None
+        _opencl_cache['queue'] = None
+        _opencl_cache['program'] = None
+        _opencl_cache['kernel'] = None
+        _opencl_cache['device_name'] = None
+        
+        print("OpenCL resources cleaned up")
+    except Exception as e:
+        print(f"Error cleaning up OpenCL resources: {e}")
