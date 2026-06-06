@@ -53,19 +53,24 @@ class CCRBackend:
                     print(f"Failed to load {os.path.basename(path)}: {e}")
                     continue
         else:
-            # Parallel loading with immediate addition
+            # Parallel loading - collect into local list to avoid concurrent modification
+            results = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_path = {executor.submit(load_single_image, path): path for path in file_paths}
-                
+
                 for future in concurrent.futures.as_completed(future_to_path):
                     if cancel_flag and cancel_flag():
                         break
                     path, img = future.result()
                     if img is not None:
-                        self.images.append(img)
-                
-                # Sort images by filename after all are loaded
-                self.images.sort(key=lambda img: os.path.basename(img.file_path))
+                        results.append(img)
+
+            results.sort(key=lambda img: os.path.basename(img.file_path))
+            self.images = results
+
+        # Keep file_paths derived from actually-loaded images so the two lists stay in sync
+        self.file_paths = [img.file_path for img in self.images]
+
     def clear(self):
         """
         Clear all images and file paths from the backend.
@@ -166,7 +171,7 @@ class CCRBackend:
 
     def get_preview_w_ref_frame_by_index(self, idx: int) -> Optional[CCRImage]:
         if idx is not None and 0 <= idx < len(self.images):
-            img = self.images[idx]
+            return self.images[idx]
         return None
 
     def get_image_horizontal_flip_by_index(self, idx: int) -> bool:
@@ -507,7 +512,6 @@ class CCRBackend:
         """
         if idx is not None and 0 <= idx < len(self.images):
             del self.images[idx]
-            if 0 <= idx < len(self.file_paths):
-                del self.file_paths[idx]
+            self.file_paths = [img.file_path for img in self.images]
 # Singleton instance
 ccr_backend = CCRBackend()

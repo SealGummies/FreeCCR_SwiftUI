@@ -29,21 +29,11 @@ class ResettableSlider(QSlider):
             parent_widget = parent_widget.parent()
         
         if parent_widget and old_value != 0:
-            # Update the value label
-            slider_idx = None
             for i, slider in enumerate(parent_widget.sliders):
                 if slider is self:
-                    slider_idx = i
+                    parent_widget.slider_value_labels[i].setText("0")
+                    parent_widget.on_slider_changed()
                     break
-            
-            if slider_idx is not None:
-                # Update the value label
-                slider_layout = parent_widget.layout().itemAt(slider_idx + 1).layout()
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText("0")
-                
-                # Trigger the adjustment update
-                parent_widget.on_slider_changed()
         
         super().mouseDoubleClickEvent(event)
 
@@ -78,6 +68,7 @@ class SlidersPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__()
         self.sliders = []
+        self.slider_value_labels = []
         self.slider_labels = []
         self.image_slider_map = {}
         self.current_image_id = None
@@ -228,6 +219,7 @@ class SlidersPanel(QWidget):
         slider_layout.addWidget(value_label, alignment=Qt.AlignVCenter)
 
         self.sliders.append(slider)
+        self.slider_value_labels.append(value_label)
 
         return slider_layout
 
@@ -259,9 +251,7 @@ class SlidersPanel(QWidget):
                 slider.blockSignals(True)
                 slider.setValue(0)
                 slider.blockSignals(False)
-                slider_layout = self.layout().itemAt(i + 1).layout()
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText("0")
+                self.slider_value_labels[i].setText("0")
             return
 
         for i, key in enumerate(self.adjustment_keys):
@@ -269,10 +259,7 @@ class SlidersPanel(QWidget):
                 self.sliders[i].blockSignals(True)
                 self.sliders[i].setValue(adjustment[key])
                 self.sliders[i].blockSignals(False)
-                # --- Update value label as well ---
-                slider_layout = self.layout().itemAt(i + 1).layout()  # +1 if histogram is at index 0
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText(str(adjustment[key]))
+                self.slider_value_labels[i].setText(str(adjustment[key]))
         if idx is not None:
             ccr_backend.apply_adjustment_by_index(idx)
 
@@ -308,17 +295,17 @@ class SlidersPanel(QWidget):
     
     def _do_backend_processing(self):
         """Perform the heavier backend processing operations (thumbnail updates, etc.)."""
+        # Capture which index to process and clear pending so new changes can queue up
+        idx = self._pending_idx
+        self._pending_adjustment = None
+        self._pending_idx = None
         try:
-            if self._pending_idx is not None and self._pending_adjustment is not None:
-                # Do the heavier processing: update thumbnails and internal caches
-                if 0 <= self._pending_idx < len(ccr_backend.images):
-                    ccr_backend.images[self._pending_idx].update_thumbnail_and_preview()
+            if idx is not None and 0 <= idx < len(ccr_backend.images):
+                ccr_backend.images[idx].update_thumbnail_and_preview()
         finally:
             self._processing = False
-            
-            # Clear the pending adjustment since we've processed it
-            self._pending_adjustment = None
-            self._pending_idx = None
+            # Process any adjustment that arrived while we were working
+            QTimer.singleShot(0, self._check_for_pending)
     
     def _check_for_pending(self):
         """Check if there's another pending adjustment to process."""
@@ -334,9 +321,7 @@ class SlidersPanel(QWidget):
             slider.blockSignals(True)
             slider.setValue(0)
             slider.blockSignals(False)
-            slider_layout = self.layout().itemAt(i + 1).layout()
-            value_label = slider_layout.itemAt(2).widget()
-            value_label.setText("0")
+            self.slider_value_labels[i].setText("0")
         # Save adjustment to backend and update preview
         if self.current_idx is not None:
             adjustment = {key: 0 for key in self.adjustment_keys}
@@ -352,9 +337,7 @@ class SlidersPanel(QWidget):
                 slider.blockSignals(True)
                 slider.setValue(0)
                 slider.blockSignals(False)
-                slider_layout = self.layout().itemAt(i + 1).layout()
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText("0")
+                self.slider_value_labels[i].setText("0")
             # Update preview with temporary adjustment
             ccr_backend.set_adjustment_by_index(self.current_idx, {key: 0 for key in self._original_adjustment or {}})
             self.parent().parent().image_preview.update_preview(self.current_idx)
@@ -368,9 +351,7 @@ class SlidersPanel(QWidget):
                 self.sliders[i].blockSignals(True)
                 self.sliders[i].setValue(val)
                 self.sliders[i].blockSignals(False)
-                slider_layout = self.layout().itemAt(i + 1).layout()
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText(str(val))
+                self.slider_value_labels[i].setText(str(val))
             ccr_backend.set_adjustment_by_index(self.current_idx, adjustment)
             self.parent().parent().image_preview.update_preview(self.current_idx)
             del self._original_adjustment
@@ -427,10 +408,7 @@ class SlidersPanel(QWidget):
                     self.sliders[i].blockSignals(True)
                     self.sliders[i].setValue(self.copied_adjustment[key])
                     self.sliders[i].blockSignals(False)
-                    # Update value label
-                    slider_layout = self.layout().itemAt(i + 1).layout()  # +1 if histogram is at index 0
-                    value_label = slider_layout.itemAt(2).widget()
-                    value_label.setText(str(self.copied_adjustment[key]))
+                    self.slider_value_labels[i].setText(str(self.copied_adjustment[key]))
             
             # Save the adjustment to backend and update preview
             ccr_backend.set_adjustment_by_index(self.current_idx, self.copied_adjustment)

@@ -631,7 +631,7 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
 
     # Clean up rgb_inverted_full as it's no longer needed
     del rgb_inverted_full
-    gc.collect
+    gc.collect()
     # --- End of brightness normalization ---
 
     # --- apply user adjustments --- only when outputting
@@ -687,8 +687,8 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
             font_scale = rgb_brightness_normalized.shape[1] / (30 * 32)
             font_thickness = max(3, int(font_scale * 2))
             text_size = cv2.getTextSize(watermark_text, font, font_scale, font_thickness)[0]
-            text_x = int(x2 - text_size[0] - 10)
-            text_y = int(y2 - text_size[1] - 10)
+            text_x = max(0, int(x2 - text_size[0] - 10))
+            text_y = max(text_size[1], int(y2 - text_size[1] - 10))
             cv2.putText(
                 rgb_brightness_normalized,
                 watermark_text,
@@ -711,8 +711,8 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
             abs_sin = abs(rot_mat[0, 1])
             new_w = int(w * abs_cos + h * abs_sin)
             new_h = int(h * abs_cos + w * abs_sin)
-            rot_mat[0, 2] += new_w / 2 - center[0]
-            rot_mat[1, 2] += new_h / 2 - center[1]
+            rot_mat[0, 2] += (new_w - w) / 2
+            rot_mat[1, 2] += (new_h - h) / 2
             try:
                 rgb_brightness_normalized = cv2.warpAffine(
                     rgb_brightness_normalized, rot_mat, (new_w, new_h),
@@ -752,14 +752,14 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
             if success:
                 print(f"Normalized image saved to {output_path}")
             else:
-                print(f"Failed to save normalized image to {output_path}")
+                raise IOError(f"Failed to save normalized image to {output_path}")
         else:
             output_path = os.path.splitext(output_path)[0] + ".tiff"
             success = safe_tifffile_imwrite(output_path, rgb_brightness_normalized, compression='deflate')
             if success:
                 print(f"Normalized image saved to {output_path}")
             else:
-                print(f"Failed to save normalized image to {output_path}")
+                raise IOError(f"Failed to save normalized image to {output_path}")
         print(f"File saving: {time.time() - step_start:.3f}s")
         #debug ----------------------v
 

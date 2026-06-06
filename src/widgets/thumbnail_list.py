@@ -68,6 +68,10 @@ class ThumbnailList(QWidget):
         super().__init__()
         self.image_selected_callback = image_selected_callback
         self.init_ui()
+
+    def _main_window(self):
+        """Return the MainWindow that owns this widget."""
+        return self.parent().parent()
         # Enable custom context menu
         self.thumbnail_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.thumbnail_list.customContextMenuRequested.connect(self.show_context_menu)
@@ -104,7 +108,7 @@ class ThumbnailList(QWidget):
         Set the initial hint when the program starts with no images loaded.
         """
         try:
-            self.parent().parent().sliders_panel.set_hint("<b>Hint:</b><br>Use file menu to import folder or files.")
+            self._main_window().sliders_panel.set_hint("<b>Hint:</b><br>Use file menu to import folder or files.")
         except AttributeError:
             # In case the parent structure isn't ready yet, try again later
             QTimer.singleShot(200, self.set_initial_hint)
@@ -113,9 +117,9 @@ class ThumbnailList(QWidget):
         # Pass a callback to cancel the worker thread
         def cancel_loading():
             # Access the worker from the main window and call cancel
-            main_window = self.parent().parent()
-            if hasattr(main_window, 'worker'):
-                main_window.worker.cancel()
+            main_window = self._main_window()
+            if hasattr(main_window, '_loader_worker'):
+                main_window._loader_worker.cancel()
         self.loading_dialog = LoadingDialog(self, cancel_callback=cancel_loading)
         self.loading_dialog.show()
         QApplication.processEvents()
@@ -126,11 +130,9 @@ class ThumbnailList(QWidget):
         logging.info(f"Loading {image_count} images from backend")
         for idx in range(image_count):
             thumbnail = ccr_backend.get_thumbnail_by_index(idx)
-            # Get filename for display
-            if idx < len(ccr_backend.file_paths):
-                filename = os.path.basename(ccr_backend.file_paths[idx])
-            else:
-                filename = ""
+            # Get filename from the CCRImage object itself (always in sync)
+            img_obj = ccr_backend.get_image_by_index(idx)
+            filename = os.path.basename(img_obj.file_path) if img_obj is not None else ""
             item = QListWidgetItem(filename)  # Set filename as item text
             # Apply rotations and flips using PySide6 transformations
             transformed_thumbnail = self.apply_frontend_transformations(thumbnail, idx)
@@ -146,12 +148,12 @@ class ThumbnailList(QWidget):
         # Set current index to 0 if there are items
         if image_count > 0:
             self.thumbnail_list.setCurrentRow(0)
-            self.parent().parent().image_preview.update_preview(0)
+            self._main_window().image_preview.update_preview(0)
             # Clear any existing hint when images are loaded
-            self.parent().parent().sliders_panel.clear_hint()
+            self._main_window().sliders_panel.clear_hint()
         else:
             # Set hint when no images are loaded
-            self.parent().parent().sliders_panel.set_hint("<b>Hint:</b><br>Use file menu to import folder or files.")
+            self._main_window().sliders_panel.set_hint("<b>Hint:</b><br>Use file menu to import folder or files.")
 
         if hasattr(self, 'loading_dialog') and self.loading_dialog is not None:
             self.loading_dialog.accept()  # Close the dialog
@@ -172,14 +174,14 @@ class ThumbnailList(QWidget):
         
     def on_thumbnail_clicked(self, item):
         idx = item.data(Qt.UserRole)
-        self.parent().parent().image_preview.update_preview(idx)
-        self.parent().parent().sliders_panel.set_current_idx(idx)
+        self._main_window().image_preview.update_preview(idx)
+        self._main_window().sliders_panel.set_current_idx(idx)
 
     def on_current_item_changed(self, current, previous):
         if current:
             idx = current.data(Qt.UserRole)
-            self.parent().parent().image_preview.update_preview(idx)
-            self.parent().parent().sliders_panel.set_current_idx(idx)
+            self._main_window().image_preview.update_preview(idx)
+            self._main_window().sliders_panel.set_current_idx(idx)
             if previous:
                 prev_idx = previous.data(Qt.UserRole)
                 self.update_thumbnail(prev_idx)  # Update previous thumbnail

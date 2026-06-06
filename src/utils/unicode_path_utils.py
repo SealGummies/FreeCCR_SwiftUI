@@ -89,8 +89,8 @@ def get_safe_filename(filename: str) -> str:
     except Exception as e:
         logging.warning(f"Error creating safe filename for '{filename}': {e}")
         # Fallback to basic ASCII-safe name
-        import time
-        return f"image_{int(time.time())}.tiff"
+        import uuid
+        return f"image_{uuid.uuid4().hex[:8]}.tiff"
 
 
 def check_unicode_support() -> bool:
