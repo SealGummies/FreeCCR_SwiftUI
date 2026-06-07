@@ -175,6 +175,25 @@ class MainWindow(QMainWindow):
             licenses_text = "No license files found."
         return licenses_text
 
+    def _cleanup_loader(self):
+        """Called when the loader thread finishes. Nulls the references so isRunning() is never called on a deleted C++ object."""
+        self._loader_thread = None
+        self._loader_worker = None
+
+    def _stop_loader_if_running(self):
+        """Cancel and join any in-progress loader thread."""
+        if getattr(self, '_loader_thread', None) is not None:
+            try:
+                if self._loader_thread.isRunning():
+                    if self._loader_worker is not None:
+                        self._loader_worker.cancel()
+                    self._loader_thread.quit()
+                    self._loader_thread.wait(3000)
+            except RuntimeError:
+                pass
+            self._loader_thread = None
+            self._loader_worker = None
+
     def open_files(self):
         # options = QFileDialog.Options()
         files, _ = QFileDialog.getOpenFileNames(
@@ -206,11 +225,7 @@ class MainWindow(QMainWindow):
                 )
             
             if valid_files:
-                if hasattr(self, '_loader_thread') and self._loader_thread is not None and self._loader_thread.isRunning():
-                    if hasattr(self, '_loader_worker'):
-                        self._loader_worker.cancel()
-                    self._loader_thread.quit()
-                    self._loader_thread.wait(3000)
+                self._stop_loader_if_running()
                 self.thumbnail_list.show_loading_dialog()
                 self._loader_thread = QThread()
                 self._loader_worker = ImageLoaderWorker(files=valid_files)
@@ -218,7 +233,7 @@ class MainWindow(QMainWindow):
                 self._loader_thread.started.connect(self._loader_worker.run)
                 self._loader_worker.finished.connect(self._loader_thread.quit)
                 self._loader_worker.finished.connect(self._loader_worker.deleteLater)
-                self._loader_thread.finished.connect(self._loader_thread.deleteLater)
+                self._loader_thread.finished.connect(self._cleanup_loader)
                 self._loader_worker.finished.connect(self.thumbnail_list.load_thumbnails)
                 self._loader_thread.start()
             elif files:  # If there were files selected but all were invalid
@@ -246,11 +261,7 @@ class MainWindow(QMainWindow):
                 )
                 return
                 
-            if hasattr(self, '_loader_thread') and self._loader_thread is not None and self._loader_thread.isRunning():
-                if hasattr(self, '_loader_worker'):
-                    self._loader_worker.cancel()
-                self._loader_thread.quit()
-                self._loader_thread.wait(3000)
+            self._stop_loader_if_running()
             self.thumbnail_list.show_loading_dialog()
             self._loader_thread = QThread()
             self._loader_worker = ImageLoaderWorker(normalized_folder)
@@ -258,7 +269,7 @@ class MainWindow(QMainWindow):
             self._loader_thread.started.connect(self._loader_worker.run)
             self._loader_worker.finished.connect(self._loader_thread.quit)
             self._loader_worker.finished.connect(self._loader_worker.deleteLater)
-            self._loader_thread.finished.connect(self._loader_thread.deleteLater)
+            self._loader_thread.finished.connect(self._cleanup_loader)
             self._loader_worker.finished.connect(self.thumbnail_list.load_thumbnails)
             self._loader_thread.start()
 

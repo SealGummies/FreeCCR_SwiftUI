@@ -57,12 +57,24 @@ class GraphicsImageView(QGraphicsView):
         self.reference_rect_item = None
         self.parent_widget = parent
 
+        self.bwpoint_mode = None   # None | "black" | "white"
+        self._bw_drag_start = None
+        self._bw_drag_end = None
+        self._bw_rect_item = None
+
         # Disable scrollbars
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self.parent_widget.pixmap_item is not None:
+        if event.button() == Qt.LeftButton and self.bwpoint_mode and self.parent_widget.pixmap_item is not None:
+            self._bw_drag_start = self.mapToScene(event.pos())
+            self._bw_drag_end = self._bw_drag_start
+            if self._bw_rect_item:
+                self.scene().removeItem(self._bw_rect_item)
+                self._bw_rect_item = None
+            self.viewport().update()
+        elif event.button() == Qt.LeftButton and self.parent_widget.pixmap_item is not None:
             self.drawing_reference = True
             self._drag_start = self.mapToScene(event.pos())
             self._drag_end = self._drag_start
@@ -85,12 +97,117 @@ class GraphicsImageView(QGraphicsView):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.drawing_reference:
+        if self.bwpoint_mode and self._bw_drag_start is not None:
+            self._bw_drag_end = self.mapToScene(event.pos())
+            self._update_bw_rect(self._bw_drag_start, self._bw_drag_end)
+        elif self.drawing_reference:
             self._drag_end = self.mapToScene(event.pos())
             self.viewport().update()
             self.parent_widget.update_reference_rect(self._drag_start, self._drag_end)
 
+    def _update_bw_rect(self, start, end):
+        """Draw the B/W point selection rect on the canvas."""
+        pw = self.parent_widget
+        cx = pw.current_pixmap.width() / 2
+        cy = pw.current_pixmap.height() / 2
+        base_transform = QTransform()
+        base_transform.translate(cx, cy)
+        if pw.current_vertical_flip:
+            base_transform.scale(1, -1)
+        if pw.current_horizontal_flip:
+            base_transform.scale(-1, 1)
+        if pw.current_rotation:
+            base_transform.rotate(pw.current_rotation)
+        base_transform.translate(-cx, -cy)
+
+        if not base_transform.isInvertible():
+            return
+        inv = base_transform.inverted()[0]
+        s = inv.map(start)
+        e = inv.map(end)
+        rect = QRectF(min(s.x(), e.x()), min(s.y(), e.y()),
+                      abs(e.x() - s.x()), abs(e.y() - s.y()))
+        color = QColor(0, 100, 255, 140) if self.bwpoint_mode == "white" else QColor(255, 140, 0, 140)
+        if self._bw_rect_item is None:
+            self._bw_rect_item = QGraphicsRectItem(rect)
+            pen = QPen(color, 2, Qt.DashLine)
+            self._bw_rect_item.setPen(pen)
+            self.scene().addItem(self._bw_rect_item)
+        else:
+            self._bw_rect_item.setPen(QPen(color, 2, Qt.DashLine))
+            self._bw_rect_item.setRect(rect)
+        self._bw_rect_item.setTransform(base_transform)
+
     def mouseReleaseEvent(self, event):
+        if self.bwpoint_mode and event.button() == Qt.LeftButton and self._bw_drag_start is not None:
+            drag_start_scene = self._bw_drag_start
+            drag_end_scene = self.mapToScene(event.pos())
+
+            pw = self.parent_widget
+            cx = pw.current_pixmap.width() / 2
+            cy = pw.current_pixmap.height() / 2
+            base_transform = QTransform()
+            base_transform.translate(cx, cy)
+            if pw.current_vertical_flip:
+                base_transform.scale(1, -1)
+            if pw.current_horizontal_flip:
+                base_transform.scale(-1, 1)
+            if pw.current_rotation:
+                base_transform.rotate(pw.current_rotation)
+            base_transform.translate(-cx, -cy)
+
+            mode = self.bwpoint_mode
+            self.bwpoint_mode = None
+            self._bw_drag_start = None
+            self._bw_drag_end = None
+            self.setCursor(Qt.ArrowCursor)
+
+            if base_transform.isInvertible():
+                inv = base_transform.inverted()[0]
+                s = inv.map(drag_start_scene)
+                e = inv.map(drag_end_scene)
+                x1 = int(min(s.x(), e.x()))
+                y1 = int(min(s.y(), e.y()))
+                x2 = int(max(s.x(), e.x()))
+                y2 = int(max(s.y(), e.y()))
+
+                img_obj = ccr_backend.get_image_by_index(pw.current_idx)
+                if img_obj is not None:
+                    import numpy as np
+                    # Always sample from original scan data, not processed data
+                    if img_obj.converted:
+                        raw_data = img_obj.read_image(img_obj.file_path)
+                        if raw_data is not None:
+                            raw_data = img_obj.resize_image_to_max_pixel(raw_data, 1080)
+                    else:
+                        raw_data = img_obj.resized_raw
+                    if raw_data is not None:
+                        h, w = raw_data.shape[:2]
+                        x1 = max(0, min(x1, w - 1))
+                        y1 = max(0, min(y1, h - 1))
+                        x2 = max(0, min(x2, w))
+                        y2 = max(0, min(y2, h))
+                        if (x2 - x1) >= 5 and (y2 - y1) >= 5:
+                            crop = raw_data[y1:y2, x1:x2, :]
+                            means = np.mean(crop.reshape(-1, 3), axis=0)
+                            bgr_tuple = (float(means[0]), float(means[1]), float(means[2]))
+                            if mode == "black":
+                                # Record per-channel 99th-percentile of THIS image so other
+                                # images on the same roll can scale relative to it.  Sprocket
+                                # holes (the brightest pixels) dominate this percentile and
+                                # scale linearly with rawpy's per-image auto-brightness factor.
+                                ref_max = tuple(
+                                    float(np.percentile(raw_data[..., c], 99)) for c in range(3)
+                                )
+                                ccr_backend.set_black_point(bgr_tuple, ref_max=ref_max)
+                            else:
+                                ccr_backend.set_white_point(bgr_tuple)
+                            try:
+                                pw.parent().parent().sliders_panel.on_bwpoint_sampled(mode)
+                            except AttributeError:
+                                pass
+            return
+
         if self.drawing_reference and event.button() == Qt.LeftButton:
             self._drag_end = self.mapToScene(event.pos())
             self.drawing_reference = False
@@ -351,6 +468,7 @@ class ImagePreview(QWidget):
         self.scene.clear()
         self.pixmap_item = None
         self.reference_rect_item = None
+        self.view._bw_rect_item = None
 
         self.parent().parent().sliders_panel.set_current_idx(idx)
 
@@ -532,6 +650,11 @@ class ImagePreview(QWidget):
             print("Setting sliders enabled based on current_converted:", self.current_converted)
             parent.parent().sliders_panel.set_sliders_enabled(self.current_converted)
         
+
+    def set_bwpoint_mode(self, mode):
+        """mode: 'black' | 'white' | None"""
+        self.view.bwpoint_mode = mode
+        self.view.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

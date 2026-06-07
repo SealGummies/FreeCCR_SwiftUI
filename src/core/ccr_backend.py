@@ -1,6 +1,6 @@
 from typing import List, Optional
 from core.ccr_image import CCRImage
-from core.ccr_processor import ccr_normalize_with_reference, auto_fine_angle, auto_frame, auto_frame_v2
+from core.ccr_processor import ccr_normalize_with_reference, ccr_normalize_with_bwpoint, auto_fine_angle, auto_frame, auto_frame_v2
 import os
 import glob
 import concurrent.futures
@@ -19,6 +19,9 @@ class CCRBackend:
     def _init(self):
         self.images: List[CCRImage] = []
         self.file_paths: List[str] = []
+        self.white_point_bgr = None  # (B, G, R) of dense/exposed area
+        self.black_point_bgr = None  # (B, G, R) of transparent/clear area
+        self.reference_image_max = None  # per-channel 99th-percentile of the image where black_point was sampled
 
     def load_images_from_files(self, file_paths: List[str], cancel_flag=None):
         self.images.clear()
@@ -421,11 +424,20 @@ class CCRBackend:
     def export_image_by_index(self, idx: int, output_path: str, jpg_output: bool = False):
         """
         Exports the processed image at the given index to the specified output path.
+        Routes to bwpoint or reference-frame pipeline depending on how the image was converted.
         """
         if idx is not None and 0 <= idx < len(self.images):
             image_obj = self.images[idx]
             try:
-                ccr_normalize_with_reference(image_obj, output_path=output_path, water_mark=not self.software_activated, jpg_out=jpg_output)
+                if image_obj.reference_frame is None and self.black_point_bgr is not None and self.white_point_bgr is not None:
+                    # B/W point conversion — re-process from original full-res file
+                    ccr_normalize_with_bwpoint(image_obj, self.black_point_bgr, self.white_point_bgr,
+                                               reference_image_max=self.reference_image_max,
+                                               output_path=output_path, water_mark=not self.software_activated,
+                                               jpg_out=jpg_output)
+                else:
+                    ccr_normalize_with_reference(image_obj, output_path=output_path,
+                                                 water_mark=not self.software_activated, jpg_out=jpg_output)
             except Exception as e:
                 print(f"Failed to export image at index {idx}: {e}")
             
@@ -513,5 +525,43 @@ class CCRBackend:
         if idx is not None and 0 <= idx < len(self.images):
             del self.images[idx]
             self.file_paths = [img.file_path for img in self.images]
+
+    def set_white_point(self, bgr_tuple):
+        self.white_point_bgr = bgr_tuple
+
+    def set_black_point(self, bgr_tuple, ref_max=None):
+        self.black_point_bgr = bgr_tuple
+        if ref_max is not None:
+            self.reference_image_max = ref_max
+
+    def apply_bwpoint_to_all_images(self, progress_callback=None):
+        """
+        Apply B/W point film negative conversion to all loaded images using the same
+        pipeline as ccr_normalize_with_reference, but with user-specified B/W points
+        instead of auto-detected percentiles.  Always converts from original scan data.
+        """
+        if self.black_point_bgr is None or self.white_point_bgr is None:
+            raise ValueError("Both black and white points must be set before applying.")
+        total = len(self.images)
+        if progress_callback:
+            progress_callback(0, total)
+        for i, img in enumerate(self.images):
+            try:
+                # Ensure we start from original (unprocessed) scan data
+                if img.converted:
+                    img.reload_image()
+                processed = ccr_normalize_with_bwpoint(
+                    img, self.black_point_bgr, self.white_point_bgr,
+                    reference_image_max=self.reference_image_max
+                )
+                if processed is not None:
+                    img.resized_raw = processed
+                img.converted = True
+                img.update_thumbnail_and_preview()
+            except Exception as e:
+                print(f"B/W point conversion failed for image {i}: {e}")
+            if progress_callback:
+                progress_callback(i + 1, total)
+
 # Singleton instance
 ccr_backend = CCRBackend()
