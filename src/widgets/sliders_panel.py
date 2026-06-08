@@ -449,8 +449,7 @@ class SlidersPanel(QWidget):
                 img.reload_image()
             from core.ccr_processor import ccr_normalize_with_bwpoint
             processed = ccr_normalize_with_bwpoint(
-                img, ccr_backend.black_point_bgr, ccr_backend.white_point_bgr,
-                reference_image_max=ccr_backend.reference_image_max
+                img, ccr_backend.black_point_bgr, ccr_backend.white_point_bgr
             )
             if processed is not None:
                 img.resized_raw = processed

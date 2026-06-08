@@ -52,6 +52,8 @@ class CCRImage:
         self.horizontal_mirrored = horizontal_mirrored
         self.vertical_mirrored = vertical_mirrored
         self.converted = converted  # Indicates if the image has been converted to CCR format
+        self.contrast_base: int = 0      # Non-destructive base contrast added internally; slider shows 0
+        self.temperature_base: int = 0   # Non-destructive base temperature offset; slider shows 0
         self.histogram_image = None
 
         self.info = self.get_camera_and_lens_for_lensfun(self.file_path)  # Extract camera and lens info for lensfun
@@ -99,6 +101,8 @@ class CCRImage:
         Reload the image from the file path and update resized_raw, thumbnail, and preview.
         This is useful if the image file has been modified externally.
         """
+        self.contrast_base = 0      # Clear base offsets when reverting to original scan
+        self.temperature_base = 0
         img = self.read_image(self.file_path)
         if img is not None:
             self.resized_raw = self.resize_image_to_max_pixel(img, 1080)
@@ -181,7 +185,7 @@ class CCRImage:
                         # Pure/raw sensor readout with minimal processing (greenish result)
                         rgb = raw.postprocess(
                             output_bps=16,
-                            no_auto_bright=False,     # No automatic brightness adjustment
+                            no_auto_bright=True,      # Consistent absolute sensor values across all frames
                             gamma=(1, 1),            # Linear gamma (no gamma correction)
                             user_flip=0,              # No rotation
                             demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,  # Simple linear demosaic
@@ -357,16 +361,18 @@ class CCRImage:
         return qimage
 
     def apply_adjustments(self, image: np.ndarray) -> np.ndarray:
-        if not self.adjustment_settings:
+        if not self.adjustment_settings and self.contrast_base == 0 and self.temperature_base == 0:
             return image
-        adjusted=adjust_image_opencl(image, self.adjustment_settings['temperature'],
-                     self.adjustment_settings['tint'],
-                     self.adjustment_settings['exposure'],
-                     self.adjustment_settings['brightness'],
-                     self.adjustment_settings['black_point'],
-                     self.adjustment_settings['white_point'],
-                     self.adjustment_settings['contrast'],
-                     self.adjustment_settings['saturation'],
+        s = self.adjustment_settings
+        adjusted = adjust_image_opencl(image,
+                     s.get('temperature', 0) + self.temperature_base,
+                     s.get('tint', 0),
+                     s.get('exposure', 0),
+                     s.get('brightness', 0),
+                     s.get('black_point', 0),
+                     s.get('white_point', 0),
+                     s.get('contrast', 0) + self.contrast_base,
+                     s.get('saturation', 0),
                      self.tint_balance_factor)
         return adjusted
 

@@ -192,14 +192,7 @@ class GraphicsImageView(QGraphicsView):
                             means = np.mean(crop.reshape(-1, 3), axis=0)
                             bgr_tuple = (float(means[0]), float(means[1]), float(means[2]))
                             if mode == "black":
-                                # Record per-channel 99th-percentile of THIS image so other
-                                # images on the same roll can scale relative to it.  Sprocket
-                                # holes (the brightest pixels) dominate this percentile and
-                                # scale linearly with rawpy's per-image auto-brightness factor.
-                                ref_max = tuple(
-                                    float(np.percentile(raw_data[..., c], 99)) for c in range(3)
-                                )
-                                ccr_backend.set_black_point(bgr_tuple, ref_max=ref_max)
+                                ccr_backend.set_black_point(bgr_tuple)
                             else:
                                 ccr_backend.set_white_point(bgr_tuple)
                             try:

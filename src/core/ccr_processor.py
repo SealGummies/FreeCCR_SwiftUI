@@ -773,7 +773,6 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
     return rgb_brightness_normalized
 
 def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
-                               reference_image_max=None,
                                output_path=None, water_mark=True, jpg_out=False):
     """
     Film negative conversion using the same pipeline as ccr_normalize_with_reference
@@ -809,46 +808,23 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         del rot_mat
 
-    # --- BWPN: user B/W points define per-channel density ratio; film-base level auto-detected per image ---
+    # --- BWPN: B/W point values are absolute anchors, constant across the whole roll ---
     #
-    # The user samples black_point (transparent film, high values) and white_point (dense film, low values)
-    # from ONE reference image.  Different images on the same roll may have different absolute brightness
-    # due to rawpy auto-brightness, so we cannot use the sampled values directly as fixed anchors.
-    #
-    # Solution: derive a per-channel density ratio  (dense / transparent)  from the user's calibration,
-    # then auto-detect each image's own film-base level (99th percentile per channel) and scale both
-    # anchors proportionally.  This keeps the colour balance the user calibrated while letting the
-    # absolute level adapt to each image.
+    # With no_auto_bright=True in rawpy, film base and dense-area values are identical in every
+    # frame. The sampled B/W points are applied directly as fixed per-channel anchors.
     img_f = img.astype(np.float32)
     norm = np.empty_like(img_f)
     for c in range(3):
-        bp_user = max(float(black_point_bgr[c]), 1.0)   # transparent film level in reference image
-        wp_user = max(float(white_point_bgr[c]), 1.0)   # dense film level in reference image
-
-        if reference_image_max is not None:
-            # Scale both anchors from the reference image's brightness to this image's brightness.
-            # The 99th percentile is dominated by sprocket holes (maximum-transparency areas) whose
-            # value scales linearly with rawpy's per-image auto-brightness factor.  Using the ratio
-            # of this image's 99th percentile to the reference's 99th percentile gives the correct
-            # per-image multiplier, so p_hi lands exactly on THIS image's film-base level.
-            ref_max_c = max(float(reference_image_max[c]), 1.0)
-            own_max_c = max(float(np.percentile(img_f[..., c], 99)), 1.0)
-            scale = own_max_c / ref_max_c
-            p_hi = bp_user * scale   # film-base level for THIS image
-            p_lo = wp_user * scale   # dense-area level for THIS image
-        else:
-            # Fallback: use the sampled values directly (works when all images have the same exposure)
-            p_hi = bp_user
-            p_lo = wp_user
+        p_hi = max(float(black_point_bgr[c]), 1.0)   # transparent film (film base) → maps to black
+        p_lo = max(float(white_point_bgr[c]), 1.0)   # dense film (exposed area) → maps to white
 
         denom = p_hi - p_lo
         if abs(denom) < 1.0:
-            norm[..., c] = 8192.0
+            norm[..., c] = 0.0
             continue
         np.subtract(img_f[..., c], p_lo, out=norm[..., c])
         np.divide(norm[..., c], denom, out=norm[..., c])
-        np.multiply(norm[..., c], 65535 - 8192, out=norm[..., c])
-        np.add(norm[..., c], 8192, out=norm[..., c])
+        np.multiply(norm[..., c], 65535.0, out=norm[..., c])
         np.clip(norm[..., c], 0, 65535, out=norm[..., c])
     del img_f
     print(f"BWPN (user points): {time.time() - total_start_time:.3f}s")
@@ -894,6 +870,10 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     rgb_result = np.clip(shadow_corrected * 65535.0, 0, 65535).astype(np.uint16)
     del shadow_corrected, gamma_corrected, rgb_inverted
     gc.collect()
+
+    # Non-destructive base offsets applied through the adjustment pipeline (UI shows 0).
+    ccr_image.contrast_base = 60
+    ccr_image.temperature_base = 20
 
     # --- User adjustments (export only) ---
     if output_path is not None:
