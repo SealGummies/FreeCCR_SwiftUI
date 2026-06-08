@@ -1,0 +1,50 @@
+name: Build and Release (Windows)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (full history for git describe)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11.0
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.0'
+
+      - name: Cache Nuitka toolchain downloads
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Nuitka\Nuitka\Cache
+          key: nuitka-mingw64-${{ runner.os }}
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate version file
+        run: python write_version.py
+
+      - name: Build executable with Nuitka
+        run: build_exe.bat
+
+      - name: Install Inno Setup 6
+        run: choco install innosetup --version=6.3.3 -y --no-progress
+
+      - name: Build Windows installer
+        run: windows_build_scripts\build_inno_installer.bat
+
+      - name: Upload installer to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: win_installer/FreeCCR_Install_*.exe
