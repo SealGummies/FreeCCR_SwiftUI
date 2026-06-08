@@ -9,7 +9,7 @@ CONTENTS_DIR="${BUNDLE_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 PLIST_SRC="macos_build_scripts/Info.plist"
-ICON_SRC="src/icons/haloimagery_logo.icns"
+ICON_SRC="src/icons/freeccr_logo.icns"
 NUITKA_BIN="main.dist/main.bin"
 DMG_NAME="${APP_NAME}.dmg"
 DMG_TEMP_DIR="dmg_temp"
@@ -30,7 +30,7 @@ cp "$PLIST_SRC" "$CONTENTS_DIR/Info.plist"
 
 # Copy icon if it exists
 if [ -f "$ICON_SRC" ]; then
-    cp "$ICON_SRC" "$RESOURCES_DIR/haloimagery_logo.icns"
+    cp "$ICON_SRC" "$RESOURCES_DIR/freeccr_logo.icns"
 fi
 
 # Copy all required .so, .dylib, and resource files from Nuitka build

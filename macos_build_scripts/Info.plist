@@ -9,7 +9,7 @@
     <key>CFBundleName</key>
     <string>FreeCCR</string>
     <key>CFBundleIconFile</key>
-    <string>haloimagery_logo</string>
+    <string>freeccr_logo</string>
     <key>CFBundleVersion</key>
     <string>1.0</string>
     <key>LSMinimumSystemVersion</key>

@@ -7,7 +7,7 @@ def main():
     from ui.main_window import MainWindow
 
     app = QApplication(sys.argv)
-    _icon_path = os.path.join(os.path.dirname(__file__), 'icons', 'haloimagery.png')
+    _icon_path = os.path.join(os.path.dirname(__file__), 'icons', 'freeccr_logo.png')
     app.setWindowIcon(QIcon(_icon_path))
     print("Starting FreeCCR...")
     window = MainWindow()

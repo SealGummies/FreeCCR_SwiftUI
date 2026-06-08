@@ -43,7 +43,7 @@ build_exe.bat
 
 This generates the version file from the current git tag, then compiles `src/main.py` into a self-contained executable using Nuitka with MinGW64/Clang. All dependencies, PyOpenCL kernels, and icon assets are bundled automatically.
 
-Output: `main.dist/` directory containing `haloimagery_ccr.exe` and all required files.
+Output: `main.dist/` directory containing `freeccr.exe` and all required files.
 
 ### Step 2 — Build the installer
 

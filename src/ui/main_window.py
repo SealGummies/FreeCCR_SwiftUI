@@ -39,7 +39,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("FreeCCR")
         self.setGeometry(100, 100, 1860, 1080)
-        app_icon = QIcon("./icons/haloimagery_logo.png")
+        app_icon = QIcon("./icons/freeccr_logo.png")
         self.setWindowIcon(app_icon)
         # try:
         #     myappid = 'ccr.project.client'

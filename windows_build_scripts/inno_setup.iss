@@ -20,7 +20,7 @@ AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
-SetupIconFile=..\src\icons\haloimagery_logo.ico
+SetupIconFile=..\src\icons\freeccr_logo.ico
 ; "ArchitecturesAllowed=x64compatible" specifies that Setup cannot run
 ; on anything but x64 and Windows 11 on Arm.
 ArchitecturesAllowed=x64compatible
@@ -47,8 +47,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "H:\Projects\ccr-project\client\ccr-client\main.dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "H:\Projects\ccr-project\client\ccr-client\main.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "H:\Projects\FreeCCR\main.dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "H:\Projects\FreeCCR\main.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
