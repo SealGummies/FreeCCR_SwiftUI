@@ -17,27 +17,91 @@
 
 ## Requirements
 
-- Python 3.11.0 (newer versions fail with Nuitka compilation)
+- Python 3.11.0 exactly (newer versions are incompatible with Nuitka compilation)
 
 ---
 
-## Installation
+## Running in development
 
-1. **Clone the repository:**
-    ```sh
-    git clone https://github.com/yourusername/freeccr.git
-    cd freeccr/src
-    ```
+```bash
+git clone https://github.com/yourusername/freeccr.git
+cd freeccr
+pip install -r requirements.txt
+python write_version.py   # required on first run or after tagging
+python src/main.py
+```
 
-2. **Install dependencies:**
-    ```sh
-    pip install -r requirements.txt
-    ```
+---
 
-3. **For Windows**
-   ```sh
-   ./build_exe.bat
-   ```
+## Building for Windows
+
+### Step 1 — Build the standalone executable
+
+```bat
+build_exe.bat
+```
+
+This generates the version file from the current git tag, then compiles `src/main.py` into a self-contained executable using Nuitka with MinGW64/Clang. All dependencies, PyOpenCL kernels, and icon assets are bundled automatically.
+
+Output: `main.dist/` directory containing `haloimagery_ccr.exe` and all required files.
+
+### Step 2 — Build the installer
+
+Requires **[Inno Setup 6](https://jrsoftware.org/isinfo.php)** installed at `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`. If installed elsewhere, update `ISCC_PATH` in `windows_build_scripts/build_inno_installer.bat`.
+
+Before running, open `windows_build_scripts/inno_setup.iss` and update the `Source:` paths under `[Files]` to point to your local `main.dist\` directory.
+
+```bat
+windows_build_scripts\build_inno_installer.bat
+```
+
+The script reads the version from `git describe --tags`, injects it into the Inno Setup script, and compiles the installer. Output is written to `win_installer/FreeCCR_Install_<version>.exe`.
+
+---
+
+## Building for macOS
+
+### Prerequisites
+
+- Xcode command line tools
+- An Apple Developer ID certificate (for distribution) or Apple Development certificate (for local testing)
+- `dmgbuild`: `pip install dmgbuild`
+
+Update the `SIGN_CERTIFICATE` variable at the top of the build script to match your certificate name as it appears in Keychain Access.
+
+### Distribution build — signed and notarized DMG
+
+```bash
+bash macos_build_scripts/build_compatible.sh
+```
+
+This script:
+1. Installs/upgrades dependencies and Nuitka
+2. Runs `write_version.py`
+3. Compiles with Nuitka targeting macOS 10.15+
+4. Assembles `FreeCCR.app` with `Info.plist` and icon
+5. Strips extended attributes (required for Gatekeeper)
+6. Code-signs all binaries and the app bundle with hardened runtime
+7. Packages into `FreeCCR.dmg` via dmgbuild
+8. Submits the DMG to Apple for notarization
+9. On success, moves the notarized DMG to `release/<version>/FreeCCR.dmg`
+
+Notarization credentials must be stored in the keychain under the profile name `notaryccr`. Run this once to set it up:
+
+```bash
+xcrun notarytool store-credentials "notaryccr" \
+  --apple-id "your@apple.id" \
+  --team-id "YOURTEAMID" \
+  --password "app-specific-password"
+```
+
+### Development build — local signing only
+
+```bash
+bash macos_build_scripts/create_bundle.sh
+```
+
+Assembles and locally signs the `.app` bundle and DMG without notarization. Suitable for internal testing.
 
 ## Activation
 
