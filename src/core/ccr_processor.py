@@ -214,14 +214,14 @@ def _initialize_opencl():
                 float img_norm_g = g / 65535.0f;
                 float img_norm_b = b / 65535.0f;
                 
-                // Parabolic midtone lift: fixed endpoints (0→0, 1→1), linear in slider
-                float lift = (brightness / 100.0f) * 0.35f;   // ±0.35 midtone shift at ±100
-                img_norm_r = img_norm_r + lift * 4.0f * img_norm_r * (1.0f - img_norm_r);
-                img_norm_g = img_norm_g + lift * 4.0f * img_norm_g * (1.0f - img_norm_g);
-                img_norm_b = img_norm_b + lift * 4.0f * img_norm_b * (1.0f - img_norm_b);
-                img_norm_r = clamp(img_norm_r, 0.0f, 1.0f);
-                img_norm_g = clamp(img_norm_g, 0.0f, 1.0f);
-                img_norm_b = clamp(img_norm_b, 0.0f, 1.0f);
+                float brightness_scale = brightness / 8.0f;   // -10.0 to +10.0 for -100 to +100
+                // The curve parameter: positive = lift, negative = compress
+                float curve = 1.0f - 0.3f * brightness_scale;  // 2.2 to 0.8 for -100 to +100
+
+                // Use pow directly like CPU version, without fmax protection
+                img_norm_r = pow(img_norm_r, curve);
+                img_norm_g = pow(img_norm_g, curve);
+                img_norm_b = pow(img_norm_b, curve);
                 
                 r = img_norm_r * 65535.0f;
                 g = img_norm_g * 65535.0f;
@@ -1352,7 +1352,7 @@ def adjust_image(
     kelvin_scale = 0.003 * kelvin_shift      # -1.0 to +1.0
     tint_scale = 0.002 * tint_shift          # -1.0 to +1.0
     exposure_scale = exposure * 2.0 / 100.0  # -2.0 to +2.0 stops
-    brightness_scale = brightness / 8.0   # unused after brightness rewrite below
+    brightness_scale = brightness / 8.0
     blackpoint_scale = 1.0 - (blackpoint / 100.0)    # -1.0 to +1.0 (fraction of 65535)
     whitepoint_scale = 1.0 + (whitepoint / 100.0)  # 0.0 to 2.0 (scaling factor)
     contrast_scale = 1.0 + (contrast / 100.0)      # 0.0 to 2.0
@@ -1495,11 +1495,12 @@ def adjust_image(
         
         img *= pixel_exposure_factors
     
-    # Brightness: parabolic midtone lift — fixed endpoints (0→0, 1→1), linear in slider
+    # Brightness
     if brightness != 0.0:
         img_norm = img / 65535.0
-        lift = (brightness / 100.0) * 0.35   # ±0.35 midtone shift at ±100
-        img_norm = img_norm + lift * 4.0 * img_norm * (1.0 - img_norm)
+        brightness_scale = brightness / 8.0
+        curve = 1.0 - 0.3 * brightness_scale
+        img_norm = np.power(img_norm, curve)
         img_norm = np.clip(img_norm, 0.0, 1.0)
         img = img_norm * 65535.0
 
