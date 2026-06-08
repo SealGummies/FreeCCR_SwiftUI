@@ -1,4 +1,4 @@
-name: Build and Release (Windows)
+name: Build and Release
 
 on:
   push:
@@ -48,3 +48,73 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: win_installer/FreeCCR_Install_*.exe
+
+  build-macos:
+    runs-on: macos-latest  # ARM64 (Apple Silicon)
+
+    steps:
+      - name: Checkout (full history for git describe)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11.0
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.0'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate version file
+        run: python write_version.py
+
+      - name: Get version
+        id: version
+        run: echo "version=$(python -c "import sys; sys.path.append('src'); from version import VERSION; print(VERSION)")" >> "$GITHUB_OUTPUT"
+
+      - name: Build executable with Nuitka
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          PYOPENCL_CL_DIR=$(python -c "import pyopencl, os; print(os.path.join(os.path.dirname(pyopencl.__file__), 'cl'))")
+          python -m nuitka \
+            --clang \
+            --standalone \
+            --include-package=numpy \
+            --include-package=pyopencl \
+            --include-data-dir="$PYOPENCL_CL_DIR=pyopencl/cl" \
+            --enable-plugin=pyside6 \
+            --include-data-dir=src/icons=icons \
+            --include-data-dir=LICENSES=LICENSES \
+            --nofollow-import-to=doctest \
+            --nofollow-import-to=IPython \
+            src/main.py
+
+      - name: Assemble .app bundle (unsigned)
+        run: |
+          APP="FreeCCR.app"
+          MACOS_DIR="$APP/Contents/MacOS"
+          RESOURCES_DIR="$APP/Contents/Resources"
+
+          rm -rf "$APP"
+          mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+
+          cp main.dist/main.bin "$MACOS_DIR/FreeCCR"
+          chmod +x "$MACOS_DIR/FreeCCR"
+          cp macos_build_scripts/Info.plist "$APP/Contents/Info.plist"
+
+          [ -f src/icons/freeccr_logo.icns ] && cp src/icons/freeccr_logo.icns "$RESOURCES_DIR/freeccr_logo.icns"
+
+          cp -R main.dist/* "$MACOS_DIR/"
+          rm -f "$MACOS_DIR/main.bin"
+
+          xattr -cr "$APP" 2>/dev/null || true
+
+      - name: Zip .app bundle
+        run: zip -r "FreeCCR_macOS_${{ steps.version.outputs.version }}.zip" FreeCCR.app
+
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: FreeCCR_macOS_*.zip
