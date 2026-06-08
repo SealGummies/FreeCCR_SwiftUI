@@ -116,7 +116,8 @@ class CCRImage:
         """
         h, w = image.shape[:2]
         if max(h, w) <= max_long_side:
-            return image  # Return the original reference, no copy        if h > w:
+            return image
+        if h > w:
             new_h = max_long_side
             new_w = int(w * max_long_side / h)
         else:
@@ -306,8 +307,9 @@ class CCRImage:
         self.resized_preview = QPixmap.fromImage(qimage)
         # Calculate histogram for the 8-bit thumbnail (RGB)
         hist = {}
+        preview_img_8bit = to_8bit(preview_img)
         for i, color in enumerate(['r', 'g', 'b']):
-            hist[color] = cv2.calcHist([to_8bit(preview_img)], [i], None, [256], [0, 256]).flatten()
+            hist[color] = cv2.calcHist([preview_img_8bit], [i], None, [256], [0, 256]).flatten()
 
         # Generate a histogram image (RGB channels overlaid)
         bg_color = np.array([180, 180, 180], dtype=np.uint8)  # dark gray background
@@ -420,7 +422,7 @@ class CCRImage:
                 if focal:
                     try:
                         val = focal.values[0]
-                        if hasattr(val, 'num') and hasattr(val, 'den'):
+                        if hasattr(val, 'num') and hasattr(val, 'den') and val.den != 0:
                             info['focal_length'] = float(val.num) / float(val.den)
                         else:
                             info['focal_length'] = float(val)
@@ -437,7 +439,7 @@ class CCRImage:
                 if fnum:
                     try:
                         val = fnum.values[0]
-                        if hasattr(val, 'num') and hasattr(val, 'den'):
+                        if hasattr(val, 'num') and hasattr(val, 'den') and val.den != 0:
                             info['aperture'] = float(val.num) / float(val.den)
                         else:
                             info['aperture'] = float(val)
@@ -455,7 +457,7 @@ class CCRImage:
                 if dist:
                     try:
                         val = dist.values[0]
-                        if hasattr(val, 'num') and hasattr(val, 'den'):
+                        if hasattr(val, 'num') and hasattr(val, 'den') and val.den != 0:
                             info['distance'] = float(val.num) / float(val.den)
                         else:
                             info['distance'] = float(val)

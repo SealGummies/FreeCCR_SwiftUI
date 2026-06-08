@@ -1,5 +1,7 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayout, QSizePolicy, QStyleOptionSlider, QFrame, QStyle
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayout,
+                                QSizePolicy, QStyleOptionSlider, QFrame, QStyle,
+                                QPushButton, QDialog, QMessageBox)
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
 from core.ccr_backend import ccr_backend
 
@@ -29,21 +31,11 @@ class ResettableSlider(QSlider):
             parent_widget = parent_widget.parent()
         
         if parent_widget and old_value != 0:
-            # Update the value label
-            slider_idx = None
             for i, slider in enumerate(parent_widget.sliders):
                 if slider is self:
-                    slider_idx = i
+                    parent_widget.slider_value_labels[i].setText("0")
+                    parent_widget.on_slider_changed()
                     break
-            
-            if slider_idx is not None:
-                # Update the value label
-                slider_layout = parent_widget.layout().itemAt(slider_idx + 1).layout()
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText("0")
-                
-                # Trigger the adjustment update
-                parent_widget.on_slider_changed()
         
         super().mouseDoubleClickEvent(event)
 
@@ -78,6 +70,7 @@ class SlidersPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__()
         self.sliders = []
+        self.slider_value_labels = []
         self.slider_labels = []
         self.image_slider_map = {}
         self.current_image_id = None
@@ -138,7 +131,6 @@ class SlidersPanel(QWidget):
         layout.addLayout(self.saturation_slider_layout)
 
         # --- Add Reset and Compare buttons inline below sliders ---
-        from PySide6.QtWidgets import QPushButton, QHBoxLayout
 
         buttons_layout = QHBoxLayout()
         self.reset_button = QPushButton("Reset")
@@ -153,11 +145,38 @@ class SlidersPanel(QWidget):
         sync_layout.addWidget(self.sync_to_all_button)
         layout.addLayout(sync_layout)
 
+        # B/W Point film calibration section — visually separated from adjustment buttons
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
+        layout.addWidget(separator)
+
+        bwp_label = QLabel("Film B/W Point")
+        bwp_label.setStyleSheet("color: #888; font-size: 11px; margin-bottom: 2px;")
+        bwp_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(bwp_label)
+
+        bwp_row = QHBoxLayout()
+        self.white_point_btn = QPushButton("Set White Point")
+        self.black_point_btn = QPushButton("Set Black Point")
+        bwp_row.addWidget(self.white_point_btn)
+        bwp_row.addWidget(self.black_point_btn)
+        layout.addLayout(bwp_row)
+        self.convert_current_bwp_btn = QPushButton("Convert Current (B/W Point)")
+        layout.addWidget(self.convert_current_bwp_btn)
+        self.convert_all_bwp_btn = QPushButton("Convert All (B/W Point)")
+        layout.addWidget(self.convert_all_bwp_btn)
+
         self.reset_button.clicked.connect(self.on_reset_clicked)
         self.compare_button.pressed.connect(self.on_compare_pressed)
         self.compare_button.released.connect(self.on_compare_released)
         self.compare_button.setCheckable(False)
         self.sync_to_all_button.clicked.connect(self.on_sync_to_all_clicked)
+        self.white_point_btn.clicked.connect(self._on_set_white_point)
+        self.black_point_btn.clicked.connect(self._on_set_black_point)
+        self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
+        self.convert_all_bwp_btn.clicked.connect(self._on_convert_all_bwpoint)
 
         # --- Add Dynamic Hint section below the buttons ---
         self.hint_label = QLabel()
@@ -228,6 +247,7 @@ class SlidersPanel(QWidget):
         slider_layout.addWidget(value_label, alignment=Qt.AlignVCenter)
 
         self.sliders.append(slider)
+        self.slider_value_labels.append(value_label)
 
         return slider_layout
 
@@ -259,9 +279,7 @@ class SlidersPanel(QWidget):
                 slider.blockSignals(True)
                 slider.setValue(0)
                 slider.blockSignals(False)
-                slider_layout = self.layout().itemAt(i + 1).layout()
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText("0")
+                self.slider_value_labels[i].setText("0")
             return
 
         for i, key in enumerate(self.adjustment_keys):
@@ -269,10 +287,7 @@ class SlidersPanel(QWidget):
                 self.sliders[i].blockSignals(True)
                 self.sliders[i].setValue(adjustment[key])
                 self.sliders[i].blockSignals(False)
-                # --- Update value label as well ---
-                slider_layout = self.layout().itemAt(i + 1).layout()  # +1 if histogram is at index 0
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText(str(adjustment[key]))
+                self.slider_value_labels[i].setText(str(adjustment[key]))
         if idx is not None:
             ccr_backend.apply_adjustment_by_index(idx)
 
@@ -308,17 +323,17 @@ class SlidersPanel(QWidget):
     
     def _do_backend_processing(self):
         """Perform the heavier backend processing operations (thumbnail updates, etc.)."""
+        # Capture which index to process and clear pending so new changes can queue up
+        idx = self._pending_idx
+        self._pending_adjustment = None
+        self._pending_idx = None
         try:
-            if self._pending_idx is not None and self._pending_adjustment is not None:
-                # Do the heavier processing: update thumbnails and internal caches
-                if 0 <= self._pending_idx < len(ccr_backend.images):
-                    ccr_backend.images[self._pending_idx].update_thumbnail_and_preview()
+            if idx is not None and 0 <= idx < len(ccr_backend.images):
+                ccr_backend.images[idx].update_thumbnail_and_preview()
         finally:
             self._processing = False
-            
-            # Clear the pending adjustment since we've processed it
-            self._pending_adjustment = None
-            self._pending_idx = None
+            # Process any adjustment that arrived while we were working
+            QTimer.singleShot(0, self._check_for_pending)
     
     def _check_for_pending(self):
         """Check if there's another pending adjustment to process."""
@@ -334,9 +349,7 @@ class SlidersPanel(QWidget):
             slider.blockSignals(True)
             slider.setValue(0)
             slider.blockSignals(False)
-            slider_layout = self.layout().itemAt(i + 1).layout()
-            value_label = slider_layout.itemAt(2).widget()
-            value_label.setText("0")
+            self.slider_value_labels[i].setText("0")
         # Save adjustment to backend and update preview
         if self.current_idx is not None:
             adjustment = {key: 0 for key in self.adjustment_keys}
@@ -352,9 +365,7 @@ class SlidersPanel(QWidget):
                 slider.blockSignals(True)
                 slider.setValue(0)
                 slider.blockSignals(False)
-                slider_layout = self.layout().itemAt(i + 1).layout()
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText("0")
+                self.slider_value_labels[i].setText("0")
             # Update preview with temporary adjustment
             ccr_backend.set_adjustment_by_index(self.current_idx, {key: 0 for key in self._original_adjustment or {}})
             self.parent().parent().image_preview.update_preview(self.current_idx)
@@ -368,9 +379,7 @@ class SlidersPanel(QWidget):
                 self.sliders[i].blockSignals(True)
                 self.sliders[i].setValue(val)
                 self.sliders[i].blockSignals(False)
-                slider_layout = self.layout().itemAt(i + 1).layout()
-                value_label = slider_layout.itemAt(2).widget()
-                value_label.setText(str(val))
+                self.slider_value_labels[i].setText(str(val))
             ccr_backend.set_adjustment_by_index(self.current_idx, adjustment)
             self.parent().parent().image_preview.update_preview(self.current_idx)
             del self._original_adjustment
@@ -401,6 +410,85 @@ class SlidersPanel(QWidget):
         # Show completion hint
         self.set_temporary_hint("Synced all adjustments!", duration=4000)
 
+    def _on_set_white_point(self):
+        if hasattr(self, 'image_preview') and self.image_preview:
+            self.image_preview.set_bwpoint_mode("white")
+            self.set_temporary_hint(
+                "<b>White Point:</b> Draw a rect over the dense/exposed film area.", duration=6000)
+
+    def _on_set_black_point(self):
+        if hasattr(self, 'image_preview') and self.image_preview:
+            self.image_preview.set_bwpoint_mode("black")
+            self.set_temporary_hint(
+                "<b>Black Point:</b> Draw a rect over the transparent/clear film base.", duration=6000)
+
+    def on_bwpoint_sampled(self, mode):
+        label = "White Point" if mode == "white" else "Black Point"
+        other = "Black Point" if mode == "white" else "White Point"
+        bp_set = ccr_backend.black_point_bgr is not None
+        wp_set = ccr_backend.white_point_bgr is not None
+        if bp_set and wp_set:
+            self.set_temporary_hint(
+                f"{label} sampled! Both points set — click <b>Convert All (B/W Point)</b>.", duration=5000)
+        else:
+            self.set_temporary_hint(
+                f"{label} sampled! Now set the <b>{other}</b>.", duration=5000)
+
+    def _on_convert_current_bwpoint(self):
+        if ccr_backend.black_point_bgr is None or ccr_backend.white_point_bgr is None:
+            QMessageBox.warning(self, "B/W Point Missing",
+                "Please set both Black Point and White Point before converting.")
+            return
+        if self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        try:
+            if img.converted:
+                img.reload_image()
+            from core.ccr_processor import ccr_normalize_with_bwpoint
+            processed = ccr_normalize_with_bwpoint(
+                img, ccr_backend.black_point_bgr, ccr_backend.white_point_bgr,
+                reference_image_max=ccr_backend.reference_image_max
+            )
+            if processed is not None:
+                img.resized_raw = processed
+            img.converted = True
+            img.update_thumbnail_and_preview()
+            mw = self.parent().parent()
+            mw.thumbnail_list.update_all_thumbnails()
+            mw.image_preview.update_preview(self.current_idx)
+            mw.image_preview._update_unconvert_action_state()
+            self.set_temporary_hint("Current image converted!", duration=3000)
+        except Exception as e:
+            QMessageBox.critical(self, "Conversion Error", str(e))
+
+    def _on_convert_all_bwpoint(self):
+        if ccr_backend.black_point_bgr is None or ccr_backend.white_point_bgr is None:
+            QMessageBox.warning(self, "B/W Point Missing",
+                "Please set both Black Point and White Point before converting.")
+            return
+        dialog = BWPointConvertDialog(self)
+        worker = BWPointConvertWorker()
+        dialog.set_worker(worker)
+        worker.progress.connect(dialog.set_progress)
+        worker.finished.connect(lambda: self._on_bwp_convert_finished(dialog))
+        worker.start()
+        dialog.exec_()
+
+    def _on_bwp_convert_finished(self, dialog):
+        dialog.accept()
+        try:
+            mw = self.parent().parent()
+            mw.thumbnail_list.update_all_thumbnails()
+            if self.current_idx is not None:
+                mw.image_preview.update_preview(self.current_idx)
+                mw.image_preview._update_unconvert_action_state()
+        except AttributeError:
+            pass
+        self.set_temporary_hint("B/W Point conversion complete!", duration=3000)
+
     def copy_adjustment_settings(self):
         """
         Copy the current adjustment settings to clipboard.
@@ -427,10 +515,7 @@ class SlidersPanel(QWidget):
                     self.sliders[i].blockSignals(True)
                     self.sliders[i].setValue(self.copied_adjustment[key])
                     self.sliders[i].blockSignals(False)
-                    # Update value label
-                    slider_layout = self.layout().itemAt(i + 1).layout()  # +1 if histogram is at index 0
-                    value_label = slider_layout.itemAt(2).widget()
-                    value_label.setText(str(self.copied_adjustment[key]))
+                    self.slider_value_labels[i].setText(str(self.copied_adjustment[key]))
             
             # Save the adjustment to backend and update preview
             ccr_backend.set_adjustment_by_index(self.current_idx, self.copied_adjustment)
@@ -476,3 +561,80 @@ class SlidersPanel(QWidget):
             duration (int): Duration in milliseconds (default: 3000ms)
         """
         self.set_hint(message, temporary=True, duration=duration)
+
+
+class BWPointConvertWorker(QThread):
+    finished = Signal()
+    progress = Signal(int, int)
+
+    def __init__(self):
+        super().__init__()
+        self._stop_requested = False
+
+    def run(self):
+        def progress_callback(current, total):
+            if not self._stop_requested:
+                self.progress.emit(current, total)
+        try:
+            ccr_backend.apply_bwpoint_to_all_images(progress_callback=progress_callback)
+        except Exception as e:
+            print(f"B/W point batch conversion failed: {e}")
+        self.finished.emit()
+
+    def stop(self):
+        self._stop_requested = True
+
+
+class BWPointConvertDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Converting...")
+        self.setModal(True)
+        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+        self.setWindowModality(Qt.ApplicationModal)
+        self.setMinimumWidth(260)
+
+        self.label = QLabel("Applying B/W point conversion", self)
+        self.label.setAlignment(Qt.AlignCenter)
+
+        self.progress_label = QLabel("", self)
+        self.progress_label.setAlignment(Qt.AlignCenter)
+
+        self.stop_button = QPushButton("Stop", self)
+        self.stop_button.clicked.connect(self._on_stop)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.label)
+        layout.addWidget(self.progress_label)
+        layout.addWidget(self.stop_button)
+        self.setLayout(layout)
+
+        self._dot_count = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._animate)
+        self._timer.start(400)
+        self.worker = None
+
+    def set_worker(self, worker):
+        self.worker = worker
+
+    def set_progress(self, current, total):
+        self.progress_label.setText(f"{current} / {total}")
+
+    def _animate(self):
+        self._dot_count = (self._dot_count + 1) % 4
+        self.label.setText("Applying B/W point conversion" + "." * self._dot_count)
+
+    def _on_stop(self):
+        if self.worker:
+            self.worker.stop()
+        self.stop_button.setEnabled(False)
+
+    def closeEvent(self, event):
+        event.ignore()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            event.ignore()
+        else:
+            super().keyPressEvent(event)

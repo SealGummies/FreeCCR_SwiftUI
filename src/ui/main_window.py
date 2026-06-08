@@ -14,30 +14,7 @@ import webbrowser
 
 # Add the utils directory to the path so we can import our Unicode utilities
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'utils'))
-
-def normalize_unicode_path(file_path: str) -> str:
-    """Normalize a file path to handle Unicode characters properly."""
-    try:
-        return os.path.normpath(os.path.abspath(file_path))
-    except Exception as e:
-        print(f"Error normalizing Unicode path '{file_path}': {e}")
-        return file_path
-
-def validate_unicode_path(file_path: str) -> bool:
-    """Validate that a file path can be properly handled with Unicode characters."""
-    try:
-        normalized_path = normalize_unicode_path(file_path)
-        if os.path.exists(normalized_path):
-            os.stat(normalized_path)
-            return True
-        else:
-            parent_dir = os.path.dirname(normalized_path)
-            if os.path.exists(parent_dir) and os.access(parent_dir, os.W_OK):
-                return True
-        return False
-    except (OSError, UnicodeError, ValueError) as e:
-        print(f"Unicode path validation failed for '{file_path}': {e}")
-        return False
+from unicode_path_utils import normalize_unicode_path, validate_unicode_path
 
 class ImageLoaderWorker(QObject):
     finished = Signal()
@@ -198,6 +175,25 @@ class MainWindow(QMainWindow):
             licenses_text = "No license files found."
         return licenses_text
 
+    def _cleanup_loader(self):
+        """Called when the loader thread finishes. Nulls the references so isRunning() is never called on a deleted C++ object."""
+        self._loader_thread = None
+        self._loader_worker = None
+
+    def _stop_loader_if_running(self):
+        """Cancel and join any in-progress loader thread."""
+        if getattr(self, '_loader_thread', None) is not None:
+            try:
+                if self._loader_thread.isRunning():
+                    if self._loader_worker is not None:
+                        self._loader_worker.cancel()
+                    self._loader_thread.quit()
+                    self._loader_thread.wait(3000)
+            except RuntimeError:
+                pass
+            self._loader_thread = None
+            self._loader_worker = None
+
     def open_files(self):
         # options = QFileDialog.Options()
         files, _ = QFileDialog.getOpenFileNames(
@@ -229,16 +225,17 @@ class MainWindow(QMainWindow):
                 )
             
             if valid_files:
+                self._stop_loader_if_running()
                 self.thumbnail_list.show_loading_dialog()
-                self.thread = QThread()
-                self.worker = ImageLoaderWorker(files=valid_files)
-                self.worker.moveToThread(self.thread)
-                self.thread.started.connect(self.worker.run)
-                self.worker.finished.connect(self.thread.quit)
-                self.worker.finished.connect(self.worker.deleteLater)
-                self.thread.finished.connect(self.thread.deleteLater)
-                self.worker.finished.connect(self.thumbnail_list.load_thumbnails)
-                self.thread.start()
+                self._loader_thread = QThread()
+                self._loader_worker = ImageLoaderWorker(files=valid_files)
+                self._loader_worker.moveToThread(self._loader_thread)
+                self._loader_thread.started.connect(self._loader_worker.run)
+                self._loader_worker.finished.connect(self._loader_thread.quit)
+                self._loader_worker.finished.connect(self._loader_worker.deleteLater)
+                self._loader_thread.finished.connect(self._cleanup_loader)
+                self._loader_worker.finished.connect(self.thumbnail_list.load_thumbnails)
+                self._loader_thread.start()
             elif files:  # If there were files selected but all were invalid
                 QMessageBox.critical(
                     self,
@@ -264,16 +261,17 @@ class MainWindow(QMainWindow):
                 )
                 return
                 
+            self._stop_loader_if_running()
             self.thumbnail_list.show_loading_dialog()
-            self.thread = QThread()
-            self.worker = ImageLoaderWorker(normalized_folder)
-            self.worker.moveToThread(self.thread)
-            self.thread.started.connect(self.worker.run)
-            self.worker.finished.connect(self.thread.quit)
-            self.worker.finished.connect(self.worker.deleteLater)
-            self.thread.finished.connect(self.thread.deleteLater)
-            self.worker.finished.connect(self.thumbnail_list.load_thumbnails)
-            self.thread.start()
+            self._loader_thread = QThread()
+            self._loader_worker = ImageLoaderWorker(normalized_folder)
+            self._loader_worker.moveToThread(self._loader_thread)
+            self._loader_thread.started.connect(self._loader_worker.run)
+            self._loader_worker.finished.connect(self._loader_thread.quit)
+            self._loader_worker.finished.connect(self._loader_worker.deleteLater)
+            self._loader_thread.finished.connect(self._cleanup_loader)
+            self._loader_worker.finished.connect(self.thumbnail_list.load_thumbnails)
+            self._loader_thread.start()
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Up, Qt.Key_Down):
