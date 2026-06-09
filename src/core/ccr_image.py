@@ -144,6 +144,9 @@ class CCRImage:
                 start_time = time.time()
                 
                 with rawpy.imread(file_path) as raw:
+                    # Capture sensor ceiling before postprocess (e.g. 16383 for 14-bit)
+                    white_level = raw.white_level
+
                     # Check if this is a monochrome sensor
                     is_monochrome = False
                     try:
@@ -163,7 +166,7 @@ class CCRImage:
                     except Exception as e:
                         logging.warning(f"Error detecting monochrome sensor: {e}")
                         is_monochrome = False
-                    
+
                     if is_monochrome:
                         print(f"Detected monochrome sensor for: {os.path.basename(file_path)}")
                         # For monochrome sensors, use different processing
@@ -180,7 +183,7 @@ class CCRImage:
                         if len(rgb.shape) == 2:
                             rgb = np.stack([rgb, rgb, rgb], axis=2)
                         elif rgb.shape[2] == 1:
-                            rgb = np.repeat(rgb, 3, axis=2)                    
+                            rgb = np.repeat(rgb, 3, axis=2)
                     else:
                         # Pure/raw sensor readout with minimal processing (greenish result)
                         rgb = raw.postprocess(
@@ -196,6 +199,15 @@ class CCRImage:
                             no_auto_scale=True,       # No automatic scaling
                             four_color_rgb=False,     # Standard 3-color processing
                         )
+
+                    # Scale native bit depth to full 16-bit range so images display at
+                    # correct brightness (e.g. 14-bit data sits in [0,16383] without this).
+                    if white_level > 0 and white_level < 65535:
+                        print(f"Scaling RAW from {white_level}-ceiling to 16-bit (factor {65535.0/white_level:.4f})")
+                        rgb = np.clip(
+                            rgb.astype(np.float32) * (65535.0 / white_level),
+                            0, 65535
+                        ).astype(np.uint16)
                 
                 elapsed_time = time.time() - start_time
                 print(f"RAW processing completed in {elapsed_time:.3f} seconds")
