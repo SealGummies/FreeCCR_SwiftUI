@@ -387,7 +387,9 @@ class CCRImage:
                      s.get('white_point', 0),
                      s.get('contrast', 0) + self.contrast_base,
                      s.get('saturation', 0),
-                     self.tint_balance_factor)
+                     self.tint_balance_factor,
+                     highlights=s.get('highlights', 0),
+                     shadows=s.get('shadows', 0))
         return adjusted
 
     def __repr__(self):

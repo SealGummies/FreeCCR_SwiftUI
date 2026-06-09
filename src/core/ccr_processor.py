@@ -77,6 +77,8 @@ def _initialize_opencl():
             float contrast = params[6];
             float saturation = params[7];
             float balance_factor = params[8];  // Global balance factor calculated on CPU
+            float highlights = params[9];
+            float shadows = params[10];
 
             int idx = gid * 3;
             float r = img[idx];
@@ -226,6 +228,25 @@ def _initialize_opencl():
                 r = img_norm_r * 65535.0f;
                 g = img_norm_g * 65535.0f;
                 b = img_norm_b * 65535.0f;
+            }
+
+            // Highlights / Shadows (luminance-masked tone-region gain)
+            if (highlights != 0.0f || shadows != 0.0f) {
+                float img_norm_r = r / 65535.0f;
+                float img_norm_g = g / 65535.0f;
+                float img_norm_b = b / 65535.0f;
+                float luminance = img_norm_r * 0.299f + img_norm_g * 0.587f + img_norm_b * 0.114f;
+
+                // Masks: highlights weighted toward bright tones, shadows toward dark tones
+                float highlight_mask = luminance * luminance;
+                float shadow_mask = (1.0f - luminance) * (1.0f - luminance);
+                float highlight_factor = 1.0f + (highlights / 100.0f) * 0.5f * highlight_mask;
+                float shadow_factor = 1.0f + (shadows / 100.0f) * 0.5f * shadow_mask;
+                float combined = highlight_factor * shadow_factor;
+
+                r *= combined;
+                g *= combined;
+                b *= combined;
             }
 
             // Black/White point (Adobe-like: remap input range)
@@ -1319,11 +1340,14 @@ def adjust_image(
     whitepoint: float = 0.0,
     contrast: float = 0.0,
     saturation: float = 0.0,
-    tint_balance_factor: float = 1.0
+    tint_balance_factor: float = 1.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0
 ) -> np.ndarray:
     """
-    Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, contrast, and saturation adjustments
-    to a 16-bit image. All input factors are in range [-100, 100], 0 = no change.
+    Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
+    contrast, and saturation adjustments to a 16-bit image.
+    All input factors are in range [-100, 100], 0 = no change.
     Returns a 16-bit image.
     """
     img = img16.astype(np.float32)
@@ -1484,6 +1508,18 @@ def adjust_image(
         img_norm = np.clip(img_norm, 0.0, 1.0)
         img = img_norm * 65535.0
 
+    # Highlights / Shadows (luminance-masked tone-region gain)
+    if highlights != 0.0 or shadows != 0.0:
+        img_norm = img / 65535.0
+        luminance = np.dot(img_norm[..., :3], [0.299, 0.587, 0.114])
+        # Masks: highlights weighted toward bright tones, shadows toward dark tones
+        highlight_mask = luminance * luminance
+        shadow_mask = (1.0 - luminance) * (1.0 - luminance)
+        highlight_factor = 1.0 + (highlights / 100.0) * 0.5 * highlight_mask
+        shadow_factor = 1.0 + (shadows / 100.0) * 0.5 * shadow_mask
+        combined = np.expand_dims(highlight_factor * shadow_factor, axis=-1)
+        img = img * combined
+
     # Black/White point (Adobe-like: remap input range)
     if blackpoint != 0.0 or whitepoint != 0.0:
         img_norm = img / 65535.0
@@ -1546,7 +1582,9 @@ def adjust_image_opencl(
     whitepoint: float = 0.0,
     contrast: float = 0.0,
     saturation: float = 0.0,
-    tint_balance_factor: float = 1.0
+    tint_balance_factor: float = 1.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
@@ -1557,8 +1595,9 @@ def adjust_image_opencl(
     # Initialize OpenCL if not already done
     if not _initialize_opencl():
         # Fallback to CPU version
-        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness, 
-                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor)
+        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
+                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor,
+                          highlights, shadows)
 
     try:
         # Use cached OpenCL objects
@@ -1574,10 +1613,11 @@ def adjust_image_opencl(
         img_flat = img.reshape(-1, 3)
         img_buf = cl_array.to_device(queue, img_flat)
 
-        # Prepare parameters as numpy arrays - add balance_factor as 9th parameter
+        # Prepare parameters as numpy arrays - balance_factor (9th), highlights (10th), shadows (11th)
         params = np.array([
             kelvin_shift, tint_shift, exposure, brightness,
-            blackpoint, whitepoint, contrast, saturation, balance_factor
+            blackpoint, whitepoint, contrast, saturation, balance_factor,
+            highlights, shadows
         ], dtype=np.float32)
 
         params_buf = cl_array.to_device(queue, params)
@@ -1593,8 +1633,9 @@ def adjust_image_opencl(
     except Exception as e:
         print(f"OpenCL processing failed: {e}")
         # Fallback to CPU version
-        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness, 
-                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor)
+        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
+                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor,
+                          highlights, shadows)
 
 
 
