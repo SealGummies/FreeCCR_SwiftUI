@@ -15,6 +15,63 @@
 
 ---
 
+## Film Negative Conversion
+
+FreeCCR converts color negative film scans to positive images. It does not guess — it maps what the scanner actually captured. **The software cannot compensate for a bad scan.** For consistent results, scan with auto-brightness and color correction turned off in your scanner software, and expose the scan so the film base sits near (but not at) the highlight ceiling. Every frame on the roll should be scanned under identical settings.
+
+---
+
+### Workflow 1 — B/W Point (recommended)
+
+This is the most accurate method. You sample two anchor values directly from the scan: the film base (sets the white point of the scene) and the densest shadow area (sets the black point of the scene). FreeCCR then maps the entire roll using those absolute anchors, so every frame inverts consistently regardless of scene content.
+
+**Step-by-step:**
+
+1. Load a folder or set of scans.
+2. Pick a frame that includes a clear strip of **film base** — the unexposed rebate between frames, or the edge leader. This is the brightest area on the negative.
+3. Right-click (or use the B/W point tool) on that film base area and **set the white point**. This tells FreeCCR what "maximum film density" looks like for this roll.
+4. Right-click on the **darkest shadow** in the image — the area with the most scene detail buried in shadow, where the film is densest. **Set the black point** there.
+5. Click **Convert All**. All frames are inverted using the same anchors.
+6. Use the sliders (exposure, contrast, white balance) for per-image fine-tuning after conversion.
+
+**Why this works:** Film density is physically linear with log exposure. By anchoring both ends of the density range to known values, the inversion is consistent across the roll even when scene brightness varies widely between frames.
+
+**What can go wrong:**
+- If the film base sample includes fogged or scratched film, your white point will be wrong — resample from a clean area.
+- If the shadow sample is too light (e.g. a midtone), highlight detail will clip after inversion.
+- If the scanner applied per-frame auto-brightness, the anchor values will differ between frames and the batch will be inconsistent. Rescan with auto-brightness off.
+
+---
+
+### Workflow 2 — Auto
+
+The auto workflow analyzes each frame's histogram independently and attempts to set the black and white points automatically. It requires no manual sampling, which makes it faster for simple rolls, but it is inherently per-frame — it has no knowledge of the film base or the physical density range of the stock being used.
+
+Use auto when:
+- Frames are simple and well-exposed with no extreme shadows or highlights.
+- You want a quick first-pass preview before committing to B/W point work.
+
+Do not rely on auto when:
+- Frames vary widely in scene brightness (e.g. interiors next to bright exteriors on the same roll).
+- You need consistent tones across multiple frames for stitching or comparison.
+- The roll includes underexposed or push-processed film.
+
+---
+
+### Scanning requirements (applies to both workflows)
+
+| Setting | Requirement |
+|---|---|
+| Auto-brightness / Auto-exposure | **Off** |
+| Per-frame color correction | **Off** |
+| Bit depth | 16-bit preferred, 14-bit minimum |
+| Output color space | Linear or no ICC profile applied |
+| Frame order | Consistent — scan the full roll in one session at identical settings |
+
+A scan that violates any of these cannot be reliably converted by FreeCCR or any other software. The physical information is simply not present in the file.
+
+---
+
 ## Requirements
 
 - Python 3.11.0 exactly (newer versions are incompatible with Nuitka compilation)
@@ -41,7 +98,7 @@ python src/main.py
 build_exe.bat
 ```
 
-This generates the version file from the current git tag, then compiles `src/main.py` into a self-contained executable using Nuitka with MinGW64/Clang. All dependencies, PyOpenCL kernels, and icon assets are bundled automatically.
+This generates the version file from the current git tag, then compiles `src/main.py` into a self-contained executable using Nuitka with MinGW64. All dependencies, PyOpenCL kernels, and icon assets are bundled automatically.
 
 Output: `main.dist/` directory containing `freeccr.exe` and all required files.
 
