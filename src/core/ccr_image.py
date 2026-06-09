@@ -54,6 +54,7 @@ class CCRImage:
         self.converted = converted  # Indicates if the image has been converted to CCR format
         self.contrast_base: int = 0      # Non-destructive base contrast added internally; slider shows 0
         self.temperature_base: int = 0   # Non-destructive base temperature offset; slider shows 0
+        self.brightness_base: int = -15  # Non-destructive base brightness offset; slider shows 0
         self.histogram_image = None
 
         self.info = self.get_camera_and_lens_for_lensfun(self.file_path)  # Extract camera and lens info for lensfun
@@ -103,6 +104,7 @@ class CCRImage:
         """
         self.contrast_base = 0      # Clear base offsets when reverting to original scan
         self.temperature_base = 0
+        self.brightness_base = -15  # Always applied; not tied to conversion state
         img = self.read_image(self.file_path)
         if img is not None:
             self.resized_raw = self.resize_image_to_max_pixel(img, 1080)
@@ -373,14 +375,14 @@ class CCRImage:
         return qimage
 
     def apply_adjustments(self, image: np.ndarray) -> np.ndarray:
-        if not self.adjustment_settings and self.contrast_base == 0 and self.temperature_base == 0:
+        if not self.adjustment_settings and self.contrast_base == 0 and self.temperature_base == 0 and self.brightness_base == 0:
             return image
         s = self.adjustment_settings
         adjusted = adjust_image_opencl(image,
                      s.get('temperature', 0) + self.temperature_base,
                      s.get('tint', 0),
                      s.get('exposure', 0),
-                     s.get('brightness', 0),
+                     s.get('brightness', 0) + self.brightness_base,
                      s.get('black_point', 0),
                      s.get('white_point', 0),
                      s.get('contrast', 0) + self.contrast_base,
