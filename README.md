@@ -31,6 +31,12 @@ Then double-click the app normally. Alternatively, right-click the app → **Ope
 
 ---
 
+## Film Development & Scanning Labs
+
+If you need a lab to develop and scan your film before using FreeCCR, check the global film developing and scanning lab directory at [FilmPhotoDeveloping.com](http://filmphotodeveloping.com/).
+
+---
+
 ## Film Negative Conversion
 
 FreeCCR converts color negative film scans to positive images. It does not guess — it maps what the scanner actually captured. **The software cannot compensate for a bad scan.**
