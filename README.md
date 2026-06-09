@@ -17,30 +17,34 @@
 
 ## Film Negative Conversion
 
-FreeCCR converts color negative film scans to positive images. It does not guess — it maps what the scanner actually captured. **The software cannot compensate for a bad scan.** For consistent results, scan with auto-brightness and color correction turned off in your scanner software, and expose the scan so the film base sits near (but not at) the highlight ceiling. Every frame on the roll should be scanned under identical settings.
+FreeCCR converts color negative film scans to positive images. It does not guess — it maps what the scanner actually captured. **The software cannot compensate for a bad scan.**
+
+> **Process one roll at a time.** The B/W point anchors are physical properties of a specific film stock, development, and scan session. Mixing frames from different rolls — or even the same roll scanned in separate sessions — will produce inconsistent results.
 
 ---
 
 ### Workflow 1 — B/W Point (recommended)
 
-This is the most accurate method. You sample two anchor values directly from the scan: the film base (sets the white point of the scene) and the densest shadow area (sets the black point of the scene). FreeCCR then maps the entire roll using those absolute anchors, so every frame inverts consistently regardless of scene content.
+This is the most accurate method. You sample two anchor values directly from the scan: the fully exposed head or tail (white point) and the clear film base (black point). FreeCCR then maps the entire roll using those absolute anchors, so every frame inverts consistently regardless of scene content.
+
+> **Scanning requirement for this workflow:** You must scan a frame (or partial frame) that includes the **fully exposed area** of the roll — typically the head or tail leader that was exposed to light before or after shooting. Without it, there is no physical reference to set the white point from.
 
 **Step-by-step:**
 
-1. Load a folder or set of scans.
-2. Find the **fully exposed head or tail** of the roll — the leader strip that was exposed to light before or after shooting. On the scanner this appears as the darkest area of the film, because maximum exposure creates maximum dye density.
-3. Right-click on that area and **set the white point**. This is the densest point the film can reach, and it anchors the top of the positive tonal range.
-4. Find a clear strip of **film base** — the unexposed rebate between frames or the edge of the frame. This is the lightest area on the scan because it has the least density.
+1. Load an entire roll — one roll at a time.
+2. Find the scan that contains the **fully exposed head or tail** of the roll. On the scanner it appears as the darkest area of the film, because maximum exposure creates maximum dye density.
+3. Right-click on that fully exposed area and **set the white point**. This is the densest point the film can reach and anchors the top of the positive tonal range.
+4. Find a clear strip of **film base** — the unexposed rebate between frames or the edge of the frame. This is the lightest area on the scan.
 5. Right-click on the film base and **set the black point**. This anchors the bottom of the positive tonal range.
 6. Click **Convert All**. Every frame on the roll is inverted using the same two anchors.
 7. Use the sliders (exposure, contrast, white balance) for per-image fine-tuning after conversion.
 
-**Why this works:** Negative film density is determined by exposure. The fully exposed leader defines the absolute maximum density for that film stock and development, and the film base defines the absolute minimum. By anchoring the conversion to these two physical references, every frame inverts consistently — regardless of how bright or dark each individual scene was.
+**Why this works:** The fully exposed leader defines the absolute maximum density for that film stock and development. The film base defines the absolute minimum. By anchoring to these two physical references, every frame inverts consistently — regardless of how bright or dark each scene was.
 
 **What can go wrong:**
-- If the fully exposed leader is not included in your scan, sample the densest visible area of the roll instead.
+- If no fully exposed area was scanned, you have no valid white point reference. Rescan to include the leader or tail.
 - If the film base sample lands on a scratched or fogged area, the black point will be off — resample from a clean edge.
-- If the scanner applied per-frame auto-brightness, the absolute density values differ between frames and the batch will be inconsistent. Rescan with auto-brightness off.
+- If the scanner used auto-exposure, the raw values differ between frames and batch conversion will be inconsistent. Rescan with a fixed exposure setting.
 
 ---
 
@@ -63,13 +67,14 @@ Do not rely on auto when:
 
 | Setting | Requirement |
 |---|---|
-| Auto-brightness / Auto-exposure | **Off** |
+| Exposure | **Fixed, manual** — do not use auto-exposure. Every frame on the roll must be scanned at exactly the same exposure setting. Auto-exposure changes the raw values frame-by-frame, destroying the absolute density information the conversion depends on. |
+| Auto-brightness / Auto-correction | **Off** |
 | Per-frame color correction | **Off** |
 | Bit depth | 16-bit preferred, 14-bit minimum |
 | Output color space | Linear or no ICC profile applied |
-| Frame order | Consistent — scan the full roll in one session at identical settings |
+| Roll handling | **Scan one complete roll per session.** Do not mix frames from different rolls or separate scan sessions. |
 
-A scan that violates any of these cannot be reliably converted by FreeCCR or any other software. The physical information is simply not present in the file.
+**A scan that violates any of these cannot be reliably converted by FreeCCR or any other software.** The physical density information is either absent or corrupted at the point of scanning — no software can recover it after the fact.
 
 ---
 
