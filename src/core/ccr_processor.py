@@ -77,6 +77,8 @@ def _initialize_opencl():
             float contrast = params[6];
             float saturation = params[7];
             float balance_factor = params[8];  // Global balance factor calculated on CPU
+            float highlights = params[9];
+            float shadows = params[10];
 
             int idx = gid * 3;
             float r = img[idx];
@@ -226,6 +228,35 @@ def _initialize_opencl():
                 r = img_norm_r * 65535.0f;
                 g = img_norm_g * 65535.0f;
                 b = img_norm_b * 65535.0f;
+            }
+
+            // Highlights / Shadows (anchored per-channel tone-region roll-off)
+            // Region bumps are zero at both endpoints so pure black and pure
+            // white stay anchored; highlights roll off smoothly below white.
+            if (highlights != 0.0f || shadows != 0.0f) {
+                float hs_peak = 0.10546875f;  // peak of x^3*(1-x); normalizes bumps to 1.0
+                float hs_strength = 0.30f;    // max channel offset at the bump peak
+                float h_amt = highlights / 100.0f;
+                float s_amt = shadows / 100.0f;
+
+                float xr = r / 65535.0f;
+                float omr = 1.0f - xr;
+                xr = xr + h_amt * hs_strength * (xr*xr*xr) * omr / hs_peak
+                        + s_amt * hs_strength * xr * (omr*omr*omr) / hs_peak;
+
+                float xg = g / 65535.0f;
+                float omg = 1.0f - xg;
+                xg = xg + h_amt * hs_strength * (xg*xg*xg) * omg / hs_peak
+                        + s_amt * hs_strength * xg * (omg*omg*omg) / hs_peak;
+
+                float xb = b / 65535.0f;
+                float omb = 1.0f - xb;
+                xb = xb + h_amt * hs_strength * (xb*xb*xb) * omb / hs_peak
+                        + s_amt * hs_strength * xb * (omb*omb*omb) / hs_peak;
+
+                r = clamp(xr, 0.0f, 1.0f) * 65535.0f;
+                g = clamp(xg, 0.0f, 1.0f) * 65535.0f;
+                b = clamp(xb, 0.0f, 1.0f) * 65535.0f;
             }
 
             // Black/White point (Adobe-like: remap input range)
@@ -1319,11 +1350,14 @@ def adjust_image(
     whitepoint: float = 0.0,
     contrast: float = 0.0,
     saturation: float = 0.0,
-    tint_balance_factor: float = 1.0
+    tint_balance_factor: float = 1.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0
 ) -> np.ndarray:
     """
-    Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, contrast, and saturation adjustments
-    to a 16-bit image. All input factors are in range [-100, 100], 0 = no change.
+    Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
+    contrast, and saturation adjustments to a 16-bit image.
+    All input factors are in range [-100, 100], 0 = no change.
     Returns a 16-bit image.
     """
     img = img16.astype(np.float32)
@@ -1484,6 +1518,21 @@ def adjust_image(
         img_norm = np.clip(img_norm, 0.0, 1.0)
         img = img_norm * 65535.0
 
+    # Highlights / Shadows (anchored per-channel tone-region roll-off)
+    # Region "bumps" are zero at both endpoints (0 and 1) so pure black and
+    # pure white stay anchored — highlights roll off smoothly below white
+    # rather than the white point itself being scaled.
+    if highlights != 0.0 or shadows != 0.0:
+        HS_PEAK = 0.10546875   # peak of x^3*(1-x), normalizes bumps to peak 1.0
+        HS_STRENGTH = 0.30     # max channel offset at the bump peak for full slider
+        x = img / 65535.0
+        one_minus = 1.0 - x
+        # Highlight bump peaks at x=0.75; shadow bump peaks at x=0.25
+        wh = (x ** 3) * one_minus / HS_PEAK
+        ws = x * (one_minus ** 3) / HS_PEAK
+        x = x + (highlights / 100.0) * HS_STRENGTH * wh + (shadows / 100.0) * HS_STRENGTH * ws
+        img = np.clip(x, 0.0, 1.0) * 65535.0
+
     # Black/White point (Adobe-like: remap input range)
     if blackpoint != 0.0 or whitepoint != 0.0:
         img_norm = img / 65535.0
@@ -1546,7 +1595,9 @@ def adjust_image_opencl(
     whitepoint: float = 0.0,
     contrast: float = 0.0,
     saturation: float = 0.0,
-    tint_balance_factor: float = 1.0
+    tint_balance_factor: float = 1.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
@@ -1557,8 +1608,9 @@ def adjust_image_opencl(
     # Initialize OpenCL if not already done
     if not _initialize_opencl():
         # Fallback to CPU version
-        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness, 
-                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor)
+        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
+                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor,
+                          highlights, shadows)
 
     try:
         # Use cached OpenCL objects
@@ -1574,10 +1626,11 @@ def adjust_image_opencl(
         img_flat = img.reshape(-1, 3)
         img_buf = cl_array.to_device(queue, img_flat)
 
-        # Prepare parameters as numpy arrays - add balance_factor as 9th parameter
+        # Prepare parameters as numpy arrays - balance_factor (9th), highlights (10th), shadows (11th)
         params = np.array([
             kelvin_shift, tint_shift, exposure, brightness,
-            blackpoint, whitepoint, contrast, saturation, balance_factor
+            blackpoint, whitepoint, contrast, saturation, balance_factor,
+            highlights, shadows
         ], dtype=np.float32)
 
         params_buf = cl_array.to_device(queue, params)
@@ -1593,8 +1646,9 @@ def adjust_image_opencl(
     except Exception as e:
         print(f"OpenCL processing failed: {e}")
         # Fallback to CPU version
-        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness, 
-                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor)
+        return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
+                          blackpoint, whitepoint, contrast, saturation, tint_balance_factor,
+                          highlights, shadows)
 
 
 
