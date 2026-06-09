@@ -12,9 +12,7 @@ import sys
 from activation.activation import validate_software
 import webbrowser
 
-# Add the utils directory to the path so we can import our Unicode utilities
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'utils'))
-from unicode_path_utils import normalize_unicode_path, validate_unicode_path
+from utils.unicode_path_utils import normalize_unicode_path, validate_unicode_path
 
 class ImageLoaderWorker(QObject):
     finished = Signal()

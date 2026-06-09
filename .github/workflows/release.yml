@@ -84,6 +84,7 @@ jobs:
             --clang \
             --standalone \
             --include-package=numpy \
+            --include-package=utils \
             --include-package=pyopencl \
             --include-data-dir="$PYOPENCL_CL_DIR=pyopencl/cl" \
             --enable-plugin=pyside6 \
