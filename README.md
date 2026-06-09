@@ -28,18 +28,19 @@ This is the most accurate method. You sample two anchor values directly from the
 **Step-by-step:**
 
 1. Load a folder or set of scans.
-2. Pick a frame that includes a clear strip of **film base** — the unexposed rebate between frames, or the edge leader. This is the brightest area on the negative.
-3. Right-click (or use the B/W point tool) on that film base area and **set the white point**. This tells FreeCCR what "maximum film density" looks like for this roll.
-4. Right-click on the **darkest shadow** in the image — the area with the most scene detail buried in shadow, where the film is densest. **Set the black point** there.
-5. Click **Convert All**. All frames are inverted using the same anchors.
-6. Use the sliders (exposure, contrast, white balance) for per-image fine-tuning after conversion.
+2. Find the **fully exposed head or tail** of the roll — the leader strip that was exposed to light before or after shooting. On the scanner this appears as the darkest area of the film, because maximum exposure creates maximum dye density.
+3. Right-click on that area and **set the white point**. This is the densest point the film can reach, and it anchors the top of the positive tonal range.
+4. Find a clear strip of **film base** — the unexposed rebate between frames or the edge of the frame. This is the lightest area on the scan because it has the least density.
+5. Right-click on the film base and **set the black point**. This anchors the bottom of the positive tonal range.
+6. Click **Convert All**. Every frame on the roll is inverted using the same two anchors.
+7. Use the sliders (exposure, contrast, white balance) for per-image fine-tuning after conversion.
 
-**Why this works:** Film density is physically linear with log exposure. By anchoring both ends of the density range to known values, the inversion is consistent across the roll even when scene brightness varies widely between frames.
+**Why this works:** Negative film density is determined by exposure. The fully exposed leader defines the absolute maximum density for that film stock and development, and the film base defines the absolute minimum. By anchoring the conversion to these two physical references, every frame inverts consistently — regardless of how bright or dark each individual scene was.
 
 **What can go wrong:**
-- If the film base sample includes fogged or scratched film, your white point will be wrong — resample from a clean area.
-- If the shadow sample is too light (e.g. a midtone), highlight detail will clip after inversion.
-- If the scanner applied per-frame auto-brightness, the anchor values will differ between frames and the batch will be inconsistent. Rescan with auto-brightness off.
+- If the fully exposed leader is not included in your scan, sample the densest visible area of the roll instead.
+- If the film base sample lands on a scratched or fogged area, the black point will be off — resample from a clean edge.
+- If the scanner applied per-frame auto-brightness, the absolute density values differ between frames and the batch will be inconsistent. Rescan with auto-brightness off.
 
 ---
 
