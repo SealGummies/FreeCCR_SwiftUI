@@ -36,12 +36,14 @@ jobs:
         run: python write_version.py
 
       - name: Build executable with Nuitka
+        shell: cmd
         run: build_exe.bat
 
       - name: Install Inno Setup 6
         run: choco install innosetup --version=6.3.3 -y --no-progress
 
       - name: Build Windows installer
+        shell: cmd
         run: windows_build_scripts\build_inno_installer.bat
 
       - name: Upload installer to GitHub release
