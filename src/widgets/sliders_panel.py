@@ -74,7 +74,7 @@ class SlidersPanel(QWidget):
         self.slider_labels = []
         self.image_slider_map = {}
         self.current_image_id = None
-        self.adjustment_keys = ["temperature", "tint", "exposure", "brightness", "white_point", "black_point", "highlights", "shadows", "contrast", "saturation"]
+        self.adjustment_keys = ["temperature", "tint", "exposure", "brightness", "highlights", "white_point", "shadows", "black_point", "contrast", "saturation"]
         self.copied_adjustment = None  # Store copied adjustment settings
         self._hint_timer = QTimer(self)  # Timer for temporary hints
         self._hint_timer.setSingleShot(True)
@@ -107,7 +107,7 @@ class SlidersPanel(QWidget):
 
         self.slider_labels = [
             "Temperature", "Tint", "Exposure", "Brightness",
-            "White Point", "Black Point", "Highlights", "Shadows", "Contrast", "Saturation"
+            "Highlights", "White Point", "Shadows", "Black Point", "Contrast", "Saturation"
         ]
 
         self.current_idx = None
@@ -116,10 +116,10 @@ class SlidersPanel(QWidget):
         self.tint_slider_layout = self.create_slider("Tint")
         self.exposure_slider_layout = self.create_slider("Exposure")
         self.brightness_slider_layout = self.create_slider("Brightness")
-        self.white_point_slider_layout = self.create_slider("White Point")
-        self.black_point_slider_layout = self.create_slider("Black Point")
         self.highlights_slider_layout = self.create_slider("Highlights")
+        self.white_point_slider_layout = self.create_slider("White Point")
         self.shadows_slider_layout = self.create_slider("Shadows")
+        self.black_point_slider_layout = self.create_slider("Black Point")
         self.contrast_slider_layout = self.create_slider("Contrast")
         self.saturation_slider_layout = self.create_slider("Saturation")
 
@@ -127,10 +127,10 @@ class SlidersPanel(QWidget):
         layout.addLayout(self.tint_slider_layout)
         layout.addLayout(self.exposure_slider_layout)
         layout.addLayout(self.brightness_slider_layout)
-        layout.addLayout(self.white_point_slider_layout)
-        layout.addLayout(self.black_point_slider_layout)
         layout.addLayout(self.highlights_slider_layout)
+        layout.addLayout(self.white_point_slider_layout)
         layout.addLayout(self.shadows_slider_layout)
+        layout.addLayout(self.black_point_slider_layout)
         layout.addLayout(self.contrast_slider_layout)
         layout.addLayout(self.saturation_slider_layout)
 
