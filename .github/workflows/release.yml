@@ -40,7 +40,7 @@ jobs:
         run: build_exe.bat
 
       - name: Install Inno Setup 6
-        run: choco install innosetup --version=6.3.3 -y --no-progress
+        run: choco install innosetup -y --no-progress
 
       - name: Build Windows installer
         shell: cmd
