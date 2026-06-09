@@ -15,6 +15,22 @@
 
 ---
 
+## Installation
+
+Download the latest release from the [Releases page](https://github.com/toonoumi/FreeCCR/releases).
+
+**Windows** — run `FreeCCR_Install_<version>.exe` and follow the installer.
+
+**macOS** — unzip `FreeCCR_macOS_<version>.zip` and move `FreeCCR.app` to your Applications folder. Because the app is not notarized, macOS Gatekeeper will block it on first launch with a *"damaged and can't be opened"* message. This is expected — the app is not damaged. Run this command once in Terminal to clear the quarantine flag:
+
+```bash
+xattr -r -d com.apple.quarantine /Applications/FreeCCR.app
+```
+
+Then double-click the app normally. Alternatively, right-click the app → **Open** → **Open** in the dialog.
+
+---
+
 ## Film Negative Conversion
 
 FreeCCR converts color negative film scans to positive images. It does not guess — it maps what the scanner actually captured. **The software cannot compensate for a bad scan.**
