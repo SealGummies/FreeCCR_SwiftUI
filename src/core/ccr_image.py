@@ -54,7 +54,7 @@ class CCRImage:
         self.converted = converted  # Indicates if the image has been converted to CCR format
         self.contrast_base: int = 0      # Non-destructive base contrast added internally; slider shows 0
         self.temperature_base: int = 0   # Non-destructive base temperature offset; slider shows 0
-        self.brightness_base: int = -15  # Non-destructive base brightness offset; slider shows 0
+        self.brightness_base: int = -8   # Non-destructive base brightness offset; slider shows 0
         self.histogram_image = None
 
         self.info = self.get_camera_and_lens_for_lensfun(self.file_path)  # Extract camera and lens info for lensfun
@@ -104,7 +104,7 @@ class CCRImage:
         """
         self.contrast_base = 0      # Clear base offsets when reverting to original scan
         self.temperature_base = 0
-        self.brightness_base = -15  # Always applied; not tied to conversion state
+        self.brightness_base = -8   # Always applied; not tied to conversion state
         img = self.read_image(self.file_path)
         if img is not None:
             self.resized_raw = self.resize_image_to_max_pixel(img, 1080)
