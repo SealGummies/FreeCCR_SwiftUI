@@ -313,14 +313,23 @@ class CCRImage:
         # Apply adjustments first
         adjusted_img = self.apply_adjustments(self.resized_raw)
 
+        # Display-only auto-brightness: the un-converted negative scan is very dark
+        # (linear-gamma data sitting low in the 16-bit range). Stretch it so it's
+        # legible in the preview/thumbnail. This is purely cosmetic — it operates on
+        # a copy and never touches resized_raw, so conversion, export, and B/W-point
+        # sampling (which read resized_raw or the original file) are unaffected.
+        # Once converted, the positive is properly exposed and the slider adjustments
+        # own the look, so the auto-brightness is skipped.
+        display_img = adjusted_img if self.converted else self._auto_brightness_for_preview(adjusted_img)
+
         # Create thumbnail
-        thumb_img = self.resize_image_to_max_pixel(adjusted_img, thumbnail_size)
+        thumb_img = self.resize_image_to_max_pixel(display_img, thumbnail_size)
         thumb_img_8 = to_8bit(thumb_img)
         qimage = self.generate_qimage_from_np_array_8(thumb_img_8)
         self.thumbnail = QPixmap.fromImage(qimage)
 
         # Create preview
-        preview_img = self.resize_image_to_max_pixel(adjusted_img, preview_size)
+        preview_img = self.resize_image_to_max_pixel(display_img, preview_size)
         qimage = self.generate_qimage_from_np_array_8(to_8bit(preview_img))
         self.resized_preview = QPixmap.fromImage(qimage)
         # Calculate histogram for the 8-bit thumbnail (RGB)
@@ -391,6 +400,33 @@ class CCRImage:
                      highlights=s.get('highlights', 0),
                      shadows=s.get('shadows', 0))
         return adjusted
+
+    def _auto_brightness_for_preview(self, image: np.ndarray) -> np.ndarray:
+        """
+        Display-only auto-brightness for the un-converted negative preview.
+
+        Linearly stretches the tonal range so the central 90% of pixel values
+        (5th-95th percentile) is spread across the full 0-65535 range. A single
+        global map is applied to all channels so the colour balance of the scan
+        is preserved (no per-channel white balancing).
+
+        Returns a new array; the input (resized_raw) is never modified, so this
+        has no effect on conversion, export, or any other processing.
+        """
+        if image is None:
+            return image
+
+        img = image.astype(np.float32)
+        # Percentiles over all channels jointly -> a single black/white anchor.
+        lo = float(np.percentile(img, 5.0))
+        hi = float(np.percentile(img, 95.0))
+        if hi <= lo:
+            # Degenerate (flat) image — nothing meaningful to stretch.
+            return image
+
+        scale = 65535.0 / (hi - lo)
+        stretched = (img - lo) * scale
+        return np.clip(stretched, 0, 65535).astype(np.uint16)
 
     def __repr__(self):
         return (
