@@ -79,6 +79,18 @@ def _initialize_opencl():
             float balance_factor = params[8];  // Global balance factor calculated on CPU
             float highlights = params[9];
             float shadows = params[10];
+            float od_input_gain   = params[11];
+            float od_master_shift = params[12];
+            float od_master_gain  = params[13];
+            float od_r_shift      = params[14];
+            float od_r_gain       = params[15];
+            float od_r_blackpoint = params[16];
+            float od_g_shift      = params[17];
+            float od_g_gain       = params[18];
+            float od_g_blackpoint = params[19];
+            float od_b_shift      = params[20];
+            float od_b_gain       = params[21];
+            float od_b_blackpoint = params[22];
 
             int idx = gid * 3;
             float r = img[idx];
@@ -337,6 +349,54 @@ def _initialize_opencl():
                 r = img_norm_r * 65535.0f;
                 g = img_norm_g * 65535.0f;
                 b = img_norm_b * 65535.0f;
+            }
+
+            // OD (optical density / log-space) channel controls - NamiColor-style.
+            if (od_input_gain != 0.0f || od_master_shift != 0.0f || od_master_gain != 0.0f ||
+                od_r_shift != 0.0f || od_r_gain != 0.0f || od_r_blackpoint != 0.0f ||
+                od_g_shift != 0.0f || od_g_gain != 0.0f || od_g_blackpoint != 0.0f ||
+                od_b_shift != 0.0f || od_b_gain != 0.0f || od_b_blackpoint != 0.0f) {
+
+                float ig  = pow(2.0f, od_input_gain  / 50.0f);
+                float ms  = od_master_shift  / 200.0f;
+                float mg  = pow(2.0f, od_master_gain / 100.0f);
+                float rs  = od_r_shift       / 200.0f;
+                float rg  = pow(2.0f, od_r_gain      / 100.0f);
+                float rbp = od_r_blackpoint  / 333.0f;
+                float gs  = od_g_shift       / 200.0f;
+                float gg  = pow(2.0f, od_g_gain      / 100.0f);
+                float gbp = od_g_blackpoint  / 333.0f;
+                float bs  = od_b_shift       / 200.0f;
+                float bg  = pow(2.0f, od_b_gain      / 100.0f);
+                float bbp = od_b_blackpoint  / 333.0f;
+
+                float tr = clamp(r / 65535.0f, 1e-7f, 1.0f);
+                float tg = clamp(g / 65535.0f, 1e-7f, 1.0f);
+                float tb = clamp(b / 65535.0f, 1e-7f, 1.0f);
+
+                tr = clamp(tr * ig, 1e-7f, 1.0f);
+                tg = clamp(tg * ig, 1e-7f, 1.0f);
+                tb = clamp(tb * ig, 1e-7f, 1.0f);
+
+                float odr = -log10(tr);
+                float odg = -log10(tg);
+                float odb = -log10(tb);
+
+                odr = (odr + ms) * mg;
+                odg = (odg + ms) * mg;
+                odb = (odb + ms) * mg;
+
+                odr += rs;  odr *= rg;  odr -= rbp;
+                odg += gs;  odg *= gg;  odg -= gbp;
+                odb += bs;  odb *= bg;  odb -= bbp;
+
+                odr = clamp(odr, 0.0f, 7.0f);
+                odg = clamp(odg, 0.0f, 7.0f);
+                odb = clamp(odb, 0.0f, 7.0f);
+
+                r = clamp(pow(10.0f, -odr), 0.0f, 1.0f) * 65535.0f;
+                g = clamp(pow(10.0f, -odg), 0.0f, 1.0f) * 65535.0f;
+                b = clamp(pow(10.0f, -odb), 0.0f, 1.0f) * 65535.0f;
             }
 
             // Final clamp and store results
@@ -1352,7 +1412,19 @@ def adjust_image(
     saturation: float = 0.0,
     tint_balance_factor: float = 1.0,
     highlights: float = 0.0,
-    shadows: float = 0.0
+    shadows: float = 0.0,
+    od_input_gain: float = 0.0,
+    od_master_shift: float = 0.0,
+    od_master_gain: float = 0.0,
+    od_r_shift: float = 0.0,
+    od_r_gain: float = 0.0,
+    od_r_blackpoint: float = 0.0,
+    od_g_shift: float = 0.0,
+    od_g_gain: float = 0.0,
+    od_g_blackpoint: float = 0.0,
+    od_b_shift: float = 0.0,
+    od_b_gain: float = 0.0,
+    od_b_blackpoint: float = 0.0,
 ) -> np.ndarray:
     """
     Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
@@ -1582,6 +1654,40 @@ def adjust_image(
         img_norm = np.clip(img_norm, 0, 1)
         img = img_norm * 65535.0
 
+    # OD (optical density / log-space) channel controls — NamiColor-style.
+    # Runs only when at least one slider is non-zero; otherwise a no-op.
+    _od_active = (od_input_gain, od_master_shift, od_master_gain,
+                  od_r_shift, od_r_gain, od_r_blackpoint,
+                  od_g_shift, od_g_gain, od_g_blackpoint,
+                  od_b_shift, od_b_gain, od_b_blackpoint)
+    if any(p != 0.0 for p in _od_active):
+        ig  = 2.0 ** (od_input_gain  / 50.0)   # 2-stop range: slider±100 → ×0.25…×4
+        ms  = od_master_shift  / 200.0          # ±0.5 OD
+        mg  = 2.0 ** (od_master_gain / 100.0)  # ±1 stop slope
+        rs  = od_r_shift       / 200.0
+        rg  = 2.0 ** (od_r_gain      / 100.0)
+        rbp = od_r_blackpoint  / 333.0          # ±0.3 OD shadow lift
+        gs  = od_g_shift       / 200.0
+        gg  = 2.0 ** (od_g_gain      / 100.0)
+        gbp = od_g_blackpoint  / 333.0
+        bs  = od_b_shift       / 200.0
+        bg  = 2.0 ** (od_b_gain      / 100.0)
+        bbp = od_b_blackpoint  / 333.0
+
+        t = np.clip(img / 65535.0, 1e-7, 1.0)   # transmittance, safe from log(0)
+        t = np.clip(t * ig, 1e-7, 1.0)           # input gain (pre-log, all channels)
+        od = -np.log10(t)                         # → OD space
+
+        od += ms                                  # master shift
+        od *= mg                                  # master gain
+
+        od[..., 0] += rs;  od[..., 0] *= rg;  od[..., 0] -= rbp
+        od[..., 1] += gs;  od[..., 1] *= gg;  od[..., 1] -= gbp
+        od[..., 2] += bs;  od[..., 2] *= bg;  od[..., 2] -= bbp
+
+        np.clip(od, 0.0, 7.0, out=od)            # prevent blow-out / NaN
+        img = np.clip(np.power(10.0, -od), 0.0, 1.0) * 65535.0
+
     img = np.clip(img, 0, 65535)
     return img.astype(np.uint16)
 
@@ -1597,7 +1703,19 @@ def adjust_image_opencl(
     saturation: float = 0.0,
     tint_balance_factor: float = 1.0,
     highlights: float = 0.0,
-    shadows: float = 0.0
+    shadows: float = 0.0,
+    od_input_gain: float = 0.0,
+    od_master_shift: float = 0.0,
+    od_master_gain: float = 0.0,
+    od_r_shift: float = 0.0,
+    od_r_gain: float = 0.0,
+    od_r_blackpoint: float = 0.0,
+    od_g_shift: float = 0.0,
+    od_g_gain: float = 0.0,
+    od_g_blackpoint: float = 0.0,
+    od_b_shift: float = 0.0,
+    od_b_gain: float = 0.0,
+    od_b_blackpoint: float = 0.0,
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
@@ -1610,7 +1728,11 @@ def adjust_image_opencl(
         # Fallback to CPU version
         return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
                           blackpoint, whitepoint, contrast, saturation, tint_balance_factor,
-                          highlights, shadows)
+                          highlights, shadows,
+                          od_input_gain, od_master_shift, od_master_gain,
+                          od_r_shift, od_r_gain, od_r_blackpoint,
+                          od_g_shift, od_g_gain, od_g_blackpoint,
+                          od_b_shift, od_b_gain, od_b_blackpoint)
 
     try:
         # Use cached OpenCL objects
@@ -1626,11 +1748,15 @@ def adjust_image_opencl(
         img_flat = img.reshape(-1, 3)
         img_buf = cl_array.to_device(queue, img_flat)
 
-        # Prepare parameters as numpy arrays - balance_factor (9th), highlights (10th), shadows (11th)
+        # Prepare parameters as numpy array (params[0..10] existing, params[11..22] OD controls)
         params = np.array([
             kelvin_shift, tint_shift, exposure, brightness,
             blackpoint, whitepoint, contrast, saturation, balance_factor,
-            highlights, shadows
+            highlights, shadows,
+            od_input_gain, od_master_shift, od_master_gain,
+            od_r_shift, od_r_gain, od_r_blackpoint,
+            od_g_shift, od_g_gain, od_g_blackpoint,
+            od_b_shift, od_b_gain, od_b_blackpoint,
         ], dtype=np.float32)
 
         params_buf = cl_array.to_device(queue, params)
@@ -1648,7 +1774,11 @@ def adjust_image_opencl(
         # Fallback to CPU version
         return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
                           blackpoint, whitepoint, contrast, saturation, tint_balance_factor,
-                          highlights, shadows)
+                          highlights, shadows,
+                          od_input_gain, od_master_shift, od_master_gain,
+                          od_r_shift, od_r_gain, od_r_blackpoint,
+                          od_g_shift, od_g_gain, od_g_blackpoint,
+                          od_b_shift, od_b_gain, od_b_blackpoint)
 
 
 

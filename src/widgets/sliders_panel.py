@@ -1,9 +1,50 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayout,
                                 QSizePolicy, QStyleOptionSlider, QFrame, QStyle,
-                                QPushButton, QDialog, QMessageBox)
+                                QPushButton, QDialog, QMessageBox, QScrollArea)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
 from core.ccr_backend import ccr_backend
+
+class CollapsibleSection(QWidget):
+    """A toggle-button header that shows/hides its content widget. Default: collapsed."""
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._toggle_btn = QPushButton(f"+ {title}")
+        self._toggle_btn.setCheckable(True)
+        self._toggle_btn.setChecked(False)
+        self._toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 4px 6px; "
+            "background: #3a3a3a; border: none; border-radius: 4px; "
+            "color: #ccc; font-size: 11px; }"
+            "QPushButton:checked { background: #505050; }"
+        )
+        self._toggle_btn.clicked.connect(self._on_toggle)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout()
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(2)
+        self._content.setLayout(self._content_layout)
+        self._content.setVisible(False)
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 4, 0, 0)
+        outer.setSpacing(2)
+        outer.addWidget(self._toggle_btn)
+        outer.addWidget(self._content)
+        self.setLayout(outer)
+
+    def add_layout(self, layout):
+        self._content_layout.addLayout(layout)
+
+    def add_widget(self, widget):
+        self._content_layout.addWidget(widget)
+
+    def _on_toggle(self, checked: bool):
+        self._content.setVisible(checked)
+        label = self._toggle_btn.text()[2:]
+        self._toggle_btn.setText(f"{'- ' if checked else '+ '}{label}")
+
 
 class ResettableSlider(QSlider):
     def mousePressEvent(self, event):
@@ -74,7 +115,16 @@ class SlidersPanel(QWidget):
         self.slider_labels = []
         self.image_slider_map = {}
         self.current_image_id = None
-        self.adjustment_keys = ["temperature", "tint", "exposure", "brightness", "highlights", "white_point", "shadows", "black_point", "contrast", "saturation"]
+        self.adjustment_keys = [
+            "temperature", "tint", "exposure", "brightness", "highlights",
+            "white_point", "shadows", "black_point", "contrast", "saturation",
+            # OD (optical-density / log-space) channel controls — appended so
+            # existing positional zip(adjustment_keys, sliders) indices are unchanged.
+            "od_input_gain", "od_master_shift", "od_master_gain",
+            "od_r_shift", "od_r_gain", "od_r_blackpoint",
+            "od_g_shift", "od_g_gain", "od_g_blackpoint",
+            "od_b_shift", "od_b_gain", "od_b_blackpoint",
+        ]
         self.copied_adjustment = None  # Store copied adjustment settings
         self._hint_timer = QTimer(self)  # Timer for temporary hints
         self._hint_timer.setSingleShot(True)
@@ -91,19 +141,36 @@ class SlidersPanel(QWidget):
         self._debounce_timer.timeout.connect(self._process_pending_adjustment)
 
     def initUI(self):
+        # Outer layout: histogram (fixed) + scroll area (stretchy) + hint (fixed)
         layout = QVBoxLayout()
-        layout.setAlignment(Qt.AlignTop)  # Align all widgets to the top
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
-        # --- Histogram image container at the top ---
+        # --- Histogram — fixed at top, outside scroll area ---
         self.histogram_label = QLabel()
         self.histogram_label.setFixedHeight(150)
         self.histogram_label.setAlignment(Qt.AlignCenter)
-        self.histogram_label.setFrameShape(QFrame.NoFrame)  # No border
+        self.histogram_label.setFrameShape(QFrame.NoFrame)
         self.histogram_label.setText("")
         self.histogram_label.setStyleSheet(
             "background-color: rgb(180,180,180); border: none; border-radius: 12px;"
-        )  # Rounded corners and dark gray
+        )
         layout.addWidget(self.histogram_label)
+
+        # --- Scrollable middle section ---
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout()
+        scroll_layout.setAlignment(Qt.AlignTop)
+        scroll_layout.setContentsMargins(4, 4, 4, 4)
+        scroll_layout.setSpacing(2)
+        scroll_content.setLayout(scroll_layout)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setWidget(scroll_content)
+        layout.addWidget(scroll_area, 1)  # stretch=1: fills remaining height
 
         self.slider_labels = [
             "Temperature", "Tint", "Exposure", "Brightness",
@@ -112,6 +179,7 @@ class SlidersPanel(QWidget):
 
         self.current_idx = None
 
+        # --- 10 existing sliders (sliders[0]–[9]) ---
         self.temperature_slider_layout = self.create_slider("Temperature")
         self.tint_slider_layout = self.create_slider("Tint")
         self.exposure_slider_layout = self.create_slider("Exposure")
@@ -123,55 +191,100 @@ class SlidersPanel(QWidget):
         self.contrast_slider_layout = self.create_slider("Contrast")
         self.saturation_slider_layout = self.create_slider("Saturation")
 
-        layout.addLayout(self.temperature_slider_layout)
-        layout.addLayout(self.tint_slider_layout)
-        layout.addLayout(self.exposure_slider_layout)
-        layout.addLayout(self.brightness_slider_layout)
-        layout.addLayout(self.highlights_slider_layout)
-        layout.addLayout(self.white_point_slider_layout)
-        layout.addLayout(self.shadows_slider_layout)
-        layout.addLayout(self.black_point_slider_layout)
-        layout.addLayout(self.contrast_slider_layout)
-        layout.addLayout(self.saturation_slider_layout)
+        scroll_layout.addLayout(self.temperature_slider_layout)
+        scroll_layout.addLayout(self.tint_slider_layout)
+        scroll_layout.addLayout(self.exposure_slider_layout)
+        scroll_layout.addLayout(self.brightness_slider_layout)
+        scroll_layout.addLayout(self.highlights_slider_layout)
+        scroll_layout.addLayout(self.white_point_slider_layout)
+        scroll_layout.addLayout(self.shadows_slider_layout)
+        scroll_layout.addLayout(self.black_point_slider_layout)
+        scroll_layout.addLayout(self.contrast_slider_layout)
+        scroll_layout.addLayout(self.saturation_slider_layout)
 
-        # --- Add Reset and Compare buttons inline below sliders ---
-
+        # --- Reset / Compare / Sync buttons ---
         buttons_layout = QHBoxLayout()
         self.reset_button = QPushButton("Reset")
         self.compare_button = QPushButton("Compare")
         buttons_layout.addWidget(self.reset_button)
         buttons_layout.addWidget(self.compare_button)
-        layout.addLayout(buttons_layout)
+        scroll_layout.addLayout(buttons_layout)
 
-        # Add Sync to All button on a new row
         sync_layout = QHBoxLayout()
         self.sync_to_all_button = QPushButton("Sync to All")
         sync_layout.addWidget(self.sync_to_all_button)
-        layout.addLayout(sync_layout)
+        scroll_layout.addLayout(sync_layout)
 
-        # B/W Point film calibration section — visually separated from adjustment buttons
+        # --- Film B/W Point section ---
         separator = QFrame()
         separator.setFrameShape(QFrame.HLine)
         separator.setFrameShadow(QFrame.Sunken)
         separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
-        layout.addWidget(separator)
+        scroll_layout.addWidget(separator)
 
         bwp_label = QLabel("Film B/W Point")
         bwp_label.setStyleSheet("color: #888; font-size: 11px; margin-bottom: 2px;")
         bwp_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(bwp_label)
+        scroll_layout.addWidget(bwp_label)
 
         bwp_row = QHBoxLayout()
         self.white_point_btn = QPushButton("Set White Point")
         self.black_point_btn = QPushButton("Set Black Point")
         bwp_row.addWidget(self.white_point_btn)
         bwp_row.addWidget(self.black_point_btn)
-        layout.addLayout(bwp_row)
+        scroll_layout.addLayout(bwp_row)
         self.convert_current_bwp_btn = QPushButton("Convert Current (B/W Point)")
-        layout.addWidget(self.convert_current_bwp_btn)
+        scroll_layout.addWidget(self.convert_current_bwp_btn)
         self.convert_all_bwp_btn = QPushButton("Convert All (B/W Point)")
-        layout.addWidget(self.convert_all_bwp_btn)
+        scroll_layout.addWidget(self.convert_all_bwp_btn)
 
+        # --- OD Controls collapsible section (sliders[10]–[21]) ---
+        od_separator = QFrame()
+        od_separator.setFrameShape(QFrame.HLine)
+        od_separator.setFrameShadow(QFrame.Sunken)
+        od_separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
+        scroll_layout.addWidget(od_separator)
+
+        self.od_section = CollapsibleSection("OD Controls (NamiColor-style)")
+        scroll_layout.addWidget(self.od_section)
+
+        # Master group
+        master_label = QLabel("Master")
+        master_label.setStyleSheet("color: #888; font-size: 11px; margin-top: 4px;")
+        master_label.setAlignment(Qt.AlignCenter)
+        self.od_section.add_widget(master_label)
+        self.od_section.add_layout(self.create_slider("Input Gain"))
+        self.od_section.add_layout(self.create_slider("Master Shift"))
+        self.od_section.add_layout(self.create_slider("Master Gain"))
+
+        # R channel group
+        r_label = QLabel("R Channel")
+        r_label.setStyleSheet("color: #c66; font-size: 11px; margin-top: 4px;")
+        r_label.setAlignment(Qt.AlignCenter)
+        self.od_section.add_widget(r_label)
+        self.od_section.add_layout(self.create_slider("R Shift"))
+        self.od_section.add_layout(self.create_slider("R Gain"))
+        self.od_section.add_layout(self.create_slider("R Blackpoint"))
+
+        # G channel group
+        g_label = QLabel("G Channel")
+        g_label.setStyleSheet("color: #6a6; font-size: 11px; margin-top: 4px;")
+        g_label.setAlignment(Qt.AlignCenter)
+        self.od_section.add_widget(g_label)
+        self.od_section.add_layout(self.create_slider("G Shift"))
+        self.od_section.add_layout(self.create_slider("G Gain"))
+        self.od_section.add_layout(self.create_slider("G Blackpoint"))
+
+        # B channel group
+        b_label = QLabel("B Channel")
+        b_label.setStyleSheet("color: #66c; font-size: 11px; margin-top: 4px;")
+        b_label.setAlignment(Qt.AlignCenter)
+        self.od_section.add_widget(b_label)
+        self.od_section.add_layout(self.create_slider("B Shift"))
+        self.od_section.add_layout(self.create_slider("B Gain"))
+        self.od_section.add_layout(self.create_slider("B Blackpoint"))
+
+        # --- Signal connections ---
         self.reset_button.clicked.connect(self.on_reset_clicked)
         self.compare_button.pressed.connect(self.on_compare_pressed)
         self.compare_button.released.connect(self.on_compare_released)
@@ -182,11 +295,11 @@ class SlidersPanel(QWidget):
         self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
         self.convert_all_bwp_btn.clicked.connect(self._on_convert_all_bwpoint)
 
-        # --- Add Dynamic Hint section below the buttons ---
+        # --- Hint label — fixed at bottom, outside scroll area ---
         self.hint_label = QLabel()
         self.hint_label.setWordWrap(True)
         self.hint_label.setStyleSheet("color: #666; font-size: 12px; margin-top: 8px;")
-        self.hint_label.setText("")  # Start with empty hint
+        self.hint_label.setText("")
         layout.addWidget(self.hint_label)
 
         self.setLayout(layout)
