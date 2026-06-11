@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QMainWindow, QHBoxLayout, QWidget, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel, QLineEdit
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QShortcut, QKeySequence
 from PySide6.QtCore import Qt, QEvent, QThread, Signal, QObject
 from widgets.thumbnail_list import ThumbnailList
 from widgets.image_preview import ImagePreview
@@ -68,6 +68,11 @@ class MainWindow(QMainWindow):
         self.installEventFilter(self)
         self.create_menu()
 
+        # Ctrl+Z (Cmd+Z on macOS): undo the last action on the current image;
+        # repeated presses walk further back through the undo stack.
+        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
+        self.undo_shortcut.activated.connect(self.undo_last_action)
+
         # Activation and verification checks are intentionally bypassed.
         ccr_backend.software_activated = True
         _, license_type = validate_software()
@@ -89,6 +94,24 @@ class MainWindow(QMainWindow):
 
     def on_image_selected(self, file_path):
         pass
+
+    def undo_last_action(self):
+        """Restore the current image's previous state (adjustments, crop,
+        rotation, flips). Each Ctrl+Z press pops one more snapshot."""
+        idx = self.image_preview.current_idx
+        img = ccr_backend.get_image_by_index(idx) if idx is not None else None
+        if img is None:
+            return
+        if not img.pop_undo_state():
+            self.sliders_panel.set_temporary_hint("Nothing to undo.", duration=2000)
+            return
+        img.update_thumbnail_and_preview()
+        self.thumbnail_list.update_thumbnail(idx)
+        self.image_preview.update_preview(idx)
+        remaining = len(img.undo_stack)
+        self.sliders_panel.set_temporary_hint(
+            f"Undo applied ({remaining} more available)." if remaining else "Undo applied.",
+            duration=2500)
 
     def create_menu(self):
         menu_bar = self.menuBar()

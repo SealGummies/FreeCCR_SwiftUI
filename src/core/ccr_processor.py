@@ -91,6 +91,7 @@ def _initialize_opencl():
             float ch_b_shift      = params[20];
             float ch_b_gain       = params[21];
             float ch_b_blackpoint = params[22];
+            float sub_saturation  = params[23];
 
             int idx = gid * 3;
             float r = img[idx];
@@ -349,6 +350,26 @@ def _initialize_opencl():
                 r = img_norm_r * 65535.0f;
                 g = img_norm_g * 65535.0f;
                 b = img_norm_b * 65535.0f;
+            }
+
+            // Subtractive (film-density) saturation: scale each pixel's
+            // chromaticity ratios by a power while pinning the dominant
+            // channel, so saturation is gained by absorbing light in the
+            // other channels (darker, denser colors) instead of adding it.
+            if (sub_saturation != 0.0f) {
+                float sr = clamp(r / 65535.0f, 0.0f, 1.0f);
+                float sg = clamp(g / 65535.0f, 0.0f, 1.0f);
+                float sb = clamp(b / 65535.0f, 0.0f, 1.0f);
+                float mx = fmax(sr, fmax(sg, sb));
+                if (mx > 1e-6f) {
+                    float gamma_s = pow(2.0f, sub_saturation / 100.0f);
+                    sr = mx * pow(sr / mx, gamma_s);
+                    sg = mx * pow(sg / mx, gamma_s);
+                    sb = mx * pow(sb / mx, gamma_s);
+                }
+                r = sr * 65535.0f;
+                g = sg * 65535.0f;
+                b = sb * 65535.0f;
             }
 
             // Per-channel levels controls (linear domain, post-conversion data).
@@ -716,6 +737,10 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
     # --- End of user adjustments ---
 
     if output_path is not None:  # this is for output
+        # User crop (normalized rect in un-rotated/un-flipped space) — applied
+        # before flips/rotation so it matches the cropped preview orientation.
+        rgb_brightness_normalized = apply_crop_to_image(
+            rgb_brightness_normalized, getattr(ccr_image, 'crop_rect', None))
         step_start = time.time()
         # Apply flips and rotation to rgb_brightness_normalized before export
         if h_flip and v_flip:
@@ -969,6 +994,9 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
 
     # --- Export path: flips, rotation, watermark, file write ---
     if output_path is not None:
+        # User crop (normalized rect in un-rotated/un-flipped space) — applied
+        # before flips/rotation so it matches the cropped preview orientation.
+        rgb_result = apply_crop_to_image(rgb_result, getattr(ccr_image, 'crop_rect', None))
         # Flips
         if h_flip and v_flip:
             rgb_result = cv2.flip(rgb_result, -1)
@@ -1046,6 +1074,26 @@ def to_8bit(img16: np.ndarray) -> np.ndarray:
     img16 = np.clip(img16, 0, 65535)
     img8 = (img16 / 257).astype(np.uint8)
     return img8
+
+
+def apply_crop_to_image(img: np.ndarray, crop_rect_norm) -> np.ndarray:
+    """
+    Crop an image using a rect of normalized (x1, y1, x2, y2) fractions
+    defined in un-rotated/un-flipped image space (the same space as
+    resized_raw). Returns the input unchanged when the rect is missing or
+    degenerate, so callers can pass it unconditionally.
+    """
+    if crop_rect_norm is None:
+        return img
+    h, w = img.shape[:2]
+    fx1, fy1, fx2, fy2 = crop_rect_norm
+    x1 = max(0, min(w - 1, int(round(fx1 * w))))
+    y1 = max(0, min(h - 1, int(round(fy1 * h))))
+    x2 = max(x1 + 1, min(w, int(round(fx2 * w))))
+    y2 = max(y1 + 1, min(h, int(round(fy2 * h))))
+    if (x2 - x1) < 2 or (y2 - y1) < 2:
+        return img
+    return img[y1:y2, x1:x2]
 
 def auto_fine_angle(img16: np.ndarray, debug: bool = False) -> float:
     """
@@ -1476,6 +1524,7 @@ def adjust_image(
     ch_b_shift: float = 0.0,
     ch_b_gain: float = 0.0,
     ch_b_blackpoint: float = 0.0,
+    sub_saturation: float = 0.0,
 ) -> np.ndarray:
     """
     Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
@@ -1705,6 +1754,20 @@ def adjust_image(
         img_norm = np.clip(img_norm, 0, 1)
         img = img_norm * 65535.0
 
+    # Subtractive (film-density) saturation: scale each pixel's chromaticity
+    # ratios by a power while pinning the dominant channel, so saturation is
+    # gained by absorbing light in the other channels (darker, denser colors)
+    # instead of adding it. Mirrors the OpenCL kernel block exactly.
+    if sub_saturation != 0.0:
+        img_norm = np.clip(img / 65535.0, 0.0, 1.0)
+        mx = np.max(img_norm, axis=-1, keepdims=True)
+        gamma_s = 2.0 ** (sub_saturation / 100.0)
+        safe_mx = np.maximum(mx, 1e-6)
+        img_norm = np.where(mx > 1e-6,
+                            mx * (img_norm / safe_mx) ** gamma_s,
+                            img_norm)
+        img = img_norm * 65535.0
+
     # Per-channel levels controls (linear domain, post-conversion data).
     # Runs only when at least one slider is non-zero; otherwise a no-op.
     #
@@ -1778,6 +1841,7 @@ def adjust_image_opencl(
     ch_b_shift: float = 0.0,
     ch_b_gain: float = 0.0,
     ch_b_blackpoint: float = 0.0,
+    sub_saturation: float = 0.0,
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
@@ -1794,7 +1858,8 @@ def adjust_image_opencl(
                           ch_input_gain, ch_master_shift, ch_master_gain,
                           ch_r_shift, ch_r_gain, ch_r_blackpoint,
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
-                          ch_b_shift, ch_b_gain, ch_b_blackpoint)
+                          ch_b_shift, ch_b_gain, ch_b_blackpoint,
+                          sub_saturation=sub_saturation)
 
     try:
         # Use cached OpenCL objects
@@ -1810,7 +1875,8 @@ def adjust_image_opencl(
         img_flat = img.reshape(-1, 3)
         img_buf = cl_array.to_device(queue, img_flat)
 
-        # Prepare parameters as numpy array (params[0..10] existing, params[11..22] channel levels)
+        # Prepare parameters as numpy array (params[0..10] existing,
+        # params[11..22] channel levels, params[23] subtractive saturation)
         params = np.array([
             kelvin_shift, tint_shift, exposure, brightness,
             blackpoint, whitepoint, contrast, saturation, balance_factor,
@@ -1819,6 +1885,7 @@ def adjust_image_opencl(
             ch_r_shift, ch_r_gain, ch_r_blackpoint,
             ch_g_shift, ch_g_gain, ch_g_blackpoint,
             ch_b_shift, ch_b_gain, ch_b_blackpoint,
+            sub_saturation,
         ], dtype=np.float32)
 
         params_buf = cl_array.to_device(queue, params)
@@ -1840,7 +1907,8 @@ def adjust_image_opencl(
                           ch_input_gain, ch_master_shift, ch_master_gain,
                           ch_r_shift, ch_r_gain, ch_r_blackpoint,
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
-                          ch_b_shift, ch_b_gain, ch_b_blackpoint)
+                          ch_b_shift, ch_b_gain, ch_b_blackpoint,
+                          sub_saturation=sub_saturation)
 
 
 
