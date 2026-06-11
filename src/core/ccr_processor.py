@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import os
+import threading
 import time
 import tifffile
 import gc
@@ -15,6 +16,10 @@ except ImportError:
     OPENCL_AVAILABLE = False
     cl = None
     cl_array = None
+
+# The hi-res zoom worker can call adjust_image_opencl concurrently with the
+# GUI thread; pyopencl command queues are not safe for concurrent submission.
+_opencl_lock = threading.Lock()
 
 # Global OpenCL cache
 _opencl_cache = {
@@ -1125,6 +1130,128 @@ def apply_crop_to_image(img: np.ndarray, crop_rect_norm, crop_angle: float = 0.0
         return img
     return img[y1:y2, x1:x2]
 
+
+# --- Resolution-independent conversion helpers (zoom hi-res detail) --------
+# These reproduce ccr_normalize_with_reference / ccr_normalize_with_bwpoint's
+# preview-path math with the normalization constants split out, so the same
+# conversion can be re-applied to a higher-resolution decode and come out
+# color-matched to the 1080px preview.
+
+_LUM_WEIGHTS = np.array([[0.299, 0.587, 0.114]], dtype=np.float32)
+
+
+def apply_postinvert_look(rgb_inverted: np.ndarray) -> np.ndarray:
+    """Shared saturation-boost + shadow-warmth styling applied after
+    inversion — identical math to both conversion pipelines, computed with
+    cv2 SIMD primitives (5-10x faster than numpy at hi-res sizes) and
+    in-place float32 ops."""
+    x = rgb_inverted.astype(np.float32)
+    x *= np.float32(1.0 / 65535.0)
+    np.clip(x, 0.0, 1.0, out=x)
+
+    luminance = cv2.transform(x, _LUM_WEIGHTS)          # (h, w) float32
+    sat_curve = cv2.pow(luminance, 0.8)
+    dynamic = np.float32(0.15) * sat_curve
+    dynamic += np.float32(1.0)                          # 1.0 + 0.15 * lum^0.8
+    lum3 = luminance[..., None]
+    x -= lum3
+    x *= dynamic[..., None]
+    x += lum3
+    np.clip(x, 0.0, 1.0, out=x)
+
+    shadow_lum = cv2.transform(x, _LUM_WEIGHTS)
+    warmth = cv2.exp(shadow_lum * np.float32(-4.0))
+    warmth *= np.float32(0.35)
+    green = cv2.exp(shadow_lum * np.float32(-3.5))
+    green *= np.float32(0.15)
+    x[..., 0] *= (np.float32(1.0) + warmth * np.float32(0.8))
+    x[..., 1] *= (np.float32(1.0) + green)
+    x[..., 2] *= (np.float32(1.0) - warmth)
+    x *= np.float32(65535.0)
+    np.clip(x, 0, 65535, out=x)
+    return x.astype(np.uint16)
+
+
+def compute_reference_norm_params(ref_img: np.ndarray, reference_rect,
+                                  fine_rotation_angle: int):
+    """Derive the per-channel percentile anchors and OD alignment factors
+    that ccr_normalize_with_reference computes from the reference frame of
+    ref_img (the 1080px scan), so the conversion can be replayed at any
+    resolution. Returns (p_lo[3], p_hi[3], od_factors[3])."""
+    img_ref = ref_img
+    fine_angle = fine_rotation_angle / 100.0
+    if fine_angle != 0:
+        h, w = img_ref.shape[:2]
+        rot = cv2.getRotationMatrix2D((w // 2, h // 2), -fine_angle, 1.0)
+        img_ref = cv2.warpAffine(img_ref, rot, (w, h), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    x1, y1, x2, y2 = map_rect_to_original(ref_img.shape, img_ref.shape, reference_rect)
+    ref_crop = img_ref[y1:y2, x1:x2].astype(np.float32)
+
+    p_lo = np.empty(3, dtype=np.float64)
+    p_hi = np.empty(3, dtype=np.float64)
+    norm_crop = np.empty_like(ref_crop)
+    for c in range(3):
+        p_lo[c] = np.percentile(ref_crop[..., c], 1)
+        p_hi[c] = np.percentile(ref_crop[..., c], 99)
+        norm_crop[..., c] = np.clip(
+            (ref_crop[..., c] - p_lo[c]) / (p_hi[c] - p_lo[c])
+            * (65535 - 8192) + 8192, 0, 65535)
+    od_crop = -np.log10((norm_crop + 1e-6) / 65535.0)
+    mean_od = np.mean(od_crop, axis=(0, 1))
+    target = np.mean(mean_od)
+    od_factors = target / (mean_od + 1e-12)
+    return p_lo, p_hi, od_factors
+
+
+def apply_reference_normalization(img: np.ndarray, p_lo, p_hi, od_factors) -> np.ndarray:
+    """Apply the reference-frame normalization + inversion + standard look to
+    an image of any resolution, using precomputed constants.
+
+    The pipeline's OD alignment (od = -log10(v); od *= f; out = 10^-od) is
+    algebraically just out = v^f — computed that way here, which halves the
+    transcendental work on large hi-res frames. The per-channel linear map
+    is folded into a single cv2.transform and the power uses cv2.pow (SIMD)."""
+    # v*s + (8192 - p_lo*s), pre-divided by 65535 into the unit domain
+    affine = np.zeros((3, 4), dtype=np.float64)
+    for c in range(3):
+        s = (65535.0 - 8192.0) / (p_hi[c] - p_lo[c])
+        affine[c, c] = s / 65535.0
+        affine[c, 3] = (8192.0 - p_lo[c] * s) / 65535.0
+    norm = cv2.transform(img.astype(np.float32), affine)
+    np.clip(norm, 0.0, 1.0, out=norm)
+    norm += np.float32(1e-6 / 65535.0)
+    channels = list(cv2.split(norm))
+    for c in range(3):
+        cv2.pow(channels[c], float(od_factors[c]), channels[c])
+    norm = cv2.merge(channels)
+    norm *= np.float32(65535.0)
+    np.clip(norm, 0, 65535, out=norm)
+    inverted = 65535 - norm.astype(np.uint16)
+    return apply_postinvert_look(inverted)
+
+
+def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bgr) -> np.ndarray:
+    """B/W-point conversion at any resolution: absolute per-channel anchors +
+    inversion + standard look — mirrors ccr_normalize_with_bwpoint's preview
+    path (the anchors are global constants, so no rescaling is needed)."""
+    img_f = img.astype(np.float32)
+    norm = np.empty_like(img_f)
+    for c in range(3):
+        p_hi = max(float(black_point_bgr[c]), 1.0)
+        p_lo = max(float(white_point_bgr[c]), 1.0)
+        denom = p_hi - p_lo
+        if abs(denom) < 1.0:
+            norm[..., c] = 0.0
+            continue
+        np.subtract(img_f[..., c], p_lo, out=norm[..., c])
+        np.divide(norm[..., c], denom, out=norm[..., c])
+        np.multiply(norm[..., c], 65535.0, out=norm[..., c])
+        np.clip(norm[..., c], 0, 65535, out=norm[..., c])
+    inverted = (65535.0 - norm).clip(0, 65535).astype(np.uint16)
+    return apply_postinvert_look(inverted)
+
+
 def auto_fine_angle(img16: np.ndarray, debug: bool = False) -> float:
     """
     Analyze a 16-bit image and estimate the rotation angle (in degrees)
@@ -1892,16 +2019,19 @@ def adjust_image_opencl(
                           sub_saturation=sub_saturation)
 
     try:
+      # Serialize GPU submissions: the hi-res zoom worker may run this
+      # concurrently with the GUI thread's preview refresh.
+      with _opencl_lock:
         # Use cached OpenCL objects
         ctx = _opencl_cache['ctx']
         queue = _opencl_cache['queue']
         kernel = _opencl_cache['kernel']
-        
+
         img = img16.astype(np.float32)
-        
+
         # Use the pre-calculated balance factor instead of calculating it
         balance_factor = tint_balance_factor
-        
+
         img_flat = img.reshape(-1, 3)
         img_buf = cl_array.to_device(queue, img_flat)
 

@@ -5,7 +5,8 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QStyle, QSizePolicy
 )
 from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter,
-                           QCursor, QDesktopServices, QPainterPath, QBrush, QPolygonF)
+                           QCursor, QDesktopServices, QPainterPath, QBrush, QPolygonF,
+                           QImage)
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
 from widgets.export_dialog import ExportSettingsDialog
@@ -79,11 +80,21 @@ class GraphicsImageView(QGraphicsView):
 
         self.wb_pick_mode = False  # eyedropper: click a neutral point for auto temp/tint
 
+        self._space_pan = False    # space held -> hand-drag panning
+
+        # Wheel zoom anchors at the cursor; clicking focuses the view so the
+        # space-pan key is received.
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setFocusPolicy(Qt.ClickFocus)
+
         # Disable scrollbars
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def mousePressEvent(self, event):
+        if self._space_pan:
+            # Space+drag pans the view (ScrollHandDrag handles the motion)
+            return super().mousePressEvent(event)
         if self.parent_widget.crop_mode and self.parent_widget.pixmap_item is not None:
             if event.button() == Qt.LeftButton:
                 self.parent_widget.begin_crop_drag(self.mapToScene(event.pos()))
@@ -126,6 +137,8 @@ class GraphicsImageView(QGraphicsView):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._space_pan:
+            return super().mouseMoveEvent(event)
         if self.parent_widget.crop_mode:
             self.parent_widget.update_crop_drag(self.mapToScene(event.pos()))
             return
@@ -216,6 +229,8 @@ class GraphicsImageView(QGraphicsView):
             pass
 
     def mouseReleaseEvent(self, event):
+        if self._space_pan:
+            return super().mouseReleaseEvent(event)
         if self.parent_widget.crop_mode:
             if event.button() == Qt.LeftButton:
                 self.parent_widget.end_crop_drag(self.mapToScene(event.pos()))
@@ -264,9 +279,7 @@ class GraphicsImageView(QGraphicsView):
                     import numpy as np
                     # Always sample from original scan data, not processed data
                     if img_obj.converted:
-                        raw_data = img_obj.read_image(img_obj.file_path)
-                        if raw_data is not None:
-                            raw_data = img_obj.resize_image_to_max_pixel(raw_data, 1080)
+                        raw_data = img_obj.read_image(img_obj.file_path, max_long_side=1080)
                     else:
                         raw_data = img_obj.resized_raw
                     if raw_data is not None:
@@ -370,15 +383,44 @@ class GraphicsImageView(QGraphicsView):
             painter.restore()
 
     def wheelEvent(self, event):
-        # Disable mouse wheel zoom/scroll
-        event.ignore()
+        # Mouse wheel zooms in/out, anchored under the cursor
+        delta = event.angleDelta().y()
+        if delta == 0 or self.parent_widget.pixmap_item is None:
+            event.ignore()
+            return
+        self.parent_widget.zoom_by(1.25 if delta > 0 else 0.8)
+        event.accept()
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            # Hold space to pan with the mouse (hand drag)
+            self._space_pan = True
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
+            event.accept()
+            return
         # Disable up/down/left/right keys from scrolling the view
         if event.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
             event.ignore()
         else:
             super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            self._space_pan = False
+            self.setDragMode(QGraphicsView.NoDrag)
+            # Restore the mode-appropriate cursor
+            pw = self.parent_widget
+            if pw is not None and pw.crop_mode:
+                self.setCursor(Qt.CrossCursor)
+            elif self.wb_pick_mode:
+                self.setCursor(_eyedropper_cursor())
+            elif self.bwpoint_mode:
+                self.setCursor(Qt.CrossCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
 class CenteringSlider(QSlider):
     def mouseDoubleClickEvent(self, event):
@@ -535,6 +577,20 @@ class ImagePreview(QWidget):
         self._fine_rot_burst_timer.setSingleShot(True)
         self._fine_rot_burst_timer.timeout.connect(self._end_fine_rot_burst)
 
+        # --- Zoom & hi-res detail state ---
+        # _zoom is relative to the fitted view (1.0 = fit). While zoomed past
+        # the preview's native resolution, a hi-res re-render of the current
+        # conversion is loaded asynchronously and displayed under identical
+        # scene geometry; zooming back out frees that memory again.
+        self._zoom = 1.0
+        self._item_prescale = 1.0   # preview_width / displayed_pixmap_width
+        self._hires = None          # cache for the CURRENT image only
+        self._hires_gen = 0
+        self._hires_workers = set()
+        self._hires_timer = QTimer(self)
+        self._hires_timer.setSingleShot(True)
+        self._hires_timer.timeout.connect(self._maybe_request_hires)
+
         self._update_unconvert_action_state()
 
         # --- Add hotkey support ---
@@ -578,6 +634,14 @@ class ImagePreview(QWidget):
         if idx != self.current_idx:
             self._end_fine_rot_burst()
             self._fine_rot_burst_timer.stop()
+            # New image: back to the fitted view, free hi-res detail memory
+            self._zoom = 1.0
+            self._release_hires(refresh=False)
+        else:
+            # Same image refreshed (sliders, crop, convert, undo, ...): the
+            # hi-res display layer is stale — fall back to preview pixels now
+            # and re-render the detail once the controls go idle.
+            self._invalidate_hires_display()
 
         preview_img = ccr_backend.get_preview_by_index(idx)
         self.current_idx = idx
@@ -701,8 +765,12 @@ class ImagePreview(QWidget):
         self.reference_rect_item.setTransform(base_transform)
 
     def _fit_view_to_content(self):
-        """Consistently fit the view to the content, prioritizing the pixmap item."""
-        if self.pixmap_item:
+        """Consistently fit the view to the content, prioritizing the pixmap
+        item — unless the user is zoomed in, in which case the current
+        zoom/pan must never be yanked back to fit."""
+        if self._zoom > 1.0:
+            pass
+        elif self.pixmap_item:
             # Fit to the transformed pixmap item for consistent zoom behavior
             self.view.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
         elif self.scene.sceneRect() and not self.scene.sceneRect().isNull():
@@ -717,6 +785,9 @@ class ImagePreview(QWidget):
     def apply_transformations(self):
         if not self.pixmap_item:
             return
+
+        # Swap preview/hi-res pixmap first so the prescale below is current
+        self._refresh_item_pixmap()
 
         # Center of the image
         cx = self.current_pixmap.width() / 2
@@ -744,7 +815,15 @@ class ImagePreview(QWidget):
             img_transform.rotate(self.current_fine_rotation / 100.0)
             img_transform.translate(-cx, -cy)
 
-        self.pixmap_item.setTransform(img_transform)
+        # A displayed hi-res pixmap is prescaled down so it occupies exactly
+        # the preview pixmap's scene footprint — all geometry (crop, frames,
+        # sampling) keeps working in preview coordinates.
+        if self._item_prescale != 1.0:
+            pre = QTransform()
+            pre.scale(self._item_prescale, self._item_prescale)
+            self.pixmap_item.setTransform(pre * img_transform)
+        else:
+            self.pixmap_item.setTransform(img_transform)
 
         # Rectangle only gets coarse rotation/flips
         if self.reference_rect_item:
@@ -793,6 +872,7 @@ class ImagePreview(QWidget):
     def rotate_left(self):
         self._push_undo_for_current()
         self._crop_drag = None  # base transform change invalidates an active crop drag
+        self._reset_zoom()      # orientation change returns to the fitted view
         self.current_rotation = (self.current_rotation - 90) % 360
         ccr_backend.set_image_rotation_by_index(self.current_idx, self.current_rotation)
         self.apply_transformations()
@@ -800,6 +880,7 @@ class ImagePreview(QWidget):
     def rotate_right(self):
         self._push_undo_for_current()
         self._crop_drag = None  # base transform change invalidates an active crop drag
+        self._reset_zoom()      # orientation change returns to the fitted view
         self.current_rotation = (self.current_rotation + 90) % 360
         ccr_backend.set_image_rotation_by_index(self.current_idx, self.current_rotation)
         self.apply_transformations()
@@ -807,6 +888,7 @@ class ImagePreview(QWidget):
     def mirror_vertical(self):
         self._push_undo_for_current()
         self._crop_drag = None  # base transform change invalidates an active crop drag
+        self._reset_zoom()      # orientation change returns to the fitted view
         flip = ccr_backend.get_image_vertical_flip_by_index(self.current_idx)
         ccr_backend.set_image_vertical_flip_by_index(self.current_idx, not flip)
         self.current_vertical_flip = not flip
@@ -815,6 +897,7 @@ class ImagePreview(QWidget):
     def mirror_horizontal(self):
         self._push_undo_for_current()
         self._crop_drag = None  # base transform change invalidates an active crop drag
+        self._reset_zoom()      # orientation change returns to the fitted view
         flip = ccr_backend.get_image_horizontal_flip_by_index(self.current_idx)
         ccr_backend.set_image_horizontal_flip_by_index(self.current_idx, not flip)
         self.current_horizontal_flip = not flip
@@ -868,6 +951,184 @@ class ImagePreview(QWidget):
         self.view.wb_pick_mode = enabled
         self.view.bwpoint_mode = None
         self.view.setCursor(_eyedropper_cursor() if enabled else Qt.ArrowCursor)
+
+    # --- Zoom & hi-res detail --------------------------------------------
+    # Wheel zooms relative to the fitted view (Lightroom-style). Once the
+    # 1080px preview is displayed past its native resolution, a hi-res
+    # re-render of the same conversion is produced on a worker thread and
+    # swapped in under identical scene geometry; zooming back out (or
+    # switching images) frees that memory again.
+
+    MAX_ZOOM = 8.0
+
+    def zoom_by(self, factor):
+        """Zoom by a factor, anchored under the cursor; clamped to [fit, 8x]."""
+        if self.pixmap_item is None or self.current_pixmap is None:
+            return
+        new_zoom = max(1.0, min(self.MAX_ZOOM, self._zoom * factor))
+        if abs(new_zoom - self._zoom) < 1e-9:
+            return
+        if new_zoom <= 1.0:
+            self._zoom = 1.0
+            self._fit_view_to_content()  # snap back to the exact fit
+        else:
+            actual = new_zoom / max(self._zoom, 1e-9)
+            self._zoom = new_zoom
+            self.view.scale(actual, actual)
+            if self.crop_mode and self._crop_overlay_item is not None:
+                self._draw_crop_overlay()  # handle sizes track the view scale
+        self._update_hires_state()
+
+    def _zoomed_in_enough(self):
+        """True when preview pixels are magnified — i.e. detail would help."""
+        return self._zoom > 1.0 and self._view_scale() > 1.05
+
+    def _update_hires_state(self):
+        if self._zoomed_in_enough():
+            self._maybe_request_hires()
+        else:
+            self._release_hires()
+
+    def _reset_zoom(self):
+        self._zoom = 1.0
+        self._release_hires(refresh=False)
+
+    def _hires_signature(self, img):
+        """Identity of the conversion state the hi-res BASE depends on."""
+        ref = img.reference_frame
+        return (bool(img.converted),
+                tuple(ref) if ref else None,
+                img.fine_rotation_angle,
+                None if ref else (ccr_backend.black_point_bgr,
+                                  ccr_backend.white_point_bgr))
+
+    def _current_adj_sig(self):
+        """Identity of the adjustment state baked into the hi-res DISPLAY."""
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return None
+        return (tuple(sorted(img.adjustment_settings.items())),
+                img.contrast_base, img.temperature_base, img.brightness_base)
+
+    def _maybe_request_hires(self):
+        if not self._zoomed_in_enough() or self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        sig = self._hires_signature(img)
+        adj_sig = self._current_adj_sig()
+        cache = self._hires
+        base = None
+        if cache is not None and cache["idx"] == self.current_idx and cache["sig"] == sig:
+            if cache.get("full_pm") is not None and cache.get("adj_sig") == adj_sig:
+                # Cache is current — just make sure it is displayed
+                self._refresh_item_pixmap()
+                self.apply_transformations()
+                return
+            base = cache.get("base")  # re-adjust only; skip decode+convert
+        # A matching render may already be in flight
+        for w in self._hires_workers:
+            if (w.isRunning() and w.req_idx == self.current_idx
+                    and w.req_sig == sig and w.req_adj_sig == adj_sig):
+                return
+        self._hires_gen += 1
+        worker = HiResDetailWorker(img, self.current_idx, self._hires_gen,
+                                   sig, adj_sig,
+                                   ccr_backend.black_point_bgr,
+                                   ccr_backend.white_point_bgr, base)
+        worker.finished_hires.connect(self._on_hires_ready)
+        worker.finished.connect(lambda w=worker: self._hires_workers.discard(w))
+        self._hires_workers.add(worker)
+        worker.start()
+
+    def _on_hires_ready(self, idx, gen, sig, adj_sig, base, display8):
+        if (gen != self._hires_gen or idx != self.current_idx
+                or not self._zoomed_in_enough()):
+            return  # superseded or no longer needed — arrays just get GC'd
+        h, w = display8.shape[:2]
+        qimg = QImage(display8.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+        self._hires = {"idx": idx, "sig": sig, "adj_sig": adj_sig, "base": base,
+                       "full_pm": QPixmap.fromImage(qimg),
+                       "display_pm": None, "crop_sig": None}
+        if adj_sig != self._current_adj_sig():
+            # Sliders moved while rendering — refresh again from the base
+            self._hires_timer.start(350)
+            return
+        self._refresh_item_pixmap()
+        self.apply_transformations()
+
+    def _invalidate_hires_display(self):
+        """Same-image refresh (adjustments/crop/conversion changed): drop the
+        stale hi-res display layer, keep the decoded base where possible, and
+        re-render once the controls go idle."""
+        if self._hires is None and not self._zoomed_in_enough():
+            return
+        if self._hires is not None:
+            self._hires["display_pm"] = None
+            self._hires["crop_sig"] = None
+            if self._hires.get("adj_sig") != self._current_adj_sig():
+                self._hires["full_pm"] = None
+                self._hires["adj_sig"] = None
+        if self._zoomed_in_enough():
+            self._hires_timer.start(350)
+
+    def _hires_display_pixmap(self):
+        """Crop-matched hi-res pixmap for the current display, or None."""
+        cache = self._hires
+        if (cache is None or cache["idx"] != self.current_idx
+                or cache.get("full_pm") is None or not self._zoomed_in_enough()):
+            return None
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return None
+        # The base must still describe the current conversion state
+        if cache["sig"] != self._hires_signature(img):
+            return None
+        crop = getattr(img, "crop_rect", None)
+        angle = getattr(img, "crop_angle", 0.0) or 0.0
+        crop_active = crop is not None and not self.crop_mode and img.converted
+        crop_sig = (crop, angle) if crop_active else None
+        if cache.get("display_pm") is not None and cache.get("crop_sig") == crop_sig:
+            return cache["display_pm"]
+        pm = cache["full_pm"]
+        if crop_active:
+            if angle:
+                ext = self._extract_rotated_crop(pm, crop, angle)
+                pm = ext[0] if ext is not None else None
+            else:
+                r = self._crop_rect_to_pixels(crop, pm)
+                pm = pm.copy(r) if r is not None else None
+        if pm is None or pm.isNull():
+            return None
+        cache["display_pm"] = pm
+        cache["crop_sig"] = crop_sig
+        return pm
+
+    def _refresh_item_pixmap(self):
+        """Display either the preview pixmap or the hi-res detail pixmap;
+        _item_prescale keeps the scene geometry identical either way."""
+        if self.pixmap_item is None or self.current_pixmap is None:
+            self._item_prescale = 1.0
+            return
+        pm = self._hires_display_pixmap()
+        if pm is not None and pm.width() > 0:
+            self._item_prescale = self.current_pixmap.width() / pm.width()
+            self.pixmap_item.setPixmap(pm)
+        else:
+            self._item_prescale = 1.0
+            self.pixmap_item.setPixmap(self.current_pixmap)
+
+    def _release_hires(self, refresh=True):
+        """Free hi-res detail memory (zoomed out / image switched) and orphan
+        any in-flight render via the generation counter."""
+        self._hires_gen += 1
+        self._hires_timer.stop()
+        had = self._hires is not None
+        self._hires = None
+        if had and refresh and self.pixmap_item is not None:
+            self._refresh_item_pixmap()
+            self.apply_transformations()
 
     # --- Crop mode -----------------------------------------------------
 
@@ -1390,6 +1651,56 @@ class ImagePreview(QWidget):
         QMessageBox.information(self, "Export Complete", "\n".join(lines))
         if plan.open_folder:
             QDesktopServices.openUrl(QUrl.fromLocalFile(plan.destination))
+
+class HiResDetailWorker(QThread):
+    """Renders the zoom detail image off the GUI thread: decode the RAW at
+    half size, replay the conversion color-matched to the preview, apply the
+    current adjustments, and hand back both the pre-adjustment base (cached
+    for fast slider re-renders) and the displayable 8-bit result."""
+
+    finished_hires = Signal(int, int, object, object, object, object)
+    # idx, generation, sig, adj_sig, base (uint16 ndarray), display8 (uint8 ndarray)
+
+    def __init__(self, img_obj, idx, generation, sig, adj_sig,
+                 black_point, white_point, base=None, parent=None):
+        super().__init__(parent)
+        self._img = img_obj
+        self.req_idx = idx
+        self.req_gen = generation
+        self.req_sig = sig
+        self.req_adj_sig = adj_sig
+        self._bp = black_point
+        self._wp = white_point
+        self._base = base
+
+    def run(self):
+        try:
+            import time as _time
+            import cv2 as _cv2
+            import numpy as _np
+            t0 = _time.perf_counter()
+            base = self._base
+            if base is None:
+                base = self._img.render_hires_base(
+                    black_point_bgr=self._bp, white_point_bgr=self._wp)
+            if base is None:
+                return
+            t1 = _time.perf_counter()
+            if self._img.converted:
+                display = self._img.apply_adjustments(base)
+            else:
+                display = self._img._auto_brightness_for_preview(base)
+            display8 = _np.ascontiguousarray(
+                _cv2.convertScaleAbs(display, alpha=255.0 / 65535.0))
+            t2 = _time.perf_counter()
+            print(f"Hi-res detail: base {(t1 - t0) * 1000:.0f} ms, "
+                  f"adjust+8bit {(t2 - t1) * 1000:.0f} ms "
+                  f"({display8.shape[1]}x{display8.shape[0]})")
+            self.finished_hires.emit(self.req_idx, self.req_gen, self.req_sig,
+                                     self.req_adj_sig, base, display8)
+        except Exception as e:
+            print(f"Hi-res detail render failed: {e}")
+
 
 class AutoFrameWorker(QThread):
     finished = Signal()
