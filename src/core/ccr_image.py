@@ -354,7 +354,9 @@ class CCRImage:
         min_scale = 0.1  # Prevent division by zero and avoid too flat lines
 
         # Draw each channel and accumulate overlap
-        for i, color in enumerate([(0, 0, 255), (0, 255, 0), (255, 0, 0)]):  # BGR for OpenCV
+        # RGB order: hist_img is rendered via QImage Format_RGB888, not cv2.imshow,
+        # so colors must be RGB — (255,0,0) draws the R-data curve in red.
+        for i, color in enumerate([(255, 0, 0), (0, 255, 0), (0, 0, 255)]):
             channel = list(hist.keys())[i]
             scale = max(max_val, min_scale)
             h_scaled = (hist[channel] / scale) * (hist_height - 1)
