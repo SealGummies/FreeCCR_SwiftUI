@@ -420,10 +420,12 @@ class CCRBackend:
             except Exception as e:
                 print(f"Failed to convert image at index {idx}: {e}")
 
-    def export_image_by_index(self, idx: int, output_path: str, jpg_output: bool = False):
+    def export_image_by_index(self, idx: int, output_path: str, jpg_output: bool = False,
+                              jpg_quality: int = 95, max_long_side: int = None) -> bool:
         """
         Exports the processed image at the given index to the specified output path.
         Routes to bwpoint or reference-frame pipeline depending on how the image was converted.
+        Returns True on success.
         """
         if idx is not None and 0 <= idx < len(self.images):
             image_obj = self.images[idx]
@@ -432,89 +434,114 @@ class CCRBackend:
                     # B/W point conversion — re-process from original full-res file
                     ccr_normalize_with_bwpoint(image_obj, self.black_point_bgr, self.white_point_bgr,
                                                output_path=output_path, water_mark=not self.software_activated,
-                                               jpg_out=jpg_output)
+                                               jpg_out=jpg_output, jpg_quality=jpg_quality,
+                                               max_long_side=max_long_side)
                 else:
                     ccr_normalize_with_reference(image_obj, output_path=output_path,
-                                                 water_mark=not self.software_activated, jpg_out=jpg_output)
+                                                 water_mark=not self.software_activated, jpg_out=jpg_output,
+                                                 jpg_quality=jpg_quality, max_long_side=max_long_side)
+                return True
             except Exception as e:
                 print(f"Failed to export image at index {idx}: {e}")
-            
-    def export_all_images(self, output_folder: str, jpg_output: bool = False, progress_callback=None):
+        return False
+
+    def export_items(self, items, jpg_output: bool = False, jpg_quality: int = 95,
+                     max_long_side: int = None, progress_callback=None, cancel_check=None) -> dict:
         """
-        Exports all processed images to the specified output folder using parallel processing.
+        Exports specific images to explicit output paths using parallel processing.
+
+        Args:
+            items: list of (idx, absolute_output_path) tuples; filename building is
+                   owned by the caller
+            progress_callback: optional callable(current, total)
+            cancel_check: optional zero-arg callable; once it returns True, queued
+                          exports are abandoned (in-flight ones finish)
+
+        Returns:
+            dict with "exported", "failed", "cancelled" counts/flag and
+            "failures" as a list of (idx, message) tuples.
         """
         import time
         total_start_time = time.time()
-        
-        if not os.path.exists(output_folder):
-            os.makedirs(output_folder)
-        
-        # Count converted images for progress tracking
-        converted_images = [(idx, img) for idx, img in enumerate(self.images) if img.converted]
-        total_images = len(converted_images)
-        
-        print(f"Starting export of {total_images} images...")
-        
-        if total_images == 0:
-            return
-        
-        def export_single_image(idx_img_tuple):
-            idx, img = idx_img_tuple
-            import time
+
+        result = {"exported": 0, "failed": 0, "cancelled": False, "failures": []}
+        total_items = len(items)
+        if total_items == 0:
+            return result
+
+        print(f"Starting export of {total_items} images...")
+
+        def cancelled():
+            return cancel_check is not None and cancel_check()
+
+        def export_single_image(idx, output_path):
+            if cancelled():
+                return idx, None, None  # None success = not attempted
             start_time = time.time()
-            try:                
-                base_name = os.path.splitext(os.path.basename(img.file_path))[0]
-                if jpg_output:
-                    output_path = os.path.join(output_folder, f"{base_name}_ccr.jpg")
-                else:
-                    output_path = os.path.join(output_folder, f"{base_name}_ccr.tiff")
-                self.export_image_by_index(idx, output_path, jpg_output=jpg_output)
-                elapsed = time.time() - start_time
+            success = self.export_image_by_index(idx, output_path, jpg_output=jpg_output,
+                                                 jpg_quality=jpg_quality, max_long_side=max_long_side)
+            elapsed = time.time() - start_time
+            base_name = os.path.basename(output_path)
+            if success:
                 print(f"Export completed for {base_name} in {elapsed:.2f}s")
                 return idx, True, None
-            except Exception as e:
-                elapsed = time.time() - start_time
-                print(f"Export failed for image {idx} after {elapsed:.2f}s: {e}")
-                return idx, False, str(e)
-        
+            print(f"Export failed for image {idx} after {elapsed:.2f}s")
+            return idx, False, "export failed (see log)"
+
         # Use parallel processing for exports
         max_workers = min(4, os.cpu_count() or 1)  # Use very few workers for export to avoid I/O contention
         completed_count = 0
-        
+
         if progress_callback:
-            progress_callback(0, total_images)
-        
+            progress_callback(0, total_items)
+
         if max_workers == 1:
             # Sequential fallback
-            for idx, img in converted_images:
-                try:                
-                    base_name = os.path.splitext(os.path.basename(img.file_path))[0]
-                    if jpg_output:
-                        output_path = os.path.join(output_folder, f"{base_name}_ccr.jpg")
-                    else:
-                        output_path = os.path.join(output_folder, f"{base_name}_ccr.tiff")
-                    self.export_image_by_index(idx, output_path, jpg_output=jpg_output)
-                except Exception as e:
-                    print(f"Failed to export image at index {idx}: {e}")
+            for idx, output_path in items:
+                if cancelled():
+                    result["cancelled"] = True
+                    break
+                idx, success, error = export_single_image(idx, output_path)
+                if success:
+                    result["exported"] += 1
+                else:
+                    result["failed"] += 1
+                    result["failures"].append((idx, error))
                 completed_count += 1
                 if progress_callback:
-                    progress_callback(completed_count, total_images)
+                    progress_callback(completed_count, total_items)
         else:
             # Parallel export
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_idx = {executor.submit(export_single_image, (idx, img)): idx 
-                                for idx, img in converted_images}
-                
+                future_to_idx = {executor.submit(export_single_image, idx, path): idx
+                                 for idx, path in items}
+
                 for future in concurrent.futures.as_completed(future_to_idx):
-                    idx, success, error = future.result()
-                    if not success:
-                        print(f"Failed to export image at index {idx}: {error}")
+                    try:
+                        idx, success, error = future.result()
+                    except concurrent.futures.CancelledError:
+                        result["cancelled"] = True
+                        continue
+                    if success is None:
+                        result["cancelled"] = True
+                    elif success:
+                        result["exported"] += 1
+                    else:
+                        result["failed"] += 1
+                        result["failures"].append((idx, error))
                     completed_count += 1
                     if progress_callback:
-                        progress_callback(completed_count, total_images)
-        
+                        progress_callback(completed_count, total_items)
+                    if cancelled() and not result["cancelled"]:
+                        result["cancelled"] = True
+                        # Cancel anything not yet started; in-flight exports finish
+                        for f in future_to_idx:
+                            f.cancel()
+
         total_elapsed = time.time() - total_start_time
-        print(f"Export completed! Total time: {total_elapsed:.2f}s for {total_images} images ({total_elapsed/total_images:.2f}s per image)")
+        print(f"Export finished in {total_elapsed:.2f}s: {result['exported']} exported, "
+              f"{result['failed']} failed{', cancelled' if result['cancelled'] else ''}")
+        return result
     
     def remove_image_by_index(self, idx: int):
         """

@@ -56,6 +56,7 @@ class CCRImage:
         self.temperature_base: int = 0   # Non-destructive base temperature offset; slider shows 0
         self.brightness_base: int = -8   # Non-destructive base brightness offset; slider shows 0
         self.histogram_image = None
+        self.original_full_size: Optional[tuple[int, int]] = None  # (height, width) of the full-res source, set by read_image
 
         self.info = self.get_camera_and_lens_for_lensfun(self.file_path)  # Extract camera and lens info for lensfun
         
@@ -148,6 +149,9 @@ class CCRImage:
                 with rawpy.imread(file_path) as raw:
                     # Capture sensor ceiling before postprocess (e.g. 16383 for 14-bit)
                     white_level = raw.white_level
+
+                    # Full processed output size, valid even when half_size=True
+                    self.original_full_size = (raw.sizes.height, raw.sizes.width)
 
                     # Check if this is a monochrome sensor
                     is_monochrome = False
@@ -293,6 +297,8 @@ class CCRImage:
             # Convert to 16-bit if needed
             if img.dtype != np.uint16:
                 img = img.astype(np.uint16) * 257 if img.dtype == np.uint8 else img
+            # This branch always reads at full resolution regardless of `preview`
+            self.original_full_size = (img.shape[0], img.shape[1])
             return img
         
     def update_thumbnail_and_preview(self, thumbnail_size: int = 156, preview_size: int = 1080) -> None:

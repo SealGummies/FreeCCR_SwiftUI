@@ -429,23 +429,25 @@ def safe_unicode_path(file_path: str) -> str:
     return os.path.normpath(file_path)
 
 
-def safe_cv2_imwrite(output_path: str, image: np.ndarray) -> bool:
+def safe_cv2_imwrite(output_path: str, image: np.ndarray, params=None) -> bool:
     """
     Safe image writing that handles Unicode file paths.
+    params: optional cv2 encode parameters, e.g. [cv2.IMWRITE_JPEG_QUALITY, 92]
     """
     output_path = safe_unicode_path(output_path)
+    params = params or []
     try:
         # Try normal cv2.imwrite first
-        success = cv2.imwrite(output_path, image)
+        success = cv2.imwrite(output_path, image, params)
         if success:
             return True
-        
+
         # If that fails, try encoding to bytes and using alternative method
         try:
             # Get file extension
             _, ext = os.path.splitext(output_path)
             # Encode image to memory buffer
-            success, buffer = cv2.imencode(ext, image)
+            success, buffer = cv2.imencode(ext, image, params)
             if success:
                 # Write buffer to file
                 with open(output_path, 'wb') as f:
@@ -477,7 +479,7 @@ def safe_tifffile_imwrite(output_path: str, image: np.ndarray, **kwargs) -> bool
 
 
 
-def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_out=False) -> np.ndarray:
+def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_out=False,jpg_quality=95,max_long_side=None) -> np.ndarray:
     """
     Normalize and align the image using the CCR algorithm, using a reference rectangle
     for percentile calculations instead of a crop factor.
@@ -812,13 +814,16 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
         # Ensure output_path has proper extension and handle Unicode
         step_start = time.time()
         output_path = safe_unicode_path(output_path)
+        if max_long_side:
+            rgb_brightness_normalized = ccr_image.resize_image_to_max_pixel(rgb_brightness_normalized, max_long_side)
         if jpg_out:
             output_path = os.path.splitext(output_path)[0] + ".jpg"
             # Convert to 8-bit for JPEG output
             rgb_brightness_normalized_8 = to_8bit(rgb_brightness_normalized)
             # Ensure output is RGB, not BGR
             rgb_brightness_normalized_8 = cv2.cvtColor(rgb_brightness_normalized_8, cv2.COLOR_RGB2BGR)
-            success = safe_cv2_imwrite(output_path, rgb_brightness_normalized_8)
+            success = safe_cv2_imwrite(output_path, rgb_brightness_normalized_8,
+                                       [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)])
             del rgb_brightness_normalized_8  # Clean up 8-bit copy
             if success:
                 print(f"Normalized image saved to {output_path}")
@@ -855,7 +860,8 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
     return rgb_brightness_normalized
 
 def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
-                               output_path=None, water_mark=True, jpg_out=False):
+                               output_path=None, water_mark=True, jpg_out=False,
+                               jpg_quality=95, max_long_side=None):
     """
     Film negative conversion using the same pipeline as ccr_normalize_with_reference
     but with explicit per-channel B/W points instead of auto-detected percentiles.
@@ -1014,11 +1020,14 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
 
         # Write file
         output_path = safe_unicode_path(output_path)
+        if max_long_side:
+            rgb_result = ccr_image.resize_image_to_max_pixel(rgb_result, max_long_side)
         if jpg_out:
             output_path = os.path.splitext(output_path)[0] + ".jpg"
             img_8 = to_8bit(rgb_result)
             img_8 = cv2.cvtColor(img_8, cv2.COLOR_RGB2BGR)
-            if not safe_cv2_imwrite(output_path, img_8):
+            if not safe_cv2_imwrite(output_path, img_8,
+                                    [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)]):
                 raise IOError(f"Failed to save image to {output_path}")
         else:
             output_path = os.path.splitext(output_path)[0] + ".tiff"
