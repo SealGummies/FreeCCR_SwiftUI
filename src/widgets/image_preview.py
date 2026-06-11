@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QToolBar, QMessageBox, QSlider, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsPathItem, QGraphicsEllipseItem,
     QGraphicsLineItem, QStyleOptionSlider, QDialog,
-    QLabel, QPushButton, QStyle, QSizePolicy, QApplication
+    QLabel, QPushButton, QStyle, QSizePolicy, QApplication, QComboBox
 )
 from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter,
                            QCursor, QDesktopServices, QPainterPath, QBrush, QPolygonF,
@@ -81,10 +81,13 @@ class GraphicsImageView(QGraphicsView):
         self.wb_pick_mode = False  # eyedropper: click a neutral point for auto temp/tint
 
         self._space_pan = False    # space held -> hand-drag panning
+        self._mid_pan = False      # middle button held -> drag panning
+        self._mid_pan_last = None  # last viewport pos during a middle-button pan
 
-        # Wheel zoom anchors at the cursor; clicking focuses the view so the
+        # Zoom anchoring is done manually in ImagePreview._apply_zoom (exact
+        # cursor/center anchoring); clicking focuses the view so the
         # space-pan key is received.
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setFocusPolicy(Qt.ClickFocus)
 
         # Disable scrollbars
@@ -92,6 +95,14 @@ class GraphicsImageView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def mousePressEvent(self, event):
+        if (event.button() == Qt.MiddleButton
+                and self.parent_widget.pixmap_item is not None):
+            # Middle-button drag pans the (zoomed) image — works in any mode
+            self._mid_pan = True
+            self._mid_pan_last = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
         if self._space_pan:
             # Space+drag pans the view (ScrollHandDrag handles the motion)
             return super().mousePressEvent(event)
@@ -137,6 +148,17 @@ class GraphicsImageView(QGraphicsView):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._mid_pan and self._mid_pan_last is not None:
+            # Pan by adjusting the (hidden) scrollbars — works even with
+            # ScrollBarAlwaysOff, the same mechanism ScrollHandDrag uses.
+            delta = event.pos() - self._mid_pan_last
+            self._mid_pan_last = event.pos()
+            hbar = self.horizontalScrollBar()
+            vbar = self.verticalScrollBar()
+            hbar.setValue(hbar.value() - delta.x())
+            vbar.setValue(vbar.value() - delta.y())
+            event.accept()
+            return
         if self._space_pan:
             return super().mouseMoveEvent(event)
         if self.parent_widget.crop_mode:
@@ -229,6 +251,12 @@ class GraphicsImageView(QGraphicsView):
             pass
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton and self._mid_pan:
+            self._mid_pan = False
+            self._mid_pan_last = None
+            self._restore_mode_cursor()
+            event.accept()
+            return
         if self._space_pan:
             return super().mouseReleaseEvent(event)
         if self.parent_widget.crop_mode:
@@ -391,7 +419,9 @@ class GraphicsImageView(QGraphicsView):
         # Take keyboard focus so space-pan is immediately available after a
         # zoom (ClickFocus alone would leave space going to other widgets)
         self.setFocus()
-        self.parent_widget.zoom_by(1.25 if delta > 0 else 0.8)
+        # The zoom center is the mouse location
+        self.parent_widget.zoom_by(1.25 if delta > 0 else 0.8,
+                                   anchor_vp=event.position().toPoint())
         event.accept()
 
     def _restore_mode_cursor(self):
@@ -537,6 +567,32 @@ class ImagePreview(QWidget):
         self.export_action.triggered.connect(self.open_export_dialog)
         self.toolbar.addAction(self.export_action)
 
+        # Zoom percentage dropdown (before Export). Percentages are relative
+        # to the source image's ACTUAL full resolution, not the preview size.
+        self.zoom_combo = QComboBox()
+        self.zoom_combo.addItems(["Fit", "25%", "50%", "100%", "200%"])
+        self.zoom_combo.setCurrentIndex(0)
+        self.zoom_combo.setFixedWidth(78)
+        # Editable + read-only line edit: lets the box DISPLAY arbitrary live
+        # percentages from wheel zoom while still being a pick-only dropdown.
+        self.zoom_combo.setEditable(True)
+        self.zoom_combo.lineEdit().setReadOnly(True)
+        self.zoom_combo.lineEdit().setAlignment(Qt.AlignCenter)
+        self.zoom_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.zoom_combo.setToolTip(
+            "Zoom level — percentages are relative to the image's actual size "
+            "(100% = one source pixel per screen pixel)")
+        self.zoom_combo.activated.connect(self._on_zoom_combo)
+        zoom_spacer_l = QWidget()
+        zoom_spacer_l.setFixedWidth(8)
+        zoom_spacer_l.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        zoom_spacer_r = QWidget()
+        zoom_spacer_r.setFixedWidth(8)
+        zoom_spacer_r.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.toolbar.insertWidget(self.export_action, zoom_spacer_l)
+        self.toolbar.insertWidget(self.export_action, self.zoom_combo)
+        self.toolbar.insertWidget(self.export_action, zoom_spacer_r)
+
         self.layout.addWidget(self.toolbar)
 
         # Graphics Scene/View
@@ -599,7 +655,8 @@ class ImagePreview(QWidget):
         # _zoom is relative to the fitted view (1.0 = fit). While zoomed past
         # the preview's native resolution, a hi-res re-render of the current
         # conversion is loaded asynchronously and displayed under identical
-        # scene geometry; zooming back out frees that memory again.
+        # scene geometry. The rendered detail is retained until the image is
+        # switched (zooming out keeps it cached for instant re-zoom).
         self._zoom = 1.0
         self._item_prescale = 1.0   # preview_width / displayed_pixmap_width
         self._hires = None          # cache for the CURRENT image only
@@ -766,6 +823,7 @@ class ImagePreview(QWidget):
             self.rotation_slider.setEnabled(False)
 
         self._update_unconvert_action_state()
+        self._sync_zoom_combo()
 
     def update_reference_rect(self, start, end):
         # Build the base (coarse) transform
@@ -996,39 +1054,162 @@ class ImagePreview(QWidget):
     # swapped in under identical scene geometry; zooming back out (or
     # switching images) frees that memory again.
 
-    MAX_ZOOM = 8.0
+    MAX_ZOOM = 8.0        # wheel ceiling, relative to the fitted view
+    MAX_PERCENT = 4.0     # absolute ceiling: 400% of the source's actual size
 
-    def zoom_by(self, factor):
-        """Zoom by a factor, anchored under the cursor; clamped to [fit, 8x]."""
+    def _compute_fit_scale(self):
+        """View scale (view px per scene px) that fitInView would produce for
+        the current pixmap item — recomputed from geometry so it stays correct
+        after window resizes while zoomed."""
+        if self.pixmap_item is None:
+            return 1.0
+        br = self.pixmap_item.mapToScene(
+            self.pixmap_item.boundingRect()).boundingRect()
+        vp = self.view.viewport().rect()
+        if br.width() <= 0 or br.height() <= 0:
+            return 1.0
+        return min(vp.width() / br.width(), vp.height() / br.height())
+
+    def _preview_to_source_ratio(self):
+        """preview-pixmap pixels per source (actual-size) pixel. The displayed
+        scene is in preview-pixmap pixel units, so percentage-of-actual needs
+        this factor. Returns None when the source size is unknown."""
+        img = ccr_backend.get_image_by_index(self.current_idx) if self.current_idx is not None else None
+        full = getattr(img, "original_full_size", None) if img is not None else None
+        if not full:
+            return None
+        source_long = max(full)
+        if source_long <= 0:
+            return None
+        preview_long = min(1080.0, float(source_long))  # how the preview was built
+        return preview_long / float(source_long)
+
+    def _max_zoom(self):
+        """Wheel/zoom ceiling as a multiple of fit: the larger of 8x fit or
+        whatever reaches MAX_PERCENT of the actual size."""
+        cap = self.MAX_ZOOM
+        ratio = self._preview_to_source_ratio()
+        fit = self._compute_fit_scale()
+        if ratio and fit > 0:
+            cap = max(cap, (self.MAX_PERCENT / ratio) / fit)
+        return cap
+
+    def zoom_by(self, factor, anchor_vp=None):
+        """Zoom by a factor, anchored under anchor_vp (the cursor) or the
+        viewport center; clamped to [fit, max]."""
         if self.pixmap_item is None or self.current_pixmap is None:
             return
-        new_zoom = max(1.0, min(self.MAX_ZOOM, self._zoom * factor))
+        new_zoom = max(1.0, min(self._max_zoom(), self._zoom * factor))
         if abs(new_zoom - self._zoom) < 1e-9:
             return
         if new_zoom <= 1.0:
             self._zoom = 1.0
-            self._fit_view_to_content()  # snap back to the exact fit
+            self._fit_view_to_content()  # snap back to the exact fit (centered)
         else:
-            actual = new_zoom / max(self._zoom, 1e-9)
-            self._zoom = new_zoom
-            self.view.scale(actual, actual)
-            if self.crop_mode and self._crop_overlay_item is not None:
-                self._draw_crop_overlay()  # handle sizes track the view scale
+            self._apply_zoom_scale(self._compute_fit_scale() * new_zoom,
+                                   new_zoom, anchor_vp=anchor_vp)
         self._update_hires_state()
+        self._sync_zoom_combo()
+
+    def _apply_zoom_scale(self, target_view_scale, new_zoom, anchor_vp=None):
+        """Set the absolute view scale, keeping the scene point under anchor_vp
+        (the cursor, or the viewport center) fixed — manual anchoring, since
+        the view uses NoAnchor."""
+        cur = self._view_scale()
+        if cur <= 0:
+            return
+        self._zoom = new_zoom
+        factor = target_view_scale / cur
+        if anchor_vp is None:
+            anchor_vp = self.view.viewport().rect().center()
+        old_scene = self.view.mapToScene(anchor_vp)
+        self.view.scale(factor, factor)
+        new_scene = self.view.mapToScene(anchor_vp)
+        delta = new_scene - old_scene
+        self.view.translate(delta.x(), delta.y())
+        if self.crop_mode and self._crop_overlay_item is not None:
+            self._draw_crop_overlay()  # handle sizes track the view scale
+
+    def zoom_to_percent(self, pct):
+        """Zoom to an absolute percentage of the source's ACTUAL size (1.0 =
+        100% = one source pixel per screen pixel). Anchors on the current
+        frame center; if the whole image fits at that scale, centers it."""
+        if self.pixmap_item is None or self.current_pixmap is None:
+            return
+        ratio = self._preview_to_source_ratio()
+        fit = self._compute_fit_scale()
+        if not ratio or fit <= 0:
+            return
+        pct = min(pct, self.MAX_PERCENT)
+        target_view_scale = pct / ratio
+        new_zoom = target_view_scale / fit
+        # Whole image is visible whenever the requested scale is <= fit
+        if new_zoom <= 1.0 + 1e-9:
+            self._zoom = 1.0
+            self._fit_view_to_content()  # fit shows the entire image, centered
+        else:
+            self._apply_zoom_scale(target_view_scale, new_zoom)
+        self._update_hires_state()
+        self._sync_zoom_combo()
+
+    def zoom_to_fit(self):
+        self._zoom = 1.0
+        self._fit_view_to_content()
+        self._update_hires_state()
+        self._sync_zoom_combo()
+
+    def _current_percent(self):
+        """Current zoom as a fraction of the source's actual size, or None."""
+        ratio = self._preview_to_source_ratio()
+        if not ratio:
+            return None
+        return self._view_scale() * ratio
 
     def _zoomed_in_enough(self):
         """True when preview pixels are magnified — i.e. detail would help."""
         return self._zoom > 1.0 and self._view_scale() > 1.05
 
     def _update_hires_state(self):
+        # Keep any rendered detail in memory until the image is switched
+        # (per user request) — only request when zoomed in; never release on
+        # zoom-out. Falling back to the preview pixmap for display is handled
+        # by _refresh_item_pixmap (which gates on _zoomed_in_enough()).
         if self._zoomed_in_enough():
             self._maybe_request_hires()
-        else:
-            self._release_hires()
+        elif self.pixmap_item is not None:
+            self._refresh_item_pixmap()
+            self.apply_transformations()
 
     def _reset_zoom(self):
         self._zoom = 1.0
+        # Image-level reset (rotate/flip/undo/crop entry): the cached detail
+        # no longer matches the geometry, so free it here.
         self._release_hires(refresh=False)
+        self._sync_zoom_combo()
+
+    def _on_zoom_combo(self, index):
+        text = self.zoom_combo.itemText(index)
+        if text == "Fit":
+            self.zoom_to_fit()
+        else:
+            try:
+                pct = float(text.rstrip('%')) / 100.0
+            except ValueError:
+                return
+            self.zoom_to_percent(pct)
+
+    def _sync_zoom_combo(self):
+        """Reflect the current zoom in the toolbar dropdown without firing it."""
+        if not hasattr(self, "zoom_combo"):
+            return
+        if self._zoom <= 1.0 + 1e-9:
+            label = "Fit"
+        else:
+            pct = self._current_percent()
+            label = f"{round(pct * 100)}%" if pct else "Fit"
+        self.zoom_combo.blockSignals(True)
+        self.zoom_combo.setCurrentText(label)
+        self.zoom_combo.blockSignals(False)
 
     def _hires_signature(self, img):
         """Identity of the conversion baked into the preview, taken from the
@@ -1271,11 +1452,16 @@ class ImagePreview(QWidget):
         self._pending_crop_local = None
         self._pending_crop_angle = 0.0
         self._crop_drag = None
+        # Entering crop always shows the entire image at the fitted view, so
+        # the whole frame (and the crop box over it) is visible.
+        self._zoom = 1.0
+        self._release_hires(refresh=False)
         self._crop_rerender = True
         try:
             self.update_preview(self.current_idx)  # re-render un-cropped
         finally:
             self._crop_rerender = False
+        self._sync_zoom_combo()
         crop = getattr(img_obj, "crop_rect", None)
         if crop is not None and self.current_pixmap is not None:
             w, h = self.current_pixmap.width(), self.current_pixmap.height()
