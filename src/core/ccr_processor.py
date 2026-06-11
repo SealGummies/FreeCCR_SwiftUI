@@ -772,6 +772,11 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
             )
         x1, y1, x2, y2 = final_mapped_rect
         del final_mapped_rect  # Clean up as it's no longer needed
+        if getattr(ccr_image, 'crop_rect', None) is not None:
+            # A crop invalidates the reference-rect scaling above — anchor
+            # the watermark to the output's bottom-right corner instead
+            # (same as the bwpoint pipeline).
+            y2, x2 = rgb_brightness_normalized.shape[:2]
         step_start = time.time()
         if water_mark:
             # Ensure the array is contiguous for OpenCV

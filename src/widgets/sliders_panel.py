@@ -513,8 +513,15 @@ class SlidersPanel(QWidget):
     def _end_undo_burst(self):
         self._undo_burst_active = False
 
+    def end_undo_burst(self):
+        """End any in-progress slider undo burst (after an undo or an action
+        that pushes its own snapshot) so the next change gets a fresh one."""
+        self._end_undo_burst()
+        self._undo_burst_timer.stop()
+
     def on_reset_clicked(self):
         # Reset is a single undoable action
+        self.end_undo_burst()
         img = ccr_backend.get_image_by_index(self.current_idx) if self.current_idx is not None else None
         if img is not None:
             img.push_undo_state()
@@ -571,12 +578,15 @@ class SlidersPanel(QWidget):
     
     def _perform_sync_to_all(self):
         """Perform the actual sync operation after UI update."""
-        # Each image gets its own undo snapshot so Ctrl+Z can revert the sync
-        # on whichever image is selected.
-        for img in ccr_backend.images:
-            img.push_undo_state()
+        self.end_undo_burst()
         # Get the current adjustment settings
         current_adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
+        # Each image whose settings will actually change gets its own undo
+        # snapshot, so Ctrl+Z can revert the sync on whichever image is
+        # selected — without dead no-op entries on already-matching images.
+        for img in ccr_backend.images:
+            if img.adjustment_settings != current_adjustment:
+                img.push_undo_state()
         print(f"Syncing adjustment to all images: {current_adjustment}")
         
         # Apply to all images in the backend
@@ -603,6 +613,8 @@ class SlidersPanel(QWidget):
 
     def on_wb_sampled(self, temp_value, tint_value):
         """Apply the auto-computed temperature/tint from the WB eyedropper."""
+        # The WB pick is its own undo step — don't merge it into a slider burst
+        self.end_undo_burst()
         temp_idx = self.adjustment_keys.index("temperature")
         tint_idx = self.adjustment_keys.index("tint")
         for idx, val in ((temp_idx, temp_value), (tint_idx, tint_value)):
@@ -711,6 +723,7 @@ class SlidersPanel(QWidget):
         """
         if self.current_idx is not None and self.copied_adjustment is not None:
             print(f"Pasting adjustment settings: {self.copied_adjustment}")
+            self.end_undo_burst()
             img = ccr_backend.get_image_by_index(self.current_idx)
             if img is not None:
                 img.push_undo_state()

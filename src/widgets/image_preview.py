@@ -558,16 +558,24 @@ class ImagePreview(QWidget):
         # (image switch, slider change, conversion, ...).
         if self.crop_mode and not self._crop_rerender:
             self._exit_crop_mode()
+        # The fine-rotation burst belongs to the previous image; a switch
+        # must end it so the next image's first drag gets its own snapshot.
+        if idx != self.current_idx:
+            self._end_fine_rot_burst()
+            self._fine_rot_burst_timer.stop()
 
         preview_img = ccr_backend.get_preview_by_index(idx)
         self.current_idx = idx
 
         # Display-level crop: show only the cropped region, except in crop
         # mode where the full image is shown so the user can adjust/regret.
+        # Skipped for un-converted images: the crop tool is disabled there,
+        # and the full negative (incl. film base) is needed to draw frames.
         self._crop_display_offset = (0, 0)
         crop = getattr(ccr_backend.images[idx], "crop_rect", None)
         if (preview_img is not None and not preview_img.isNull()
-                and crop is not None and not self.crop_mode):
+                and crop is not None and not self.crop_mode
+                and ccr_backend.images[idx].converted):
             px_rect = self._crop_rect_to_pixels(crop, preview_img)
             if px_rect is not None:
                 preview_img = preview_img.copy(px_rect)
@@ -598,13 +606,18 @@ class ImagePreview(QWidget):
             if ref:
                 x1, y1, x2, y2 = ref
                 # Backend rect is in full-image coords; shift into the
-                # displayed (possibly cropped) pixmap's coordinate space.
+                # displayed (possibly cropped) pixmap's coordinate space and
+                # clip to it so no dashed lines float beside the image.
                 dx, dy = self._crop_display_offset
                 rect = QRectF(x1 - dx, y1 - dy, x2 - x1, y2 - y1)
-                self.reference_rect_item = QGraphicsRectItem(rect)
-                pen = QPen(QColor(255, 0, 0, 180), 2, Qt.DashLine)
-                self.reference_rect_item.setPen(pen)
-                self.scene.addItem(self.reference_rect_item)
+                if self._crop_display_offset != (0, 0):
+                    rect = rect.intersected(
+                        QRectF(0, 0, preview_img.width(), preview_img.height()))
+                if not rect.isEmpty():
+                    self.reference_rect_item = QGraphicsRectItem(rect)
+                    pen = QPen(QColor(255, 0, 0, 180), 2, Qt.DashLine)
+                    self.reference_rect_item.setPen(pen)
+                    self.scene.addItem(self.reference_rect_item)
 
             else:
                 # Show hint when no reference frame exists
@@ -688,9 +701,12 @@ class ImagePreview(QWidget):
             base_transform.rotate(self.current_rotation)
         base_transform.translate(-cx, -cy)
 
-        # Fine rotation (only for image)
+        # Fine rotation (only for image). Suppressed while in crop mode so
+        # the displayed image, the dim overlay, and the drag-to-rect mapping
+        # (all base-transform-only) share the same coordinate space — the
+        # selection then bounds exactly the pixels the crop keeps.
         img_transform = QTransform(base_transform)
-        if self.current_fine_rotation:
+        if self.current_fine_rotation and not self.crop_mode:
             img_transform.translate(cx, cy)
             img_transform.rotate(self.current_fine_rotation / 100.0)
             img_transform.translate(-cx, -cy)
@@ -701,11 +717,25 @@ class ImagePreview(QWidget):
         if self.reference_rect_item:
             self.reference_rect_item.setTransform(base_transform)
 
+        # Crop overlay follows the same coarse transform, so toolbar
+        # rotates/flips during crop mode keep it aligned with the image
+        if self._crop_overlay_item is not None:
+            try:
+                self._crop_overlay_item.setTransform(base_transform)
+            except RuntimeError:
+                self._crop_overlay_item = None
+
         # Always fit the view to the content consistently
         self._fit_view_to_content()
 
     def _end_fine_rot_burst(self):
         self._fine_rot_burst_active = False
+
+    def end_undo_bursts(self):
+        """End any in-progress fine-rotation undo burst, e.g. after an undo,
+        so the next change gets its own snapshot."""
+        self._end_fine_rot_burst()
+        self._fine_rot_burst_timer.stop()
 
     def _on_slider_rotate(self, value):
         # Snapshot once per burst, and only for real user changes (the slider
@@ -792,6 +822,9 @@ class ImagePreview(QWidget):
 
     def set_bwpoint_mode(self, mode):
         """mode: 'black' | 'white' | None"""
+        if mode and self.crop_mode:
+            # Pick modes and crop mode are mutually exclusive in both directions
+            self.cancel_crop_mode()
         self.view.bwpoint_mode = mode
         self.view.wb_pick_mode = False
         self.view.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
@@ -799,6 +832,8 @@ class ImagePreview(QWidget):
     def set_wb_pick_mode(self, enabled):
         """Eyedropper mode: next click on the image picks a neutral point
         for automatic temperature/tint adjustment."""
+        if enabled and self.crop_mode:
+            self.cancel_crop_mode()
         self.view.wb_pick_mode = enabled
         self.view.bwpoint_mode = None
         self.view.setCursor(_eyedropper_cursor() if enabled else Qt.ArrowCursor)
@@ -884,6 +919,10 @@ class ImagePreview(QWidget):
         y1 = max(0.0, min(float(h), min(s.y(), e.y())))
         x2 = max(0.0, min(float(w), max(s.x(), e.x())))
         y2 = max(0.0, min(float(h), max(s.y(), e.y())))
+        if (x2 - x1) < 3 and (y2 - y1) < 3:
+            # Stray click, not a drag — keep the current selection so the
+            # display keeps matching what Enter will confirm.
+            return
         self._pending_crop_local = QRectF(x1, y1, x2 - x1, y2 - y1)
         self._draw_crop_overlay()
 
@@ -914,6 +953,18 @@ class ImagePreview(QWidget):
         self.scene.addItem(item)
         self._crop_overlay_item = item
 
+    @staticmethod
+    def _crops_equal(a, b, w, h):
+        """Sub-pixel-tolerant comparison of normalized crop rects, so an
+        unchanged selection round-tripped through pixel coords does not
+        register as a change (and push a junk undo snapshot)."""
+        if a is None or b is None:
+            return a is b
+        tol_x = 0.5 / max(w, 1)
+        tol_y = 0.5 / max(h, 1)
+        return (abs(a[0] - b[0]) < tol_x and abs(a[2] - b[2]) < tol_x
+                and abs(a[1] - b[1]) < tol_y and abs(a[3] - b[3]) < tol_y)
+
     def confirm_crop(self):
         """Enter pressed in crop mode: store the selection as the new crop.
         Display-level only — the conversion result is untouched."""
@@ -921,23 +972,37 @@ class ImagePreview(QWidget):
             return
         img_obj = ccr_backend.get_image_by_index(self.current_idx)
         sel = self._pending_crop_local
-        if (img_obj is not None and sel is not None and self.current_pixmap is not None
-                and sel.width() >= 10 and sel.height() >= 10):
+        applied = False
+        cleared = False
+        too_small = False
+        if img_obj is not None and sel is not None and self.current_pixmap is not None:
             w, h = self.current_pixmap.width(), self.current_pixmap.height()
-            new_crop = (max(0.0, sel.left() / w), max(0.0, sel.top() / h),
-                        min(1.0, sel.right() / w), min(1.0, sel.bottom() / h))
-            # Selecting (almost) the whole image clears the crop
-            if (new_crop[0] <= 0.001 and new_crop[1] <= 0.001
-                    and new_crop[2] >= 0.999 and new_crop[3] >= 0.999):
-                new_crop = None
-            if new_crop != img_obj.crop_rect:
-                img_obj.push_undo_state()
-                img_obj.crop_rect = new_crop
+            if sel.width() >= 10 and sel.height() >= 10:
+                new_crop = (max(0.0, sel.left() / w), max(0.0, sel.top() / h),
+                            min(1.0, sel.right() / w), min(1.0, sel.bottom() / h))
+                # Selecting (almost) the whole image clears the crop
+                if (new_crop[0] <= 0.001 and new_crop[1] <= 0.001
+                        and new_crop[2] >= 0.999 and new_crop[3] >= 0.999):
+                    new_crop = None
+                if not self._crops_equal(new_crop, img_obj.crop_rect, w, h):
+                    img_obj.push_undo_state()
+                    img_obj.crop_rect = new_crop
+                    applied = True
+                    cleared = new_crop is None
+            else:
+                too_small = True
         self._exit_crop_mode()
         self.update_preview(self.current_idx)
+        if cleared:
+            hint = "Crop cleared. Ctrl+Z to undo."
+        elif applied:
+            hint = "Crop applied. Ctrl+Z to undo, or press Crop again to adjust."
+        elif too_small:
+            hint = "Selection too small — crop unchanged."
+        else:
+            hint = "Crop unchanged."
         try:
-            self.parent().parent().sliders_panel.set_temporary_hint(
-                "Crop applied. Ctrl+Z to undo, or press Crop again to adjust.", duration=4000)
+            self.parent().parent().sliders_panel.set_temporary_hint(hint, duration=4000)
         except AttributeError:
             pass
 

@@ -98,6 +98,10 @@ class MainWindow(QMainWindow):
     def undo_last_action(self):
         """Restore the current image's previous state (adjustments, crop,
         rotation, flips). Each Ctrl+Z press pops one more snapshot."""
+        # While Compare is held, the backend holds a temporary zeroed state
+        # that the button release will overwrite — undoing now would be lost.
+        if hasattr(self.sliders_panel, "_original_adjustment"):
+            return
         idx = self.image_preview.current_idx
         img = ccr_backend.get_image_by_index(idx) if idx is not None else None
         if img is None:
@@ -105,6 +109,10 @@ class MainWindow(QMainWindow):
         if not img.pop_undo_state():
             self.sliders_panel.set_temporary_hint("Nothing to undo.", duration=2000)
             return
+        # End the coalescing bursts so the next edit pushes a fresh snapshot
+        # of the just-restored state instead of merging into a stale burst.
+        self.sliders_panel.end_undo_burst()
+        self.image_preview.end_undo_bursts()
         img.update_thumbnail_and_preview()
         self.thumbnail_list.update_thumbnail(idx)
         self.image_preview.update_preview(idx)
