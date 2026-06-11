@@ -8,6 +8,7 @@ Exercises a headless ImagePreview with an explicitly sized viewport.
 import os
 import sys
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -27,8 +28,10 @@ from widgets.image_preview import ImagePreview  # noqa: E402
 
 
 class _StubImage:
-    def __init__(self, source_long, source_short):
+    def __init__(self, source_long, source_short, preview_long, preview_short):
         self.original_full_size = (source_short, source_long)  # (h, w)
+        # The working/preview image resolution — what the ratio is derived from
+        self.resized_raw = np.zeros((preview_short, preview_long, 3), dtype=np.uint16)
         self.converted = False
 
 
@@ -69,7 +72,7 @@ def _setup_preview(source_w=8660, source_h=5773, preview_w=1080, preview_h=720,
     host.show()
     _app.processEvents()
 
-    ccr_backend.images = [_StubImage(source_w, source_h)]
+    ccr_backend.images = [_StubImage(source_w, source_h, preview_w, preview_h)]
     ip.current_idx = 0
     ip._current_image_ref = ccr_backend.images[0]
 
@@ -100,6 +103,14 @@ class TestPercentRatio:
         # Source smaller than 1080 -> preview is full size -> ratio 1.0
         ip = _setup_preview(source_w=800, source_h=600, preview_w=800, preview_h=600)
         assert ip._preview_to_source_ratio() == pytest.approx(1.0)
+
+    def test_ratio_uses_actual_preview_for_raw_half_decode(self):
+        # RAW: full 2000px source, but the preview is built from the HALF-size
+        # decode (~1000px, not downscaled since <1080). The ratio must reflect
+        # the ACTUAL 1000px preview (0.5), not min(1080,2000)/2000 = 0.54.
+        ip = _setup_preview(source_w=2000, source_h=1334,
+                            preview_w=1000, preview_h=667)
+        assert ip._preview_to_source_ratio() == pytest.approx(1000.0 / 2000.0)
 
     def test_ratio_none_without_source_size(self):
         ip = _setup_preview()

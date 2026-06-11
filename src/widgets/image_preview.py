@@ -95,14 +95,24 @@ class GraphicsImageView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def mousePressEvent(self, event):
-        if (event.button() == Qt.MiddleButton
-                and self.parent_widget.pixmap_item is not None):
-            # Middle-button drag pans the (zoomed) image — works in any mode
-            self._mid_pan = True
-            self._mid_pan_last = event.pos()
-            self.setCursor(Qt.ClosedHandCursor)
+        if self._mid_pan:
+            # Already panning — swallow any other button so it can't start a
+            # reference/crop/B-W interaction underneath the pan.
             event.accept()
             return
+        if (event.button() == Qt.MiddleButton
+                and self.parent_widget.pixmap_item is not None):
+            # Middle-button drag pans the (zoomed) image — works in any mode,
+            # but not while another interaction or space-pan is already active.
+            interaction_active = (self.drawing_reference or self._space_pan
+                                  or self._bw_drag_start is not None
+                                  or self.parent_widget.crop_mode)
+            if not interaction_active:
+                self._mid_pan = True
+                self._mid_pan_last = event.pos()
+                self.setCursor(Qt.ClosedHandCursor)
+                event.accept()
+                return
         if self._space_pan:
             # Space+drag pans the view (ScrollHandDrag handles the motion)
             return super().mousePressEvent(event)
@@ -251,10 +261,13 @@ class GraphicsImageView(QGraphicsView):
             pass
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MiddleButton and self._mid_pan:
-            self._mid_pan = False
-            self._mid_pan_last = None
-            self._restore_mode_cursor()
+        if self._mid_pan:
+            if event.button() == Qt.MiddleButton:
+                self._mid_pan = False
+                self._mid_pan_last = None
+                self._restore_mode_cursor()
+            # Swallow any release while panning (other buttons never started
+            # an interaction, so nothing to finalize).
             event.accept()
             return
         if self._space_pan:
@@ -1073,16 +1086,22 @@ class ImagePreview(QWidget):
     def _preview_to_source_ratio(self):
         """preview-pixmap pixels per source (actual-size) pixel. The displayed
         scene is in preview-pixmap pixel units, so percentage-of-actual needs
-        this factor. Returns None when the source size is unknown."""
+        this factor. Returns None when the source size is unknown.
+
+        The factor is taken from the ACTUAL working-image resolution
+        (resized_raw), not re-derived from the 1080 resize policy: RAW is
+        decoded at HALF size before the 1080 downscale, so a low-res RAW's
+        preview can be well below min(1080, full_long)."""
         img = ccr_backend.get_image_by_index(self.current_idx) if self.current_idx is not None else None
         full = getattr(img, "original_full_size", None) if img is not None else None
-        if not full:
+        rr = getattr(img, "resized_raw", None) if img is not None else None
+        if not full or rr is None:
             return None
         source_long = max(full)
-        if source_long <= 0:
+        preview_long = max(rr.shape[:2])  # the working/preview pixel resolution
+        if source_long <= 0 or preview_long <= 0:
             return None
-        preview_long = min(1080.0, float(source_long))  # how the preview was built
-        return preview_long / float(source_long)
+        return float(preview_long) / float(source_long)
 
     def _max_zoom(self):
         """Wheel/zoom ceiling as a multiple of fit: the larger of 8x fit or
@@ -1099,6 +1118,13 @@ class ImagePreview(QWidget):
         viewport center; clamped to [fit, max]."""
         if self.pixmap_item is None or self.current_pixmap is None:
             return
+        # Re-derive _zoom from the live transform first: a window resize while
+        # zoomed preserves the absolute transform but changes the fit scale, so
+        # the stored _zoom (a multiple of fit) would otherwise be stale and the
+        # next wheel step would jump discontinuously.
+        fit = self._compute_fit_scale()
+        if fit > 0:
+            self._zoom = max(1.0, self._view_scale() / fit)
         new_zoom = max(1.0, min(self._max_zoom(), self._zoom * factor))
         if abs(new_zoom - self._zoom) < 1e-9:
             return
@@ -1209,6 +1235,12 @@ class ImagePreview(QWidget):
             label = f"{round(pct * 100)}%" if pct else "Fit"
         self.zoom_combo.blockSignals(True)
         self.zoom_combo.setCurrentText(label)
+        # setCurrentText on an editable combo doesn't move currentIndex, which
+        # leaves the open dropdown highlighting the wrong row — align it when
+        # the label matches a listed item.
+        match = self.zoom_combo.findText(label)
+        if match >= 0:
+            self.zoom_combo.setCurrentIndex(match)
         self.zoom_combo.blockSignals(False)
 
     def _hires_signature(self, img):
