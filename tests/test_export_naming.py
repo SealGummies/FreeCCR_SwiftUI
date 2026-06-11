@@ -58,19 +58,22 @@ class TestSanitizeFilename:
 
 class TestBuildFilename:
     def test_default_ccr_convention(self):
-        # Matches the legacy "{base}_ccr.tiff" naming
-        out = build_filename("photo", "", "_ccr", ".tiff", seq=1, seq_width=3, now=NOW)
+        # The default "{name}_ccr" template matches the legacy "{base}_ccr.tiff" naming
+        out = build_filename("photo", "{name}_ccr", ".tiff", seq=1, seq_width=3, now=NOW)
         assert out == "photo_ccr.tiff"
 
-    def test_prefix_and_suffix_with_macros(self):
-        out = build_filename("roll1", "{date}_", "_{seq}", ".jpg", seq=2, seq_width=3, now=NOW)
+    def test_template_with_macros(self):
+        out = build_filename("roll1", "{date}_{name}_{seq}", ".jpg", seq=2, seq_width=3, now=NOW)
         assert out == "2026-06-10_roll1_002.jpg"
 
-    def test_empty_prefix_suffix_keeps_base(self):
-        assert build_filename("scan", "", "", ".tiff", seq=1, seq_width=3, now=NOW) == "scan.tiff"
+    def test_template_without_name_macro(self):
+        assert build_filename("scan", "output", ".tiff", seq=1, seq_width=3, now=NOW) == "output.tiff"
+
+    def test_empty_template_falls_back_to_base(self):
+        assert build_filename("scan", "", ".tiff", seq=1, seq_width=3, now=NOW) == "scan.tiff"
 
     def test_sanitization_applied_to_whole_stem(self):
-        out = build_filename("a/b", "x:", "", ".jpg", seq=1, seq_width=3, now=NOW)
+        out = build_filename("a/b", "x:{name}", ".jpg", seq=1, seq_width=3, now=NOW)
         assert out == "x_a_b.jpg"
 
 
@@ -95,24 +98,28 @@ class TestUniquifyInBatch:
 
 class TestBuildExportNames:
     def test_seq_width_minimum_three(self):
-        out = build_export_names(["a"], "{seq}_", "", ".jpg", now=NOW)
+        out = build_export_names(["a"], "{seq}_{name}", ".jpg", now=NOW)
         assert out == ["001_a.jpg"]
 
     def test_seq_width_grows_with_count(self):
         bases = [f"img{i}" for i in range(1500)]
-        out = build_export_names(bases, "{seq}_", "", ".jpg", now=NOW)
+        out = build_export_names(bases, "{seq}_{name}", ".jpg", now=NOW)
         assert out[0] == "0001_img0.jpg"
         assert out[-1] == "1500_img1499.jpg"
 
-    def test_date_only_suffix_forces_in_batch_dedup(self):
+    def test_name_only_template_forces_in_batch_dedup(self):
         # Identical stems after macro expansion must still be unique
-        out = build_export_names(["a", "b"], "", "", ".jpg", now=NOW)
+        out = build_export_names(["a", "b"], "{name}", ".jpg", now=NOW)
         assert out == ["a.jpg", "b.jpg"]
-        out = build_export_names(["same", "same"], "", "_{date}", ".jpg", now=NOW)
+        out = build_export_names(["same", "same"], "{name}_{date}", ".jpg", now=NOW)
         assert out == ["same_2026-06-10.jpg", "same_2026-06-10-1.jpg"]
 
+    def test_template_without_name_dedups_whole_batch(self):
+        out = build_export_names(["x", "y", "z"], "{date}", ".jpg", now=NOW)
+        assert out == ["2026-06-10.jpg", "2026-06-10-1.jpg", "2026-06-10-2.jpg"]
+
     def test_legacy_convention_for_batch(self):
-        out = build_export_names(["p1", "p2"], "", "_ccr", ".tiff", now=NOW)
+        out = build_export_names(["p1", "p2"], "{name}_ccr", ".tiff", now=NOW)
         assert out == ["p1_ccr.tiff", "p2_ccr.tiff"]
 
 
@@ -146,7 +153,7 @@ class TestResolveConflicts:
 class TestCombinedScenario:
     def test_full_pipeline(self):
         bases = ["roll1_001", "roll1_001", "roll1_002"]
-        names = build_export_names(bases, "", "_{date}", ".jpg", now=NOW)
+        names = build_export_names(bases, "{name}_{date}", ".jpg", now=NOW)
         assert names == [
             "roll1_001_2026-06-10.jpg",
             "roll1_001_2026-06-10-1.jpg",

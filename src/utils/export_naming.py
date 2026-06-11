@@ -17,11 +17,11 @@ _INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 def expand_macros(template: str, *, base_name: str, seq: int, seq_width: int, now: datetime) -> str:
     """
-    Expand {date}, {time}, {seq} and {name} macros in a prefix/suffix template.
+    Expand {date}, {time}, {seq} and {name} macros in a filename template.
     Unknown {...} tokens are left literal.
 
     Args:
-        template (str): The prefix or suffix template
+        template (str): The filename stem template, e.g. "{name}_ccr"
         base_name (str): Original file base name (no extension)
         seq (int): 1-based sequence number of this file in the batch
         seq_width (int): Zero-padding width for {seq}
@@ -47,20 +47,16 @@ def sanitize_filename(name: str) -> str:
     return _INVALID_CHARS_RE.sub("_", name).rstrip(". ")
 
 
-def build_filename(base_name: str, prefix: str, suffix: str, ext: str, *,
+def build_filename(base_name: str, template: str, ext: str, *,
                    seq: int, seq_width: int, now: datetime) -> str:
     """
-    Build a single output filename: expanded prefix + base name + expanded
-    suffix + extension, sanitized for the filesystem.
+    Build a single output filename from a stem template (e.g. "{name}_ccr"),
+    expanding macros and sanitizing for the filesystem.
 
     Args:
         ext (str): Extension including the leading dot, e.g. ".tiff"
     """
-    stem = (
-        expand_macros(prefix, base_name=base_name, seq=seq, seq_width=seq_width, now=now)
-        + base_name
-        + expand_macros(suffix, base_name=base_name, seq=seq, seq_width=seq_width, now=now)
-    )
+    stem = expand_macros(template, base_name=base_name, seq=seq, seq_width=seq_width, now=now)
     stem = sanitize_filename(stem)
     if not stem:
         stem = base_name or "image"
@@ -72,7 +68,8 @@ def uniquify_in_batch(names: Sequence[str]) -> List[str]:
     Make a list of filenames unique within itself (case-insensitive). The
     first occurrence keeps its name; later duplicates get -1, -2, ... before
     the extension. Always applied regardless of conflict policy, since a
-    macro-only suffix (e.g. just {date}) would otherwise collide every file.
+    template without {name} or {seq} (e.g. just "{date}") would otherwise
+    collide every file.
     """
     seen = set()
     result = []
@@ -95,14 +92,15 @@ def uniquify_in_batch(names: Sequence[str]) -> List[str]:
     return result
 
 
-def build_export_names(base_names: Sequence[str], prefix: str, suffix: str, ext: str,
+def build_export_names(base_names: Sequence[str], template: str, ext: str,
                        now: Optional[datetime] = None) -> List[str]:
     """
-    Build the full list of output filenames for a batch, expanding macros and
-    guaranteeing in-batch uniqueness.
+    Build the full list of output filenames for a batch from a stem template,
+    expanding macros and guaranteeing in-batch uniqueness.
 
     Args:
         base_names: Original file base names (no extension), in export order
+        template: Stem template, e.g. "{name}_ccr"
         ext (str): Extension including the leading dot, e.g. ".jpg"
         now: Timestamp for {date}/{time}; defaults to datetime.now()
 
@@ -113,7 +111,7 @@ def build_export_names(base_names: Sequence[str], prefix: str, suffix: str, ext:
         now = datetime.now()
     seq_width = max(3, len(str(len(base_names))))
     names = [
-        build_filename(base, prefix, suffix, ext, seq=i + 1, seq_width=seq_width, now=now)
+        build_filename(base, template, ext, seq=i + 1, seq_width=seq_width, now=now)
         for i, base in enumerate(base_names)
     ]
     return uniquify_in_batch(names)

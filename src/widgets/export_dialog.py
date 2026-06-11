@@ -1,5 +1,5 @@
 """
-Export settings dialog: scope, destination, prefix/suffix naming with macros,
+Export settings dialog: scope, destination, filename template with macros,
 format + JPEG quality with live size estimate, resize-on-export, conflict
 policy and persisted preferences.
 """
@@ -95,20 +95,16 @@ class ExportSettingsDialog(QDialog):
         naming_group = QGroupBox("File naming")
         naming_layout = QVBoxLayout(naming_group)
         fields_layout = QHBoxLayout()
-        fields_layout.addWidget(QLabel("Prefix"))
-        self.prefix_edit = QLineEdit()
-        fields_layout.addWidget(self.prefix_edit, 1)
-        fields_layout.addWidget(QLabel("Suffix"))
-        self.suffix_edit = QLineEdit()
-        fields_layout.addWidget(self.suffix_edit, 1)
+        fields_layout.addWidget(QLabel("Filename"))
+        self.filename_edit = QLineEdit("{name}_ccr")
+        fields_layout.addWidget(self.filename_edit, 1)
         naming_layout.addLayout(fields_layout)
-        hint = QLabel("Macros: {date}  {time}  {seq}  {name}")
+        hint = QLabel("Macros: {name} = original filename, {date}, {time}, {seq}")
         hint.setStyleSheet("color: gray;")
         naming_layout.addWidget(hint)
         self.example_label = QLabel("")
         naming_layout.addWidget(self.example_label)
-        self.prefix_edit.textChanged.connect(self._update_example)
-        self.suffix_edit.textChanged.connect(self._update_example)
+        self.filename_edit.textChanged.connect(self._update_example)
         layout.addWidget(naming_group)
 
         # Format / quality / estimate / resize / conflicts
@@ -186,8 +182,7 @@ class ExportSettingsDialog(QDialog):
 
         if s.value("export/scope", "all", type=str) == "current" and self._current_converted:
             self.scope_current_radio.setChecked(True)
-        self.prefix_edit.setText(s.value("export/prefix", "", type=str))
-        self.suffix_edit.setText(s.value("export/suffix", "_ccr", type=str))
+        self.filename_edit.setText(s.value("export/filename_template", "{name}_ccr", type=str))
         fmt_index = self.format_combo.findData(s.value("export/format", "tiff", type=str))
         if fmt_index >= 0:
             self.format_combo.setCurrentIndex(fmt_index)
@@ -205,8 +200,7 @@ class ExportSettingsDialog(QDialog):
         s = self._settings
         s.setValue("export/destination", self.dest_edit.text().strip())
         s.setValue("export/scope", "current" if self.scope_current_radio.isChecked() else "all")
-        s.setValue("export/prefix", self.prefix_edit.text())
-        s.setValue("export/suffix", self.suffix_edit.text())
+        s.setValue("export/filename_template", self.filename_edit.text())
         s.setValue("export/format", self.format_combo.currentData())
         s.setValue("export/jpeg_quality", self.quality_slider.value())
         s.setValue("export/resize", self.resize_combo.currentData())
@@ -279,9 +273,8 @@ class ExportSettingsDialog(QDialog):
             return
         base = self._base_names(indices[:1])[0]
         seq_width = max(3, len(str(len(indices))))
-        name = build_filename(base, self.prefix_edit.text(), self.suffix_edit.text(),
-                              self._selected_ext(), seq=1, seq_width=seq_width,
-                              now=datetime.now())
+        name = build_filename(base, self.filename_edit.text(), self._selected_ext(),
+                              seq=1, seq_width=seq_width, now=datetime.now())
         self.example_label.setText(f"Example: {name}")
 
     # ---------- size estimate ----------
@@ -345,8 +338,8 @@ class ExportSettingsDialog(QDialog):
                                     "There are no converted images to export.")
             return
 
-        names = build_export_names(self._base_names(indices), self.prefix_edit.text(),
-                                   self.suffix_edit.text(), self._selected_ext())
+        names = build_export_names(self._base_names(indices), self.filename_edit.text(),
+                                   self._selected_ext())
         full_paths = [os.path.join(destination, name) for name in names]
         resolved = resolve_conflicts(full_paths, self.conflict_combo.currentData(),
                                      exists=os.path.exists)
