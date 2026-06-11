@@ -100,6 +100,11 @@ class MainWindow(QMainWindow):
         open_folder_action = file_menu.addAction("Open Folder")
         open_folder_action.triggered.connect(self.open_folder)
 
+        file_menu.addSeparator()
+        export_action = file_menu.addAction("Export…")
+        export_action.setShortcut("Ctrl+E")
+        export_action.triggered.connect(self.image_preview.open_export_dialog)
+
         # Add Help menu with About, Licenses, Activation, and Help actions
         help_menu = menu_bar.addMenu("Help")
         about_action = help_menu.addAction("About")

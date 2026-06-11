@@ -1,11 +1,12 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QToolBar, QMessageBox, QSlider, QGraphicsView, QGraphicsScene,
-    QGraphicsPixmapItem, QGraphicsRectItem, QStyleOptionSlider, QFileDialog, QDialog,
-    QLabel, QPushButton, QStyle, QCheckBox, QSizePolicy  
+    QGraphicsPixmapItem, QGraphicsRectItem, QStyleOptionSlider, QDialog,
+    QLabel, QPushButton, QStyle, QSizePolicy
 )
-from PySide6.QtGui import QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter, QCursor
-from PySide6.QtCore import Qt, QSize, Signal, QRectF, QPointF, QThread, QTimer
+from PySide6.QtGui import QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter, QCursor, QDesktopServices
+from PySide6.QtCore import Qt, QSize, Signal, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
+from widgets.export_dialog import ExportSettingsDialog
 import sys
 import os
 
@@ -56,18 +57,6 @@ def resource_path(relative_path):
     # Not found, return as-is (QIcon will fail gracefully)
     return relative_path
 
-
-def normalize_unicode_path(path):
-    """Normalize Unicode path - fallback if utils not available"""
-    return os.path.normpath(os.path.abspath(path))
-
-
-def validate_unicode_path(path):
-    """Validate Unicode path - fallback if utils not available"""
-    try:
-        return os.path.exists(path)
-    except (UnicodeError, OSError):
-        return False
 
 class GraphicsImageView(QGraphicsView):
     def __init__(self, parent=None):
@@ -448,21 +437,9 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(self.unconvert_action)
         add_spacer()
 
-        self.export_action = QAction("Export", self)  # <-- assign to self
-        self.export_action.triggered.connect(self.export_image)
+        self.export_action = QAction("Export…", self)
+        self.export_action.triggered.connect(self.open_export_dialog)
         self.toolbar.addAction(self.export_action)
-        add_spacer()
-
-        self.export_all_action = QAction("Export All", self)  # <-- assign to self
-        self.export_all_action.triggered.connect(self.export_all_images)
-        self.toolbar.addAction(self.export_all_action)
-        add_spacer()
-
-        # --- Add Export jpgs checkbox ---
-        self.export_jpgs_checkbox = QCheckBox("Export jpgs")
-        self.export_jpgs_checkbox.setChecked(False)
-        self.toolbar.addWidget(self.export_jpgs_checkbox)
-        # --- End checkbox addition ---
 
         self.layout.addWidget(self.toolbar)
 
@@ -710,7 +687,7 @@ class ImagePreview(QWidget):
     def _update_unconvert_action_state(self):
         self.current_converted = ccr_backend.get_converted_state_by_index(self.current_idx) if self.current_idx is not None else False
         self.unconvert_action.setEnabled(self.current_converted)
-        self.export_action.setEnabled(self.current_converted)
+        self.export_action.setEnabled(any(img.converted for img in ccr_backend.images))
         parent = self.parent()
         if hasattr(parent.parent(), "sliders_panel"):
             print("Setting sliders enabled based on current_converted:", self.current_converted)
@@ -754,89 +731,39 @@ class ImagePreview(QWidget):
         # Show completion hint
         self.parent().parent().sliders_panel.set_temporary_hint("Auto frame conversion completed!", duration=2000)
 
-    def export_image(self):
-        if self.current_idx is None:
-            QMessageBox.warning(self, "No Image Selected", "Please select an image to convert.")
+    def open_export_dialog(self):
+        if not any(img.converted for img in ccr_backend.images):
+            QMessageBox.information(self, "Nothing to Export",
+                                    "Convert at least one image before exporting.")
             return
 
-        ccr_img = ccr_backend.images[self.current_idx]
-        base_name = os.path.splitext(os.path.basename(ccr_img.file_path))[0]
-
-        export_jpg = self.export_jpgs_checkbox.isChecked()  # <-- Check the checkbox state
-
-        if export_jpg:
-            default_name = f"{base_name}_ccr.jpg"
-            file_filter = "JPEG Files (*.jpg *.jpeg)"
-        else:
-            default_name = f"{base_name}_ccr.tiff"
-            file_filter = "TIFF Files (*.tiff *.tif)"
-
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Normalized Image",
-            default_name,
-            file_filter
-        )
-        if not file_path:
+        settings_dialog = ExportSettingsDialog(self, current_idx=self.current_idx)
+        if settings_dialog.exec_() != QDialog.Accepted or settings_dialog.plan is None:
             return
-        
-        # Validate Unicode path
-        normalized_path = normalize_unicode_path(file_path)
-        if not validate_unicode_path(os.path.dirname(normalized_path)):
-            QMessageBox.warning(
-                self,
-                "Unicode Path Warning",
-                f"The export path contains characters that may cause issues:\n\n{file_path}\n\nPlease choose a simpler path name."
-            )
-            return
+        plan = settings_dialog.plan
 
-        # Ensure correct extension
-        if export_jpg:
-            if not (normalized_path.lower().endswith(".jpg") or normalized_path.lower().endswith(".jpeg")):
-                normalized_path += ".jpg"
-        else:
-            if not (normalized_path.lower().endswith(".tiff") or normalized_path.lower().endswith(".tif")):
-                normalized_path += ".tiff"
+        progress_dialog = ExportProgressDialog(self)
+        self._export_worker = ExportItemsWorker(plan)
+        progress_dialog.set_worker(self._export_worker)
+        self._export_worker.progress.connect(progress_dialog.set_progress)
+        self._export_worker.finished.connect(
+            lambda result: self._on_export_finished(progress_dialog, result, plan))
+        self._export_worker.start()
+        progress_dialog.exec_()
 
-        dialog = ExportDialog(self)
-        worker = ExportWorker(self.current_idx, normalized_path, export_jpg)  # <-- Pass flag to worker
-        worker.finished.connect(lambda path: self._on_export_all_finished(dialog, path))
-        worker.start()
-        dialog.exec_()
-
-    def export_all_images(self):
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Folder to Export All Images",
-            "",
-            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-        )
-        if not folder:
-            return
-        
-        # Validate Unicode path
-        normalized_folder = normalize_unicode_path(folder)
-        if not validate_unicode_path(normalized_folder):
-            QMessageBox.warning(
-                self,
-                "Unicode Path Warning",
-                f"The export folder path contains characters that may cause issues:\n\n{folder}\n\nPlease choose a simpler folder path."
-            )
-            return
-
-        export_jpg = self.export_jpgs_checkbox.isChecked()  # <-- Check the checkbox state
-
-        dialog = ExportDialog(self)
-        worker = ExportAllWorker(normalized_folder, export_jpg)  # <-- Pass flag to worker
-        dialog.set_worker(worker)
-        worker.progress.connect(dialog.set_progress)
-        worker.finished.connect(lambda path: self._on_export_all_finished(dialog, path))
-        worker.start()
-        dialog.exec_()
-
-    def _on_export_all_finished(self, dialog, path):
+    def _on_export_finished(self, dialog, result, plan):
         dialog.accept()
-        QMessageBox.information(self, "Export Complete", f"All images exported to:\n{path}")
+        lines = [f"Exported: {result.get('exported', 0)}"]
+        if plan.skipped:
+            lines.append(f"Skipped (already exist): {plan.skipped}")
+        if result.get("failed"):
+            lines.append(f"Failed: {result['failed']}")
+        if result.get("cancelled"):
+            lines.append("Export was stopped before completion.")
+        lines.append(f"\nFolder: {plan.destination}")
+        QMessageBox.information(self, "Export Complete", "\n".join(lines))
+        if plan.open_folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(plan.destination))
 
 class AutoFrameWorker(QThread):
     finished = Signal()
@@ -930,53 +857,39 @@ class AutoFrameDialog(QDialog):
         else:
             super().keyPressEvent(event)
 
-class ExportWorker(QThread):
-    finished = Signal(str)
-
-    def __init__(self, idx, file_path, jpg_output=False):  # <-- Add jpg_output
-        super().__init__()
-        self.idx = idx
-        self.file_path = file_path
-        self.jpg_output = jpg_output  # <-- Store flag
-
-    def run(self):
-        ccr_backend.export_image_by_index(self.idx, self.file_path, jpg_output=self.jpg_output)  # <-- Pass flag
-        self.finished.emit(self.file_path)
-
-class ExportAllWorker(QThread):
-    finished = Signal(str)
+class ExportItemsWorker(QThread):
+    finished = Signal(dict)
     progress = Signal(int, int)  # current, total
 
-    def __init__(self, output_folder, jpg_output=False):  # <-- Add jpg_output
+    def __init__(self, plan):
         super().__init__()
-        self.output_folder = output_folder
-        self.jpg_output = jpg_output  # <-- Store flag
+        self.plan = plan
         self._stop_requested = False
 
     def run(self):
-        images = ccr_backend.images
-        total = sum(1 for img in images if img.converted)
-        if not os.path.exists(self.output_folder):
-            os.makedirs(self.output_folder)
-        self.progress.emit(0, total)
-        
-        # Define progress callback
         def progress_callback(current, total_count):
             if not self._stop_requested:
                 self.progress.emit(current, total_count)
-        
-        # Use the parallel export functionality from backend with progress
+
         try:
-            ccr_backend.export_all_images(self.output_folder, jpg_output=self.jpg_output, progress_callback=progress_callback)
+            result = ccr_backend.export_items(
+                self.plan.items,
+                jpg_output=self.plan.jpg_output,
+                jpg_quality=self.plan.jpg_quality,
+                max_long_side=self.plan.max_long_side,
+                progress_callback=progress_callback,
+                cancel_check=lambda: self._stop_requested,
+            )
         except Exception as e:
             print(f"Failed to export images: {e}")
-        
-        self.finished.emit(self.output_folder)
+            result = {"exported": 0, "failed": len(self.plan.items),
+                      "cancelled": False, "failures": []}
+        self.finished.emit(result)
 
     def stop(self):
         self._stop_requested = True
 
-class ExportDialog(QDialog):
+class ExportProgressDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Exporting...")
