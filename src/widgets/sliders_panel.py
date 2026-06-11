@@ -204,9 +204,14 @@ class SlidersPanel(QWidget):
         separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
         scroll_layout.addWidget(separator)
 
-        # Auto white balance: pick a neutral point with an eyedropper
-        self.wb_picker_btn = QPushButton("Auto WB (Pick Neutral Point)")
-        scroll_layout.addWidget(self.wb_picker_btn)
+        # Auto white balance: pick a neutral point with an eyedropper.
+        # Enabled only for converted images (same gating as the sliders).
+        self.wb_picker_btn = QPushButton("Auto WB Picker")
+        self.wb_picker_btn.setFixedWidth(140)
+        self.wb_picker_btn.setToolTip(
+            "Click, then pick a neutral gray/white point on the image "
+            "to auto-set Temperature and Tint.")
+        scroll_layout.addWidget(self.wb_picker_btn, alignment=Qt.AlignLeft)
 
         self.temperature_slider_layout = self.create_slider("Temperature")
         self.tint_slider_layout = self.create_slider("Tint")
@@ -376,6 +381,7 @@ class SlidersPanel(QWidget):
 
     def set_sliders_enabled(self, enabled: bool):
         print(f"Setting sliders enabled: {enabled}")
+        self.wb_picker_btn.setEnabled(enabled)
         for slider in self.sliders:
             slider.setEnabled(enabled)
             if not enabled:
