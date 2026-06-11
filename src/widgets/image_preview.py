@@ -3,11 +3,34 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem, QGraphicsRectItem, QStyleOptionSlider, QFileDialog, QDialog,
     QLabel, QPushButton, QStyle, QCheckBox, QSizePolicy  
 )
-from PySide6.QtGui import QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter
+from PySide6.QtGui import QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter, QCursor
 from PySide6.QtCore import Qt, QSize, Signal, QRectF, QPointF, QThread, QTimer
 from core.ccr_backend import ccr_backend
 import sys
 import os
+
+_eyedropper_cursor_cache = None
+
+def _eyedropper_cursor():
+    """Small painter-drawn eyedropper cursor, hotspot at the tip (bottom-left)."""
+    global _eyedropper_cursor_cache
+    if _eyedropper_cursor_cache is None:
+        pm = QPixmap(24, 24)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        # White underlay then dark dropper on top, so it reads on any image.
+        for color, body_w, bulb_w in ((QColor(255, 255, 255), 5, 7),
+                                      (QColor(25, 25, 25), 3, 5)):
+            pen = QPen(color, body_w, Qt.SolidLine, Qt.RoundCap)
+            p.setPen(pen)
+            p.drawLine(4, 20, 13, 11)        # body, tip toward bottom-left
+            pen.setWidth(bulb_w)
+            p.setPen(pen)
+            p.drawLine(11, 7, 17, 13)        # bulb across the top end
+        p.end()
+        _eyedropper_cursor_cache = QCursor(pm, 3, 21)
+    return _eyedropper_cursor_cache
 
 def resource_path(relative_path):
     """
@@ -62,11 +85,19 @@ class GraphicsImageView(QGraphicsView):
         self._bw_drag_end = None
         self._bw_rect_item = None
 
+        self.wb_pick_mode = False  # eyedropper: click a neutral point for auto temp/tint
+
         # Disable scrollbars
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.wb_pick_mode and self.parent_widget.pixmap_item is not None:
+            scene_pos = self.mapToScene(event.pos())
+            self.wb_pick_mode = False
+            self.setCursor(Qt.ArrowCursor)
+            self._sample_wb_point(scene_pos)
+            return
         if event.button() == Qt.LeftButton and self.bwpoint_mode and self.parent_widget.pixmap_item is not None:
             self._bw_drag_start = self.mapToScene(event.pos())
             self._bw_drag_end = self._bw_drag_start
@@ -137,6 +168,48 @@ class GraphicsImageView(QGraphicsView):
             self._bw_rect_item.setPen(QPen(color, 2, Qt.DashLine))
             self._bw_rect_item.setRect(rect)
         self._bw_rect_item.setTransform(base_transform)
+
+    def _sample_wb_point(self, scene_pos):
+        """Sample a small neighborhood at the clicked point and auto-set the
+        temperature/tint sliders so that point becomes neutral."""
+        pw = self.parent_widget
+        cx = pw.current_pixmap.width() / 2
+        cy = pw.current_pixmap.height() / 2
+        base_transform = QTransform()
+        base_transform.translate(cx, cy)
+        if pw.current_vertical_flip:
+            base_transform.scale(1, -1)
+        if pw.current_horizontal_flip:
+            base_transform.scale(-1, 1)
+        if pw.current_rotation:
+            base_transform.rotate(pw.current_rotation)
+        base_transform.translate(-cx, -cy)
+        if not base_transform.isInvertible():
+            return
+        local = base_transform.inverted()[0].map(scene_pos)
+        x, y = int(local.x()), int(local.y())
+
+        img_obj = ccr_backend.get_image_by_index(pw.current_idx)
+        if img_obj is None or img_obj.resized_raw is None:
+            return
+        data = img_obj.resized_raw
+        h, w = data.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return
+        import numpy as np
+        rad = 3
+        crop = data[max(0, y - rad):min(h, y + rad + 1),
+                    max(0, x - rad):min(w, x + rad + 1), :]
+        means = np.mean(crop.reshape(-1, 3), axis=0)
+
+        from core.ccr_processor import compute_neutral_temp_tint
+        temp, tint = compute_neutral_temp_tint(
+            means[0], means[1], means[2],
+            getattr(img_obj, 'tint_balance_factor', 1.0))
+        try:
+            pw.parent().parent().sliders_panel.on_wb_sampled(temp, tint)
+        except AttributeError:
+            pass
 
     def mouseReleaseEvent(self, event):
         if self.bwpoint_mode and event.button() == Qt.LeftButton and self._bw_drag_start is not None:
@@ -647,7 +720,15 @@ class ImagePreview(QWidget):
     def set_bwpoint_mode(self, mode):
         """mode: 'black' | 'white' | None"""
         self.view.bwpoint_mode = mode
+        self.view.wb_pick_mode = False
         self.view.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
+
+    def set_wb_pick_mode(self, enabled):
+        """Eyedropper mode: next click on the image picks a neutral point
+        for automatic temperature/tint adjustment."""
+        self.view.wb_pick_mode = enabled
+        self.view.bwpoint_mode = None
+        self.view.setCursor(_eyedropper_cursor() if enabled else Qt.ArrowCursor)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

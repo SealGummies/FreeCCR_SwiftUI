@@ -1391,6 +1391,57 @@ def map_rect_to_original(resized_shape, original_shape, rect):
     return (x1o, y1o, x2o, y2o)
 
 
+def compute_neutral_temp_tint(r: float, g: float, b: float,
+                              tint_balance_factor: float = 1.0) -> tuple:
+    """
+    Given the mean RGB (0–65535) of a user-picked neutral reference point,
+    compute the temperature and tint slider values [-100, 100] that make that
+    point neutral (R == G == B) after adjust_image's temperature/tint stage.
+
+    Inverts the same perceptual formulas adjust_image applies:
+        temperature:  r *= (1 + s),  b *= (1 - s)
+                      s = (slider/100) * 0.40 * tone_curve
+        tint:         g *= (1 - t),  r *= (1 + 0.3t),  b *= (1 + 0.3t)
+                      t = tanh(slider * 0.02) * 0.18 * tone_curve
+                          * balance_factor * skin_tone_sensitivity
+    Solving r(1+s) = b(1-s) gives s; then m(1+0.3t) = g(1-t) gives t, where
+    m is the common R/B value after the temperature step.
+    """
+    eps = 1e-6
+    r = max(float(r), eps)
+    g = max(float(g), eps)
+    b = max(float(b), eps)
+    lum = (0.299 * r + 0.587 * g + 0.114 * b) / 65535.0
+
+    # Same piecewise tone-aware strength curve as adjust_image (luminance is
+    # taken from the un-adjusted pixel there too, so this matches apply time).
+    if lum <= 0.3:
+        tone = 0.8 + 0.2 * min(max(lum / 0.3, 0.0), 1.0)
+    elif lum <= 0.6:
+        tone = 1.0
+    else:
+        progress = (lum - 0.6) / 0.4
+        sigmoid = 1.0 / (1.0 + np.exp(-8.0 * (progress - 0.5)))
+        tone = 1.0 - 0.75 * sigmoid
+
+    # Temperature: choose s so the R and B channels meet.
+    s = (b - r) / (b + r)
+    temp_slider = float(np.clip(s * 100.0 / (0.40 * tone), -100.0, 100.0))
+
+    # Use the achieved (possibly clamped) scale for the tint step.
+    s_eff = (temp_slider / 100.0) * 0.40 * tone
+    m = (r * (1.0 + s_eff) + b * (1.0 - s_eff)) / 2.0
+
+    # Tint: choose t so G meets the common R/B level m.
+    t = (g - m) / (g + 0.3 * m)
+    skin = 1.0 + 0.5 * np.exp(-12.0 * (lum - 0.35) ** 2)
+    denom = 0.18 * tone * tint_balance_factor * skin
+    x = float(np.clip(t / max(denom, eps), -0.999, 0.999))
+    tint_slider = float(np.clip(np.arctanh(x) / 0.02, -100.0, 100.0))
+
+    return int(round(temp_slider)), int(round(tint_slider))
+
+
 def adjust_image(
     img16: np.ndarray,
     kelvin_shift: float = 0.0,
