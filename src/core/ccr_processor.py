@@ -352,51 +352,56 @@ def _initialize_opencl():
             }
 
             // OD (optical density / log-space) channel controls - NamiColor-style.
+            // Cineon-like log space x = 1 - OD/D (x=1 white, x=0 deep black).
+            // NamiColor formula: out = (x + shift + black) / ((1 - gain) + black)
+            // Shift translates (+ = brighter); gain scales anchored at the black
+            // end (moves the white end); blackpoint remaps the lower end with
+            // the white end anchored.
             if (od_input_gain != 0.0f || od_master_shift != 0.0f || od_master_gain != 0.0f ||
                 od_r_shift != 0.0f || od_r_gain != 0.0f || od_r_blackpoint != 0.0f ||
                 od_g_shift != 0.0f || od_g_gain != 0.0f || od_g_blackpoint != 0.0f ||
                 od_b_shift != 0.0f || od_b_gain != 0.0f || od_b_blackpoint != 0.0f) {
 
-                float ig  = pow(2.0f, od_input_gain  / 50.0f);
-                float ms  = od_master_shift  / 200.0f;
-                float mg  = pow(2.0f, od_master_gain / 100.0f);
-                float rs  = od_r_shift       / 200.0f;
-                float rg  = pow(2.0f, od_r_gain      / 100.0f);
-                float rbp = od_r_blackpoint  / 333.0f;
-                float gs  = od_g_shift       / 200.0f;
-                float gg  = pow(2.0f, od_g_gain      / 100.0f);
-                float gbp = od_g_blackpoint  / 333.0f;
-                float bs  = od_b_shift       / 200.0f;
-                float bg  = pow(2.0f, od_b_gain      / 100.0f);
-                float bbp = od_b_blackpoint  / 333.0f;
+                float OD_D = 3.0f;
+                float ig = pow(2.0f, od_input_gain / 50.0f);
+                float ms = od_master_shift / 200.0f;
+                float mg = od_master_gain / 200.0f;
+                float rs  = ms + od_r_shift / 200.0f;
+                float rg  = mg + od_r_gain  / 200.0f;
+                float rbp = od_r_blackpoint / 200.0f;
+                float gs  = ms + od_g_shift / 200.0f;
+                float gg  = mg + od_g_gain  / 200.0f;
+                float gbp = od_g_blackpoint / 200.0f;
+                float bs  = ms + od_b_shift / 200.0f;
+                float bg  = mg + od_b_gain  / 200.0f;
+                float bbp = od_b_blackpoint / 200.0f;
 
-                float tr = clamp(r / 65535.0f, 1e-7f, 1.0f);
-                float tg = clamp(g / 65535.0f, 1e-7f, 1.0f);
-                float tb = clamp(b / 65535.0f, 1e-7f, 1.0f);
-
-                tr = clamp(tr * ig, 1e-7f, 1.0f);
-                tg = clamp(tg * ig, 1e-7f, 1.0f);
-                tb = clamp(tb * ig, 1e-7f, 1.0f);
-
-                float odr = -log10(tr);
-                float odg = -log10(tg);
-                float odb = -log10(tb);
-
-                odr = (odr + ms) * mg;
-                odg = (odg + ms) * mg;
-                odb = (odb + ms) * mg;
-
-                odr += rs;  odr *= rg;  odr -= rbp;
-                odg += gs;  odg *= gg;  odg -= gbp;
-                odb += bs;  odb *= bg;  odb -= bbp;
-
-                odr = clamp(odr, 0.0f, 7.0f);
-                odg = clamp(odg, 0.0f, 7.0f);
-                odb = clamp(odb, 0.0f, 7.0f);
-
-                r = clamp(pow(10.0f, -odr), 0.0f, 1.0f) * 65535.0f;
-                g = clamp(pow(10.0f, -odg), 0.0f, 1.0f) * 65535.0f;
-                b = clamp(pow(10.0f, -odb), 0.0f, 1.0f) * 65535.0f;
+                // Process each channel only when non-neutral, so the log
+                // round-trip can't drift untouched channels by 1 LSB.
+                if (ig != 1.0f || rs != 0.0f || rg != 0.0f || rbp != 0.0f) {
+                    float tr = clamp(r / 65535.0f, 1e-7f, 1.0f);
+                    tr = clamp(tr * ig, 1e-7f, 1.0f);
+                    float xr = 1.0f + log10(tr) / OD_D;
+                    xr = (xr + rs + rbp) / fmax((1.0f - rg) + rbp, 0.05f);
+                    float odr = clamp((1.0f - xr) * OD_D, 0.0f, 10.0f);
+                    r = clamp(pow(10.0f, -odr), 0.0f, 1.0f) * 65535.0f;
+                }
+                if (ig != 1.0f || gs != 0.0f || gg != 0.0f || gbp != 0.0f) {
+                    float tg = clamp(g / 65535.0f, 1e-7f, 1.0f);
+                    tg = clamp(tg * ig, 1e-7f, 1.0f);
+                    float xg = 1.0f + log10(tg) / OD_D;
+                    xg = (xg + gs + gbp) / fmax((1.0f - gg) + gbp, 0.05f);
+                    float odg = clamp((1.0f - xg) * OD_D, 0.0f, 10.0f);
+                    g = clamp(pow(10.0f, -odg), 0.0f, 1.0f) * 65535.0f;
+                }
+                if (ig != 1.0f || bs != 0.0f || bg != 0.0f || bbp != 0.0f) {
+                    float tb = clamp(b / 65535.0f, 1e-7f, 1.0f);
+                    tb = clamp(tb * ig, 1e-7f, 1.0f);
+                    float xb = 1.0f + log10(tb) / OD_D;
+                    xb = (xb + bs + bbp) / fmax((1.0f - bg) + bbp, 0.05f);
+                    float odb = clamp((1.0f - xb) * OD_D, 0.0f, 10.0f);
+                    b = clamp(pow(10.0f, -odb), 0.0f, 1.0f) * 65535.0f;
+                }
             }
 
             // Final clamp and store results
@@ -1656,37 +1661,40 @@ def adjust_image(
 
     # OD (optical density / log-space) channel controls — NamiColor-style.
     # Runs only when at least one slider is non-zero; otherwise a no-op.
+    #
+    # Works in a NamiColor/Cineon-like log space x = 1 - OD/D, where x=1 is
+    # white and x=0 is a deep black D density units below white. NamiColor's
+    # exact per-channel formula is applied:
+    #     x1  = x + shift + master_shift
+    #     out = (x1 + black) / ((1 - gain - master_gain) + black)
+    # Behaviours: shift translates the whole curve (exposure-like, + = brighter);
+    # gain scales anchored at the black end (x=0) so it moves the white/upper
+    # end; blackpoint remaps the lower end while white (x=1) stays anchored.
     _od_active = (od_input_gain, od_master_shift, od_master_gain,
                   od_r_shift, od_r_gain, od_r_blackpoint,
                   od_g_shift, od_g_gain, od_g_blackpoint,
                   od_b_shift, od_b_gain, od_b_blackpoint)
     if any(p != 0.0 for p in _od_active):
-        ig  = 2.0 ** (od_input_gain  / 50.0)   # 2-stop range: slider±100 → ×0.25…×4
-        ms  = od_master_shift  / 200.0          # ±0.5 OD
-        mg  = 2.0 ** (od_master_gain / 100.0)  # ±1 stop slope
-        rs  = od_r_shift       / 200.0
-        rg  = 2.0 ** (od_r_gain      / 100.0)
-        rbp = od_r_blackpoint  / 333.0          # ±0.3 OD shadow lift
-        gs  = od_g_shift       / 200.0
-        gg  = 2.0 ** (od_g_gain      / 100.0)
-        gbp = od_g_blackpoint  / 333.0
-        bs  = od_b_shift       / 200.0
-        bg  = 2.0 ** (od_b_gain      / 100.0)
-        bbp = od_b_blackpoint  / 333.0
+        OD_D = 3.0                              # density range mapped to x∈[0,1]
+        ig = 2.0 ** (od_input_gain / 50.0)      # pre-log gain: slider±100 → ×0.25…×4
+        ms = od_master_shift / 200.0            # all log-space sliders: ±100 → ±0.5 x-units
+        mg = od_master_gain / 200.0
+        shifts = (ms + od_r_shift / 200.0, ms + od_g_shift / 200.0, ms + od_b_shift / 200.0)
+        gains  = (mg + od_r_gain  / 200.0, mg + od_g_gain  / 200.0, mg + od_b_gain  / 200.0)
+        blacks = (od_r_blackpoint / 200.0, od_g_blackpoint / 200.0, od_b_blackpoint / 200.0)
 
-        t = np.clip(img / 65535.0, 1e-7, 1.0)   # transmittance, safe from log(0)
-        t = np.clip(t * ig, 1e-7, 1.0)           # input gain (pre-log, all channels)
-        od = -np.log10(t)                         # → OD space
-
-        od += ms                                  # master shift
-        od *= mg                                  # master gain
-
-        od[..., 0] += rs;  od[..., 0] *= rg;  od[..., 0] -= rbp
-        od[..., 1] += gs;  od[..., 1] *= gg;  od[..., 1] -= gbp
-        od[..., 2] += bs;  od[..., 2] *= bg;  od[..., 2] -= bbp
-
-        np.clip(od, 0.0, 7.0, out=od)            # prevent blow-out / NaN
-        img = np.clip(np.power(10.0, -od), 0.0, 1.0) * 65535.0
+        for c in range(3):
+            # Skip neutral channels so the log round-trip can't introduce
+            # ±1 LSB quantization drift on channels the user didn't touch.
+            if ig == 1.0 and shifts[c] == 0.0 and gains[c] == 0.0 and blacks[c] == 0.0:
+                continue
+            t = np.clip(img[..., c] / 65535.0, 1e-7, 1.0)  # transmittance, safe from log(0)
+            t = np.clip(t * ig, 1e-7, 1.0)                  # input gain (pre-log)
+            x = 1.0 + np.log10(t) / OD_D                    # == 1 - OD/D
+            denom = max((1.0 - gains[c]) + blacks[c], 0.05)
+            x = (x + shifts[c] + blacks[c]) / denom
+            od = np.clip((1.0 - x) * OD_D, 0.0, 10.0)       # ≤white, prevent blow-out
+            img[..., c] = np.clip(np.power(10.0, -od), 0.0, 1.0) * 65535.0
 
     img = np.clip(img, 0, 65535)
     return img.astype(np.uint16)
