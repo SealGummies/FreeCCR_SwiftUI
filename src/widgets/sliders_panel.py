@@ -504,12 +504,15 @@ class SlidersPanel(QWidget):
                 self.slider_value_labels[i].setText("0")
             return
 
+        # Missing keys count as 0 so a partial dict can never leave a slider
+        # showing the previously selected image's value.
         for i, key in enumerate(self.adjustment_keys):
-            if key in adjustment and i < len(self.sliders):
+            if i < len(self.sliders):
+                val = adjustment.get(key, 0)
                 self.sliders[i].blockSignals(True)
-                self.sliders[i].setValue(adjustment[key])
+                self.sliders[i].setValue(val)
                 self.sliders[i].blockSignals(False)
-                self.slider_value_labels[i].setText(str(adjustment[key]))
+                self.slider_value_labels[i].setText(str(val))
         if idx is not None:
             ccr_backend.apply_adjustment_by_index(idx)
 
@@ -674,17 +677,25 @@ class SlidersPanel(QWidget):
             if not adj_changes and not crop_changes:
                 continue  # nothing to change — and no dead undo snapshot
             img.push_undo_state()
-            merged = dict(img.adjustment_settings)
-            for k in keys:
-                merged[k] = current_adjustment.get(k, 0)
-            img.adjustment_settings = merged
+            if adj_changes:
+                # Build a COMPLETE dict (missing keys filled with 0) so the
+                # rest of the app keeps its invariant that a non-empty
+                # adjustment dict carries every key — set_current_idx and
+                # friends rely on it.
+                merged = {k: img.adjustment_settings.get(k, 0) for k in self.adjustment_keys}
+                for k in keys:
+                    merged[k] = current_adjustment.get(k, 0)
+                img.adjustment_settings = merged
             if sync_crop:
                 img.crop_rect = crop_rect
                 img.crop_angle = crop_angle
-            try:
-                img.update_thumbnail_and_preview()
-            except Exception as e:
-                print(f"Failed to sync settings to {img.file_path}: {e}")
+            if adj_changes:
+                # Crop is display/export-level only — no reprocessing needed
+                # when nothing but the crop changed.
+                try:
+                    img.update_thumbnail_and_preview()
+                except Exception as e:
+                    print(f"Failed to sync settings to {img.file_path}: {e}")
 
         mw = self.parent().parent()
         try:

@@ -248,13 +248,16 @@ class GraphicsImageView(QGraphicsView):
                 s = inv.map(drag_start_scene)
                 e = inv.map(drag_end_scene)
                 # Map from displayed (possibly cropped/rotated) coords to
-                # full-image coords; use the AABB of the mapped corners.
-                sx, sy = pw.map_displayed_to_full(s.x(), s.y())
-                ex, ey = pw.map_displayed_to_full(e.x(), e.y())
-                x1 = int(min(sx, ex))
-                y1 = int(min(sy, ey))
-                x2 = int(max(sx, ex))
-                y2 = int(max(sy, ey))
+                # full-image coords. All FOUR rect corners must be mapped —
+                # under a rotated crop, the AABB of just the two diagonal
+                # corners degenerates (zero width at 45 degrees).
+                pts = [pw.map_displayed_to_full(px, py)
+                       for px, py in ((s.x(), s.y()), (e.x(), s.y()),
+                                      (s.x(), e.y()), (e.x(), e.y()))]
+                x1 = int(min(p[0] for p in pts))
+                y1 = int(min(p[1] for p in pts))
+                x2 = int(max(p[0] for p in pts))
+                y2 = int(max(p[1] for p in pts))
 
                 img_obj = ccr_backend.get_image_by_index(pw.current_idx)
                 if img_obj is not None:
@@ -317,19 +320,24 @@ class GraphicsImageView(QGraphicsView):
             w, h = x2 - x, y2 - y
             if w > 20 and h > 20:
                 # Map from displayed (possibly cropped/rotated) coords to
-                # full-image coords; store the AABB of the mapped corners.
-                ax, ay = self.parent_widget.map_displayed_to_full(x, y)
-                bx, by = self.parent_widget.map_displayed_to_full(x2, y2)
-                ccr_backend.set_reference_frame_by_index(
-                    self.parent_widget.current_idx,
-                    (int(min(ax, bx)), int(min(ay, by)),
-                     int(max(ax, bx)), int(max(ay, by)))
-                )
-                self.parent_widget.parent().parent().sliders_panel.set_temporary_hint(
-                    "<b>Hint:</b><br>Reference frame set! Click the Convert button to view the updates.",
-                    duration=5000
-                )
-                print("Set reference frame:", (int(x), int(y), int(x2), int(y2)))
+                # full-image coords. All FOUR corners must be mapped — under
+                # a rotated crop the two-diagonal AABB degenerates — and the
+                # minimum size re-checked in full-image space.
+                pw = self.parent_widget
+                pts = [pw.map_displayed_to_full(px, py)
+                       for px, py in ((x, y), (x2, y), (x, y2), (x2, y2))]
+                fx1 = int(min(p[0] for p in pts))
+                fy1 = int(min(p[1] for p in pts))
+                fx2 = int(max(p[0] for p in pts))
+                fy2 = int(max(p[1] for p in pts))
+                if (fx2 - fx1) > 20 and (fy2 - fy1) > 20:
+                    ccr_backend.set_reference_frame_by_index(
+                        pw.current_idx, (fx1, fy1, fx2, fy2))
+                    pw.parent().parent().sliders_panel.set_temporary_hint(
+                        "<b>Hint:</b><br>Reference frame set! Click the Convert button to view the updates.",
+                        duration=5000
+                    )
+                    print("Set reference frame:", (fx1, fy1, fx2, fy2))
         self.parent_widget.update_preview(self.parent_widget.current_idx)
 
     def resizeEvent(self, event):
@@ -700,6 +708,11 @@ class ImagePreview(QWidget):
         elif self.scene.sceneRect() and not self.scene.sceneRect().isNull():
             # Fallback to scene rect if no pixmap item
             self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        # Crop handle glyph sizes are baked at draw time from the view scale,
+        # which fitInView just changed (window resize, rotate, ...) — rebuild
+        # so the drawn handles keep matching their hit-test zones.
+        if self.crop_mode and self._crop_overlay_item is not None:
+            self._draw_crop_overlay()
 
     def apply_transformations(self):
         if not self.pixmap_item:
@@ -737,14 +750,10 @@ class ImagePreview(QWidget):
         if self.reference_rect_item:
             self.reference_rect_item.setTransform(base_transform)
 
-        # Always fit the view to the content consistently
+        # Always fit the view to the content consistently. (This also
+        # rebuilds the crop overlay when crop mode is active, keeping the
+        # dim region and handles aligned after rotates/flips.)
         self._fit_view_to_content()
-
-        # Rebuild the crop overlay after fitting: toolbar rotates/flips during
-        # crop mode change both the base transform and the view scale (which
-        # sizes the handles), so a full redraw keeps everything aligned.
-        if self.crop_mode and self._crop_overlay_item is not None:
-            self._draw_crop_overlay()
 
     def _end_fine_rot_burst(self):
         self._fine_rot_burst_active = False
@@ -783,18 +792,21 @@ class ImagePreview(QWidget):
 
     def rotate_left(self):
         self._push_undo_for_current()
+        self._crop_drag = None  # base transform change invalidates an active crop drag
         self.current_rotation = (self.current_rotation - 90) % 360
         ccr_backend.set_image_rotation_by_index(self.current_idx, self.current_rotation)
         self.apply_transformations()
 
     def rotate_right(self):
         self._push_undo_for_current()
+        self._crop_drag = None  # base transform change invalidates an active crop drag
         self.current_rotation = (self.current_rotation + 90) % 360
         ccr_backend.set_image_rotation_by_index(self.current_idx, self.current_rotation)
         self.apply_transformations()
 
     def mirror_vertical(self):
         self._push_undo_for_current()
+        self._crop_drag = None  # base transform change invalidates an active crop drag
         flip = ccr_backend.get_image_vertical_flip_by_index(self.current_idx)
         ccr_backend.set_image_vertical_flip_by_index(self.current_idx, not flip)
         self.current_vertical_flip = not flip
@@ -802,6 +814,7 @@ class ImagePreview(QWidget):
 
     def mirror_horizontal(self):
         self._push_undo_for_current()
+        self._crop_drag = None  # base transform change invalidates an active crop drag
         flip = ccr_backend.get_image_horizontal_flip_by_index(self.current_idx)
         ccr_backend.set_image_horizontal_flip_by_index(self.current_idx, not flip)
         self.current_horizontal_flip = not flip
@@ -1002,10 +1015,18 @@ class ImagePreview(QWidget):
             ("edge-l", -hw, 0.0), ("edge-r", hw, 0.0),
             ("move", 0.0, 0.0),
         ]
+        # Pick the NEAREST handle among all within tolerance — on small boxes
+        # the zones overlap, and first-match priority would shadow the center
+        # move handle behind corners/edges.
+        best = None
+        best_d2 = None
         for name, hx, hy in handles:
-            if abs(q.x() - hx) <= tol and abs(q.y() - hy) <= tol:
-                return name
-        return None
+            dx, dy = q.x() - hx, q.y() - hy
+            if abs(dx) <= tol and abs(dy) <= tol:
+                d2 = dx * dx + dy * dy
+                if best_d2 is None or d2 < best_d2:
+                    best, best_d2 = name, d2
+        return best
 
     def begin_crop_drag(self, scene_pos):
         base = self._base_transform()
@@ -1067,8 +1088,15 @@ class ImagePreview(QWidget):
         box0 = drag["box0"]
         if box0 is None:
             return
+        delta = p - drag["start"]
+        if abs(delta.x()) < 1e-9 and abs(delta.y()) < 1e-9:
+            # A plain click must be a no-op: if the box center sits outside
+            # the image (possible after a big corner drag), the clamp below
+            # would otherwise yank the box inward without any mouse motion.
+            self._pending_crop_local = QRectF(box0)
+            return
         w, h = self.current_pixmap.width(), self.current_pixmap.height()
-        c = box0.center() + (p - drag["start"])
+        c = box0.center() + delta
         box = QRectF(box0)
         box.moveCenter(QPointF(min(max(c.x(), 0.0), float(w)),
                                min(max(c.y(), 0.0), float(h))))
