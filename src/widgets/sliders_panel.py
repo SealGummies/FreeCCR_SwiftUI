@@ -180,6 +180,30 @@ class SlidersPanel(QWidget):
         self.current_idx = None
 
         # --- 10 existing sliders (sliders[0]–[9]) ---
+        # --- Film B/W Point section — at the top, right below the histogram ---
+        bwp_label = QLabel("Film B/W Point")
+        bwp_label.setStyleSheet("color: #888; font-size: 11px; margin-bottom: 2px;")
+        bwp_label.setAlignment(Qt.AlignCenter)
+        scroll_layout.addWidget(bwp_label)
+
+        bwp_row = QHBoxLayout()
+        self.white_point_btn = QPushButton("Set White Point")
+        self.black_point_btn = QPushButton("Set Black Point")
+        bwp_row.addWidget(self.white_point_btn)
+        bwp_row.addWidget(self.black_point_btn)
+        scroll_layout.addLayout(bwp_row)
+        self.convert_current_bwp_btn = QPushButton("Convert Current (B/W Point)")
+        scroll_layout.addWidget(self.convert_current_bwp_btn)
+        self.convert_all_bwp_btn = QPushButton("Convert All (B/W Point)")
+        scroll_layout.addWidget(self.convert_all_bwp_btn)
+
+        # Separator between B/W Point tools and the adjustment sliders
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
+        scroll_layout.addWidget(separator)
+
         self.temperature_slider_layout = self.create_slider("Temperature")
         self.tint_slider_layout = self.create_slider("Tint")
         self.exposure_slider_layout = self.create_slider("Exposure")
@@ -214,29 +238,6 @@ class SlidersPanel(QWidget):
         self.sync_to_all_button = QPushButton("Sync to All")
         sync_layout.addWidget(self.sync_to_all_button)
         scroll_layout.addLayout(sync_layout)
-
-        # --- Film B/W Point section ---
-        separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
-        separator.setFrameShadow(QFrame.Sunken)
-        separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
-        scroll_layout.addWidget(separator)
-
-        bwp_label = QLabel("Film B/W Point")
-        bwp_label.setStyleSheet("color: #888; font-size: 11px; margin-bottom: 2px;")
-        bwp_label.setAlignment(Qt.AlignCenter)
-        scroll_layout.addWidget(bwp_label)
-
-        bwp_row = QHBoxLayout()
-        self.white_point_btn = QPushButton("Set White Point")
-        self.black_point_btn = QPushButton("Set Black Point")
-        bwp_row.addWidget(self.white_point_btn)
-        bwp_row.addWidget(self.black_point_btn)
-        scroll_layout.addLayout(bwp_row)
-        self.convert_current_bwp_btn = QPushButton("Convert Current (B/W Point)")
-        scroll_layout.addWidget(self.convert_current_bwp_btn)
-        self.convert_all_bwp_btn = QPushButton("Convert All (B/W Point)")
-        scroll_layout.addWidget(self.convert_all_bwp_btn)
 
         # --- Channel Levels collapsible section (sliders[10]–[21]) ---
         od_separator = QFrame()
