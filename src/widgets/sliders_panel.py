@@ -204,6 +204,15 @@ class SlidersPanel(QWidget):
         separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
         scroll_layout.addWidget(separator)
 
+        # Auto white balance: pick a neutral point with an eyedropper.
+        # Enabled only for converted images (same gating as the sliders).
+        self.wb_picker_btn = QPushButton("Auto WB Picker")
+        self.wb_picker_btn.setFixedWidth(140)
+        self.wb_picker_btn.setToolTip(
+            "Click, then pick a neutral gray/white point on the image "
+            "to auto-set Temperature and Tint.")
+        scroll_layout.addWidget(self.wb_picker_btn, alignment=Qt.AlignLeft)
+
         self.temperature_slider_layout = self.create_slider("Temperature")
         self.tint_slider_layout = self.create_slider("Tint")
         self.exposure_slider_layout = self.create_slider("Exposure")
@@ -291,6 +300,7 @@ class SlidersPanel(QWidget):
         self.compare_button.released.connect(self.on_compare_released)
         self.compare_button.setCheckable(False)
         self.sync_to_all_button.clicked.connect(self.on_sync_to_all_clicked)
+        self.wb_picker_btn.clicked.connect(self._on_pick_neutral_point)
         self.white_point_btn.clicked.connect(self._on_set_white_point)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
         self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
@@ -371,6 +381,7 @@ class SlidersPanel(QWidget):
 
     def set_sliders_enabled(self, enabled: bool):
         print(f"Setting sliders enabled: {enabled}")
+        self.wb_picker_btn.setEnabled(enabled)
         for slider in self.sliders:
             slider.setEnabled(enabled)
             if not enabled:
@@ -527,6 +538,25 @@ class SlidersPanel(QWidget):
         
         # Show completion hint
         self.set_temporary_hint("Synced all adjustments!", duration=4000)
+
+    def _on_pick_neutral_point(self):
+        if hasattr(self, 'image_preview') and self.image_preview:
+            self.image_preview.set_wb_pick_mode(True)
+            self.set_temporary_hint(
+                "<b>Auto WB:</b> Click a neutral gray or white point on the image.", duration=8000)
+
+    def on_wb_sampled(self, temp_value, tint_value):
+        """Apply the auto-computed temperature/tint from the WB eyedropper."""
+        temp_idx = self.adjustment_keys.index("temperature")
+        tint_idx = self.adjustment_keys.index("tint")
+        for idx, val in ((temp_idx, temp_value), (tint_idx, tint_value)):
+            self.sliders[idx].blockSignals(True)
+            self.sliders[idx].setValue(val)
+            self.sliders[idx].blockSignals(False)
+            self.slider_value_labels[idx].setText(str(val))
+        self.on_slider_changed()
+        self.set_temporary_hint(
+            f"Auto WB applied — Temperature: {temp_value}, Tint: {tint_value}.", duration=5000)
 
     def _on_set_white_point(self):
         if hasattr(self, 'image_preview') and self.image_preview:
