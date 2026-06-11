@@ -714,12 +714,18 @@ class SlidersPanel(QWidget):
                 "<b>Auto WB:</b> Click a neutral gray or white point on the image.", duration=8000)
 
     def _on_crop_clicked(self):
-        if hasattr(self, 'image_preview') and self.image_preview:
-            if self.image_preview.enter_crop_mode():
-                self.set_temporary_hint(
-                    "<b>Crop:</b> Drag to draw a box; drag handles to resize, "
-                    "top knob to rotate, center to move. <b>Enter</b> = confirm, "
-                    "<b>Esc</b> = cancel, right-click = clear crop.", duration=12000)
+        if not (hasattr(self, 'image_preview') and self.image_preview):
+            return
+        # Toggle: clicking Crop again leaves crop mode (without changing it)
+        if self.image_preview.crop_mode:
+            self.image_preview.cancel_crop_mode()
+            return
+        if self.image_preview.enter_crop_mode():
+            self.set_temporary_hint(
+                "<b>Crop:</b> Drag to draw a box; drag handles to resize, "
+                "top knob to rotate, center to move. <b>Enter</b> = confirm, "
+                "<b>Esc</b> = cancel, right-click = clear crop, "
+                "<b>Crop</b> again = exit.", duration=12000)
 
     def on_wb_sampled(self, temp_value, tint_value):
         """Apply the auto-computed temperature/tint from the WB eyedropper."""

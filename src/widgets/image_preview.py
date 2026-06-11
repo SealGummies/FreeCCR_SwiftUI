@@ -37,6 +37,35 @@ def _eyedropper_cursor():
         _eyedropper_cursor_cache = QCursor(pm, 3, 21)
     return _eyedropper_cursor_cache
 
+_rotate_cursor_cache = None
+
+def _rotate_cursor():
+    """Small painter-drawn curved-arrow cursor for the crop rotate handle."""
+    global _rotate_cursor_cache
+    if _rotate_cursor_cache is None:
+        import math as _math
+        pm = QPixmap(28, 28)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        # White underlay then dark arrow on top, so it reads on any image.
+        for color, w in ((QColor(255, 255, 255), 4.0), (QColor(25, 25, 25), 2.0)):
+            pen = QPen(color, w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            p.setPen(pen)
+            # ~270deg arc, leaving a gap at the top-right
+            p.drawArc(6, 6, 16, 16, 20 * 16, 280 * 16)
+            # Arrowhead at the arc's end (near 20deg, right side)
+            cx, cy, r = 14.0, 14.0, 8.0
+            ang = _math.radians(20)
+            ex, ey = cx + r * _math.cos(ang), cy - r * _math.sin(ang)
+            for da in (130, 200):  # two short barbs forming the head
+                bx = ex + 5.0 * _math.cos(_math.radians(20 + da))
+                by = ey - 5.0 * _math.sin(_math.radians(20 + da))
+                p.drawLine(int(ex), int(ey), int(bx), int(by))
+        p.end()
+        _rotate_cursor_cache = QCursor(pm, 14, 14)
+    return _rotate_cursor_cache
+
 def resource_path(relative_path):
     """
     Get absolute path to resource, works for dev and for Nuitka bundle.
@@ -172,7 +201,12 @@ class GraphicsImageView(QGraphicsView):
         if self._space_pan:
             return super().mouseMoveEvent(event)
         if self.parent_widget.crop_mode:
-            self.parent_widget.update_crop_drag(self.mapToScene(event.pos()))
+            scene_pos = self.mapToScene(event.pos())
+            if self.parent_widget._crop_drag is not None:
+                self.parent_widget.update_crop_drag(scene_pos)
+            else:
+                # Hover: show the transform cursor for the handle underneath
+                self.parent_widget.update_crop_hover_cursor(scene_pos)
             return
         if self.bwpoint_mode and self._bw_drag_start is not None:
             self._bw_drag_end = self.mapToScene(event.pos())
@@ -933,6 +967,13 @@ class ImagePreview(QWidget):
         else:
             self.pixmap_item.setTransform(img_transform)
 
+        # Pin the scene rect to the current image extent. QGraphicsScene's
+        # default sceneRect only ever grows, so after a crop (smaller pixmap)
+        # the stale larger rect would bound panning to empty space on one side
+        # — the image gets stuck against a wall and can't be re-centred.
+        self.scene.setSceneRect(
+            self.pixmap_item.mapToScene(self.pixmap_item.boundingRect()).boundingRect())
+
         # Rectangle only gets coarse rotation/flips
         if self.reference_rect_item:
             self.reference_rect_item.setTransform(base_transform)
@@ -1561,6 +1602,44 @@ class ImagePreview(QWidget):
                     best, best_d2 = name, d2
         return best
 
+    # Base orientation (deg) of each handle's resize axis on an un-rotated box
+    _HANDLE_BASE_ANGLE = {
+        "edge-l": 0.0, "edge-r": 0.0, "edge-t": 90.0, "edge-b": 90.0,
+        "corner-tl": 45.0, "corner-br": 45.0, "corner-tr": 135.0, "corner-bl": 135.0,
+    }
+
+    def _cursor_for_handle(self, handle):
+        """Cursor that indicates the transform a handle performs, accounting
+        for the box's current rotation."""
+        if handle is None:
+            return Qt.CrossCursor
+        if handle == "move":
+            return Qt.SizeAllCursor
+        if handle == "rotate":
+            return _rotate_cursor()
+        base = self._HANDLE_BASE_ANGLE.get(handle)
+        if base is None:
+            return Qt.CrossCursor
+        a = (base + self._pending_crop_angle) % 180.0
+        if a < 22.5:
+            return Qt.SizeHorCursor       # ↔
+        elif a < 67.5:
+            return Qt.SizeFDiagCursor     # ⤡  (\)
+        elif a < 112.5:
+            return Qt.SizeVerCursor       # ↕
+        elif a < 157.5:
+            return Qt.SizeBDiagCursor     # ⤢  (/)
+        return Qt.SizeHorCursor
+
+    def update_crop_hover_cursor(self, scene_pos):
+        """Set the cursor based on the handle under the (un-dragged) cursor."""
+        base = self._base_transform()
+        if base is None or self._pending_crop_local is None:
+            self.view.setCursor(Qt.CrossCursor)
+            return
+        p = base.inverted()[0].map(scene_pos)
+        self.view.setCursor(self._cursor_for_handle(self._crop_handle_at(p)))
+
     def begin_crop_drag(self, scene_pos):
         base = self._base_transform()
         if base is None or self.current_pixmap is None:
@@ -1574,6 +1653,8 @@ class ImagePreview(QWidget):
             "box0": QRectF(sel) if sel is not None else None,
             "angle0": self._pending_crop_angle,
         }
+        if mode != "new":
+            self.view.setCursor(self._cursor_for_handle(mode))
         self.update_crop_drag(scene_pos)
 
     def update_crop_drag(self, scene_pos):

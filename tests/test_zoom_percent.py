@@ -177,5 +177,55 @@ class TestWheelZoomMax:
         assert ip._current_percent() >= 2.0 - 0.05
 
 
+class TestSceneRectTracksContent:
+    """The pan-wall bug: QGraphicsScene's sceneRect only grows by default, so
+    after a crop the stale larger rect stranded the image against a wall.
+    apply_transformations must pin sceneRect to the current pixmap extent."""
+
+    def test_scene_rect_shrinks_with_smaller_pixmap(self):
+        from PySide6.QtGui import QPixmap as _QPixmap, QColor as _QColor
+        ip = _setup_preview(preview_w=1080, preview_h=720)
+        ip.apply_transformations()
+        big = ip.scene.sceneRect()
+        assert big.width() == pytest.approx(1080, abs=1)
+        # Swap to a smaller (cropped) pixmap and re-apply
+        small_pm = _QPixmap(400, 300)
+        small_pm.fill(_QColor(0, 0, 0))
+        ip.current_pixmap = small_pm
+        ip.pixmap_item.setPixmap(small_pm)
+        ip.apply_transformations()
+        small = ip.scene.sceneRect()
+        assert small.width() == pytest.approx(400, abs=1)
+        assert small.width() < big.width()  # did not retain the stale rect
+
+
+class TestCropHandleCursor:
+    def test_move_and_default(self):
+        from PySide6.QtCore import Qt as _Qt
+        ip = _setup_preview()
+        ip._pending_crop_angle = 0.0
+        assert ip._cursor_for_handle("move") == _Qt.SizeAllCursor
+        assert ip._cursor_for_handle(None) == _Qt.CrossCursor
+
+    def test_edges_and_corners_unrotated(self):
+        from PySide6.QtCore import Qt as _Qt
+        ip = _setup_preview()
+        ip._pending_crop_angle = 0.0
+        assert ip._cursor_for_handle("edge-l") == _Qt.SizeHorCursor
+        assert ip._cursor_for_handle("edge-t") == _Qt.SizeVerCursor
+        assert ip._cursor_for_handle("corner-tl") == _Qt.SizeFDiagCursor
+        assert ip._cursor_for_handle("corner-tr") == _Qt.SizeBDiagCursor
+
+    def test_cursor_follows_box_rotation(self):
+        from PySide6.QtCore import Qt as _Qt
+        ip = _setup_preview()
+        # Rotating the box 90deg swaps horizontal<->vertical resize cursors
+        ip._pending_crop_angle = 90.0
+        assert ip._cursor_for_handle("edge-l") == _Qt.SizeVerCursor
+        assert ip._cursor_for_handle("edge-t") == _Qt.SizeHorCursor
+        # ...and the two diagonals swap
+        assert ip._cursor_for_handle("corner-tl") == _Qt.SizeBDiagCursor
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
