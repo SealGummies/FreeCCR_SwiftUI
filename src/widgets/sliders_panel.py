@@ -780,6 +780,11 @@ class SlidersPanel(QWidget):
             if processed is not None:
                 img.resized_raw = processed
             img.converted = True
+            img.conversion_inputs = {
+                "mode": "bw",
+                "bw": (tuple(ccr_backend.black_point_bgr), tuple(ccr_backend.white_point_bgr)),
+                "fine_rot": img.fine_rotation_angle,
+            }
             img.update_thumbnail_and_preview()
             mw = self.parent().parent()
             mw.thumbnail_list.update_all_thumbnails()

@@ -52,6 +52,13 @@ class CCRImage:
         self.horizontal_mirrored = horizontal_mirrored
         self.vertical_mirrored = vertical_mirrored
         self.converted = converted  # Indicates if the image has been converted to CCR format
+        # Snapshot of the inputs the CURRENT conversion was baked with —
+        # set by the converters, cleared on reload/unconvert. The zoom
+        # hi-res replay must use this (not live editable state) so the
+        # detail layer always matches the conversion the preview shows.
+        # {"mode": "ref", "ref": (x1,y1,x2,y2), "fine_rot": int} or
+        # {"mode": "bw", "bw": ((B,G,R),(B,G,R)), "fine_rot": int}
+        self.conversion_inputs: Optional[Dict[str, Any]] = None
         # User crop as normalized (x1, y1, x2, y2) fractions of the un-rotated/
         # un-flipped image; None = no crop. Display-level only — resized_raw is
         # never modified, so clearing the crop needs no re-conversion.
@@ -114,6 +121,7 @@ class CCRImage:
         self.contrast_base = 0      # Clear base offsets when reverting to original scan
         self.temperature_base = 0
         self.brightness_base = -8   # Always applied; not tied to conversion state
+        self.conversion_inputs = None
         img = self.read_image(self.file_path, max_long_side=1080)
         if img is not None:
             self.resized_raw = img
@@ -406,18 +414,25 @@ class CCRImage:
         )
         return qimage
 
-    def apply_adjustments(self, image: np.ndarray) -> np.ndarray:
-        if not self.adjustment_settings and self.contrast_base == 0 and self.temperature_base == 0 and self.brightness_base == 0:
+    def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
+                          temperature_base=None, brightness_base=None) -> np.ndarray:
+        """Apply the slider adjustments. The optional overrides let the zoom
+        hi-res worker render from a snapshot taken at request time instead of
+        live state the GUI thread may be mutating concurrently."""
+        s = self.adjustment_settings if settings is None else settings
+        cb = self.contrast_base if contrast_base is None else contrast_base
+        tb = self.temperature_base if temperature_base is None else temperature_base
+        bb = self.brightness_base if brightness_base is None else brightness_base
+        if not s and cb == 0 and tb == 0 and bb == 0:
             return image
-        s = self.adjustment_settings
         adjusted = adjust_image_opencl(image,
-                     s.get('temperature', 0) + self.temperature_base,
+                     s.get('temperature', 0) + tb,
                      s.get('tint', 0),
                      s.get('exposure', 0),
-                     s.get('brightness', 0) + self.brightness_base,
+                     s.get('brightness', 0) + bb,
                      s.get('black_point', 0),
                      s.get('white_point', 0),
-                     s.get('contrast', 0) + self.contrast_base,
+                     s.get('contrast', 0) + cb,
                      s.get('saturation', 0),
                      self.tint_balance_factor,
                      highlights=s.get('highlights', 0),
@@ -437,17 +452,22 @@ class CCRImage:
                      sub_saturation=s.get('sub_saturation', 0))
         return adjusted
 
-    def render_hires_base(self, black_point_bgr=None, white_point_bgr=None,
-                          max_long_side: Optional[int] = None) -> Optional[np.ndarray]:
+    def render_hires_base(self, max_long_side: Optional[int] = None,
+                          conversion_inputs=None) -> Optional[np.ndarray]:
         """
-        Re-decode this image and reproduce its current conversion at the RAW
-        half-size resolution (or capped at max_long_side), color-matched to
-        the 1080 preview: the normalization constants are re-derived from the
-        same 1080px downsize the preview conversion used. Returns the
-        converted, PRE-adjustment uint16 array (or the raw scan for
-        un-converted images). Runs on a worker thread for the zoom detail
-        view; intentionally never touches resized_raw or any preview state.
+        Re-decode this image and reproduce its conversion at the RAW
+        half-size resolution (capped at max_long_side — important for
+        non-RAW sources, which otherwise decode at FULL resolution),
+        color-matched to the 1080 preview: the conversion is replayed from
+        the snapshot captured at convert time (conversion_inputs), never
+        from live editable state, so it always matches what the preview
+        shows. Returns the converted, PRE-adjustment uint16 array (or the
+        raw scan for un-converted images). Runs on a worker thread for the
+        zoom detail view; never touches resized_raw or any preview state.
         """
+        ci = conversion_inputs if conversion_inputs is not None else self.conversion_inputs
+        if self.converted and ci is None:
+            return None  # converted through an unknown path — no replay possible
         t0 = time.time()
         img = self.read_image(self.file_path, preview=True, max_long_side=max_long_side)
         if img is None:
@@ -460,13 +480,23 @@ class CCRImage:
                                         apply_reference_normalization,
                                         apply_bwpoint_normalization)
         t0 = time.time()
-        if self.reference_frame is not None:
+        if ci.get("mode") == "ref":
             ref_small = self.resize_image_to_max_pixel(img, 1080)
             p_lo, p_hi, od_factors = compute_reference_norm_params(
-                ref_small, self.reference_frame, self.fine_rotation_angle)
+                ref_small, ci["ref"], ci["fine_rot"])
             out = apply_reference_normalization(img, p_lo, p_hi, od_factors)
-        elif black_point_bgr is not None and white_point_bgr is not None:
-            out = apply_bwpoint_normalization(img, black_point_bgr, white_point_bgr)
+        elif ci.get("mode") == "bw":
+            # The bwpoint pipeline bakes the fine rotation into the preview
+            # pixels BEFORE normalization — replicate that here so the
+            # detail layer lines up with the preview content.
+            fine_angle = ci.get("fine_rot", 0) / 100.0
+            if fine_angle != 0:
+                h0, w0 = img.shape[:2]
+                rot = cv2.getRotationMatrix2D((w0 // 2, h0 // 2), -fine_angle, 1.0)
+                img = cv2.warpAffine(img, rot, (w0, h0), flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            black_point, white_point = ci["bw"]
+            out = apply_bwpoint_normalization(img, black_point, white_point)
         else:
             return None
         print(f"Hi-res convert: {time.time() - t0:.2f}s")

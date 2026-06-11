@@ -310,6 +310,13 @@ class CCRBackend:
                 processed = ccr_normalize_with_reference(image_obj,water_mark=not self.software_activated)
                 image_obj.resized_raw = processed
                 image_obj.converted = True
+                # Snapshot what this conversion was baked with (the zoom
+                # hi-res replay must use these, not later edited values)
+                image_obj.conversion_inputs = {
+                    "mode": "ref",
+                    "ref": tuple(image_obj.reference_frame),
+                    "fine_rot": image_obj.fine_rotation_angle,
+                }
                 image_obj.update_thumbnail_and_preview()
             except Exception as e:
                 print(f"Failed to convert image at index {idx}: {e}")
@@ -556,6 +563,11 @@ class CCRBackend:
                 if processed is not None:
                     img.resized_raw = processed
                 img.converted = True
+                img.conversion_inputs = {
+                    "mode": "bw",
+                    "bw": (tuple(self.black_point_bgr), tuple(self.white_point_bgr)),
+                    "fine_rot": img.fine_rotation_angle,
+                }
                 img.update_thumbnail_and_preview()
             except Exception as e:
                 print(f"B/W point conversion failed for image {i}: {e}")

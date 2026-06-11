@@ -113,6 +113,9 @@ class MainWindow(QMainWindow):
         # of the just-restored state instead of merging into a stale burst.
         self.sliders_panel.end_undo_burst()
         self.image_preview.end_undo_bursts()
+        # Undo can change crop/rotation/flips, which moves or resizes the
+        # displayed content — a preserved zoom would strand the viewport.
+        self.image_preview._reset_zoom()
         img.update_thumbnail_and_preview()
         self.thumbnail_list.update_thumbnail(idx)
         self.image_preview.update_preview(idx)

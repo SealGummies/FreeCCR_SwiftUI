@@ -35,6 +35,7 @@ def _conversion_stub(img, ref_rect, fine_rot=0):
     s.temperature_base = 0
     s.brightness_base = -8
     s.adjustment_settings = {}
+    s.conversion_inputs = None
     return s
 
 
@@ -117,7 +118,7 @@ class TestRenderHiresBaseRouting:
         out = stub.render_hires_base()
         assert out is not None and out.shape == (240, 360, 3)
 
-    def test_converted_without_ref_or_points_returns_none(self, tmp_path):
+    def test_converted_without_conversion_snapshot_returns_none(self, tmp_path):
         import cv2
         path = str(tmp_path / "scan.png")
         cv2.imwrite(path, cv2.cvtColor(_scan_like_image(h=120, w=160),
@@ -125,7 +126,49 @@ class TestRenderHiresBaseRouting:
         stub = _conversion_stub(None, None)
         stub.file_path = path
         stub.converted = True
+        stub.conversion_inputs = None
         assert stub.render_hires_base() is None
+
+    def test_bwpoint_replay_includes_fine_rotation(self, tmp_path):
+        """The bwpoint pipeline bakes the fine rotation into the preview
+        pixels before normalization; the hi-res replay must do the same so
+        the detail layer lines up with the preview content."""
+        import cv2
+        img = _scan_like_image(h=240, w=360, seed=5)
+        path = str(tmp_path / "scan.png")
+        cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        black_point = (52000.0, 48000.0, 39000.0)
+        white_point = (9000.0, 9500.0, 7000.0)
+        fine_rot = 250  # 2.5 degrees
+        expected = ccr_normalize_with_bwpoint(
+            _conversion_stub(img.copy(), None, fine_rot), black_point, white_point)
+        stub = _conversion_stub(None, None, fine_rot)
+        stub.file_path = path
+        stub.converted = True
+        stub.conversion_inputs = {"mode": "bw",
+                                  "bw": (black_point, white_point),
+                                  "fine_rot": fine_rot}
+        got = stub.render_hires_base()
+        np.testing.assert_allclose(got.astype(np.int64),
+                                   expected.astype(np.int64), atol=2)
+
+    def test_ref_replay_uses_snapshot_not_live_state(self, tmp_path):
+        """Changing the live reference frame after conversion must not change
+        the replay — it renders from the convert-time snapshot."""
+        import cv2
+        img = _scan_like_image(h=200, w=300, seed=9)
+        path = str(tmp_path / "scan.png")
+        cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        ref = (20, 20, 280, 180)
+        stub = _conversion_stub(None, ref)
+        stub.file_path = path
+        stub.converted = True
+        stub.conversion_inputs = {"mode": "ref", "ref": ref, "fine_rot": 0}
+        baseline = stub.render_hires_base()
+        stub.reference_frame = (100, 100, 150, 150)   # live edit, no re-convert
+        stub.fine_rotation_angle = 900
+        again = stub.render_hires_base()
+        np.testing.assert_array_equal(baseline, again)
 
 
 if __name__ == "__main__":
