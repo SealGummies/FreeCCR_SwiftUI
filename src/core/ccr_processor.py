@@ -740,7 +740,8 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
         # User crop (normalized rect in un-rotated/un-flipped space) — applied
         # before flips/rotation so it matches the cropped preview orientation.
         rgb_brightness_normalized = apply_crop_to_image(
-            rgb_brightness_normalized, getattr(ccr_image, 'crop_rect', None))
+            rgb_brightness_normalized, getattr(ccr_image, 'crop_rect', None),
+            getattr(ccr_image, 'crop_angle', 0.0))
         step_start = time.time()
         # Apply flips and rotation to rgb_brightness_normalized before export
         if h_flip and v_flip:
@@ -1001,7 +1002,8 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     if output_path is not None:
         # User crop (normalized rect in un-rotated/un-flipped space) — applied
         # before flips/rotation so it matches the cropped preview orientation.
-        rgb_result = apply_crop_to_image(rgb_result, getattr(ccr_image, 'crop_rect', None))
+        rgb_result = apply_crop_to_image(rgb_result, getattr(ccr_image, 'crop_rect', None),
+                                         getattr(ccr_image, 'crop_angle', 0.0))
         # Flips
         if h_flip and v_flip:
             rgb_result = cv2.flip(rgb_result, -1)
@@ -1081,17 +1083,40 @@ def to_8bit(img16: np.ndarray) -> np.ndarray:
     return img8
 
 
-def apply_crop_to_image(img: np.ndarray, crop_rect_norm) -> np.ndarray:
+def apply_crop_to_image(img: np.ndarray, crop_rect_norm, crop_angle: float = 0.0) -> np.ndarray:
     """
-    Crop an image using a rect of normalized (x1, y1, x2, y2) fractions
+    Crop an image using a box of normalized (x1, y1, x2, y2) fractions
     defined in un-rotated/un-flipped image space (the same space as
-    resized_raw). Returns the input unchanged when the rect is missing or
-    degenerate, so callers can pass it unconditionally.
+    resized_raw), optionally rotated by crop_angle degrees about the box
+    center (positive = clockwise on screen, matching Qt's rotate()).
+    Returns the input unchanged when the rect is missing or degenerate,
+    so callers can pass it unconditionally.
     """
     if crop_rect_norm is None:
         return img
     h, w = img.shape[:2]
     fx1, fy1, fx2, fy2 = crop_rect_norm
+    if crop_angle:
+        # Rotated crop box: output pixel (u, v) samples the source at
+        # C + R(angle) . (u - bw/2, v - bh/2). R matches Qt's
+        # clockwise-positive rotate() in y-down coords, so the exported
+        # content equals the on-screen selection. Areas outside the source
+        # are filled black. The box rect is not clamped to the image here —
+        # a rotated box may legitimately overhang the image bounds.
+        bw = int(round((fx2 - fx1) * w))
+        bh = int(round((fy2 - fy1) * h))
+        if bw < 2 or bh < 2:
+            return img
+        cx = (fx1 + fx2) / 2.0 * w
+        cy = (fy1 + fy2) / 2.0 * h
+        theta = np.deg2rad(crop_angle)
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        rot = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float64)
+        offset = np.array([cx, cy]) - rot @ np.array([bw / 2.0, bh / 2.0])
+        affine = np.hstack([rot, offset[:, None]]).astype(np.float32)
+        return cv2.warpAffine(img, affine, (bw, bh),
+                              flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     x1 = max(0, min(w - 1, int(round(fx1 * w))))
     y1 = max(0, min(h - 1, int(round(fy1 * h))))
     x2 = max(x1 + 1, min(w, int(round(fx2 * w))))

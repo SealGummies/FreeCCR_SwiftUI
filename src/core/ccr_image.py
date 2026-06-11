@@ -55,7 +55,10 @@ class CCRImage:
         # User crop as normalized (x1, y1, x2, y2) fractions of the un-rotated/
         # un-flipped image; None = no crop. Display-level only — resized_raw is
         # never modified, so clearing the crop needs no re-conversion.
+        # crop_angle rotates the box about its center (degrees, positive =
+        # clockwise on screen, Qt convention).
         self.crop_rect: Optional[tuple[float, float, float, float]] = None
+        self.crop_angle: float = 0.0
         self.undo_stack: list = []  # Snapshots for Ctrl+Z, most recent last
         self.contrast_base: int = 0      # Non-destructive base contrast added internally; slider shows 0
         self.temperature_base: int = 0   # Non-destructive base temperature offset; slider shows 0
@@ -435,6 +438,7 @@ class CCRImage:
         return {
             "adjustment_settings": dict(self.adjustment_settings),
             "crop_rect": self.crop_rect,
+            "crop_angle": self.crop_angle,
             "rotation_angle": self.rotation_angle,
             "fine_rotation_angle": self.fine_rotation_angle,
             "horizontal_mirrored": self.horizontal_mirrored,
@@ -460,6 +464,7 @@ class CCRImage:
         state = self.undo_stack.pop()
         self.adjustment_settings = state["adjustment_settings"]
         self.crop_rect = state["crop_rect"]
+        self.crop_angle = state.get("crop_angle", 0.0)
         self.rotation_angle = state["rotation_angle"]
         self.fine_rotation_angle = state["fine_rotation_angle"]
         self.horizontal_mirrored = state["horizontal_mirrored"]

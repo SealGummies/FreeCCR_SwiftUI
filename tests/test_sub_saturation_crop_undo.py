@@ -110,11 +110,69 @@ class TestApplyCrop:
         np.testing.assert_array_equal(out, img[3:8, 2:7])
 
 
+def _coordinate_image(h=200, w=200):
+    """Image whose channel 0 encodes x*100 and channel 1 encodes y*100."""
+    img = np.zeros((h, w, 3), dtype=np.uint16)
+    img[..., 0] = (np.arange(w, dtype=np.uint16) * 100)[None, :]
+    img[..., 1] = (np.arange(h, dtype=np.uint16) * 100)[:, None]
+    return img
+
+
+class TestRotatedCrop:
+    # Box: center (100, 100), 40 wide x 60 tall, on a 200x200 image
+    CROP = (80 / 200, 70 / 200, 120 / 200, 130 / 200)
+
+    def test_angle_zero_uses_plain_slice(self):
+        img = _coordinate_image()
+        out = apply_crop_to_image(img, self.CROP, 0.0)
+        np.testing.assert_array_equal(out, img[70:130, 80:120])
+
+    def test_rotated_90_orientation(self):
+        # Output (u, v) samples source at C + R(angle).(u - bw/2, v - bh/2);
+        # R is Qt's clockwise-positive rotation, so at 90 deg:
+        # src = (cx - (v - bh/2), cy + (u - bw/2)).
+        img = _coordinate_image()
+        out = apply_crop_to_image(img, self.CROP, 90.0)
+        assert out.shape == (60, 40, 3)
+        assert out[30, 20, 0] == 100 * 100 and out[30, 20, 1] == 100 * 100  # center
+        assert out[10, 10, 0] == 120 * 100  # src x = 100 - (10 - 30) = 120
+        assert out[10, 10, 1] == 90 * 100   # src y = 100 + (10 - 20) = 90
+
+    def test_small_angle_center_is_invariant(self):
+        img = _coordinate_image()
+        out = apply_crop_to_image(img, self.CROP, 7.0)
+        assert out.shape == (60, 40, 3)
+        np.testing.assert_allclose(
+            out[30, 20, :2].astype(np.int64), (100 * 100, 100 * 100), atol=200)
+
+    def test_overhanging_rotated_box_fills_black(self):
+        img = np.full((100, 100, 3), 30000, dtype=np.uint16)
+        # Box centered near the corner, rotated — parts fall outside the image
+        out = apply_crop_to_image(img, (-0.2, -0.2, 0.3, 0.3), 30.0)
+        assert out.shape == (50, 50, 3)
+        assert (out == 0).any()        # black fill outside the source
+        assert (out == 30000).any()    # and real content inside
+
+
+class TestSyncGroups:
+    def test_groups_partition_adjustment_keys(self):
+        from widgets.sliders_panel import SYNC_GROUPS, SlidersPanel
+        keys = [k for _gid, _label, group_keys in SYNC_GROUPS for k in group_keys]
+        assert sorted(keys) == sorted(SlidersPanel.ADJUSTMENT_KEYS)
+        assert len(keys) == len(set(keys))
+
+    def test_expected_group_ids(self):
+        from widgets.sliders_panel import SYNC_GROUPS
+        assert [gid for gid, _l, _k in SYNC_GROUPS] == [
+            "wb", "tone", "sat", "crop", "channels"]
+
+
 def _stub_image():
     """CCRImage without the heavy file-loading __init__."""
     img = CCRImage.__new__(CCRImage)
     img.adjustment_settings = {}
     img.crop_rect = None
+    img.crop_angle = 0.0
     img.rotation_angle = 0
     img.fine_rotation_angle = 0
     img.horizontal_mirrored = False
@@ -134,10 +192,12 @@ class TestUndoStack:
         img.push_undo_state()
         img.adjustment_settings = {"temperature": 50}
         img.crop_rect = (0.1, 0.1, 0.9, 0.9)
+        img.crop_angle = 12.5
         img.rotation_angle = 90
         assert img.pop_undo_state() is True
         assert img.adjustment_settings == {"temperature": 10}
         assert img.crop_rect is None
+        assert img.crop_angle == 0.0
         assert img.rotation_angle == 0
 
     def test_multiple_undo_steps(self):
