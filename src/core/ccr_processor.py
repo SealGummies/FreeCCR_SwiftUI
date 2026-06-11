@@ -79,6 +79,18 @@ def _initialize_opencl():
             float balance_factor = params[8];  // Global balance factor calculated on CPU
             float highlights = params[9];
             float shadows = params[10];
+            float ch_input_gain   = params[11];
+            float ch_master_shift = params[12];
+            float ch_master_gain  = params[13];
+            float ch_r_shift      = params[14];
+            float ch_r_gain       = params[15];
+            float ch_r_blackpoint = params[16];
+            float ch_g_shift      = params[17];
+            float ch_g_gain       = params[18];
+            float ch_g_blackpoint = params[19];
+            float ch_b_shift      = params[20];
+            float ch_b_gain       = params[21];
+            float ch_b_blackpoint = params[22];
 
             int idx = gid * 3;
             float r = img[idx];
@@ -337,6 +349,45 @@ def _initialize_opencl():
                 r = img_norm_r * 65535.0f;
                 g = img_norm_g * 65535.0f;
                 b = img_norm_b * 65535.0f;
+            }
+
+            // Per-channel levels controls (linear domain, post-conversion data).
+            // Blackpoint/Gain mirror the regular Black/White Point sliders
+            // (same /300 mapping) per channel; Shift is a uniform additive
+            // offset; Input Gain is a pre-everything exposure multiplier.
+            if (ch_input_gain != 0.0f || ch_master_shift != 0.0f || ch_master_gain != 0.0f ||
+                ch_r_shift != 0.0f || ch_r_gain != 0.0f || ch_r_blackpoint != 0.0f ||
+                ch_g_shift != 0.0f || ch_g_gain != 0.0f || ch_g_blackpoint != 0.0f ||
+                ch_b_shift != 0.0f || ch_b_gain != 0.0f || ch_b_blackpoint != 0.0f) {
+
+                float ig = pow(2.0f, ch_input_gain / 50.0f);
+                float rs  = clamp(ch_master_shift + ch_r_shift, -100.0f, 100.0f) / 300.0f;
+                float rg  = clamp(ch_master_gain + ch_r_gain, -100.0f, 100.0f) / 300.0f;
+                float rbp = clamp(ch_r_blackpoint, -100.0f, 100.0f) / 300.0f;
+                float gs  = clamp(ch_master_shift + ch_g_shift, -100.0f, 100.0f) / 300.0f;
+                float gg  = clamp(ch_master_gain + ch_g_gain, -100.0f, 100.0f) / 300.0f;
+                float gbp = clamp(ch_g_blackpoint, -100.0f, 100.0f) / 300.0f;
+                float bs  = clamp(ch_master_shift + ch_b_shift, -100.0f, 100.0f) / 300.0f;
+                float bg  = clamp(ch_master_gain + ch_b_gain, -100.0f, 100.0f) / 300.0f;
+                float bbp = clamp(ch_b_blackpoint, -100.0f, 100.0f) / 300.0f;
+
+                // Process each channel only when non-neutral, so the normalize
+                // round-trip can't drift untouched channels by 1 LSB.
+                if (ig != 1.0f || rs != 0.0f || rg != 0.0f || rbp != 0.0f) {
+                    float xr = (r / 65535.0f) * ig + rs;
+                    xr = (xr - rbp) / ((1.0f - rg) - rbp);
+                    r = clamp(xr, 0.0f, 1.0f) * 65535.0f;
+                }
+                if (ig != 1.0f || gs != 0.0f || gg != 0.0f || gbp != 0.0f) {
+                    float xg = (g / 65535.0f) * ig + gs;
+                    xg = (xg - gbp) / ((1.0f - gg) - gbp);
+                    g = clamp(xg, 0.0f, 1.0f) * 65535.0f;
+                }
+                if (ig != 1.0f || bs != 0.0f || bg != 0.0f || bbp != 0.0f) {
+                    float xb = (b / 65535.0f) * ig + bs;
+                    xb = (xb - bbp) / ((1.0f - bg) - bbp);
+                    b = clamp(xb, 0.0f, 1.0f) * 65535.0f;
+                }
             }
 
             // Final clamp and store results
@@ -1352,7 +1403,19 @@ def adjust_image(
     saturation: float = 0.0,
     tint_balance_factor: float = 1.0,
     highlights: float = 0.0,
-    shadows: float = 0.0
+    shadows: float = 0.0,
+    ch_input_gain: float = 0.0,
+    ch_master_shift: float = 0.0,
+    ch_master_gain: float = 0.0,
+    ch_r_shift: float = 0.0,
+    ch_r_gain: float = 0.0,
+    ch_r_blackpoint: float = 0.0,
+    ch_g_shift: float = 0.0,
+    ch_g_gain: float = 0.0,
+    ch_g_blackpoint: float = 0.0,
+    ch_b_shift: float = 0.0,
+    ch_b_gain: float = 0.0,
+    ch_b_blackpoint: float = 0.0,
 ) -> np.ndarray:
     """
     Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
@@ -1582,6 +1645,51 @@ def adjust_image(
         img_norm = np.clip(img_norm, 0, 1)
         img = img_norm * 65535.0
 
+    # Per-channel levels controls (linear domain, post-conversion data).
+    # Runs only when at least one slider is non-zero; otherwise a no-op.
+    #
+    # Blackpoint and Gain are per-channel versions of the regular Black Point
+    # and White Point sliders (same /300 mapping); Shift is a uniform additive
+    # offset that translates the channel's histogram; Input Gain is an
+    # exposure-style multiplier applied before everything else.
+    #     out = ((in * input_gain + shift) - black_val) / (white_val - black_val)
+    # where black_val anchors white and remaps the dark end (regular Black
+    # Point behaviour) and white_val = 1 - gain anchors black and moves the
+    # bright end (regular White Point behaviour).
+    _ch_active = (ch_input_gain, ch_master_shift, ch_master_gain,
+                  ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                  ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                  ch_b_shift, ch_b_gain, ch_b_blackpoint)
+    if any(p != 0.0 for p in _ch_active):
+        ig = 2.0 ** (ch_input_gain / 50.0)      # slider ±100 → ×0.25…×4 (±2 stops)
+        # Master + channel combined, clamped to slider range, then /300 like
+        # the regular Black/White Point sliders.
+        shifts = (np.clip(ch_master_shift + ch_r_shift, -100, 100) / 300.0,
+                  np.clip(ch_master_shift + ch_g_shift, -100, 100) / 300.0,
+                  np.clip(ch_master_shift + ch_b_shift, -100, 100) / 300.0)
+        gains  = (np.clip(ch_master_gain + ch_r_gain, -100, 100) / 300.0,
+                  np.clip(ch_master_gain + ch_g_gain, -100, 100) / 300.0,
+                  np.clip(ch_master_gain + ch_b_gain, -100, 100) / 300.0)
+        blacks = (np.clip(ch_r_blackpoint, -100, 100) / 300.0,
+                  np.clip(ch_g_blackpoint, -100, 100) / 300.0,
+                  np.clip(ch_b_blackpoint, -100, 100) / 300.0)
+
+        for c in range(3):
+            # Skip neutral channels so the normalize round-trip can't introduce
+            # ±1 LSB quantization drift on channels the user didn't touch.
+            if ig == 1.0 and shifts[c] == 0.0 and gains[c] == 0.0 and blacks[c] == 0.0:
+                continue
+            ch = img[..., c] / 65535.0
+            if ig != 1.0:
+                ch = ch * ig
+            if shifts[c] != 0.0:
+                ch = ch + shifts[c]
+            black_val = blacks[c]
+            white_val = 1.0 - gains[c]
+            if black_val != 0.0 or white_val != 1.0:
+                ch = (ch - black_val) / (white_val - black_val)
+            img[..., c] = np.clip(ch, 0.0, 1.0) * 65535.0
+
     img = np.clip(img, 0, 65535)
     return img.astype(np.uint16)
 
@@ -1597,20 +1705,36 @@ def adjust_image_opencl(
     saturation: float = 0.0,
     tint_balance_factor: float = 1.0,
     highlights: float = 0.0,
-    shadows: float = 0.0
+    shadows: float = 0.0,
+    ch_input_gain: float = 0.0,
+    ch_master_shift: float = 0.0,
+    ch_master_gain: float = 0.0,
+    ch_r_shift: float = 0.0,
+    ch_r_gain: float = 0.0,
+    ch_r_blackpoint: float = 0.0,
+    ch_g_shift: float = 0.0,
+    ch_g_gain: float = 0.0,
+    ch_g_blackpoint: float = 0.0,
+    ch_b_shift: float = 0.0,
+    ch_b_gain: float = 0.0,
+    ch_b_blackpoint: float = 0.0,
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
     Uses cached OpenCL context and compiled program for better performance.
     """
     global _opencl_cache
-    
+
     # Initialize OpenCL if not already done
     if not _initialize_opencl():
         # Fallback to CPU version
         return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
                           blackpoint, whitepoint, contrast, saturation, tint_balance_factor,
-                          highlights, shadows)
+                          highlights, shadows,
+                          ch_input_gain, ch_master_shift, ch_master_gain,
+                          ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                          ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                          ch_b_shift, ch_b_gain, ch_b_blackpoint)
 
     try:
         # Use cached OpenCL objects
@@ -1626,11 +1750,15 @@ def adjust_image_opencl(
         img_flat = img.reshape(-1, 3)
         img_buf = cl_array.to_device(queue, img_flat)
 
-        # Prepare parameters as numpy arrays - balance_factor (9th), highlights (10th), shadows (11th)
+        # Prepare parameters as numpy array (params[0..10] existing, params[11..22] channel levels)
         params = np.array([
             kelvin_shift, tint_shift, exposure, brightness,
             blackpoint, whitepoint, contrast, saturation, balance_factor,
-            highlights, shadows
+            highlights, shadows,
+            ch_input_gain, ch_master_shift, ch_master_gain,
+            ch_r_shift, ch_r_gain, ch_r_blackpoint,
+            ch_g_shift, ch_g_gain, ch_g_blackpoint,
+            ch_b_shift, ch_b_gain, ch_b_blackpoint,
         ], dtype=np.float32)
 
         params_buf = cl_array.to_device(queue, params)
@@ -1648,7 +1776,11 @@ def adjust_image_opencl(
         # Fallback to CPU version
         return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
                           blackpoint, whitepoint, contrast, saturation, tint_balance_factor,
-                          highlights, shadows)
+                          highlights, shadows,
+                          ch_input_gain, ch_master_shift, ch_master_gain,
+                          ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                          ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                          ch_b_shift, ch_b_gain, ch_b_blackpoint)
 
 
 
