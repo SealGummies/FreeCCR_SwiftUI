@@ -118,12 +118,12 @@ class SlidersPanel(QWidget):
         self.adjustment_keys = [
             "temperature", "tint", "exposure", "brightness", "highlights",
             "white_point", "shadows", "black_point", "contrast", "saturation",
-            # OD (optical-density / log-space) channel controls — appended so
-            # existing positional zip(adjustment_keys, sliders) indices are unchanged.
-            "od_input_gain", "od_master_shift", "od_master_gain",
-            "od_r_shift", "od_r_gain", "od_r_blackpoint",
-            "od_g_shift", "od_g_gain", "od_g_blackpoint",
-            "od_b_shift", "od_b_gain", "od_b_blackpoint",
+            # Per-channel levels controls — appended so existing positional
+            # zip(adjustment_keys, sliders) indices are unchanged.
+            "ch_input_gain", "ch_master_shift", "ch_master_gain",
+            "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
+            "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
+            "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
         ]
         self.copied_adjustment = None  # Store copied adjustment settings
         self._hint_timer = QTimer(self)  # Timer for temporary hints
@@ -238,14 +238,14 @@ class SlidersPanel(QWidget):
         self.convert_all_bwp_btn = QPushButton("Convert All (B/W Point)")
         scroll_layout.addWidget(self.convert_all_bwp_btn)
 
-        # --- OD Controls collapsible section (sliders[10]–[21]) ---
+        # --- Channel Levels collapsible section (sliders[10]–[21]) ---
         od_separator = QFrame()
         od_separator.setFrameShape(QFrame.HLine)
         od_separator.setFrameShadow(QFrame.Sunken)
         od_separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
         scroll_layout.addWidget(od_separator)
 
-        self.od_section = CollapsibleSection("OD Controls (NamiColor-style)")
+        self.od_section = CollapsibleSection("Channel Levels")
         scroll_layout.addWidget(self.od_section)
 
         # Master group

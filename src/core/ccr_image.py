@@ -399,18 +399,18 @@ class CCRImage:
                      self.tint_balance_factor,
                      highlights=s.get('highlights', 0),
                      shadows=s.get('shadows', 0),
-                     od_input_gain=s.get('od_input_gain', 0),
-                     od_master_shift=s.get('od_master_shift', 0),
-                     od_master_gain=s.get('od_master_gain', 0),
-                     od_r_shift=s.get('od_r_shift', 0),
-                     od_r_gain=s.get('od_r_gain', 0),
-                     od_r_blackpoint=s.get('od_r_blackpoint', 0),
-                     od_g_shift=s.get('od_g_shift', 0),
-                     od_g_gain=s.get('od_g_gain', 0),
-                     od_g_blackpoint=s.get('od_g_blackpoint', 0),
-                     od_b_shift=s.get('od_b_shift', 0),
-                     od_b_gain=s.get('od_b_gain', 0),
-                     od_b_blackpoint=s.get('od_b_blackpoint', 0))
+                     ch_input_gain=s.get('ch_input_gain', 0),
+                     ch_master_shift=s.get('ch_master_shift', 0),
+                     ch_master_gain=s.get('ch_master_gain', 0),
+                     ch_r_shift=s.get('ch_r_shift', 0),
+                     ch_r_gain=s.get('ch_r_gain', 0),
+                     ch_r_blackpoint=s.get('ch_r_blackpoint', 0),
+                     ch_g_shift=s.get('ch_g_shift', 0),
+                     ch_g_gain=s.get('ch_g_gain', 0),
+                     ch_g_blackpoint=s.get('ch_g_blackpoint', 0),
+                     ch_b_shift=s.get('ch_b_shift', 0),
+                     ch_b_gain=s.get('ch_b_gain', 0),
+                     ch_b_blackpoint=s.get('ch_b_blackpoint', 0))
         return adjusted
 
     def _auto_brightness_for_preview(self, image: np.ndarray) -> np.ndarray:
