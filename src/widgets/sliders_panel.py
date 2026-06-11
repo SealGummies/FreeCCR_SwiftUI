@@ -1,9 +1,71 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayout,
                                 QSizePolicy, QStyleOptionSlider, QFrame, QStyle,
-                                QPushButton, QDialog, QMessageBox, QScrollArea)
+                                QPushButton, QDialog, QMessageBox, QScrollArea,
+                                QCheckBox)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
 from core.ccr_backend import ccr_backend
+
+# Setting groups offered by the "Sync to All" dialog. The adjustment-key
+# groups partition SlidersPanel.ADJUSTMENT_KEYS exactly; "crop" syncs the
+# image's crop box (rect + angle) instead of adjustment keys.
+SYNC_GROUPS = [
+    ("wb", "White Balance / Tint", ("temperature", "tint")),
+    ("tone", "Tone (exposure, brightness, contrast, ...)",
+     ("exposure", "brightness", "highlights", "white_point",
+      "shadows", "black_point", "contrast")),
+    ("sat", "Saturation", ("saturation", "sub_saturation")),
+    ("crop", "Crop", ()),
+    ("channels", "Channel Levels", (
+        "ch_input_gain", "ch_master_shift", "ch_master_gain",
+        "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
+        "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
+        "ch_b_shift", "ch_b_gain", "ch_b_blackpoint")),
+]
+
+
+class SyncSettingsDialog(QDialog):
+    """Pick which setting groups 'Sync to All' copies to every image."""
+
+    def __init__(self, parent=None, selection=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sync to All")
+        self.setMinimumWidth(280)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Sync these settings to all images:"))
+
+        self._checkboxes = {}
+        for gid, label, _keys in SYNC_GROUPS:
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True if selection is None else selection.get(gid, True))
+            layout.addWidget(checkbox)
+            self._checkboxes[gid] = checkbox
+
+        select_row = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        deselect_all_btn = QPushButton("Deselect All")
+        select_all_btn.clicked.connect(lambda: self._set_all(True))
+        deselect_all_btn.clicked.connect(lambda: self._set_all(False))
+        select_row.addWidget(select_all_btn)
+        select_row.addWidget(deselect_all_btn)
+        layout.addLayout(select_row)
+
+        button_row = QHBoxLayout()
+        sync_btn = QPushButton("Sync")
+        sync_btn.setDefault(True)
+        cancel_btn = QPushButton("Cancel")
+        sync_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        button_row.addWidget(sync_btn)
+        button_row.addWidget(cancel_btn)
+        layout.addLayout(button_row)
+
+    def _set_all(self, checked: bool):
+        for checkbox in self._checkboxes.values():
+            checkbox.setChecked(checked)
+
+    def selection(self) -> dict:
+        return {gid: checkbox.isChecked() for gid, checkbox in self._checkboxes.items()}
 
 class CollapsibleSection(QWidget):
     """A toggle-button header that shows/hides its content widget. Default: collapsed."""
@@ -108,6 +170,19 @@ class ResettableSlider(QSlider):
         event.accept()
 
 class SlidersPanel(QWidget):
+    # Order must match the create_slider() call order exactly — the two
+    # lists are zipped positionally.
+    ADJUSTMENT_KEYS = [
+        "temperature", "tint", "exposure", "brightness", "highlights",
+        "white_point", "shadows", "black_point", "contrast", "saturation",
+        "sub_saturation",
+        # Per-channel levels controls (collapsible section, created last)
+        "ch_input_gain", "ch_master_shift", "ch_master_gain",
+        "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
+        "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
+        "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
+    ]
+
     def __init__(self, parent=None):
         super().__init__()
         self.sliders = []
@@ -115,16 +190,8 @@ class SlidersPanel(QWidget):
         self.slider_labels = []
         self.image_slider_map = {}
         self.current_image_id = None
-        self.adjustment_keys = [
-            "temperature", "tint", "exposure", "brightness", "highlights",
-            "white_point", "shadows", "black_point", "contrast", "saturation",
-            # Per-channel levels controls — appended so existing positional
-            # zip(adjustment_keys, sliders) indices are unchanged.
-            "ch_input_gain", "ch_master_shift", "ch_master_gain",
-            "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
-            "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
-            "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
-        ]
+        self.adjustment_keys = list(self.ADJUSTMENT_KEYS)
+        self._sync_group_selection = None  # remembered while the app is open
         self.copied_adjustment = None  # Store copied adjustment settings
         self._hint_timer = QTimer(self)  # Timer for temporary hints
         self._hint_timer.setSingleShot(True)
@@ -133,7 +200,13 @@ class SlidersPanel(QWidget):
         self._processing = False
         self._pending_adjustment = None
         self._pending_idx = None
-        
+
+        # Coalesce rapid slider changes (one drag) into a single undo step.
+        self._undo_burst_active = False
+        self._undo_burst_timer = QTimer(self)
+        self._undo_burst_timer.setSingleShot(True)
+        self._undo_burst_timer.timeout.connect(self._end_undo_burst)
+
         self.initUI()
         self.setup_shortcuts()
         self._debounce_timer = QTimer(self)
@@ -174,7 +247,8 @@ class SlidersPanel(QWidget):
 
         self.slider_labels = [
             "Temperature", "Tint", "Exposure", "Brightness",
-            "Highlights", "White Point", "Shadows", "Black Point", "Contrast", "Saturation"
+            "Highlights", "White Point", "Shadows", "Black Point", "Contrast", "Saturation",
+            "Subtracted Sat"
         ]
 
         self.current_idx = None
@@ -211,7 +285,17 @@ class SlidersPanel(QWidget):
         self.wb_picker_btn.setToolTip(
             "Click, then pick a neutral gray/white point on the image "
             "to auto-set Temperature and Tint.")
-        scroll_layout.addWidget(self.wb_picker_btn, alignment=Qt.AlignLeft)
+        # Crop: non-destructive crop of the preview/export (same gating).
+        self.crop_btn = QPushButton("Crop")
+        self.crop_btn.setToolTip(
+            "Crop the image. Drag to draw a box; drag the handles to resize, "
+            "the top knob to rotate, the center to move. Enter confirms, "
+            "Esc cancels, right-click clears the crop.")
+        wb_crop_row = QHBoxLayout()
+        wb_crop_row.addWidget(self.wb_picker_btn)
+        wb_crop_row.addWidget(self.crop_btn)
+        wb_crop_row.addStretch()
+        scroll_layout.addLayout(wb_crop_row)
 
         self.temperature_slider_layout = self.create_slider("Temperature")
         self.tint_slider_layout = self.create_slider("Tint")
@@ -223,6 +307,7 @@ class SlidersPanel(QWidget):
         self.black_point_slider_layout = self.create_slider("Black Point")
         self.contrast_slider_layout = self.create_slider("Contrast")
         self.saturation_slider_layout = self.create_slider("Saturation")
+        self.sub_saturation_slider_layout = self.create_slider("Subtracted Sat")
 
         scroll_layout.addLayout(self.temperature_slider_layout)
         scroll_layout.addLayout(self.tint_slider_layout)
@@ -234,6 +319,7 @@ class SlidersPanel(QWidget):
         scroll_layout.addLayout(self.black_point_slider_layout)
         scroll_layout.addLayout(self.contrast_slider_layout)
         scroll_layout.addLayout(self.saturation_slider_layout)
+        scroll_layout.addLayout(self.sub_saturation_slider_layout)
 
         # --- Reset / Compare / Sync buttons ---
         buttons_layout = QHBoxLayout()
@@ -301,6 +387,7 @@ class SlidersPanel(QWidget):
         self.compare_button.setCheckable(False)
         self.sync_to_all_button.clicked.connect(self.on_sync_to_all_clicked)
         self.wb_picker_btn.clicked.connect(self._on_pick_neutral_point)
+        self.crop_btn.clicked.connect(self._on_crop_clicked)
         self.white_point_btn.clicked.connect(self._on_set_white_point)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
         self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
@@ -382,6 +469,7 @@ class SlidersPanel(QWidget):
     def set_sliders_enabled(self, enabled: bool):
         print(f"Setting sliders enabled: {enabled}")
         self.wb_picker_btn.setEnabled(enabled)
+        self.crop_btn.setEnabled(enabled)
         for slider in self.sliders:
             slider.setEnabled(enabled)
             if not enabled:
@@ -398,7 +486,12 @@ class SlidersPanel(QWidget):
         self._pending_adjustment = None
         self._pending_idx = None
         self._debounce_timer.stop()
-        
+        # End the undo burst only on a real image switch — this method is
+        # also re-entered on same-image refreshes during a slider drag.
+        if idx != self.current_idx:
+            self._end_undo_burst()
+            self._undo_burst_timer.stop()
+
         self.current_idx = idx
         adjustment = ccr_backend.get_adjustment_by_index(idx)
         print(f"Setting current index: {idx}, adjustment: {adjustment}")
@@ -411,12 +504,15 @@ class SlidersPanel(QWidget):
                 self.slider_value_labels[i].setText("0")
             return
 
+        # Missing keys count as 0 so a partial dict can never leave a slider
+        # showing the previously selected image's value.
         for i, key in enumerate(self.adjustment_keys):
-            if key in adjustment and i < len(self.sliders):
+            if i < len(self.sliders):
+                val = adjustment.get(key, 0)
                 self.sliders[i].blockSignals(True)
-                self.sliders[i].setValue(adjustment[key])
+                self.sliders[i].setValue(val)
                 self.sliders[i].blockSignals(False)
-                self.slider_value_labels[i].setText(str(adjustment[key]))
+                self.slider_value_labels[i].setText(str(val))
         if idx is not None:
             ccr_backend.apply_adjustment_by_index(idx)
 
@@ -428,9 +524,12 @@ class SlidersPanel(QWidget):
         """
         if self.current_idx is not None:
             adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
-            
+
             # Immediate lightweight feedback - just store the adjustment settings
             if 0 <= self.current_idx < len(ccr_backend.images):
+                # Snapshot the pre-change state once per burst so a whole
+                # slider drag undoes as a single Ctrl+Z step.
+                self._begin_undo_burst(ccr_backend.images[self.current_idx])
                 ccr_backend.images[self.current_idx].adjustment_settings = adjustment
             
             # Immediate preview update for visual feedback
@@ -472,7 +571,29 @@ class SlidersPanel(QWidget):
     def get_slider_values(self):
         return {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
 
+    def _begin_undo_burst(self, img):
+        """Push one undo snapshot at the start of a burst of rapid slider
+        changes; the burst ends after a short idle period."""
+        if not self._undo_burst_active:
+            img.push_undo_state()
+            self._undo_burst_active = True
+        self._undo_burst_timer.start(800)
+
+    def _end_undo_burst(self):
+        self._undo_burst_active = False
+
+    def end_undo_burst(self):
+        """End any in-progress slider undo burst (after an undo or an action
+        that pushes its own snapshot) so the next change gets a fresh one."""
+        self._end_undo_burst()
+        self._undo_burst_timer.stop()
+
     def on_reset_clicked(self):
+        # Reset is a single undoable action
+        self.end_undo_burst()
+        img = ccr_backend.get_image_by_index(self.current_idx) if self.current_idx is not None else None
+        if img is not None:
+            img.push_undo_state()
         # Set all sliders to 0 and update preview
         for i, slider in enumerate(self.sliders):
             slider.blockSignals(True)
@@ -515,29 +636,76 @@ class SlidersPanel(QWidget):
 
     def on_sync_to_all_clicked(self):
         """
-        Apply the current image's adjustment settings to all images.
+        Apply the current image's settings to all images. A dialog picks
+        which setting groups to sync; the choice is remembered while the
+        app is open.
         """
-        if self.current_idx is not None:
-            # Show syncing hint
-            self.set_hint("Syncing adjustments to all images...")
-            
-            # Use QTimer to allow UI to update before starting the operation
-            QTimer.singleShot(100, self._perform_sync_to_all)
-    
+        if self.current_idx is None:
+            return
+        dialog = SyncSettingsDialog(self, self._sync_group_selection)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self._sync_group_selection = dialog.selection()
+        if not any(self._sync_group_selection.values()):
+            self.set_temporary_hint("Nothing selected to sync.", duration=3000)
+            return
+        # Show syncing hint
+        self.set_hint("Syncing settings to all images...")
+
+        # Use QTimer to allow UI to update before starting the operation
+        QTimer.singleShot(100, self._perform_sync_to_all)
+
     def _perform_sync_to_all(self):
-        """Perform the actual sync operation after UI update."""
-        # Get the current adjustment settings
+        """Sync the selected setting groups from the current image to all
+        images, leaving each image's un-synced groups untouched."""
+        self.end_undo_burst()
+        selection = self._sync_group_selection or {gid: True for gid, _l, _k in SYNC_GROUPS}
+        keys = [k for gid, _label, group_keys in SYNC_GROUPS
+                if selection.get(gid) for k in group_keys]
+        sync_crop = bool(selection.get("crop"))
         current_adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
-        print(f"Syncing adjustment to all images: {current_adjustment}")
-        
-        # Apply to all images in the backend
-        ccr_backend.sync_adjustment_to_all(current_adjustment)
-        
-        # Update the preview for the current image to reflect any changes
-        self.parent().parent().image_preview.update_preview(self.current_idx)
-        
+        src = ccr_backend.get_image_by_index(self.current_idx)
+        crop_rect = src.crop_rect if src is not None else None
+        crop_angle = getattr(src, "crop_angle", 0.0) if src is not None else 0.0
+        print(f"Syncing groups {sorted(g for g, on in selection.items() if on)} to all images")
+
+        for img in ccr_backend.images:
+            adj_changes = any(img.adjustment_settings.get(k, 0) != current_adjustment.get(k, 0)
+                              for k in keys)
+            crop_changes = sync_crop and (img.crop_rect != crop_rect
+                                          or getattr(img, "crop_angle", 0.0) != crop_angle)
+            if not adj_changes and not crop_changes:
+                continue  # nothing to change — and no dead undo snapshot
+            img.push_undo_state()
+            if adj_changes:
+                # Build a COMPLETE dict (missing keys filled with 0) so the
+                # rest of the app keeps its invariant that a non-empty
+                # adjustment dict carries every key — set_current_idx and
+                # friends rely on it.
+                merged = {k: img.adjustment_settings.get(k, 0) for k in self.adjustment_keys}
+                for k in keys:
+                    merged[k] = current_adjustment.get(k, 0)
+                img.adjustment_settings = merged
+            if sync_crop:
+                img.crop_rect = crop_rect
+                img.crop_angle = crop_angle
+            if adj_changes:
+                # Crop is display/export-level only — no reprocessing needed
+                # when nothing but the crop changed.
+                try:
+                    img.update_thumbnail_and_preview()
+                except Exception as e:
+                    print(f"Failed to sync settings to {img.file_path}: {e}")
+
+        mw = self.parent().parent()
+        try:
+            mw.thumbnail_list.update_all_thumbnails()
+        except AttributeError:
+            pass
+        mw.image_preview.update_preview(self.current_idx)
+
         # Show completion hint
-        self.set_temporary_hint("Synced all adjustments!", duration=4000)
+        self.set_temporary_hint("Synced selected settings to all images!", duration=4000)
 
     def _on_pick_neutral_point(self):
         if hasattr(self, 'image_preview') and self.image_preview:
@@ -545,8 +713,18 @@ class SlidersPanel(QWidget):
             self.set_temporary_hint(
                 "<b>Auto WB:</b> Click a neutral gray or white point on the image.", duration=8000)
 
+    def _on_crop_clicked(self):
+        if hasattr(self, 'image_preview') and self.image_preview:
+            if self.image_preview.enter_crop_mode():
+                self.set_temporary_hint(
+                    "<b>Crop:</b> Drag to draw a box; drag handles to resize, "
+                    "top knob to rotate, center to move. <b>Enter</b> = confirm, "
+                    "<b>Esc</b> = cancel, right-click = clear crop.", duration=12000)
+
     def on_wb_sampled(self, temp_value, tint_value):
         """Apply the auto-computed temperature/tint from the WB eyedropper."""
+        # The WB pick is its own undo step — don't merge it into a slider burst
+        self.end_undo_burst()
         temp_idx = self.adjustment_keys.index("temperature")
         tint_idx = self.adjustment_keys.index("tint")
         for idx, val in ((temp_idx, temp_value), (tint_idx, tint_value)):
@@ -655,7 +833,11 @@ class SlidersPanel(QWidget):
         """
         if self.current_idx is not None and self.copied_adjustment is not None:
             print(f"Pasting adjustment settings: {self.copied_adjustment}")
-            
+            self.end_undo_burst()
+            img = ccr_backend.get_image_by_index(self.current_idx)
+            if img is not None:
+                img.push_undo_state()
+
             # Apply the copied settings to the current sliders
             for i, key in enumerate(self.adjustment_keys):
                 if key in self.copied_adjustment and i < len(self.sliders):

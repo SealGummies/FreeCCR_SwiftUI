@@ -255,29 +255,6 @@ class CCRBackend:
             return self.images[idx].adjustment_settings
         return None       
 
-    def sync_adjustment_to_all(self, adjustment: dict):
-        """
-        Apply the given adjustment settings to all images in the backend.
-        
-        Args:
-            adjustment (dict): Dictionary containing adjustment parameters like
-                             'temperature', 'tint', 'exposure', 'brightness', etc.
-        """
-        if not adjustment:
-            return
-            
-        print(f"Syncing adjustment to {len(self.images)} images: {adjustment}")
-        
-        for idx, image_obj in enumerate(self.images):
-            try:
-                # Set the adjustment settings for each image
-                image_obj.adjustment_settings = adjustment.copy()
-                # Update the thumbnail and preview to reflect the changes
-                image_obj.update_thumbnail_and_preview()
-                print(f"Applied adjustment to image {idx + 1}/{len(self.images)}")
-            except Exception as e:
-                print(f"Failed to apply adjustment to image at index {idx}: {e}")
-
     def apply_adjustment_by_index(self, idx: int):
         """
         Applies the adjustment settings to the image at the given index.

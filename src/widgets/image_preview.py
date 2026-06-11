@@ -1,12 +1,15 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QToolBar, QMessageBox, QSlider, QGraphicsView, QGraphicsScene,
-    QGraphicsPixmapItem, QGraphicsRectItem, QStyleOptionSlider, QDialog,
+    QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsPathItem, QGraphicsEllipseItem,
+    QGraphicsLineItem, QStyleOptionSlider, QDialog,
     QLabel, QPushButton, QStyle, QSizePolicy
 )
-from PySide6.QtGui import QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter, QCursor, QDesktopServices
-from PySide6.QtCore import Qt, QSize, Signal, QRectF, QPointF, QThread, QTimer, QUrl
+from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter,
+                           QCursor, QDesktopServices, QPainterPath, QBrush, QPolygonF)
+from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
 from widgets.export_dialog import ExportSettingsDialog
+import math
 import sys
 import os
 
@@ -81,6 +84,12 @@ class GraphicsImageView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def mousePressEvent(self, event):
+        if self.parent_widget.crop_mode and self.parent_widget.pixmap_item is not None:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.begin_crop_drag(self.mapToScene(event.pos()))
+            elif event.button() == Qt.RightButton:
+                self.parent_widget.clear_crop()
+            return
         if event.button() == Qt.LeftButton and self.wb_pick_mode and self.parent_widget.pixmap_item is not None:
             scene_pos = self.mapToScene(event.pos())
             self.wb_pick_mode = False
@@ -117,6 +126,9 @@ class GraphicsImageView(QGraphicsView):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self.parent_widget.crop_mode:
+            self.parent_widget.update_crop_drag(self.mapToScene(event.pos()))
+            return
         if self.bwpoint_mode and self._bw_drag_start is not None:
             self._bw_drag_end = self.mapToScene(event.pos())
             self._update_bw_rect(self._bw_drag_start, self._bw_drag_end)
@@ -176,7 +188,10 @@ class GraphicsImageView(QGraphicsView):
         if not base_transform.isInvertible():
             return
         local = base_transform.inverted()[0].map(scene_pos)
-        x, y = int(local.x()), int(local.y())
+        # Displayed pixmap may be a crop of the full image — map back to
+        # full-image coordinates before indexing resized_raw.
+        fx, fy = pw.map_displayed_to_full(local.x(), local.y())
+        x, y = int(fx), int(fy)
 
         img_obj = ccr_backend.get_image_by_index(pw.current_idx)
         if img_obj is None or img_obj.resized_raw is None:
@@ -201,6 +216,10 @@ class GraphicsImageView(QGraphicsView):
             pass
 
     def mouseReleaseEvent(self, event):
+        if self.parent_widget.crop_mode:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.end_crop_drag(self.mapToScene(event.pos()))
+            return
         if self.bwpoint_mode and event.button() == Qt.LeftButton and self._bw_drag_start is not None:
             drag_start_scene = self._bw_drag_start
             drag_end_scene = self.mapToScene(event.pos())
@@ -228,10 +247,17 @@ class GraphicsImageView(QGraphicsView):
                 inv = base_transform.inverted()[0]
                 s = inv.map(drag_start_scene)
                 e = inv.map(drag_end_scene)
-                x1 = int(min(s.x(), e.x()))
-                y1 = int(min(s.y(), e.y()))
-                x2 = int(max(s.x(), e.x()))
-                y2 = int(max(s.y(), e.y()))
+                # Map from displayed (possibly cropped/rotated) coords to
+                # full-image coords. All FOUR rect corners must be mapped —
+                # under a rotated crop, the AABB of just the two diagonal
+                # corners degenerates (zero width at 45 degrees).
+                pts = [pw.map_displayed_to_full(px, py)
+                       for px, py in ((s.x(), s.y()), (e.x(), s.y()),
+                                      (s.x(), e.y()), (e.x(), e.y()))]
+                x1 = int(min(p[0] for p in pts))
+                y1 = int(min(p[1] for p in pts))
+                x2 = int(max(p[0] for p in pts))
+                y2 = int(max(p[1] for p in pts))
 
                 img_obj = ccr_backend.get_image_by_index(pw.current_idx)
                 if img_obj is not None:
@@ -293,15 +319,25 @@ class GraphicsImageView(QGraphicsView):
             x2, y2 = max(x1, x2), max(y1, y2)
             w, h = x2 - x, y2 - y
             if w > 20 and h > 20:
-                ccr_backend.set_reference_frame_by_index(
-                    self.parent_widget.current_idx,
-                    (int(x), int(y), int(x2), int(y2))
-                )
-                self.parent_widget.parent().parent().sliders_panel.set_temporary_hint(
-                    "<b>Hint:</b><br>Reference frame set! Click the Convert button to view the updates.",
-                    duration=5000
-                )
-                print("Set reference frame:", (int(x), int(y), int(x2), int(y2)))
+                # Map from displayed (possibly cropped/rotated) coords to
+                # full-image coords. All FOUR corners must be mapped — under
+                # a rotated crop the two-diagonal AABB degenerates — and the
+                # minimum size re-checked in full-image space.
+                pw = self.parent_widget
+                pts = [pw.map_displayed_to_full(px, py)
+                       for px, py in ((x, y), (x2, y), (x, y2), (x2, y2))]
+                fx1 = int(min(p[0] for p in pts))
+                fy1 = int(min(p[1] for p in pts))
+                fx2 = int(max(p[0] for p in pts))
+                fy2 = int(max(p[1] for p in pts))
+                if (fx2 - fx1) > 20 and (fy2 - fy1) > 20:
+                    ccr_backend.set_reference_frame_by_index(
+                        pw.current_idx, (fx1, fy1, fx2, fy2))
+                    pw.parent().parent().sliders_panel.set_temporary_hint(
+                        "<b>Hint:</b><br>Reference frame set! Click the Convert button to view the updates.",
+                        duration=5000
+                    )
+                    print("Set reference frame:", (fx1, fy1, fx2, fy2))
         self.parent_widget.update_preview(self.parent_widget.current_idx)
 
     def resizeEvent(self, event):
@@ -478,6 +514,27 @@ class ImagePreview(QWidget):
         self.reference_rect_item = None
         self.group_item = None
 
+        # Crop state. crop_mode shows the full image with a selection overlay;
+        # outside crop mode the confirmed crop is applied to the displayed
+        # pixmap only (display-level — no reprocessing/re-conversion).
+        self.crop_mode = False
+        self._crop_rerender = False          # guards update_preview while entering crop mode
+        self._pending_crop_local = None      # QRectF box (un-rotated) in full-pixmap coords
+        self._pending_crop_angle = 0.0       # box rotation, degrees (Qt clockwise-positive)
+        self._crop_drag = None               # in-progress handle/new-rect drag state
+        self._crop_overlay_item = None
+        self._crop_handle_items = []
+        # Maps displayed-pixmap coords -> full-image coords while a confirmed
+        # crop is displayed (None = identity / no crop shown)
+        self._crop_display_transform = None
+        self._crop_display_angle = 0.0
+
+        # Coalesce a fine-rotation drag into a single undo step
+        self._fine_rot_burst_active = False
+        self._fine_rot_burst_timer = QTimer(self)
+        self._fine_rot_burst_timer.setSingleShot(True)
+        self._fine_rot_burst_timer.timeout.connect(self._end_fine_rot_burst)
+
         self._update_unconvert_action_state()
 
         # --- Add hotkey support ---
@@ -490,17 +547,65 @@ class ImagePreview(QWidget):
         QShortcut(QKeySequence("["), self, self.rotate_left)
         # Right bracket: rotate right
         QShortcut(QKeySequence("]"), self, self.rotate_right)
-        # Enter: convert image
-        QShortcut(QKeySequence(Qt.Key_Return), self, self.convert_ccr)
-        QShortcut(QKeySequence(Qt.Key_Enter), self, self.convert_ccr)
+        # Enter: confirm crop while in crop mode, otherwise convert image
+        QShortcut(QKeySequence(Qt.Key_Return), self, self._on_enter_key)
+        QShortcut(QKeySequence(Qt.Key_Enter), self, self._on_enter_key)
+        # Esc: leave crop mode without changing the crop
+        QShortcut(QKeySequence(Qt.Key_Escape), self, self._on_escape_key)
+
+    def _on_enter_key(self):
+        if self.crop_mode:
+            # Confirming a crop is display-level only — never re-converts.
+            self.confirm_crop()
+        else:
+            self.convert_ccr()
+
+    def _on_escape_key(self):
+        if self.crop_mode:
+            self.cancel_crop_mode()
 
     def update_preview(self, idx):
         ''' Update the UI image based on the backend, using the index from the thumbnail list. '''
         if idx is None or not (0 <= idx < len(ccr_backend.images)):
             print("Invalid index for update_preview:", idx)
             return
+        # Any external refresh while picking a crop abandons crop mode
+        # (image switch, slider change, conversion, ...).
+        if self.crop_mode and not self._crop_rerender:
+            self._exit_crop_mode()
+        # The fine-rotation burst belongs to the previous image; a switch
+        # must end it so the next image's first drag gets its own snapshot.
+        if idx != self.current_idx:
+            self._end_fine_rot_burst()
+            self._fine_rot_burst_timer.stop()
+
         preview_img = ccr_backend.get_preview_by_index(idx)
         self.current_idx = idx
+
+        # Display-level crop: show only the cropped region, except in crop
+        # mode where the full image is shown so the user can adjust/regret.
+        # Skipped for un-converted images: the crop tool is disabled there,
+        # and the full negative (incl. film base) is needed to draw frames.
+        self._crop_display_transform = None
+        self._crop_display_angle = 0.0
+        crop = getattr(ccr_backend.images[idx], "crop_rect", None)
+        crop_angle = getattr(ccr_backend.images[idx], "crop_angle", 0.0) or 0.0
+        if (preview_img is not None and not preview_img.isNull()
+                and crop is not None and not self.crop_mode
+                and ccr_backend.images[idx].converted):
+            if crop_angle:
+                extracted = self._extract_rotated_crop(preview_img, crop, crop_angle)
+                if extracted is not None:
+                    preview_img, self._crop_display_transform = extracted
+                    self._crop_display_angle = crop_angle
+            else:
+                px_rect = self._crop_rect_to_pixels(crop, preview_img)
+                if px_rect is not None:
+                    t = QTransform()
+                    t.translate(px_rect.x(), px_rect.y())
+                    self._crop_display_transform = t
+                    preview_img = preview_img.copy(px_rect)
+
         self.current_pixmap = preview_img
         self.current_fine_rotation = ccr_backend.get_image_fine_rotation_by_index(idx)
         self.rotation_slider.setValue(self.current_fine_rotation)
@@ -512,6 +617,8 @@ class ImagePreview(QWidget):
         self.pixmap_item = None
         self.reference_rect_item = None
         self.view._bw_rect_item = None
+        self._crop_overlay_item = None
+        self._crop_handle_items = []
 
         self.parent().parent().sliders_panel.set_current_idx(idx)
 
@@ -523,12 +630,22 @@ class ImagePreview(QWidget):
             ref = getattr(ccr_backend.images[idx], "reference_frame", None)
             print("Loaded reference_frame from backend:", ref)
             if ref:
-                x1, y1, x2, y2 = ref
-                rect = QRectF(x1, y1, x2 - x1, y2 - y1)
-                self.reference_rect_item = QGraphicsRectItem(rect)
-                pen = QPen(QColor(255, 0, 0, 180), 2, Qt.DashLine)
-                self.reference_rect_item.setPen(pen)
-                self.scene.addItem(self.reference_rect_item)
+                # Backend rect is in full-image coords; map into the displayed
+                # (possibly cropped) pixmap's coordinate space and clip to it.
+                # With a rotated crop displayed the frame would not be
+                # axis-aligned in display space, so it is not drawn at all.
+                if self._crop_display_angle == 0.0:
+                    x1, y1, x2, y2 = ref
+                    rect = QRectF(x1, y1, x2 - x1, y2 - y1)
+                    if self._crop_display_transform is not None:
+                        inv = self._crop_display_transform.inverted()[0]
+                        rect = inv.mapRect(rect).intersected(
+                            QRectF(0, 0, preview_img.width(), preview_img.height()))
+                    if not rect.isEmpty():
+                        self.reference_rect_item = QGraphicsRectItem(rect)
+                        pen = QPen(QColor(255, 0, 0, 180), 2, Qt.DashLine)
+                        self.reference_rect_item.setPen(pen)
+                        self.scene.addItem(self.reference_rect_item)
 
             else:
                 # Show hint when no reference frame exists
@@ -591,6 +708,11 @@ class ImagePreview(QWidget):
         elif self.scene.sceneRect() and not self.scene.sceneRect().isNull():
             # Fallback to scene rect if no pixmap item
             self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        # Crop handle glyph sizes are baked at draw time from the view scale,
+        # which fitInView just changed (window resize, rotate, ...) — rebuild
+        # so the drawn handles keep matching their hit-test zones.
+        if self.crop_mode and self._crop_overlay_item is not None:
+            self._draw_crop_overlay()
 
     def apply_transformations(self):
         if not self.pixmap_item:
@@ -612,9 +734,12 @@ class ImagePreview(QWidget):
             base_transform.rotate(self.current_rotation)
         base_transform.translate(-cx, -cy)
 
-        # Fine rotation (only for image)
+        # Fine rotation (only for image). Suppressed while in crop mode so
+        # the displayed image, the dim overlay, and the drag-to-rect mapping
+        # (all base-transform-only) share the same coordinate space — the
+        # selection then bounds exactly the pixels the crop keeps.
         img_transform = QTransform(base_transform)
-        if self.current_fine_rotation:
+        if self.current_fine_rotation and not self.crop_mode:
             img_transform.translate(cx, cy)
             img_transform.rotate(self.current_fine_rotation / 100.0)
             img_transform.translate(-cx, -cy)
@@ -625,10 +750,29 @@ class ImagePreview(QWidget):
         if self.reference_rect_item:
             self.reference_rect_item.setTransform(base_transform)
 
-        # Always fit the view to the content consistently
+        # Always fit the view to the content consistently. (This also
+        # rebuilds the crop overlay when crop mode is active, keeping the
+        # dim region and handles aligned after rotates/flips.)
         self._fit_view_to_content()
 
+    def _end_fine_rot_burst(self):
+        self._fine_rot_burst_active = False
+
+    def end_undo_bursts(self):
+        """End any in-progress fine-rotation undo burst, e.g. after an undo,
+        so the next change gets its own snapshot."""
+        self._end_fine_rot_burst()
+        self._fine_rot_burst_timer.stop()
+
     def _on_slider_rotate(self, value):
+        # Snapshot once per burst, and only for real user changes (the slider
+        # is also set programmatically to the backend value on image switch).
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is not None and img.fine_rotation_angle != value:
+            if not self._fine_rot_burst_active:
+                img.push_undo_state()
+                self._fine_rot_burst_active = True
+            self._fine_rot_burst_timer.start(800)
         self.current_fine_rotation = value
         ccr_backend.set_image_fine_rotation_by_index(self.current_idx, value)
         self.apply_transformations()
@@ -641,23 +785,36 @@ class ImagePreview(QWidget):
         self.show_grid = False
         self.view.viewport().update()
 
+    def _push_undo_for_current(self):
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is not None:
+            img.push_undo_state()
+
     def rotate_left(self):
+        self._push_undo_for_current()
+        self._crop_drag = None  # base transform change invalidates an active crop drag
         self.current_rotation = (self.current_rotation - 90) % 360
         ccr_backend.set_image_rotation_by_index(self.current_idx, self.current_rotation)
         self.apply_transformations()
 
     def rotate_right(self):
+        self._push_undo_for_current()
+        self._crop_drag = None  # base transform change invalidates an active crop drag
         self.current_rotation = (self.current_rotation + 90) % 360
         ccr_backend.set_image_rotation_by_index(self.current_idx, self.current_rotation)
         self.apply_transformations()
 
     def mirror_vertical(self):
+        self._push_undo_for_current()
+        self._crop_drag = None  # base transform change invalidates an active crop drag
         flip = ccr_backend.get_image_vertical_flip_by_index(self.current_idx)
         ccr_backend.set_image_vertical_flip_by_index(self.current_idx, not flip)
         self.current_vertical_flip = not flip
         self.apply_transformations()
 
     def mirror_horizontal(self):
+        self._push_undo_for_current()
+        self._crop_drag = None  # base transform change invalidates an active crop drag
         flip = ccr_backend.get_image_horizontal_flip_by_index(self.current_idx)
         ccr_backend.set_image_horizontal_flip_by_index(self.current_idx, not flip)
         self.current_horizontal_flip = not flip
@@ -696,6 +853,9 @@ class ImagePreview(QWidget):
 
     def set_bwpoint_mode(self, mode):
         """mode: 'black' | 'white' | None"""
+        if mode and self.crop_mode:
+            # Pick modes and crop mode are mutually exclusive in both directions
+            self.cancel_crop_mode()
         self.view.bwpoint_mode = mode
         self.view.wb_pick_mode = False
         self.view.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
@@ -703,9 +863,475 @@ class ImagePreview(QWidget):
     def set_wb_pick_mode(self, enabled):
         """Eyedropper mode: next click on the image picks a neutral point
         for automatic temperature/tint adjustment."""
+        if enabled and self.crop_mode:
+            self.cancel_crop_mode()
         self.view.wb_pick_mode = enabled
         self.view.bwpoint_mode = None
         self.view.setCursor(_eyedropper_cursor() if enabled else Qt.ArrowCursor)
+
+    # --- Crop mode -----------------------------------------------------
+
+    def map_displayed_to_full(self, x, y):
+        """Map a point from displayed-pixmap coords to full-image coords.
+        Identity unless a confirmed crop is currently being displayed."""
+        if self._crop_display_transform is None:
+            return x, y
+        p = self._crop_display_transform.map(QPointF(x, y))
+        return p.x(), p.y()
+
+    @staticmethod
+    def _extract_rotated_crop(pixmap, crop, angle):
+        """Render the content under a rotated crop box into an upright pixmap.
+        Returns (pixmap, displayed->full QTransform), or None when degenerate.
+        Display twin of apply_crop_to_image's rotated branch: displayed pixel
+        (u, v) shows the source at C + R(angle) . (u - bw/2, v - bh/2)."""
+        w, h = pixmap.width(), pixmap.height()
+        bw = int(round((crop[2] - crop[0]) * w))
+        bh = int(round((crop[3] - crop[1]) * h))
+        if bw < 2 or bh < 2 or w <= 0 or h <= 0:
+            return None
+        cx = (crop[0] + crop[2]) / 2.0 * w
+        cy = (crop[1] + crop[3]) / 2.0 * h
+        to_full = QTransform()
+        to_full.translate(cx, cy)
+        to_full.rotate(angle)
+        to_full.translate(-bw / 2.0, -bh / 2.0)
+        inverted, ok = to_full.inverted()
+        if not ok:
+            return None
+        out = QPixmap(bw, bh)
+        out.fill(QColor(0, 0, 0))
+        painter = QPainter(out)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setTransform(inverted)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.end()
+        return out, to_full
+
+    @staticmethod
+    def _crop_rect_to_pixels(crop, pixmap) -> "QRect | None":
+        """Convert a normalized (x1, y1, x2, y2) crop to a QRect in pixmap
+        pixels, or None when the rect is degenerate."""
+        w, h = pixmap.width(), pixmap.height()
+        if w <= 0 or h <= 0:
+            return None
+        x1 = max(0, min(w - 1, int(round(crop[0] * w))))
+        y1 = max(0, min(h - 1, int(round(crop[1] * h))))
+        x2 = max(x1 + 1, min(w, int(round(crop[2] * w))))
+        y2 = max(y1 + 1, min(h, int(round(crop[3] * h))))
+        if (x2 - x1) < 2 or (y2 - y1) < 2:
+            return None
+        return QRect(x1, y1, x2 - x1, y2 - y1)
+
+    def _base_transform(self):
+        """Coarse flip/rotation transform around the displayed pixmap center
+        (same construction the reference-frame and B/W tools use)."""
+        if self.current_pixmap is None:
+            return None
+        cx = self.current_pixmap.width() / 2
+        cy = self.current_pixmap.height() / 2
+        t = QTransform()
+        t.translate(cx, cy)
+        if self.current_vertical_flip:
+            t.scale(1, -1)
+        if self.current_horizontal_flip:
+            t.scale(-1, 1)
+        if self.current_rotation:
+            t.rotate(self.current_rotation)
+        t.translate(-cx, -cy)
+        return t if t.isInvertible() else None
+
+    def enter_crop_mode(self) -> bool:
+        """Show the full image with the current crop (if any) as the starting
+        selection, so the user can adjust or undo a previous crop."""
+        if self.current_idx is None:
+            return False
+        img_obj = ccr_backend.get_image_by_index(self.current_idx)
+        if img_obj is None or self.current_pixmap is None or self.current_pixmap.isNull():
+            return False
+        # Crop mode replaces any other interactive pick mode
+        self.view.bwpoint_mode = None
+        self.view.wb_pick_mode = False
+        self.crop_mode = True
+        self._pending_crop_local = None
+        self._pending_crop_angle = 0.0
+        self._crop_drag = None
+        self._crop_rerender = True
+        try:
+            self.update_preview(self.current_idx)  # re-render un-cropped
+        finally:
+            self._crop_rerender = False
+        crop = getattr(img_obj, "crop_rect", None)
+        if crop is not None and self.current_pixmap is not None:
+            w, h = self.current_pixmap.width(), self.current_pixmap.height()
+            self._pending_crop_local = QRectF(
+                crop[0] * w, crop[1] * h,
+                (crop[2] - crop[0]) * w, (crop[3] - crop[1]) * h)
+            self._pending_crop_angle = getattr(img_obj, "crop_angle", 0.0) or 0.0
+        self._draw_crop_overlay()
+        self.view.setCursor(Qt.CrossCursor)
+        return True
+
+    # ---- Crop drag interaction: new rect + 10 control handles -----------
+    # 4 corners (resize), 4 edge midpoints (move that edge), a rotate knob
+    # above the top edge, and a center handle (move the whole box).
+
+    HANDLE_VIEW_PX = 14.0          # hit tolerance, in view pixels
+    HANDLE_DRAW_PX = 9.0           # handle glyph size, in view pixels
+    ROTATE_HANDLE_VIEW_PX = 28.0   # rotate-knob stem length, in view pixels
+    _CORNER_SIGNS = {"tl": (-1, -1), "tr": (1, -1), "bl": (-1, 1), "br": (1, 1)}
+
+    def _view_scale(self):
+        m = self.view.transform().m11()
+        return abs(m) if m else 1.0
+
+    def _box_transform(self, sel):
+        """Rotation of the crop box about its own center (image coords)."""
+        c = sel.center()
+        t = QTransform()
+        t.translate(c.x(), c.y())
+        t.rotate(self._pending_crop_angle)
+        t.translate(-c.x(), -c.y())
+        return t
+
+    def _crop_handle_at(self, p):
+        """Return the handle name under local image point p, or None."""
+        sel = self._pending_crop_local
+        if sel is None or sel.width() < 2 or sel.height() < 2:
+            return None
+        c = sel.center()
+        unrot = QTransform()
+        unrot.rotate(-self._pending_crop_angle)
+        q = unrot.map(QPointF(p.x() - c.x(), p.y() - c.y()))
+        hw, hh = sel.width() / 2.0, sel.height() / 2.0
+        tol = self.HANDLE_VIEW_PX / self._view_scale()
+        rot_off = self.ROTATE_HANDLE_VIEW_PX / self._view_scale()
+        # Corners first (most specific), then the rotate knob, edges, center.
+        handles = [
+            ("corner-tl", -hw, -hh), ("corner-tr", hw, -hh),
+            ("corner-bl", -hw, hh), ("corner-br", hw, hh),
+            ("rotate", 0.0, -hh - rot_off),
+            ("edge-t", 0.0, -hh), ("edge-b", 0.0, hh),
+            ("edge-l", -hw, 0.0), ("edge-r", hw, 0.0),
+            ("move", 0.0, 0.0),
+        ]
+        # Pick the NEAREST handle among all within tolerance — on small boxes
+        # the zones overlap, and first-match priority would shadow the center
+        # move handle behind corners/edges.
+        best = None
+        best_d2 = None
+        for name, hx, hy in handles:
+            dx, dy = q.x() - hx, q.y() - hy
+            if abs(dx) <= tol and abs(dy) <= tol:
+                d2 = dx * dx + dy * dy
+                if best_d2 is None or d2 < best_d2:
+                    best, best_d2 = name, d2
+        return best
+
+    def begin_crop_drag(self, scene_pos):
+        base = self._base_transform()
+        if base is None or self.current_pixmap is None:
+            return
+        p = base.inverted()[0].map(scene_pos)
+        mode = self._crop_handle_at(p) or "new"
+        sel = self._pending_crop_local
+        self._crop_drag = {
+            "mode": mode,
+            "start": QPointF(p),
+            "box0": QRectF(sel) if sel is not None else None,
+            "angle0": self._pending_crop_angle,
+        }
+        self.update_crop_drag(scene_pos)
+
+    def update_crop_drag(self, scene_pos):
+        drag = self._crop_drag
+        if drag is None or self.current_pixmap is None:
+            return
+        base = self._base_transform()
+        if base is None:
+            return
+        p = base.inverted()[0].map(scene_pos)
+        mode = drag["mode"]
+        if mode == "new":
+            self._update_new_selection(drag["start"], p)
+        elif mode == "move":
+            self._drag_move_box(drag, p)
+        elif mode == "rotate":
+            self._drag_rotate_box(drag, p)
+        elif mode.startswith("corner-"):
+            self._drag_corner(drag, p, mode[len("corner-"):])
+        elif mode.startswith("edge-"):
+            self._drag_edge(drag, p, mode[len("edge-"):])
+        self._draw_crop_overlay()
+
+    def end_crop_drag(self, scene_pos):
+        if self._crop_drag is None:
+            return
+        self.update_crop_drag(scene_pos)
+        self._crop_drag = None
+
+    def _update_new_selection(self, p0, p1):
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        x1 = max(0.0, min(float(w), min(p0.x(), p1.x())))
+        y1 = max(0.0, min(float(h), min(p0.y(), p1.y())))
+        x2 = max(0.0, min(float(w), max(p0.x(), p1.x())))
+        y2 = max(0.0, min(float(h), max(p0.y(), p1.y())))
+        if (x2 - x1) < 3 and (y2 - y1) < 3:
+            # Stray click, not a drag — keep the current selection (and its
+            # angle) so the display keeps matching what Enter will confirm.
+            return
+        # A freshly drawn box starts axis-aligned
+        self._pending_crop_local = QRectF(x1, y1, x2 - x1, y2 - y1)
+        self._pending_crop_angle = 0.0
+
+    def _drag_move_box(self, drag, p):
+        box0 = drag["box0"]
+        if box0 is None:
+            return
+        delta = p - drag["start"]
+        if abs(delta.x()) < 1e-9 and abs(delta.y()) < 1e-9:
+            # A plain click must be a no-op: if the box center sits outside
+            # the image (possible after a big corner drag), the clamp below
+            # would otherwise yank the box inward without any mouse motion.
+            self._pending_crop_local = QRectF(box0)
+            return
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        c = box0.center() + delta
+        box = QRectF(box0)
+        box.moveCenter(QPointF(min(max(c.x(), 0.0), float(w)),
+                               min(max(c.y(), 0.0), float(h))))
+        self._pending_crop_local = box
+
+    def _drag_rotate_box(self, drag, p):
+        box0 = drag["box0"]
+        if box0 is None:
+            return
+        c = box0.center()
+        v0 = drag["start"] - c
+        v1 = p - c
+        if (abs(v1.x()) + abs(v1.y())) < 1e-6:
+            return
+        a0 = math.degrees(math.atan2(v0.y(), v0.x()))
+        a1 = math.degrees(math.atan2(v1.y(), v1.x()))
+        angle = drag["angle0"] + (a1 - a0)
+        angle = (angle + 180.0) % 360.0 - 180.0
+        if abs(angle) < 0.75:
+            angle = 0.0  # snap to straight
+        self._pending_crop_angle = angle
+        self._pending_crop_local = QRectF(box0)
+
+    def _drag_corner(self, drag, p, which):
+        box0 = drag["box0"]
+        if box0 is None:
+            return
+        sx, sy = self._CORNER_SIGNS[which]
+        angle = drag["angle0"]
+        fwd = QTransform()
+        fwd.rotate(angle)
+        unrot = QTransform()
+        unrot.rotate(-angle)
+        hw0, hh0 = box0.width() / 2.0, box0.height() / 2.0
+        # The opposite corner stays fixed in image space
+        anchor = box0.center() + fwd.map(QPointF(-sx * hw0, -sy * hh0))
+        d = unrot.map(p - anchor)  # dragged corner in box frame, rel. anchor
+        min_sz = 10.0
+        dx = sx * max(sx * d.x(), min_sz)
+        dy = sy * max(sy * d.y(), min_sz)
+        c = anchor + fwd.map(QPointF(dx / 2.0, dy / 2.0))
+        bw, bh = abs(dx), abs(dy)
+        self._pending_crop_local = QRectF(c.x() - bw / 2.0, c.y() - bh / 2.0, bw, bh)
+
+    def _drag_edge(self, drag, p, which):
+        box0 = drag["box0"]
+        if box0 is None:
+            return
+        angle = drag["angle0"]
+        fwd = QTransform()
+        fwd.rotate(angle)
+        unrot = QTransform()
+        unrot.rotate(-angle)
+        c0 = box0.center()
+        hw0, hh0 = box0.width() / 2.0, box0.height() / 2.0
+        d = unrot.map(p - c0)  # mouse in box frame, rel. the old center
+        min_sz = 10.0
+        left, right, top, bottom = -hw0, hw0, -hh0, hh0
+        if which == "r":
+            right = max(d.x(), left + min_sz)
+        elif which == "l":
+            left = min(d.x(), right - min_sz)
+        elif which == "b":
+            bottom = max(d.y(), top + min_sz)
+        elif which == "t":
+            top = min(d.y(), bottom - min_sz)
+        c = c0 + fwd.map(QPointF((left + right) / 2.0, (top + bottom) / 2.0))
+        bw, bh = right - left, bottom - top
+        self._pending_crop_local = QRectF(c.x() - bw / 2.0, c.y() - bh / 2.0, bw, bh)
+
+    def _remove_crop_overlay_items(self):
+        for item in self._crop_handle_items:
+            try:
+                self.scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._crop_handle_items = []
+        if self._crop_overlay_item is not None:
+            try:
+                self.scene.removeItem(self._crop_overlay_item)
+            except RuntimeError:
+                pass
+            self._crop_overlay_item = None
+
+    def _draw_crop_overlay(self):
+        """Dim everything outside the pending crop box (so both the entire
+        image and the crop target stay visible) and draw its 10 control
+        handles: 4 corners, 4 edge midpoints, a rotate knob sticking out on
+        top, and a center move handle."""
+        self._remove_crop_overlay_items()
+        if not self.crop_mode or self.current_pixmap is None:
+            return
+        sel = self._pending_crop_local
+        if sel is None or sel.width() < 2 or sel.height() < 2:
+            return
+        base = self._base_transform()
+        if base is None:
+            return
+        box_t = self._box_transform(sel)
+        combined = box_t * base  # box rotation first, then coarse flips/rotation
+
+        path = QPainterPath()
+        path.setFillRule(Qt.OddEvenFill)
+        path.addRect(QRectF(0, 0, self.current_pixmap.width(), self.current_pixmap.height()))
+        path.addPolygon(box_t.map(QPolygonF(sel)))
+        overlay = QGraphicsPathItem(path)
+        overlay.setBrush(QBrush(QColor(0, 0, 0, 110)))
+        overlay.setPen(QPen(QColor(255, 255, 255, 220), 2, Qt.DashLine))
+        overlay.setTransform(base)
+        self.scene.addItem(overlay)
+        self._crop_overlay_item = overlay
+
+        # Handles are laid out in un-rotated box coords and carry the
+        # combined transform, so they ride along with the box rotation.
+        scale = self._view_scale()
+        hs = self.HANDLE_DRAW_PX / scale
+        rot_off = self.ROTATE_HANDLE_VIEW_PX / scale
+        hw, hh = sel.width() / 2.0, sel.height() / 2.0
+        c = sel.center()
+        handle_pen = QPen(QColor(30, 30, 30, 230), max(1.0 / scale, 0.5))
+        handle_brush = QBrush(QColor(255, 255, 255, 235))
+
+        def add_handle(item):
+            item.setPen(handle_pen)
+            item.setBrush(handle_brush)
+            item.setTransform(combined)
+            self.scene.addItem(item)
+            self._crop_handle_items.append(item)
+
+        # 4 corners + 4 edge midpoints (squares)
+        for hx, hy in ((-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh),
+                       (0.0, -hh), (0.0, hh), (-hw, 0.0), (hw, 0.0)):
+            x, y = c.x() + hx, c.y() + hy
+            add_handle(QGraphicsRectItem(QRectF(x - hs / 2, y - hs / 2, hs, hs)))
+
+        # Rotate knob: stem + circle sticking out above the top edge
+        stem = QGraphicsLineItem(c.x(), c.y() - hh, c.x(), c.y() - hh - rot_off)
+        stem.setPen(QPen(QColor(255, 255, 255, 220), max(1.5 / scale, 0.5)))
+        stem.setTransform(combined)
+        self.scene.addItem(stem)
+        self._crop_handle_items.append(stem)
+        add_handle(QGraphicsEllipseItem(
+            QRectF(c.x() - hs / 2, c.y() - hh - rot_off - hs / 2, hs, hs)))
+
+        # Center (move) handle (circle)
+        add_handle(QGraphicsEllipseItem(QRectF(c.x() - hs / 2, c.y() - hs / 2, hs, hs)))
+
+    @staticmethod
+    def _crops_equal(a, b, w, h):
+        """Sub-pixel-tolerant comparison of normalized crop rects, so an
+        unchanged selection round-tripped through pixel coords does not
+        register as a change (and push a junk undo snapshot)."""
+        if a is None or b is None:
+            return a is b
+        tol_x = 0.5 / max(w, 1)
+        tol_y = 0.5 / max(h, 1)
+        return (abs(a[0] - b[0]) < tol_x and abs(a[2] - b[2]) < tol_x
+                and abs(a[1] - b[1]) < tol_y and abs(a[3] - b[3]) < tol_y)
+
+    def confirm_crop(self):
+        """Enter pressed in crop mode: store the selection as the new crop.
+        Display-level only — the conversion result is untouched."""
+        if not self.crop_mode:
+            return
+        img_obj = ccr_backend.get_image_by_index(self.current_idx)
+        sel = self._pending_crop_local
+        applied = False
+        cleared = False
+        too_small = False
+        if img_obj is not None and sel is not None and self.current_pixmap is not None:
+            w, h = self.current_pixmap.width(), self.current_pixmap.height()
+            angle = self._pending_crop_angle
+            if abs(angle) < 0.05:
+                angle = 0.0
+                # Without rotation, anything outside the image is empty —
+                # commit only the visible part of the box.
+                sel = sel.intersected(QRectF(0, 0, w, h))
+            if sel.width() >= 10 and sel.height() >= 10:
+                new_crop = (sel.left() / w, sel.top() / h,
+                            sel.right() / w, sel.bottom() / h)
+                # An un-rotated selection of (almost) the whole image clears the crop
+                if (angle == 0.0
+                        and new_crop[0] <= 0.001 and new_crop[1] <= 0.001
+                        and new_crop[2] >= 0.999 and new_crop[3] >= 0.999):
+                    new_crop = None
+                old_angle = getattr(img_obj, "crop_angle", 0.0) or 0.0
+                if (not self._crops_equal(new_crop, img_obj.crop_rect, w, h)
+                        or abs(angle - old_angle) >= 0.05):
+                    img_obj.push_undo_state()
+                    img_obj.crop_rect = new_crop
+                    img_obj.crop_angle = 0.0 if new_crop is None else angle
+                    applied = True
+                    cleared = new_crop is None
+            else:
+                too_small = True
+        self._exit_crop_mode()
+        self.update_preview(self.current_idx)
+        if cleared:
+            hint = "Crop cleared. Ctrl+Z to undo."
+        elif applied:
+            hint = "Crop applied. Ctrl+Z to undo, or press Crop again to adjust."
+        elif too_small:
+            hint = "Selection too small — crop unchanged."
+        else:
+            hint = "Crop unchanged."
+        try:
+            self.parent().parent().sliders_panel.set_temporary_hint(hint, duration=4000)
+        except AttributeError:
+            pass
+
+    def cancel_crop_mode(self):
+        """Esc pressed in crop mode: leave without changing the crop."""
+        if not self.crop_mode:
+            return
+        self._exit_crop_mode()
+        self.update_preview(self.current_idx)
+
+    def clear_crop(self):
+        """Right-click in crop mode: remove the crop entirely."""
+        img_obj = ccr_backend.get_image_by_index(self.current_idx)
+        if img_obj is not None and (img_obj.crop_rect is not None
+                                    or getattr(img_obj, "crop_angle", 0.0)):
+            img_obj.push_undo_state()
+            img_obj.crop_rect = None
+            img_obj.crop_angle = 0.0
+        self._exit_crop_mode()
+        self.update_preview(self.current_idx)
+
+    def _exit_crop_mode(self):
+        self.crop_mode = False
+        self._pending_crop_local = None
+        self._pending_crop_angle = 0.0
+        self._crop_drag = None
+        self._remove_crop_overlay_items()
+        self.view.setCursor(Qt.ArrowCursor)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

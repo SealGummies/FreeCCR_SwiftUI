@@ -52,6 +52,14 @@ class CCRImage:
         self.horizontal_mirrored = horizontal_mirrored
         self.vertical_mirrored = vertical_mirrored
         self.converted = converted  # Indicates if the image has been converted to CCR format
+        # User crop as normalized (x1, y1, x2, y2) fractions of the un-rotated/
+        # un-flipped image; None = no crop. Display-level only — resized_raw is
+        # never modified, so clearing the crop needs no re-conversion.
+        # crop_angle rotates the box about its center (degrees, positive =
+        # clockwise on screen, Qt convention).
+        self.crop_rect: Optional[tuple[float, float, float, float]] = None
+        self.crop_angle: float = 0.0
+        self.undo_stack: list = []  # Snapshots for Ctrl+Z, most recent last
         self.contrast_base: int = 0      # Non-destructive base contrast added internally; slider shows 0
         self.temperature_base: int = 0   # Non-destructive base temperature offset; slider shows 0
         self.brightness_base: int = -8   # Non-destructive base brightness offset; slider shows 0
@@ -418,8 +426,50 @@ class CCRImage:
                      ch_g_blackpoint=s.get('ch_g_blackpoint', 0),
                      ch_b_shift=s.get('ch_b_shift', 0),
                      ch_b_gain=s.get('ch_b_gain', 0),
-                     ch_b_blackpoint=s.get('ch_b_blackpoint', 0))
+                     ch_b_blackpoint=s.get('ch_b_blackpoint', 0),
+                     sub_saturation=s.get('sub_saturation', 0))
         return adjusted
+
+    # --- Undo support (Ctrl+Z) ---------------------------------------------
+    UNDO_STACK_LIMIT = 50
+
+    def capture_undo_state(self) -> dict:
+        """Snapshot of every user-editable, non-destructive setting."""
+        return {
+            "adjustment_settings": dict(self.adjustment_settings),
+            "crop_rect": self.crop_rect,
+            "crop_angle": self.crop_angle,
+            "rotation_angle": self.rotation_angle,
+            "fine_rotation_angle": self.fine_rotation_angle,
+            "horizontal_mirrored": self.horizontal_mirrored,
+            "vertical_mirrored": self.vertical_mirrored,
+        }
+
+    def push_undo_state(self) -> None:
+        """Push the current state onto the undo stack. Call BEFORE mutating
+        settings. Consecutive identical snapshots are collapsed so every
+        Ctrl+Z press changes something."""
+        state = self.capture_undo_state()
+        if self.undo_stack and self.undo_stack[-1] == state:
+            return
+        self.undo_stack.append(state)
+        if len(self.undo_stack) > self.UNDO_STACK_LIMIT:
+            del self.undo_stack[0]
+
+    def pop_undo_state(self) -> bool:
+        """Restore the most recent snapshot. Returns False when there is
+        nothing to undo. Callers own refreshing previews/UI afterwards."""
+        if not self.undo_stack:
+            return False
+        state = self.undo_stack.pop()
+        self.adjustment_settings = state["adjustment_settings"]
+        self.crop_rect = state["crop_rect"]
+        self.crop_angle = state.get("crop_angle", 0.0)
+        self.rotation_angle = state["rotation_angle"]
+        self.fine_rotation_angle = state["fine_rotation_angle"]
+        self.horizontal_mirrored = state["horizontal_mirrored"]
+        self.vertical_mirrored = state["vertical_mirrored"]
+        return True
 
     def _auto_brightness_for_preview(self, image: np.ndarray) -> np.ndarray:
         """
