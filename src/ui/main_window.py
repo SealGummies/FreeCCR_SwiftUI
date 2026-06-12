@@ -1,18 +1,84 @@
-from PySide6.QtWidgets import QMainWindow, QHBoxLayout, QWidget, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel, QLineEdit
+from PySide6.QtWidgets import QApplication, QMainWindow, QHBoxLayout, QWidget, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel, QLineEdit
 from PySide6.QtGui import QIcon, QShortcut, QKeySequence
-from PySide6.QtCore import Qt, QEvent, QThread, Signal, QObject, QSettings
+from PySide6.QtCore import Qt, QEvent, QThread, Signal, QObject, QSettings, QTimer
 from widgets.thumbnail_list import ThumbnailList
 from widgets.image_preview import ImagePreview
 from widgets.sliders_panel import SlidersPanel
 from core.ccr_backend import ccr_backend
 import ctypes
 from version import VERSION  # Make sure version.py is in your src folder
+import html
 import os
 import sys
+import threading
+import time
 from activation.activation import validate_software
 import webbrowser
 
 from utils.unicode_path_utils import normalize_unicode_path, validate_unicode_path
+from utils.update_check import (fetch_latest_release, parse_version,
+                                should_offer_update, REPO_URL)
+
+class UpdateCheckWorker(QObject):
+    """Fetches the latest GitHub release off the GUI thread.
+
+    Runs on a daemon threading.Thread, not a QThread: a daemon never blocks
+    interpreter exit, whereas a QThread still running at teardown aborts the
+    process with qFatal. urlopen's 2s timeout bounds socket ops only, not DNS
+    resolution, so results that took too long overall are discarded.
+    """
+    finished = Signal(object)  # release dict or None
+
+    MAX_TOTAL_SECONDS = 6.0
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True,
+                         name="FreeCCR-update-check").start()
+
+    def _run(self):
+        started = time.monotonic()
+        release = fetch_latest_release(timeout=2.0)
+        try:
+            if time.monotonic() - started <= self.MAX_TOTAL_SECONDS:
+                self.finished.emit(release)
+        except RuntimeError:
+            pass  # Qt object already deleted — app is shutting down
+
+
+class UpdateAvailableDialog(QDialog):
+    REMIND = 0   # == QDialog.Rejected, so closing the window means "later"
+    UPDATE = 1
+    SKIP = 2
+
+    def __init__(self, parent, release, current_version):
+        super().__init__(parent)
+        self.setWindowTitle("Update Available")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(18)
+        message = QLabel(
+            f"A new version of FreeCCR is available: "
+            f"<b>{html.escape(release['tag'])}</b><br>"
+            f"You are running {html.escape(str(current_version))}.")
+        message.setWordWrap(True)
+        layout.addWidget(message)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        update_btn = QPushButton("Update")
+        update_btn.setDefault(True)
+        remind_btn = QPushButton("Remind Me Later")
+        skip_btn = QPushButton("Skip This Version")
+        for btn in (update_btn, remind_btn, skip_btn):
+            btn.setMinimumHeight(30)
+        update_btn.clicked.connect(lambda: self.done(self.UPDATE))
+        remind_btn.clicked.connect(lambda: self.done(self.REMIND))
+        skip_btn.clicked.connect(lambda: self.done(self.SKIP))
+        buttons.addWidget(update_btn)
+        buttons.addWidget(remind_btn)
+        buttons.addWidget(skip_btn)
+        layout.addLayout(buttons)
+
 
 class ImageLoaderWorker(QObject):
     finished = Signal()
@@ -81,6 +147,34 @@ class MainWindow(QMainWindow):
         _, license_type = validate_software()
         if license_type:
             self.setWindowTitle(f"FreeCCR - {license_type}")
+
+        # Non-blocking startup update check (2s network timeout, off-thread)
+        self._update_worker = UpdateCheckWorker(self)
+        self._update_worker.finished.connect(self._on_update_check_done)
+        QTimer.singleShot(1000, self._update_worker.start)
+
+    def _on_update_check_done(self, release):
+        if not release:
+            return
+        if not self.isVisible():
+            return  # window already closed — app is shutting down
+        if QApplication.activeModalWidget() is not None:
+            # Don't stack on top of a file picker / progress / exit prompt
+            QTimer.singleShot(
+                3000, lambda: self._on_update_check_done(release))
+            return
+        current = parse_version(VERSION)
+        skipped = parse_version(
+            self._settings.value("update/skipped_version", "", type=str))
+        if not should_offer_update(release["version"], current, skipped):
+            return
+        dialog = UpdateAvailableDialog(self, release, VERSION)
+        choice = dialog.exec()
+        if choice == UpdateAvailableDialog.UPDATE:
+            webbrowser.open(release["url"])
+        elif choice == UpdateAvailableDialog.SKIP:
+            # Stay quiet until a release with a bigger major/minor appears
+            self._settings.setValue("update/skipped_version", release["tag"])
 
     def closeEvent(self, event):
         reply = QMessageBox.question(
@@ -168,7 +262,7 @@ class MainWindow(QMainWindow):
             self,
             "About FreeCCR",
             f"""<b>FreeCCR</b><br>Version {VERSION}<br><br>Copyright © 2025 FreeCCR
-            <br>Website: <a href="https://www.freeccr.com">www.freeccr.com</a><br>
+            <br>Website: <a href="{REPO_URL}">github.com/toonoumi/FreeCCR</a><br>
             <br>Built along with PySide6 v6.7.1<br>
             <br>For more info, visit PySide6 on PyPI: https://pypi.org/project/PySide6/ <br>
             <br>For third-party licenses, see the Licenses section in the Help menu."""
@@ -332,7 +426,7 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def open_help_website(self):
-        webbrowser.open("https://www.freeccr.com/help")
+        webbrowser.open(REPO_URL)
 
 class ActivationDialog(QDialog):
     def __init__(self, parent=None, allow_deactivate=False):
