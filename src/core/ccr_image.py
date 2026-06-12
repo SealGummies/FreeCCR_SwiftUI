@@ -57,6 +57,10 @@ class CCRImage:
         # Display/export name override (e.g. "scan_s2.ARW" for slice #2);
         # None = use the file's basename.
         self.display_name = display_name
+        # True for working copies made via Duplicate. Duplicates are session
+        # artifacts: removing one from the list also removes its catalog
+        # entry, whereas removing an ACTUAL image keeps its stored edits.
+        self.is_duplicate = False
         self.thumbnail = thumbnail
         self.resized_raw = resized_raw
         self.reference_frame = reference_frame

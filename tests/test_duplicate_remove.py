@@ -135,29 +135,67 @@ class TestRemoveMultiple:
         assert ccr_backend.remove_images_by_indices([5, -1]) == 0
         assert ccr_backend.get_image_count() == 1
 
-    def test_full_removal_deletes_catalog_record(self, tmp_path, monkeypatch):
-        """Explicitly removing ALL images of a file must also drop its
-        catalog record — otherwise a deleted duplicate resurrects on the
-        next open."""
+    def test_removed_duplicate_entry_is_deleted(self, tmp_path, monkeypatch):
+        """Removing a DUPLICATE deletes its catalog entry: a discarded copy
+        must not resurrect on the next open."""
         cat = str(tmp_path / "catalog.json")
         monkeypatch.setattr(catalog, "default_catalog_path", lambda: cat)
         path, _ = _scan_png(tmp_path)
         ccr_backend.images = [CCRImage(path)]
+        ccr_backend._catalog_preserved = {}
         ccr_backend.duplicate_images_by_indices([0])
         catalog.update_for_images(ccr_backend.images, path=cat)
-        assert catalog.entries_for_path(path, path=cat) is not None
-        ccr_backend.remove_images_by_indices([0, 1])
-        assert catalog.entries_for_path(path, path=cat) is None
-
-    def test_partial_removal_keeps_record(self, tmp_path, monkeypatch):
-        cat = str(tmp_path / "catalog.json")
-        monkeypatch.setattr(catalog, "default_catalog_path", lambda: cat)
-        path, _ = _scan_png(tmp_path)
-        ccr_backend.images = [CCRImage(path)]
-        ccr_backend.duplicate_images_by_indices([0])
-        catalog.update_for_images(ccr_backend.images, path=cat)
+        entries = catalog.entries_for_path(path, path=cat)
+        assert len(entries) == 2
         ccr_backend.remove_images_by_indices([1])  # remove only the dup
-        assert catalog.entries_for_path(path, path=cat) is not None
+        entries = catalog.entries_for_path(path, path=cat)
+        assert len(entries) == 1
+        assert not entries[0]["is_duplicate"]
+
+    def test_removed_actual_keeps_catalog_info(self, tmp_path, monkeypatch):
+        """Removing an ACTUAL image keeps its stored edits — even across a
+        later save_catalog (the preserved state is merged back)."""
+        cat = str(tmp_path / "catalog.json")
+        monkeypatch.setattr(catalog, "default_catalog_path", lambda: cat)
+        path_a, _ = _scan_png(tmp_path, name="a.png")
+        path_b, _ = _scan_png(tmp_path, name="b.png")
+        img_a = CCRImage(path_a)
+        img_a.adjustment_settings = {"temperature": 33}
+        ccr_backend.images = [img_a, CCRImage(path_b)]
+        ccr_backend.file_paths = [path_a, path_b]
+        ccr_backend._catalog_preserved = {}
+        catalog.update_for_images(ccr_backend.images, path=cat)
+        # Remove the actual image a.png, then save (as close/convert would)
+        ccr_backend.remove_images_by_indices([0])
+        ccr_backend.save_catalog()
+        entries = catalog.entries_for_path(path_a, path=cat)
+        assert entries is not None
+        assert entries[0]["adjustment_settings"] == {"temperature": 33}
+
+    def test_remove_original_and_duplicate_keeps_only_original(
+            self, tmp_path, monkeypatch):
+        cat = str(tmp_path / "catalog.json")
+        monkeypatch.setattr(catalog, "default_catalog_path", lambda: cat)
+        path, _ = _scan_png(tmp_path)
+        ccr_backend.images = [CCRImage(path)]
+        ccr_backend._catalog_preserved = {}
+        ccr_backend.duplicate_images_by_indices([0])
+        catalog.update_for_images(ccr_backend.images, path=cat)
+        ccr_backend.remove_images_by_indices([0, 1])
+        ccr_backend.save_catalog()
+        entries = catalog.entries_for_path(path, path=cat)
+        assert entries is not None and len(entries) == 1
+        assert not entries[0]["is_duplicate"]
+
+    def test_duplicate_flag_round_trips_catalog(self, tmp_path):
+        cat = str(tmp_path / "catalog.json")
+        path, _ = _scan_png(tmp_path)
+        ccr_backend.images = [CCRImage(path)]
+        ccr_backend.duplicate_images_by_indices([0])
+        assert ccr_backend.images[1].is_duplicate
+        catalog.update_for_images(ccr_backend.images, path=cat)
+        restored = catalog.create_images_for_path(path, path=cat)
+        assert [im.is_duplicate for im in restored] == [False, True]
 
 
 if __name__ == "__main__":

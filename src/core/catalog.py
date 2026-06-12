@@ -94,6 +94,7 @@ def serialize_image(img) -> dict:
     """Everything needed to bring a CCRImage back to its current state."""
     return {
         "display_name": img.display_name,
+        "is_duplicate": bool(getattr(img, "is_duplicate", False)),
         "source_ops": [[int(rot), list(region)] for rot, region in img.source_ops],
         "converted": bool(img.converted),
         "conversion_inputs": _ci_to_json(img.conversion_inputs),
@@ -130,14 +131,23 @@ def _prune(catalog: dict) -> None:
         del files[fkey]
 
 
-def update_for_images(images, path: str = None) -> None:
+def update_for_images(images, path: str = None, preserved: dict = None) -> None:
     """Write the current state of all loaded images into the catalog,
     grouped by source file (the slices of one file form one entry list, in
-    list order). Entries for files not currently loaded are kept."""
+    list order). Entries for files not currently loaded are kept.
+
+    preserved: states of ACTUAL images removed from the list this session,
+    {file_path: {"signature": sig, "entries": {display_name: state}}} —
+    removal must not lose their stored edits, so they are merged back into
+    the records alongside the loaded images."""
     catalog = load_catalog(path)
     grouped = {}
     for img in images:
         grouped.setdefault(_file_key(img.file_path), []).append(img)
+    preserved_by_key = {}
+    for file_path, record in (preserved or {}).items():
+        if record.get("entries"):
+            preserved_by_key[_file_key(file_path)] = record
     now = time.time()
     for fkey, imgs in grouped.items():
         states = [serialize_image(im) for im in imgs]
@@ -146,7 +156,14 @@ def update_for_images(images, path: str = None) -> None:
         # edits) unless the user has since made real edits worth saving.
         if (any(getattr(im, "_catalog_restore_failed", False) for im in imgs)
                 and all(_is_pristine(s) for s in states)):
+            preserved_by_key.pop(fkey, None)
             continue
+        # Merge in the states of this file's removed actual images
+        kept_record = preserved_by_key.pop(fkey, None)
+        if kept_record:
+            loaded_names = {s.get("display_name") for s in states}
+            states += [state for name, state in kept_record["entries"].items()
+                       if name not in loaded_names]
         # Prefer the signature captured when the file was actually READ:
         # edits belong to the content as loaded, not as it is at save time.
         signature = next((getattr(im, "_catalog_signature", None) for im in imgs
@@ -161,20 +178,50 @@ def update_for_images(images, path: str = None) -> None:
             "saved_at": now,
             "images": states,
         }
+    # Files whose images were ALL removed (as actuals): merge the preserved
+    # states into the existing record so their edits survive.
+    for fkey, kept_record in preserved_by_key.items():
+        entries = kept_record["entries"]
+        existing = catalog["files"].get(fkey)
+        if isinstance(existing, dict) and existing.get("images"):
+            removed_names = set(entries)
+            merged = [s for s in existing["images"]
+                      if s.get("display_name") not in removed_names]
+            merged += list(entries.values())
+            existing["images"] = merged
+            existing["saved_at"] = now
+        elif kept_record.get("signature"):
+            catalog["files"][fkey] = {
+                "signature": kept_record["signature"],
+                "saved_at": now,
+                "images": list(entries.values()),
+            }
     _prune(catalog)
     save_catalog(catalog, path)
 
 
-def remove_records_for_files(file_paths, path: str = None) -> None:
-    """Delete the catalog records for files whose images the user explicitly
-    removed entirely — otherwise reopening them would resurrect images
-    (e.g. duplicates) that were deliberately discarded."""
+def remove_duplicate_entries(removals: dict, path: str = None) -> None:
+    """Delete the catalog entries of removed DUPLICATES so a deliberately
+    discarded copy does not resurrect on the next open. Entries of actual
+    images are never touched here.
+
+    removals: {file_path: set of duplicate display_names removed}"""
     catalog = load_catalog(path)
     changed = False
-    for file_path in file_paths:
+    for file_path, names in removals.items():
         fkey = _file_key(file_path)
-        if fkey in catalog["files"]:
-            del catalog["files"][fkey]
+        record = catalog["files"].get(fkey)
+        if not isinstance(record, dict):
+            continue
+        entries = record.get("images") or []
+        kept = [state for state in entries
+                if not (state.get("is_duplicate")
+                        and state.get("display_name") in names)]
+        if len(kept) != len(entries):
+            if kept:
+                record["images"] = kept
+            else:
+                del catalog["files"][fkey]
             changed = True
     if changed:
         save_catalog(catalog, path)
@@ -256,6 +303,7 @@ def _restore_image(file_path: str, state: dict):
         source_ops=source_ops,
         display_name=state.get("display_name"),
     )
+    img.is_duplicate = bool(state.get("is_duplicate", False))
     ref = state.get("reference_frame")
     img.reference_frame = tuple(ref) if ref else None
     crop = state.get("crop_rect")

@@ -24,12 +24,20 @@ class CCRBackend:
         self.file_paths: List[str] = []
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
+        # Catalog entries of ACTUAL images removed from the list this
+        # session: {file_path: {"signature": sig, "entries": {name: state}}}.
+        # Removal must not lose their stored edits, so saves merge these
+        # back into the records (duplicates, by contrast, are deleted).
+        self._catalog_preserved = {}
 
     def load_images_from_files(self, file_paths: List[str], cancel_flag=None) -> int:
         """Load files (with catalog restore). Returns the number of FILES
         that produced at least one image (a sliced file yields several)."""
         self.images.clear()
         self.file_paths = file_paths
+        # Preserved removal states belong to the previous batch (the open
+        # flows save the catalog before loading a new one)
+        self._catalog_preserved = {}
 
         # Read the catalog ONCE for the whole batch — per-file reads would
         # re-parse the entire JSON N times across the loader threads.
@@ -573,27 +581,38 @@ class CCRBackend:
 
     def remove_images_by_indices(self, indices) -> int:
         """Remove several images at once. Returns how many were removed.
-        When the removal covers ALL images of a file, that file's catalog
-        record is deleted too — an explicit discard must not resurrect the
-        removed images (e.g. duplicates) on the next open."""
-        affected_paths = set()
-        removed = 0
+
+        Catalog semantics: a removed DUPLICATE also loses its catalog entry
+        (a deliberately discarded copy must not resurrect on the next open),
+        while a removed ACTUAL image keeps its stored edits — its latest
+        state is preserved so later saves don't silently drop it."""
+        removed_images = []
         for idx in sorted(set(indices), reverse=True):
             if 0 <= idx < len(self.images):
-                affected_paths.add(self.images[idx].file_path)
+                removed_images.append(self.images[idx])
                 del self.images[idx]
-                removed += 1
         self.file_paths = [img.file_path for img in self.images]
-        if removed:
-            surviving_paths = set(self.file_paths)
-            emptied = {p for p in affected_paths if p not in surviving_paths}
-            if emptied:
-                try:
-                    from core.catalog import remove_records_for_files
-                    remove_records_for_files(emptied)
-                except Exception as e:
-                    print(f"Catalog record removal failed: {e}")
-        return removed
+        if not removed_images:
+            return 0
+        try:
+            from core.catalog import serialize_image, remove_duplicate_entries
+            duplicate_removals = {}
+            for img in removed_images:
+                if getattr(img, "is_duplicate", False):
+                    if img.display_name:
+                        duplicate_removals.setdefault(img.file_path,
+                                                      set()).add(img.display_name)
+                else:
+                    record = self._catalog_preserved.setdefault(
+                        img.file_path,
+                        {"signature": getattr(img, "_catalog_signature", None),
+                         "entries": {}})
+                    record["entries"][img.display_name] = serialize_image(img)
+            if duplicate_removals:
+                remove_duplicate_entries(duplicate_removals)
+        except Exception as e:
+            print(f"Catalog removal bookkeeping failed: {e}")
+        return len(removed_images)
 
     def duplicate_images_by_indices(self, indices) -> int:
         """Insert a working copy right after each selected image. Copies are
@@ -636,6 +655,7 @@ class CCRBackend:
             dup.brightness_base = img.brightness_base
             dup.tint_balance_factor = getattr(img, "tint_balance_factor", 1.0)
             dup._catalog_signature = getattr(img, "_catalog_signature", None)
+            dup.is_duplicate = True
             if ((dup.contrast_base, dup.temperature_base, dup.brightness_base)
                     != (0, 0, -8) or img.adjustment_settings.get("tint")):
                 dup.update_thumbnail_and_preview()
@@ -648,11 +668,11 @@ class CCRBackend:
         """Persist the edit state (conversion, slices, crop, adjustments) of
         all loaded images so reopening the files restores it. Cheap; called
         after significant operations and on app close."""
-        if not self.images:
+        if not self.images and not self._catalog_preserved:
             return
         try:
             from core.catalog import update_for_images
-            update_for_images(self.images)
+            update_for_images(self.images, preserved=self._catalog_preserved)
         except Exception as e:
             print(f"Catalog save failed: {e}")
 
