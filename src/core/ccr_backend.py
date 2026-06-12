@@ -25,10 +25,20 @@ class CCRBackend:
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
 
-    def load_images_from_files(self, file_paths: List[str], cancel_flag=None):
+    def load_images_from_files(self, file_paths: List[str], cancel_flag=None) -> int:
+        """Load files (with catalog restore). Returns the number of FILES
+        that produced at least one image (a sliced file yields several)."""
         self.images.clear()
         self.file_paths = file_paths
-        
+
+        # Read the catalog ONCE for the whole batch — per-file reads would
+        # re-parse the entire JSON N times across the loader threads.
+        from core.catalog import create_images_for_path, load_catalog
+        try:
+            catalog_data = load_catalog()
+        except Exception:
+            catalog_data = None
+
         def load_single_image(path):
             try:
                 if cancel_flag and cancel_flag():
@@ -36,8 +46,7 @@ class CCRBackend:
                 print(f"Loading image: {os.path.basename(path)}")
                 # Restores cataloged state (slices, conversion, adjustments)
                 # when this file was processed before; plain load otherwise.
-                from core.catalog import create_images_for_path
-                imgs = create_images_for_path(path)
+                imgs = create_images_for_path(path, catalog_data=catalog_data)
                 for order, img in enumerate(imgs):
                     img._catalog_order = order  # keep slice order within a file
                 print(f"Successfully loaded: {os.path.basename(path)}")
@@ -49,6 +58,7 @@ class CCRBackend:
         # Use parallel loading with ThreadPoolExecutor
         max_workers = min(8, os.cpu_count() or 1)
         
+        loaded_file_count = 0
         if max_workers == 1:
             # Sequential fallback
             for path in file_paths:
@@ -57,6 +67,7 @@ class CCRBackend:
                 _path, imgs = load_single_image(path)
                 if imgs:
                     self.images.extend(imgs)
+                    loaded_file_count += 1
         else:
             # Parallel loading - collect into local list to avoid concurrent modification
             results = []
@@ -69,6 +80,7 @@ class CCRBackend:
                     path, imgs = future.result()
                     if imgs:
                         results.extend(imgs)
+                        loaded_file_count += 1
 
             # Slices of one file keep their catalog order within the file
             results.sort(key=lambda img: (os.path.basename(img.file_path),
@@ -77,6 +89,7 @@ class CCRBackend:
 
         # Keep file_paths derived from actually-loaded images so the two lists stay in sync
         self.file_paths = [img.file_path for img in self.images]
+        return loaded_file_count
 
     def clear(self):
         """
@@ -154,13 +167,13 @@ class CCRBackend:
         
         print(f"Found {len(file_paths)} files total: {file_paths[:5]}...")  # Show first 5 files
         
-        # Load images and track success/failure
-        initial_count = len(self.images)
-        self.load_images_from_files(sorted(file_paths), cancel_flag=cancel_flag)
-        loaded_count = len(self.images) - initial_count
-        failed_count = len(file_paths) - loaded_count
-        
-        print(f"Loading complete: {loaded_count} images loaded successfully, {failed_count} failed")
+        # Load images and track success/failure (counted in FILES — a sliced
+        # file restores as several images)
+        loaded_files = self.load_images_from_files(sorted(file_paths), cancel_flag=cancel_flag) or 0
+        failed_count = len(file_paths) - loaded_files
+
+        print(f"Loading complete: {loaded_files} files loaded successfully "
+              f"({len(self.images)} images), {failed_count} failed")
 
     def get_image_by_index(self, idx: int) -> Optional[CCRImage]:
         if idx is not None and 0 <= idx < len(self.images):
@@ -686,6 +699,9 @@ class CCRBackend:
                     display_name=f"{stem}_s{index}{ext}",
                 )
                 child.conversion_inputs = child_ci
+                # Slices descend from the parent's loaded content — carry its
+                # load-time file signature for the edit catalog.
+                child._catalog_signature = getattr(img_obj, "_catalog_signature", None)
                 # Inherit the parent's perceptual tint factor: the child's
                 # ctor derived one from CONVERTED pixels, which would render
                 # an inherited tint setting differently than the parent did.

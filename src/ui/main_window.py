@@ -238,6 +238,8 @@ class MainWindow(QMainWindow):
             self._loader_worker = None
 
     def open_files(self):
+        # Loading a new batch replaces the current one — persist its edits first
+        ccr_backend.save_catalog()
         start_dir = self._settings.value("files/last_open_dir", "", type=str)
         files, _ = QFileDialog.getOpenFileNames(
             self,
@@ -289,6 +291,8 @@ class MainWindow(QMainWindow):
                 )
 
     def open_folder(self):
+        # Loading a new batch replaces the current one — persist its edits first
+        ccr_backend.save_catalog()
         start_dir = self._settings.value("files/last_open_dir", "", type=str)
         folder = QFileDialog.getExistingDirectory(
             self,

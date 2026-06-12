@@ -183,6 +183,75 @@ class TestCatalogInvalidation:
         restored = catalog.create_images_for_path(path, path=cat)
         assert len(restored) == 1
 
+    def test_malformed_but_parseable_catalog_is_tolerated(self, tmp_path):
+        """{"version": 1} without "files" used to raise out of the loader
+        and block EVERY image from loading."""
+        cat = str(tmp_path / "catalog.json")
+        import json
+        with open(cat, "w", encoding="utf-8") as f:
+            json.dump({"version": 1}, f)
+        path, _ = _scan_png(tmp_path)
+        restored = catalog.create_images_for_path(path, path=cat)
+        assert len(restored) == 1
+
+    def test_partial_restore_falls_back_and_preserves_record(self, tmp_path):
+        """All-or-nothing: one bad entry must not silently drop a photo, and
+        the next save must not erase the stored record."""
+        cat = str(tmp_path / "catalog.json")
+        path, _ = _scan_png(tmp_path)
+        parent = CCRImage(path)
+        ccr_backend.images = [parent]
+        ccr_backend.file_paths = [path]
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        catalog.update_for_images(ccr_backend.images, path=cat)
+        # Corrupt ONE entry so its restore raises
+        data = catalog.load_catalog(cat)
+        record = data["files"][catalog._file_key(path)]
+        record["images"][1]["source_ops"] = [["garbage"]]
+        catalog.save_catalog(data, cat)
+
+        restored = catalog.create_images_for_path(path, path=cat)
+        assert len(restored) == 1  # whole-scan fallback, not a partial list
+        assert getattr(restored[0], "_catalog_restore_failed", False)
+        # A save with the pristine fallback must keep the stored record
+        catalog.update_for_images(restored, path=cat)
+        kept = catalog.load_catalog(cat)["files"][catalog._file_key(path)]
+        assert len(kept["images"]) == 2
+
+    def test_cleared_reference_frame_stays_cleared(self, tmp_path):
+        cat = str(tmp_path / "catalog.json")
+        path, _ = _scan_png(tmp_path)
+        img = CCRImage(path)
+        img.reference_frame = (20, 20, 580, 380)
+        ccr_backend.images = [img]
+        ccr_backend.convert_negative_by_index(0)
+        img.reference_frame = None  # user right-clicked the frame away
+        catalog.update_for_images([img], path=cat)
+        restored = catalog.create_images_for_path(path, path=cat)[0]
+        assert restored.converted
+        assert restored.reference_frame is None
+
+
+class TestLoaderIntegration:
+    def test_loader_restores_slices_in_order(self, tmp_path, monkeypatch):
+        cat = str(tmp_path / "catalog.json")
+        monkeypatch.setattr(catalog, "default_catalog_path", lambda: cat)
+        path, _ = _scan_png(tmp_path)
+        parent = CCRImage(path)
+        ccr_backend.images = [parent]
+        ccr_backend.file_paths = [path]
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        catalog.update_for_images(ccr_backend.images, path=cat)
+
+        ccr_backend.images = []
+        ccr_backend.file_paths = []
+        loaded_files = ccr_backend.load_images_from_files([path])
+        assert loaded_files == 1
+        assert ccr_backend.get_image_count() == 2
+        assert [im.display_name for im in ccr_backend.images] == \
+               ["negative_s1.png", "negative_s2.png"]
+        assert ccr_backend.file_paths == [path, path]
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

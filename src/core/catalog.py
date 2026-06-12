@@ -12,8 +12,10 @@ import json
 import logging
 import os
 import tempfile
+import time
 
 CATALOG_VERSION = 1
+MAX_CATALOG_ENTRIES = 2000  # bounds growth; oldest records pruned beyond this
 
 
 def default_catalog_path() -> str:
@@ -28,7 +30,10 @@ def load_catalog(path: str = None) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict) and data.get("version") == CATALOG_VERSION:
+        # Structural validation too: a parseable-but-malformed catalog must
+        # degrade to a fresh one, never block image loading.
+        if (isinstance(data, dict) and data.get("version") == CATALOG_VERSION
+                and isinstance(data.get("files"), dict)):
             return data
     except FileNotFoundError:
         pass
@@ -107,6 +112,24 @@ def serialize_image(img) -> dict:
     }
 
 
+def _is_pristine(state: dict) -> bool:
+    """True when a serialized state carries no user edits worth saving."""
+    return (not state["converted"] and not state["source_ops"]
+            and not state["adjustment_settings"] and state["crop_rect"] is None
+            and state["rotation_angle"] == 0 and state["fine_rotation_angle"] == 0
+            and not state["horizontal_mirrored"] and not state["vertical_mirrored"]
+            and state["reference_frame"] is None)
+
+
+def _prune(catalog: dict) -> None:
+    files = catalog["files"]
+    if len(files) <= MAX_CATALOG_ENTRIES:
+        return
+    oldest_first = sorted(files.items(), key=lambda kv: kv[1].get("saved_at", 0))
+    for fkey, _record in oldest_first[:len(files) - MAX_CATALOG_ENTRIES]:
+        del files[fkey]
+
+
 def update_for_images(images, path: str = None) -> None:
     """Write the current state of all loaded images into the catalog,
     grouped by source file (the slices of one file form one entry list, in
@@ -115,23 +138,42 @@ def update_for_images(images, path: str = None) -> None:
     grouped = {}
     for img in images:
         grouped.setdefault(_file_key(img.file_path), []).append(img)
+    now = time.time()
     for fkey, imgs in grouped.items():
-        try:
-            signature = _file_signature(imgs[0].file_path)
-        except OSError:
+        states = [serialize_image(im) for im in imgs]
+        # A failed restore fell back to a plain load — never let that
+        # OVERWRITE the stored record (which still holds the real slices and
+        # edits) unless the user has since made real edits worth saving.
+        if (any(getattr(im, "_catalog_restore_failed", False) for im in imgs)
+                and all(_is_pristine(s) for s in states)):
             continue
+        # Prefer the signature captured when the file was actually READ:
+        # edits belong to the content as loaded, not as it is at save time.
+        signature = next((getattr(im, "_catalog_signature", None) for im in imgs
+                          if getattr(im, "_catalog_signature", None)), None)
+        if signature is None:
+            try:
+                signature = _file_signature(imgs[0].file_path)
+            except OSError:
+                continue
         catalog["files"][fkey] = {
             "signature": signature,
-            "images": [serialize_image(im) for im in imgs],
+            "saved_at": now,
+            "images": states,
         }
+    _prune(catalog)
     save_catalog(catalog, path)
 
 
-def entries_for_path(file_path: str, path: str = None):
+def entries_for_path(file_path: str, path: str = None, catalog_data: dict = None):
     """Catalog entries for a file, or None when absent or when the file has
-    changed since it was cataloged (stale edits must not be misapplied)."""
-    catalog = load_catalog(path)
+    changed since it was cataloged (stale edits must not be misapplied).
+    Pass a preloaded catalog_data to avoid re-reading the catalog per file
+    (batch loads)."""
+    catalog = catalog_data if catalog_data is not None else load_catalog(path)
     record = catalog["files"].get(_file_key(file_path))
+    if not isinstance(record, dict):
+        return None
     if not record:
         return None
     try:
@@ -145,21 +187,44 @@ def entries_for_path(file_path: str, path: str = None):
     return record.get("images") or None
 
 
-def create_images_for_path(file_path: str, path: str = None) -> list:
+def create_images_for_path(file_path: str, path: str = None,
+                           catalog_data: dict = None) -> list:
     """Create the CCRImage(s) for a file, restoring cataloged state when
-    available (slices, conversion, adjustments, crop, orientation). Falls
-    back to a plain load on any failure."""
+    available (slices, conversion, adjustments, crop, orientation).
+
+    Restore is ALL-OR-NOTHING per file: a partial restore would silently
+    drop a photo from the session, and the next catalog save would then
+    permanently erase its record. On any entry failure the whole file falls
+    back to a plain load, flagged so the save path preserves the stored
+    record until the user makes new edits."""
     from core.ccr_image import CCRImage
-    entries = entries_for_path(file_path, path)
+    signature = None
+    try:
+        signature = _file_signature(file_path)
+        entries = entries_for_path(file_path, path, catalog_data)
+    except Exception as e:
+        logging.warning(f"Catalog lookup failed for {file_path}: {e}")
+        entries = None
+
+    def _plain(restore_failed=False):
+        img = CCRImage(file_path)
+        img._catalog_signature = signature
+        if restore_failed:
+            img._catalog_restore_failed = True
+        return [img]
+
     if not entries:
-        return [CCRImage(file_path)]
+        return _plain()
     images = []
     for state in entries:
         try:
             images.append(_restore_image(file_path, state))
         except Exception as e:
             logging.warning(f"Catalog restore failed for {file_path}: {e}")
-    return images or [CCRImage(file_path)]
+            return _plain(restore_failed=True)
+    for img in images:
+        img._catalog_signature = signature
+    return images
 
 
 def _restore_image(file_path: str, state: dict):
@@ -212,7 +277,9 @@ def _replay_conversion(img, ci) -> None:
             processed = ccr_normalize_with_reference(img)
         finally:
             img.fine_rotation_angle = saved_fine
-            img.reference_frame = saved_ref if saved_ref is not None else ci["ref"]
+            # Unconditionally: the user may have deleted the frame after
+            # converting, and a restore must reproduce exactly that state.
+            img.reference_frame = saved_ref
         img.resized_raw = processed
     elif mode == "ref_params":
         img.resized_raw = apply_reference_normalization(

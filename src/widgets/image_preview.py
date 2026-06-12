@@ -2345,7 +2345,8 @@ class ImagePreview(QWidget):
         self.parent().parent().thumbnail_list.update_all_thumbnails()
         if self.current_idx is not None:
             self.update_preview(self.current_idx)
-        
+        ccr_backend.save_catalog()
+
         # Show completion hint
         self.parent().parent().sliders_panel.set_temporary_hint("Auto frame conversion completed!", duration=2000)
 
