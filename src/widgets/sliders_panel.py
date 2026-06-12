@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayou
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
 from core.ccr_backend import ccr_backend
+from core.ccr_processor import COLOR_BANDS, BAND_PARAMS, BAND_ADJUSTMENT_KEYS
 
 # Setting groups offered by the "Sync to All" dialog. The adjustment-key
 # groups partition SlidersPanel.ADJUSTMENT_KEYS exactly; "crop" syncs the
@@ -21,6 +22,7 @@ SYNC_GROUPS = [
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint")),
+    ("bands", "Subtractive Saturations (per color)", BAND_ADJUSTMENT_KEYS),
 ]
 
 
@@ -176,12 +178,14 @@ class SlidersPanel(QWidget):
         "temperature", "tint", "exposure", "brightness", "highlights",
         "white_point", "shadows", "black_point", "contrast", "saturation",
         "sub_saturation",
-        # Per-channel levels controls (collapsible section, created last)
+        # Per-channel levels controls (collapsible section)
         "ch_input_gain", "ch_master_shift", "ch_master_gain",
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
-    ]
+        # Per-color-band sliders (Subtractive Saturations section, created
+        # last): band_<color>_<param> for the 6 bands × 4 params
+    ] + list(BAND_ADJUSTMENT_KEYS)
 
     def __init__(self, parent=None):
         super().__init__()
@@ -391,6 +395,60 @@ class SlidersPanel(QWidget):
         self.od_section.add_layout(self.create_slider("B Gain"))
         self.od_section.add_layout(self.create_slider("B Blackpoint"))
 
+        # --- Subtractive Saturations collapsible section (per-color bands) ---
+        band_separator = QFrame()
+        band_separator.setFrameShape(QFrame.HLine)
+        band_separator.setFrameShadow(QFrame.Sunken)
+        band_separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
+        scroll_layout.addWidget(band_separator)
+
+        self.band_section = CollapsibleSection("Subtractive Saturations")
+        scroll_layout.addWidget(self.band_section)
+
+        # A swatch button per color selects which band's sliders are shown;
+        # all 24 sliders exist (and feed adjustment_settings) regardless.
+        band_swatch_colors = {
+            "red": "#c0392b", "skin": "#d8956b", "yellow": "#c8b900",
+            "green": "#27ae60", "blue": "#2f6fd0", "purple": "#8e44ad",
+        }
+        self._band_buttons = {}
+        self._band_pages = {}
+        band_btn_row = QHBoxLayout()
+        band_btn_row.setSpacing(4)
+        for color in COLOR_BANDS:
+            btn = QPushButton()
+            btn.setCheckable(True)
+            btn.setFixedSize(28, 20)
+            btn.setToolTip(color.capitalize())
+            btn.setStyleSheet(
+                f"QPushButton {{ background: {band_swatch_colors[color]}; "
+                "border: 1px solid #222; border-radius: 3px; }"
+                "QPushButton:checked { border: 2px solid #eee; }")
+            btn.clicked.connect(lambda _=False, c=color: self._show_band_page(c))
+            band_btn_row.addWidget(btn)
+            self._band_buttons[color] = btn
+        band_btn_row.addStretch()
+        band_btn_widget = QWidget()
+        band_btn_widget.setLayout(band_btn_row)
+        self.band_section.add_widget(band_btn_widget)
+
+        # Slider creation order must mirror BAND_ADJUSTMENT_KEYS: for each
+        # color in COLOR_BANDS, the four BAND_PARAMS in order.
+        band_param_labels = ("Sub Sat", "Sat", "Brightness", "Hue")
+        assert len(band_param_labels) == len(BAND_PARAMS)
+        for color in COLOR_BANDS:
+            page = QWidget()
+            page_layout = QVBoxLayout()
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(2)
+            for param_label in band_param_labels:
+                page_layout.addLayout(self.create_slider(param_label))
+            page.setLayout(page_layout)
+            page.setVisible(False)
+            self.band_section.add_widget(page)
+            self._band_pages[color] = page
+        self._show_band_page("red")
+
         # --- Signal connections ---
         self.reset_button.clicked.connect(self.on_reset_clicked)
         self.compare_button.pressed.connect(self.on_compare_pressed)
@@ -477,6 +535,13 @@ class SlidersPanel(QWidget):
         self.slider_value_labels.append(value_label)
 
         return slider_layout
+
+    def _show_band_page(self, color: str):
+        """Show one color band's slider page in the Subtractive Saturations
+        section; the others stay hidden (but keep their values)."""
+        for c, page in self._band_pages.items():
+            page.setVisible(c == color)
+            self._band_buttons[c].setChecked(c == color)
 
     def set_sliders_enabled(self, enabled: bool):
         print(f"Setting sliders enabled: {enabled}")

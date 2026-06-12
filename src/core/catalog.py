@@ -90,11 +90,20 @@ def _ci_from_json(ci):
     return out
 
 
+def _slice_parent_to_json(parent):
+    """slice_parent is a plain {display_name, is_duplicate, slice_group} dict
+    of JSON-safe scalars, but copy defensively so the stored catalog never
+    aliases live state."""
+    return dict(parent) if parent else None
+
+
 def serialize_image(img) -> dict:
     """Everything needed to bring a CCRImage back to its current state."""
     return {
         "display_name": img.display_name,
         "is_duplicate": bool(getattr(img, "is_duplicate", False)),
+        "slice_group": getattr(img, "slice_group", None),
+        "slice_parent": _slice_parent_to_json(getattr(img, "slice_parent", None)),
         "source_ops": [[int(rot), list(region)] for rot, region in img.source_ops],
         "converted": bool(img.converted),
         "conversion_inputs": _ci_to_json(img.conversion_inputs),
@@ -302,6 +311,9 @@ def _restore_image(file_path: str, state: dict):
         vertical_mirrored=state.get("vertical_mirrored", False),
         source_ops=source_ops,
         display_name=state.get("display_name"),
+        slice_group=state.get("slice_group"),
+        slice_parent=(dict(state["slice_parent"])
+                      if state.get("slice_parent") else None),
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
     ref = state.get("reference_frame")
