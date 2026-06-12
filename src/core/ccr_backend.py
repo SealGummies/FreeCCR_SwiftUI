@@ -1,4 +1,5 @@
 from typing import List, Optional
+import cv2
 from core.ccr_image import CCRImage
 from core.ccr_processor import ccr_normalize_with_reference, ccr_normalize_with_bwpoint, auto_fine_angle, auto_frame, auto_frame_v2
 import os
@@ -549,12 +550,17 @@ class CCRBackend:
     def slice_image_by_index(self, idx: int, x_cuts, y_cuts, progress_callback=None) -> int:
         """
         Split the image at idx into a grid of separate images along the given
-        cut positions (fractions of the image's own coordinates; x_cuts are
+        cut positions (fractions of the image's displayed frame; x_cuts are
         vertical lines, y_cuts horizontal). The slices replace the original
-        in the list, in reading order (left-to-right, top-to-bottom). Each
-        slice is a fresh un-converted CCRImage whose source_region maps back
-        to the ORIGINAL file, so conversion, zoom detail, and export all read
-        the correct region at full quality. The source is decoded only once.
+        in the list, in reading order (left-to-right, top-to-bottom).
+
+        The parent's edits carry over: its fine rotation is BAKED into the
+        slices (cuts are made on the rotated frame, exactly as displayed),
+        its conversion is replayed on each slice with the parent's own
+        constants so colors match, and adjustments/bases/orientation are
+        inherited. Each slice's source_ops chain maps back to the ORIGINAL
+        file, so zoom detail and full-res export read the correct region at
+        full quality. The source is decoded only once.
         Returns the number of slices created (0 = nothing done).
         """
         img_obj = self.get_image_by_index(idx)
@@ -566,13 +572,37 @@ class CCRBackend:
         if total <= 1:
             return 0
 
-        # One shared decode (region-aware when slicing an existing slice)
+        # One shared decode (the parent's own slice chain is applied inside)
         full = img_obj.read_image(img_obj.file_path, preview=True)
         if full is None:
             return 0
+
+        # Conversion replay: derive the parent's conversion constants so each
+        # slice can be converted to look exactly like the parent did.
+        parent_ci = img_obj.conversion_inputs if img_obj.converted else None
+        norm_params = None
+        if parent_ci is not None and parent_ci.get("mode") == "ref":
+            from core.ccr_processor import compute_reference_norm_params
+            ref_small = img_obj.resize_image_to_max_pixel(full, 1080)
+            p_lo, p_hi, od = compute_reference_norm_params(
+                ref_small, parent_ci["ref"], parent_ci["fine_rot"])
+            norm_params = (tuple(float(v) for v in p_lo),
+                           tuple(float(v) for v in p_hi),
+                           tuple(float(v) for v in od))
+        elif parent_ci is not None and parent_ci.get("mode") == "ref_params":
+            norm_params = (parent_ci["p_lo"], parent_ci["p_hi"], parent_ci["od"])
+
+        # Bake the parent's current fine rotation: the cuts were placed on
+        # the rotated display, so the slices are cut from the rotated frame.
+        baked_rotation = img_obj.fine_rotation_angle or 0
+        if baked_rotation:
+            h0, w0 = full.shape[:2]
+            matrix = cv2.getRotationMatrix2D((w0 // 2, h0 // 2),
+                                             -baked_rotation / 100.0, 1.0)
+            full = cv2.warpAffine(full, matrix, (w0, h0), flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
         h, w = full.shape[:2]
-        px1, py1, px2, py2 = img_obj.source_region or (0.0, 0.0, 1.0, 1.0)
-        parent_w_frac, parent_h_frac = px2 - px1, py2 - py1
         parent_full = img_obj.original_full_size or (h, w)
         # Nested slices must extend the PARENT's name (scan_s2 -> scan_s2_s1):
         # deriving from the file basename would make cousins collide and
@@ -591,20 +621,45 @@ class CCRBackend:
                 cy1 = max(0, min(h - 1, int(round(fy1 * h))))
                 cx2 = max(cx1 + 1, min(w, int(round(fx2 * w))))
                 cy2 = max(cy1 + 1, min(h, int(round(fy2 * h))))
-                # Compose into ORIGINAL-file coordinates (parents may
-                # themselves already be slices)
-                region = (px1 + fx1 * parent_w_frac, py1 + fy1 * parent_h_frac,
-                          px1 + fx2 * parent_w_frac, py1 + fy2 * parent_h_frac)
+                crop = full[cy1:cy2, cx1:cx2]
                 child_full = (max(1, int(round((fy2 - fy1) * parent_full[0]))),
                               max(1, int(round((fx2 - fx1) * parent_full[1]))))
+
+                # Replay the parent's conversion on this slice
+                child_ci = None
+                if norm_params is not None:
+                    from core.ccr_processor import apply_reference_normalization
+                    crop = apply_reference_normalization(crop, *norm_params)
+                    child_ci = {"mode": "ref_params", "p_lo": norm_params[0],
+                                "p_hi": norm_params[1], "od": norm_params[2]}
+                elif parent_ci is not None and parent_ci.get("mode") == "bw":
+                    from core.ccr_processor import apply_bwpoint_normalization
+                    black_point, white_point = parent_ci["bw"]
+                    crop = apply_bwpoint_normalization(crop, black_point, white_point)
+                    child_ci = {"mode": "bw", "bw": parent_ci["bw"], "fine_rot": 0}
+
                 index = len(children) + 1
                 child = CCRImage(
                     img_obj.file_path,
-                    source_region=region,
-                    preloaded_img=full[cy1:cy2, cx1:cx2],
+                    adjustment_settings=dict(img_obj.adjustment_settings),
+                    rotation_angle=img_obj.rotation_angle,
+                    horizontal_mirrored=img_obj.horizontal_mirrored,
+                    vertical_mirrored=img_obj.vertical_mirrored,
+                    converted=child_ci is not None,
+                    source_ops=img_obj.source_ops + [(baked_rotation, (fx1, fy1, fx2, fy2))],
+                    preloaded_img=crop,
                     preloaded_full_size=child_full,
                     display_name=f"{stem}_s{index}{ext}",
                 )
+                child.conversion_inputs = child_ci
+                # Inherit the non-destructive base offsets; rebuild the
+                # preview when they differ from the ctor-time defaults.
+                child.contrast_base = img_obj.contrast_base
+                child.temperature_base = img_obj.temperature_base
+                child.brightness_base = img_obj.brightness_base
+                if (child.contrast_base, child.temperature_base,
+                        child.brightness_base) != (0, 0, -8):
+                    child.update_thumbnail_and_preview()
                 children.append(child)
                 if progress_callback:
                     progress_callback(len(children), total)

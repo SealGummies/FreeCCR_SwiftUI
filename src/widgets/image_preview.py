@@ -722,6 +722,7 @@ class ImagePreview(QWidget):
         self._slice_rerender = False     # guards update_preview during entry
         self._slice_lines = []           # {"orient": 'v'|'h', "frac": float, "item": item}
         self._slice_ghost_item = None    # preview line following the cursor
+        self._slice_dim_item = None      # darker cast marking slice mode
         self._slice_drag = None          # line dict being dragged, or None
         self._slice_worker = None
 
@@ -865,6 +866,7 @@ class ImagePreview(QWidget):
         self._crop_overlay_item = None
         self._crop_handle_items = []
         self._slice_ghost_item = None
+        self._slice_dim_item = None
         for _slice_line in self._slice_lines:
             _slice_line["item"] = None
 
@@ -966,10 +968,12 @@ class ImagePreview(QWidget):
         # so the drawn handles keep matching their hit-test zones.
         if self.crop_mode and self._crop_overlay_item is not None:
             self._draw_crop_overlay()
-        # Slice lines follow the (possibly changed) base transform; the ghost
-        # is simply dropped (it reappears on the next mouse move).
+        # Slice overlay follows the (possibly changed) display transform; the
+        # ghost is simply dropped (it reappears on the next mouse move). The
+        # dim cast is rebuilt first so the lines render on top of it.
         if self.slice_mode:
             self._set_slice_ghost(None)
+            self._draw_slice_dim()
             if self._slice_lines:
                 self._redraw_slice_lines()
 
@@ -1000,8 +1004,10 @@ class ImagePreview(QWidget):
         # the displayed image, the dim overlay, and the drag-to-rect mapping
         # (all base-transform-only) share the same coordinate space — the
         # selection then bounds exactly the pixels the crop keeps.
+        # (Slice mode keeps the fine rotation displayed: cuts are placed on
+        # the rotated frame and the rotation is baked into the slices.)
         img_transform = QTransform(base_transform)
-        if self.current_fine_rotation and not (self.crop_mode or self.slice_mode):
+        if self.current_fine_rotation and not self.crop_mode:
             img_transform.translate(cx, cy)
             img_transform.rotate(self.current_fine_rotation / 100.0)
             img_transform.translate(-cx, -cy)
@@ -1537,6 +1543,7 @@ class ImagePreview(QWidget):
             self.update_preview(self.current_idx)  # re-render full image
         finally:
             self._slice_rerender = False
+        self._draw_slice_dim()
         self.view.setCursor(Qt.CrossCursor)
         self._sync_zoom_combo()
         return True
@@ -1556,12 +1563,29 @@ class ImagePreview(QWidget):
         self._teardown_slice_items()
         self.view.setCursor(Qt.ArrowCursor)
 
-    def _slice_local(self, scene_pos):
-        """Map a scene point into un-rotated image-local coords."""
-        base = self._base_transform()
-        if base is None or self.current_pixmap is None:
+    def _slice_display_transform(self):
+        """Transform of the slice-mode display: coarse flips/rotation PLUS
+        the fine rotation (which stays visible in slice mode — cuts are
+        placed on the rotated frame and the rotation is baked into the
+        slices, matching the backend's warp exactly)."""
+        t = self._base_transform()
+        if t is None or self.current_pixmap is None:
             return None
-        return base.inverted()[0].map(scene_pos)
+        if self.current_fine_rotation:
+            cx = self.current_pixmap.width() / 2
+            cy = self.current_pixmap.height() / 2
+            t = QTransform(t)
+            t.translate(cx, cy)
+            t.rotate(self.current_fine_rotation / 100.0)
+            t.translate(-cx, -cy)
+        return t if t.isInvertible() else None
+
+    def _slice_local(self, scene_pos):
+        """Map a scene point into the slice frame (rotated image coords)."""
+        t = self._slice_display_transform()
+        if t is None:
+            return None
+        return t.inverted()[0].map(scene_pos)
 
     def _slice_line_at(self, p):
         """Placed line near local point p, or None."""
@@ -1672,11 +1696,32 @@ class ImagePreview(QWidget):
                    Qt.DashLine if ghost else Qt.SolidLine)
         pen.setCosmetic(True)  # constant on-screen width at any zoom
         item.setPen(pen)
-        base = self._base_transform()
-        if base is not None:
-            item.setTransform(base)
+        t = self._slice_display_transform()
+        if t is not None:
+            item.setTransform(t)
         self.scene.addItem(item)
         return item
+
+    def _draw_slice_dim(self):
+        """Darker cast over the whole image while in slice mode, so the mode
+        is unmistakable; cut lines render on top of it."""
+        if self._slice_dim_item is not None:
+            try:
+                self.scene.removeItem(self._slice_dim_item)
+            except RuntimeError:
+                pass
+            self._slice_dim_item = None
+        if not self.slice_mode or self.current_pixmap is None:
+            return
+        rect = QGraphicsRectItem(QRectF(0, 0, self.current_pixmap.width(),
+                                        self.current_pixmap.height()))
+        rect.setBrush(QBrush(QColor(0, 0, 0, 80)))
+        rect.setPen(QPen(Qt.NoPen))
+        t = self._slice_display_transform()
+        if t is not None:
+            rect.setTransform(t)
+        self.scene.addItem(rect)
+        self._slice_dim_item = rect
 
     def _set_slice_ghost(self, spec):
         if self._slice_ghost_item is not None:
@@ -1700,6 +1745,12 @@ class ImagePreview(QWidget):
 
     def _teardown_slice_items(self):
         self._set_slice_ghost(None)
+        if self._slice_dim_item is not None:
+            try:
+                self.scene.removeItem(self._slice_dim_item)
+            except RuntimeError:
+                pass
+            self._slice_dim_item = None
         for line in self._slice_lines:
             if line["item"] is not None:
                 try:

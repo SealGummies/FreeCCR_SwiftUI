@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for slice mode's model layer: source_region reading, single-decode
+Tests for slice mode's model layer: source_ops reading, single-decode
 child construction, backend grid slicing, region composition for nested
 slices, and cut cleaning.
 """
@@ -36,25 +36,34 @@ def _coordinate_png(tmp_path, w=600, h=400, name="scan.png"):
     return path, img
 
 
-class TestSourceRegion:
+class TestSourceOps:
     def test_read_image_crops_to_region(self, tmp_path):
         path, img = _coordinate_png(tmp_path)
-        obj = CCRImage(path, source_region=(0.25, 0.5, 0.75, 1.0))
+        obj = CCRImage(path, source_ops=[(0, (0.25, 0.5, 0.75, 1.0))])
         # Region of a 600x400 image: x 150..450, y 200..400
         expected = img[200:400, 150:450]
         np.testing.assert_array_equal(obj.resized_raw, expected)
         assert obj.original_full_size == (200, 300)
 
-    def test_no_region_reads_whole_file(self, tmp_path):
+    def test_no_ops_reads_whole_file(self, tmp_path):
         path, img = _coordinate_png(tmp_path)
         obj = CCRImage(path)
         np.testing.assert_array_equal(obj.resized_raw, img)
         assert obj.original_full_size == (400, 600)
 
+    def test_rotation_op_matches_reference_warp(self, tmp_path):
+        import cv2 as _cv2
+        path, img = _coordinate_png(tmp_path, w=400, h=400)
+        obj = CCRImage(path, source_ops=[(1500, (0.0, 0.0, 0.5, 1.0))])
+        m = _cv2.getRotationMatrix2D((200, 200), -15.0, 1.0)
+        rotated = _cv2.warpAffine(img, m, (400, 400), flags=_cv2.INTER_LINEAR,
+                                  borderMode=_cv2.BORDER_CONSTANT, borderValue=0)
+        np.testing.assert_array_equal(obj.resized_raw, rotated[:, 0:200])
+
     def test_preloaded_constructor_skips_file_read(self, tmp_path):
         path, img = _coordinate_png(tmp_path)
         crop = img[0:200, 0:300]
-        obj = CCRImage(path, source_region=(0.0, 0.0, 0.5, 0.5),
+        obj = CCRImage(path, source_ops=[(0, (0.0, 0.0, 0.5, 0.5))],
                        preloaded_img=crop, preloaded_full_size=(200, 300),
                        display_name="scan_s1.png")
         np.testing.assert_array_equal(obj.resized_raw, crop)
@@ -63,9 +72,9 @@ class TestSourceRegion:
         # Must own its pixels, not view the shared parent decode
         assert obj.resized_raw.base is None
 
-    def test_reload_respects_region(self, tmp_path):
+    def test_reload_respects_ops(self, tmp_path):
         path, img = _coordinate_png(tmp_path)
-        obj = CCRImage(path, source_region=(0.5, 0.0, 1.0, 0.5))
+        obj = CCRImage(path, source_ops=[(0, (0.5, 0.0, 1.0, 0.5))])
         obj.reload_image()
         np.testing.assert_array_equal(obj.resized_raw, img[0:200, 300:600])
 
@@ -97,10 +106,12 @@ class TestSliceImage:
         n = ccr_backend.slice_image_by_index(0, [1.0 / 3.0, 2.0 / 3.0], [])
         assert n == 3
         assert ccr_backend.get_image_count() == 3
-        regions = [im.source_region for im in ccr_backend.images]
+        regions = [im.source_ops[-1][1] for im in ccr_backend.images]
         assert regions[0] == pytest.approx((0.0, 0.0, 1.0 / 3.0, 1.0))
         assert regions[1] == pytest.approx((1.0 / 3.0, 0.0, 2.0 / 3.0, 1.0))
         assert regions[2] == pytest.approx((2.0 / 3.0, 0.0, 1.0, 1.0))
+        assert all(len(im.source_ops) == 1 and im.source_ops[0][0] == 0
+                   for im in ccr_backend.images)
         # Children carry the correct pixels (reading order, left to right)
         np.testing.assert_array_equal(ccr_backend.images[1].resized_raw,
                                       img[:, 200:400])
@@ -115,7 +126,7 @@ class TestSliceImage:
         n = ccr_backend.slice_image_by_index(0, [0.5], [0.5])
         assert n == 4
         # Reading order: TL, TR, BL, BR
-        regions = [im.source_region for im in ccr_backend.images]
+        regions = [im.source_ops[-1][1] for im in ccr_backend.images]
         assert regions[0] == pytest.approx((0.0, 0.0, 0.5, 0.5))
         assert regions[1] == pytest.approx((0.5, 0.0, 1.0, 0.5))
         assert regions[2] == pytest.approx((0.0, 0.5, 0.5, 1.0))
@@ -127,12 +138,17 @@ class TestSliceImage:
         # Slice the RIGHT half again at its own middle
         n = ccr_backend.slice_image_by_index(1, [0.5], [])
         assert n == 2
-        regions = [im.source_region for im in ccr_backend.images]
-        assert regions[1] == pytest.approx((0.5, 0.0, 0.75, 1.0))
-        assert regions[2] == pytest.approx((0.75, 0.0, 1.0, 1.0))
+        # The nested children's chains extend the parent's
+        assert ccr_backend.images[1].source_ops == [
+            (0, (0.5, 0.0, 1.0, 1.0)), (0, (0.0, 0.0, 0.5, 1.0))]
+        assert ccr_backend.images[2].source_ops == [
+            (0, (0.5, 0.0, 1.0, 1.0)), (0, (0.5, 0.0, 1.0, 1.0))]
         # The nested child's pixels come from the right place in the ORIGINAL
         np.testing.assert_array_equal(ccr_backend.images[2].resized_raw,
                                       img[:, 450:600])
+        # ...and a fresh re-read from the file reproduces them
+        reread = ccr_backend.images[2].read_image(path, preview=True)
+        np.testing.assert_array_equal(reread, img[:, 450:600])
         # Nested names extend the parent's name — no collision with cousins
         names = [im.display_name for im in ccr_backend.images]
         assert names == ["scan_s1.png", "scan_s2_s1.png", "scan_s2_s2.png"]
@@ -163,6 +179,84 @@ class TestSliceImage:
         child = ccr_backend.images[1]
         full = child.read_image(child.file_path, preview=False)
         np.testing.assert_array_equal(full, img[:, 300:600])
+
+    def test_fine_rotation_baked_into_slices(self, tmp_path):
+        """Cuts are made on the rotated frame the user saw; children consume
+        the rotation (their own fine_rotation_angle starts at 0) and re-reads
+        from the file reproduce the same rotated pixels."""
+        path, img = self._load(tmp_path, w=400, h=400)
+        ccr_backend.images[0].fine_rotation_angle = 1500  # 15 degrees
+        n = ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert n == 2
+        m = cv2.getRotationMatrix2D((200, 200), -15.0, 1.0)
+        rotated = cv2.warpAffine(img, m, (400, 400), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        np.testing.assert_array_equal(ccr_backend.images[0].resized_raw,
+                                      rotated[:, 0:200])
+        assert ccr_backend.images[0].source_ops == [(1500, (0.0, 0.0, 0.5, 1.0))]
+        assert all(im.fine_rotation_angle == 0 for im in ccr_backend.images)
+        # A fresh file read (export/hi-res path) reproduces the same pixels
+        reread = ccr_backend.images[1].read_image(path, preview=True)
+        np.testing.assert_array_equal(reread, rotated[:, 200:400])
+
+
+class TestEditInheritance:
+    def _scan_png(self, tmp_path, w=600, h=400):
+        rng = np.random.default_rng(21)
+        yy, xx = np.mgrid[0:h, 0:w]
+        base = 20000 + 25000 * (xx / w) + 10000 * (yy / h)
+        img = np.stack([base * 1.2, base, base * 0.7], axis=-1)
+        img += rng.normal(0, 1500, img.shape)
+        img = np.clip(img, 1000, 64000).astype(np.uint16)
+        path = str(tmp_path / "negative.png")
+        cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        return path, img
+
+    def test_conversion_and_adjustments_inherited(self, tmp_path):
+        path, img = self._scan_png(tmp_path)
+        parent = CCRImage(path)
+        parent.reference_frame = (20, 20, 580, 380)
+        ccr_backend.images = [parent]
+        ccr_backend.file_paths = [path]
+        ccr_backend.convert_negative_by_index(0)
+        assert parent.converted
+        parent.adjustment_settings = {"temperature": 25, "contrast": 10}
+        parent_converted = parent.resized_raw.copy()
+
+        n = ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert n == 2
+        for child in ccr_backend.images:
+            assert child.converted
+            assert child.conversion_inputs["mode"] == "ref_params"
+            assert child.adjustment_settings == {"temperature": 25, "contrast": 10}
+            # Inherited dicts must not be shared between siblings
+        assert (ccr_backend.images[0].adjustment_settings
+                is not ccr_backend.images[1].adjustment_settings)
+        # Colors match the parent's conversion (same constants replayed)
+        left = parent_converted[:, 0:300]
+        np.testing.assert_allclose(
+            ccr_backend.images[0].resized_raw.astype(np.int64),
+            left.astype(np.int64), atol=3)
+
+    def test_bases_inherited(self, tmp_path):
+        path, img = self._scan_png(tmp_path)
+        parent = CCRImage(path)
+        parent.converted = True
+        parent.conversion_inputs = {"mode": "bw",
+                                    "bw": ((52000.0, 48000.0, 39000.0),
+                                           (9000.0, 9500.0, 7000.0)),
+                                    "fine_rot": 0}
+        parent.contrast_base = 60
+        parent.temperature_base = 10
+        ccr_backend.images = [parent]
+        ccr_backend.file_paths = [path]
+        n = ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert n == 2
+        for child in ccr_backend.images:
+            assert child.converted
+            assert child.conversion_inputs["mode"] == "bw"
+            assert child.contrast_base == 60
+            assert child.temperature_base == 10
 
 
 if __name__ == "__main__":
