@@ -2207,11 +2207,21 @@ class ImagePreview(QWidget):
         self._remove_crop_overlay_items()
         if not self.crop_mode or self.current_pixmap is None:
             return
-        sel = self._pending_crop_local
-        if sel is None or sel.width() < 2 or sel.height() < 2:
-            return
         base = self._base_transform()
         if base is None:
+            return
+        sel = self._pending_crop_local
+        if sel is None or sel.width() < 2 or sel.height() < 2:
+            # No box drawn yet: dim the whole canvas so crop mode reads as
+            # active immediately (matching slice mode). The clear hole and
+            # handles appear as soon as the user starts a selection.
+            dim = QGraphicsRectItem(QRectF(0, 0, self.current_pixmap.width(),
+                                           self.current_pixmap.height()))
+            dim.setBrush(QBrush(QColor(0, 0, 0, 110)))
+            dim.setPen(QPen(Qt.NoPen))
+            dim.setTransform(base)
+            self.scene.addItem(dim)
+            self._crop_overlay_item = dim
             return
         box_t = self._box_transform(sel)
         combined = box_t * base  # box rotation first, then coarse flips/rotation
