@@ -574,7 +574,11 @@ class CCRBackend:
         px1, py1, px2, py2 = img_obj.source_region or (0.0, 0.0, 1.0, 1.0)
         parent_w_frac, parent_h_frac = px2 - px1, py2 - py1
         parent_full = img_obj.original_full_size or (h, w)
-        stem, ext = os.path.splitext(os.path.basename(img_obj.file_path))
+        # Nested slices must extend the PARENT's name (scan_s2 -> scan_s2_s1):
+        # deriving from the file basename would make cousins collide and
+        # exports could silently overwrite each other.
+        stem, ext = os.path.splitext(img_obj.display_name
+                                     or os.path.basename(img_obj.file_path))
 
         children = []
         if progress_callback:

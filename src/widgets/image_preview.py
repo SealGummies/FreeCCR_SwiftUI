@@ -531,6 +531,14 @@ class GraphicsImageView(QGraphicsView):
             self._end_space_pan()
         super().focusOutEvent(event)
 
+    def leaveEvent(self, event):
+        # Don't leave a ghost slice line painted when the cursor exits the
+        # canvas (slice_move only fires while over the viewport).
+        pw = self.parent_widget
+        if pw is not None and pw.slice_mode:
+            pw._set_slice_ghost(None)
+        super().leaveEvent(event)
+
 class CenteringSlider(QSlider):
     def mouseDoubleClickEvent(self, event):
         super().mouseDoubleClickEvent(event)
@@ -958,9 +966,12 @@ class ImagePreview(QWidget):
         # so the drawn handles keep matching their hit-test zones.
         if self.crop_mode and self._crop_overlay_item is not None:
             self._draw_crop_overlay()
-        # Slice lines follow the (possibly changed) base transform
-        if self.slice_mode and self._slice_lines:
-            self._redraw_slice_lines()
+        # Slice lines follow the (possibly changed) base transform; the ghost
+        # is simply dropped (it reappears on the next mouse move).
+        if self.slice_mode:
+            self._set_slice_ghost(None)
+            if self._slice_lines:
+                self._redraw_slice_lines()
 
     def apply_transformations(self):
         if not self.pixmap_item:
@@ -1498,6 +1509,19 @@ class ImagePreview(QWidget):
         img_obj = ccr_backend.get_image_by_index(self.current_idx)
         if img_obj is None or self.current_pixmap is None or self.current_pixmap.isNull():
             return False
+        ci = getattr(img_obj, "conversion_inputs", None)
+        if ci is not None and ci.get("mode") == "bw" and ci.get("fine_rot"):
+            # The B/W-point conversion baked this fine rotation into the
+            # preview pixels, so cut lines placed here would land offset in
+            # the source file. Steer to the supported workflow instead.
+            try:
+                self.parent().parent().sliders_panel.set_temporary_hint(
+                    "This image's B/W conversion has a fine rotation baked "
+                    "in — <b>Un-convert</b> first (or slice before "
+                    "converting) to slice it accurately.", duration=8000)
+            except AttributeError:
+                pass
+            return False
         if self.crop_mode:
             self._exit_crop_mode()
         self.view.bwpoint_mode = None
@@ -1581,17 +1605,23 @@ class ImagePreview(QWidget):
         if self._slice_drag is not None:
             w, h = self.current_pixmap.width(), self.current_pixmap.height()
             line = self._slice_drag
+            # Clamp matches the backend's keep-range (_clean_slice_cuts), so
+            # a visibly placed line can never be silently discarded at Enter.
             if line["orient"] == 'v':
-                line["frac"] = min(max(p.x() / w, 0.005), 0.995)
+                line["frac"] = min(max(p.x() / w, 0.01), 0.99)
             else:
-                line["frac"] = min(max(p.y() / h, 0.005), 0.995)
+                line["frac"] = min(max(p.y() / h, 0.01), 0.99)
             self._redraw_slice_lines()
             return
         # Hover: grab cursor near an existing line, else rim ghost line
         near = self._slice_line_at(p)
         if near is not None:
             self._set_slice_ghost(None)
-            self.view.setCursor(Qt.SizeHorCursor if near["orient"] == 'v'
+            # The grab cursor is screen-space: a 90/270-degree view rotation
+            # swaps which way the line runs on screen.
+            screen_vertical = ((near["orient"] == 'v')
+                               != (self.current_rotation % 180 == 90))
+            self.view.setCursor(Qt.SizeHorCursor if screen_vertical
                                 else Qt.SizeVerCursor)
             return
         self.view.setCursor(Qt.CrossCursor)
@@ -1608,7 +1638,7 @@ class ImagePreview(QWidget):
         spec = self._slice_ghost_spec(p)
         if spec is not None:
             orient, frac = spec
-            line = {"orient": orient, "frac": min(max(frac, 0.005), 0.995),
+            line = {"orient": orient, "frac": min(max(frac, 0.01), 0.99),
                     "item": None}
             self._slice_lines.append(line)
             self._slice_drag = line   # keep dragging while the button is held

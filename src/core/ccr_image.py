@@ -163,7 +163,9 @@ class CCRImage:
         y1 = max(0, min(h - 1, int(round(fy1 * h))))
         x2 = max(x1 + 1, min(w, int(round(fx2 * w))))
         y2 = max(y1 + 1, min(h, int(round(fy2 * h))))
-        return img[y1:y2, x1:x2]
+        # Materialize: returning a view would pin the entire full-frame
+        # decode in long-lived holders (hi-res cache, resized_raw).
+        return np.ascontiguousarray(img[y1:y2, x1:x2])
 
     def _region_full_size(self, full_hw: tuple) -> tuple:
         """Full-resolution (height, width) of this image's source_region."""
@@ -215,8 +217,12 @@ class CCRImage:
                     # Capture sensor ceiling before postprocess (e.g. 16383 for 14-bit)
                     white_level = raw.white_level
 
-                    # Full processed output size, valid even when half_size=True
-                    self.original_full_size = (raw.sizes.height, raw.sizes.width)
+                    # Full processed output size, valid even when half_size=True.
+                    # Kept LOCAL until after the (slow) postprocess: with a
+                    # source_region the final value differs, and read_image
+                    # runs on worker threads while the GUI reads
+                    # original_full_size — it must be assigned exactly once.
+                    full_decode_size = (raw.sizes.height, raw.sizes.width)
 
                     # Check if this is a monochrome sensor
                     is_monochrome = False
@@ -271,11 +277,10 @@ class CCRImage:
                             four_color_rgb=False,     # Standard 3-color processing
                         )
 
-                    # Sliced images read only their region of the source
-                    if self.source_region is not None:
-                        rgb = self._apply_source_region(rgb)
-                        if self.original_full_size:
-                            self.original_full_size = self._region_full_size(self.original_full_size)
+                    # Sliced images read only their region of the source.
+                    # Single atomic assignment of the final size (see above).
+                    rgb = self._apply_source_region(rgb)
+                    self.original_full_size = self._region_full_size(full_decode_size)
 
                     # Downsize before white-level scaling when a target size is
                     # known (see docstring — measured ~100 ms saved per image).

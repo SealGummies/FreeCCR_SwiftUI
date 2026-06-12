@@ -133,6 +133,10 @@ class TestSliceImage:
         # The nested child's pixels come from the right place in the ORIGINAL
         np.testing.assert_array_equal(ccr_backend.images[2].resized_raw,
                                       img[:, 450:600])
+        # Nested names extend the parent's name — no collision with cousins
+        names = [im.display_name for im in ccr_backend.images]
+        assert names == ["scan_s1.png", "scan_s2_s1.png", "scan_s2_s2.png"]
+        assert len(set(names)) == len(names)
 
     def test_no_effective_cuts_is_noop(self, tmp_path):
         self._load(tmp_path)
