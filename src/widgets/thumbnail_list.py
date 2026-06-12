@@ -72,9 +72,6 @@ class ThumbnailList(QWidget):
     def _main_window(self):
         """Return the MainWindow that owns this widget."""
         return self.parent().parent()
-        # Enable custom context menu
-        self.thumbnail_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.thumbnail_list.customContextMenuRequested.connect(self.show_context_menu)
 
     def init_ui(self):
         self.layout = QVBoxLayout()
@@ -89,8 +86,13 @@ class ThumbnailList(QWidget):
         self.thumbnail_list.setFixedWidth(196)
         self.thumbnail_list.setFocusPolicy(Qt.StrongFocus)  # <-- Ensure strong focus
         self.thumbnail_list.setFocus()  # <-- Optionally set focus immediately
+        # Ctrl+click toggles, Shift+click selects a range
+        self.thumbnail_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.thumbnail_list.itemClicked.connect(self.on_thumbnail_clicked)
         self.thumbnail_list.currentItemChanged.connect(self.on_current_item_changed)
+        # Right-click menu: duplicate / remove the selected image(s)
+        self.thumbnail_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.thumbnail_list.customContextMenuRequested.connect(self.show_context_menu)
         self.layout.addWidget(self.thumbnail_list)
 
         self.count_label = QLabel("Total: 0 image(s)")
@@ -199,21 +201,49 @@ class ThumbnailList(QWidget):
         else:
             super().keyPressEvent(event)
 
+    def selected_indices(self):
+        """Backend indices of the selected thumbnails, ascending."""
+        return sorted({item.data(Qt.UserRole)
+                       for item in self.thumbnail_list.selectedItems()})
+
     def show_context_menu(self, pos):
         item = self.thumbnail_list.itemAt(pos)
-        if item is not None:
-            menu = QMenu(self)
-            remove_action = menu.addAction("Remove from list")
-            action = menu.exec_(self.thumbnail_list.mapToGlobal(pos))
-            if action == remove_action:
-                idx = item.data(Qt.UserRole)
-                self.remove_image(idx)
+        if item is None:
+            return
+        # Right-clicking outside the current selection targets just that item
+        if not item.isSelected():
+            self.thumbnail_list.setCurrentItem(item)
+        indices = self.selected_indices()
+        if not indices:
+            return
+        suffix = f" ({len(indices)})" if len(indices) > 1 else ""
+        menu = QMenu(self)
+        duplicate_action = menu.addAction(f"Duplicate{suffix}")
+        remove_action = menu.addAction(f"Remove from list{suffix}")
+        action = menu.exec_(self.thumbnail_list.mapToGlobal(pos))
+        if action == duplicate_action:
+            self.duplicate_images(indices)
+        elif action == remove_action:
+            self.remove_images(indices)
+
+    def duplicate_images(self, indices):
+        created = ccr_backend.duplicate_images_by_indices(indices)
+        if not created:
+            return
+        self.load_thumbnails()
+        first_copy = min(indices) + 1
+        if first_copy < ccr_backend.get_image_count():
+            self.thumbnail_list.setCurrentRow(first_copy)
+        ccr_backend.save_catalog()
+
+    def remove_images(self, indices):
+        if ccr_backend.remove_images_by_indices(indices):
+            self.load_thumbnails()
+            ccr_backend.save_catalog()
 
     def remove_image(self, idx):
-        # Remove from backend
-        ccr_backend.remove_image_by_index(idx)
-        # Reload thumbnails to update indices and UI
-        self.load_thumbnails()
+        """Single-image removal (kept for compatibility)."""
+        self.remove_images([idx])
 
     def apply_frontend_transformations(self, thumbnail, idx):
         """

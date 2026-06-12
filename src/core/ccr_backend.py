@@ -571,6 +571,65 @@ class CCRBackend:
             del self.images[idx]
             self.file_paths = [img.file_path for img in self.images]
 
+    def remove_images_by_indices(self, indices) -> int:
+        """Remove several images at once. Returns how many were removed."""
+        removed = 0
+        for idx in sorted(set(indices), reverse=True):
+            if 0 <= idx < len(self.images):
+                del self.images[idx]
+                removed += 1
+        self.file_paths = [img.file_path for img in self.images]
+        return removed
+
+    def duplicate_images_by_indices(self, indices) -> int:
+        """Insert a working copy right after each selected image. Copies are
+        instant (no file re-read — they reuse the in-memory pixels) and carry
+        the full edit state (conversion, crop, adjustments, orientation), so
+        each copy can then be edited independently, e.g. to crop the same
+        frame two different ways. Returns the number of copies made."""
+        created = 0
+        for idx in sorted({i for i in indices if 0 <= i < len(self.images)},
+                          reverse=True):
+            img = self.images[idx]
+            if img.resized_raw is None:
+                continue
+            stem, ext = os.path.splitext(img.display_name
+                                         or os.path.basename(img.file_path))
+            existing = {im.display_name for im in self.images if im.display_name}
+            n = 1
+            while f"{stem}_copy{n}{ext}" in existing:
+                n += 1
+            dup = CCRImage(
+                img.file_path,
+                adjustment_settings=dict(img.adjustment_settings),
+                rotation_angle=img.rotation_angle,
+                fine_rotation_angle=img.fine_rotation_angle,
+                horizontal_mirrored=img.horizontal_mirrored,
+                vertical_mirrored=img.vertical_mirrored,
+                converted=img.converted,
+                source_ops=list(img.source_ops),
+                preloaded_img=img.resized_raw.copy(),
+                preloaded_full_size=img.original_full_size,
+                display_name=f"{stem}_copy{n}{ext}",
+            )
+            dup.reference_frame = img.reference_frame
+            dup.conversion_inputs = (dict(img.conversion_inputs)
+                                     if img.conversion_inputs else None)
+            dup.crop_rect = img.crop_rect
+            dup.crop_angle = img.crop_angle
+            dup.contrast_base = img.contrast_base
+            dup.temperature_base = img.temperature_base
+            dup.brightness_base = img.brightness_base
+            dup.tint_balance_factor = getattr(img, "tint_balance_factor", 1.0)
+            dup._catalog_signature = getattr(img, "_catalog_signature", None)
+            if ((dup.contrast_base, dup.temperature_base, dup.brightness_base)
+                    != (0, 0, -8) or img.adjustment_settings.get("tint")):
+                dup.update_thumbnail_and_preview()
+            self.images.insert(idx + 1, dup)
+            created += 1
+        self.file_paths = [im.file_path for im in self.images]
+        return created
+
     def save_catalog(self):
         """Persist the edit state (conversion, slices, crop, adjustments) of
         all loaded images so reopening the files restores it. Cheap; called
