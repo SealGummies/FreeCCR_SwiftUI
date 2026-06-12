@@ -39,9 +39,28 @@ class CCRImage:
         horizontal_mirrored: bool = False,
         vertical_mirrored: bool = False,
         converted: bool = False,
+        source_ops: Optional[list] = None,
+        preloaded_img: Optional[np.ndarray] = None,
+        preloaded_full_size: Optional[tuple[int, int]] = None,
+        display_name: Optional[str] = None,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
+        # Sliced images own a chain of slice operations applied to the source
+        # file by read_image in every path (preview load, hi-res zoom,
+        # full-res export, B/W sampling). Each op is
+        #   (rotation_hundredths_deg, (x1, y1, x2, y2))
+        # — rotate the current frame about its center (the fine rotation
+        # baked at slice time), then crop to the fractional region of that
+        # frame. Nested slices simply append ops. [] = whole file.
+        self.source_ops: list = list(source_ops) if source_ops else []
+        # Display/export name override (e.g. "scan_s2.ARW" for slice #2);
+        # None = use the file's basename.
+        self.display_name = display_name
+        # True for working copies made via Duplicate. Duplicates are session
+        # artifacts: removing one from the list also removes its catalog
+        # entry, whereas removing an ACTUAL image keeps its stored edits.
+        self.is_duplicate = False
         self.thumbnail = thumbnail
         self.resized_raw = resized_raw
         self.reference_frame = reference_frame
@@ -74,10 +93,19 @@ class CCRImage:
         self.original_full_size: Optional[tuple[int, int]] = None  # (height, width) of the full-res source, set by read_image
 
         self.info = self.get_camera_and_lens_for_lensfun(self.file_path)  # Extract camera and lens info for lensfun
-        
+
         # Read image from file and populate resized_raw (downsized to 1080
-        # long side inside the reader, before white-level scaling)
-        img = self.read_image(self.file_path, max_long_side=1080)
+        # long side inside the reader, before white-level scaling). Slicing
+        # passes preloaded_img (the shared parent decode, already cropped to
+        # this slice's region) so N slices don't re-decode the file N times.
+        if preloaded_img is not None:
+            self.original_full_size = preloaded_full_size
+            img = self.resize_image_to_max_pixel(preloaded_img, 1080)
+            if img is preloaded_img or img.base is not None:
+                # Never retain a view of the shared parent decode
+                img = img.copy()
+        else:
+            img = self.read_image(self.file_path, max_long_side=1080)
         if img is not None:
             self.resized_raw = img
             #correct lens distortion and vignetting if possible
@@ -131,6 +159,40 @@ class CCRImage:
         else:
             logging.error(f"Failed to reload image: {self.file_path}")
 
+    def _apply_source_ops(self, img: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Apply this image's slice chain to a decoded image: each op rotates
+        the current frame about its center (the fine rotation that was baked
+        at slice time — the same warp the preview displayed) and then crops
+        to a fractional region of that frame. Identity when no ops are set."""
+        if not self.source_ops or img is None:
+            return img
+        for rotation, region in self.source_ops:
+            if rotation:
+                h, w = img.shape[:2]
+                matrix = cv2.getRotationMatrix2D((w // 2, h // 2), -rotation / 100.0, 1.0)
+                img = cv2.warpAffine(img, matrix, (w, h), flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            h, w = img.shape[:2]
+            fx1, fy1, fx2, fy2 = region
+            x1 = max(0, min(w - 1, int(round(fx1 * w))))
+            y1 = max(0, min(h - 1, int(round(fy1 * h))))
+            x2 = max(x1 + 1, min(w, int(round(fx2 * w))))
+            y2 = max(y1 + 1, min(h, int(round(fy2 * h))))
+            img = img[y1:y2, x1:x2]
+        # Materialize: returning a view would pin the entire full-frame
+        # decode in long-lived holders (hi-res cache, resized_raw).
+        return np.ascontiguousarray(img)
+
+    def _ops_full_size(self, full_hw: tuple) -> tuple:
+        """Full-resolution (height, width) after this image's slice chain
+        (rotations keep the frame size; regions scale it)."""
+        h, w = full_hw
+        for _rotation, region in self.source_ops:
+            fx1, fy1, fx2, fy2 = region
+            h = max(1, int(round((fy2 - fy1) * h)))
+            w = max(1, int(round((fx2 - fx1) * w)))
+        return (h, w)
+
     def resize_image_to_max_pixel(self, image: np.ndarray, max_long_side: int) -> np.ndarray:
         """
         Resize the image so that its longest side is equal to max_long_side pixels,
@@ -173,8 +235,12 @@ class CCRImage:
                     # Capture sensor ceiling before postprocess (e.g. 16383 for 14-bit)
                     white_level = raw.white_level
 
-                    # Full processed output size, valid even when half_size=True
-                    self.original_full_size = (raw.sizes.height, raw.sizes.width)
+                    # Full processed output size, valid even when half_size=True.
+                    # Kept LOCAL until after the (slow) postprocess: with a
+                    # source_ops chain the final value differs, and read_image
+                    # runs on worker threads while the GUI reads
+                    # original_full_size — it must be assigned exactly once.
+                    full_decode_size = (raw.sizes.height, raw.sizes.width)
 
                     # Check if this is a monochrome sensor
                     is_monochrome = False
@@ -228,6 +294,11 @@ class CCRImage:
                             no_auto_scale=True,       # No automatic scaling
                             four_color_rgb=False,     # Standard 3-color processing
                         )
+
+                    # Sliced images read only their region of the source.
+                    # Single atomic assignment of the final size (see above).
+                    rgb = self._apply_source_ops(rgb)
+                    self.original_full_size = self._ops_full_size(full_decode_size)
 
                     # Downsize before white-level scaling when a target size is
                     # known (see docstring — measured ~100 ms saved per image).
@@ -325,6 +396,8 @@ class CCRImage:
             # Convert to 16-bit if needed
             if img.dtype != np.uint16:
                 img = img.astype(np.uint16) * 257 if img.dtype == np.uint8 else img
+            # Sliced images read only their region of the source
+            img = self._apply_source_ops(img)
             # This branch always reads at full resolution regardless of `preview`
             self.original_full_size = (img.shape[0], img.shape[1])
             if max_long_side:
@@ -485,6 +558,11 @@ class CCRImage:
             p_lo, p_hi, od_factors = compute_reference_norm_params(
                 ref_small, ci["ref"], ci["fine_rot"])
             out = apply_reference_normalization(img, p_lo, p_hi, od_factors)
+        elif ci.get("mode") == "ref_params":
+            # Sliced children of a reference-converted parent carry the
+            # parent's precomputed conversion constants directly (the
+            # parent's frame coordinates would be meaningless here).
+            out = apply_reference_normalization(img, ci["p_lo"], ci["p_hi"], ci["od"])
         elif ci.get("mode") == "bw":
             # The bwpoint pipeline bakes the fine rotation into the preview
             # pixels BEFORE normalization — replicate that here so the

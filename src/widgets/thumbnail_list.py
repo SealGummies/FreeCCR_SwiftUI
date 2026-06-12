@@ -72,9 +72,6 @@ class ThumbnailList(QWidget):
     def _main_window(self):
         """Return the MainWindow that owns this widget."""
         return self.parent().parent()
-        # Enable custom context menu
-        self.thumbnail_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.thumbnail_list.customContextMenuRequested.connect(self.show_context_menu)
 
     def init_ui(self):
         self.layout = QVBoxLayout()
@@ -89,8 +86,13 @@ class ThumbnailList(QWidget):
         self.thumbnail_list.setFixedWidth(196)
         self.thumbnail_list.setFocusPolicy(Qt.StrongFocus)  # <-- Ensure strong focus
         self.thumbnail_list.setFocus()  # <-- Optionally set focus immediately
+        # Ctrl+click toggles, Shift+click selects a range
+        self.thumbnail_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.thumbnail_list.itemClicked.connect(self.on_thumbnail_clicked)
         self.thumbnail_list.currentItemChanged.connect(self.on_current_item_changed)
+        # Right-click menu: duplicate / remove the selected image(s)
+        self.thumbnail_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.thumbnail_list.customContextMenuRequested.connect(self.show_context_menu)
         self.layout.addWidget(self.thumbnail_list)
 
         self.count_label = QLabel("Total: 0 image(s)")
@@ -125,14 +127,28 @@ class ThumbnailList(QWidget):
         QApplication.processEvents()
 
     def load_thumbnails(self):
+        # Guard re-entrancy: the per-5-items processEvents below can deliver
+        # a right-click whose menu mutates the backend and re-enters here.
+        self._rebuilding = True
+        try:
+            self._load_thumbnails_inner()
+        finally:
+            self._rebuilding = False
+
+    def _load_thumbnails_inner(self):
         self.thumbnail_list.clear()
         image_count = ccr_backend.get_image_count()
         logging.info(f"Loading {image_count} images from backend")
         for idx in range(image_count):
             thumbnail = ccr_backend.get_thumbnail_by_index(idx)
-            # Get filename from the CCRImage object itself (always in sync)
+            # Get filename from the CCRImage object itself (always in sync);
+            # sliced images carry a distinguishing display name (e.g. _s2)
             img_obj = ccr_backend.get_image_by_index(idx)
-            filename = os.path.basename(img_obj.file_path) if img_obj is not None else ""
+            if img_obj is None:
+                filename = ""
+            else:
+                filename = (getattr(img_obj, "display_name", None)
+                            or os.path.basename(img_obj.file_path))
             item = QListWidgetItem(filename)  # Set filename as item text
             # Apply rotations and flips using PySide6 transformations
             transformed_thumbnail = self.apply_frontend_transformations(thumbnail, idx)
@@ -152,8 +168,14 @@ class ThumbnailList(QWidget):
             # Clear any existing hint when images are loaded
             self._main_window().sliders_panel.clear_hint()
         else:
-            # Set hint when no images are loaded
+            # Set hint when no images are loaded, and clear the preview —
+            # otherwise the last removed image stays on the canvas with
+            # stale state (and its memory pinned).
             self._main_window().sliders_panel.set_hint("<b>Hint:</b><br>Use file menu to import folder or files.")
+            try:
+                self._main_window().image_preview.clear_preview()
+            except AttributeError:
+                pass
 
         if hasattr(self, 'loading_dialog') and self.loading_dialog is not None:
             self.loading_dialog.accept()  # Close the dialog
@@ -194,21 +216,68 @@ class ThumbnailList(QWidget):
         else:
             super().keyPressEvent(event)
 
+    def selected_indices(self):
+        """Backend indices of the selected thumbnails, ascending."""
+        return sorted({item.data(Qt.UserRole)
+                       for item in self.thumbnail_list.selectedItems()})
+
     def show_context_menu(self, pos):
+        if getattr(self, "_rebuilding", False):
+            return  # list is mid-rebuild; stale items must not act
         item = self.thumbnail_list.itemAt(pos)
-        if item is not None:
-            menu = QMenu(self)
-            remove_action = menu.addAction("Remove from list")
-            action = menu.exec_(self.thumbnail_list.mapToGlobal(pos))
-            if action == remove_action:
-                idx = item.data(Qt.UserRole)
-                self.remove_image(idx)
+        if item is None:
+            return
+        # Right-clicking outside the current selection targets just that
+        # item. clearSelection() is required: with Ctrl/Shift still held,
+        # setCurrentItem alone KEEPS committed selection ranges and would
+        # make the menu act on a wrong multi-item set.
+        if not item.isSelected():
+            self.thumbnail_list.clearSelection()
+            self.thumbnail_list.setCurrentItem(item)
+        indices = self.selected_indices()
+        if not indices:
+            return
+        suffix = f" ({len(indices)})" if len(indices) > 1 else ""
+        menu = QMenu(self)
+        duplicate_action = menu.addAction(f"Duplicate{suffix}")
+        remove_action = menu.addAction(f"Remove from list{suffix}")
+        action = menu.exec_(self.thumbnail_list.mapToGlobal(pos))
+        if action == duplicate_action:
+            self.duplicate_images(indices)
+        elif action == remove_action:
+            self.remove_images(indices)
+
+    def duplicate_images(self, indices):
+        created = ccr_backend.duplicate_images_by_indices(indices)
+        if not created:
+            return
+        self.load_thumbnails()
+        first_copy = min(indices) + 1
+        if first_copy < ccr_backend.get_image_count():
+            self.thumbnail_list.setCurrentRow(first_copy)
+        ccr_backend.save_catalog()
+
+    @staticmethod
+    def _next_selection_target(removed_indices, new_count):
+        """Row to select after a removal: the image that followed the
+        removed one(s) — it now occupies the lowest removed index — clamped
+        to the new last image when the tail was removed."""
+        if new_count <= 0:
+            return None
+        return min(min(removed_indices), new_count - 1)
+
+    def remove_images(self, indices):
+        if not ccr_backend.remove_images_by_indices(indices):
+            return
+        self.load_thumbnails()
+        target = self._next_selection_target(indices, ccr_backend.get_image_count())
+        if target is not None and target != 0:  # load_thumbnails already selected row 0
+            self.thumbnail_list.setCurrentRow(target)
+        ccr_backend.save_catalog()
 
     def remove_image(self, idx):
-        # Remove from backend
-        ccr_backend.remove_image_by_index(idx)
-        # Reload thumbnails to update indices and UI
-        self.load_thumbnails()
+        """Single-image removal (kept for compatibility)."""
+        self.remove_images([idx])
 
     def apply_frontend_transformations(self, thumbnail, idx):
         """

@@ -215,8 +215,13 @@ class ExportSettingsDialog(QDialog):
         return list(self._converted_indices)
 
     def _base_names(self, indices) -> List[str]:
-        return [os.path.splitext(os.path.basename(ccr_backend.images[i].file_path))[0]
-                for i in indices]
+        names = []
+        for i in indices:
+            img = ccr_backend.images[i]
+            # Sliced images carry a distinguishing display name (e.g. _s2)
+            base = getattr(img, "display_name", None) or os.path.basename(img.file_path)
+            names.append(os.path.splitext(base)[0])
+        return names
 
     def _selected_ext(self) -> str:
         return ".jpg" if self.format_combo.currentData() == "jpeg" else ".tiff"

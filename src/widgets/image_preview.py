@@ -135,7 +135,8 @@ class GraphicsImageView(QGraphicsView):
             # but not while another interaction or space-pan is already active.
             interaction_active = (self.drawing_reference or self._space_pan
                                   or self._bw_drag_start is not None
-                                  or self.parent_widget.crop_mode)
+                                  or self.parent_widget.crop_mode
+                                  or self.parent_widget._slice_drag is not None)
             if not interaction_active:
                 self._mid_pan = True
                 self._mid_pan_last = event.pos()
@@ -150,6 +151,12 @@ class GraphicsImageView(QGraphicsView):
                 self.parent_widget.begin_crop_drag(self.mapToScene(event.pos()))
             elif event.button() == Qt.RightButton:
                 self.parent_widget.clear_crop()
+            return
+        if self.parent_widget.slice_mode and self.parent_widget.pixmap_item is not None:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.slice_press(self.mapToScene(event.pos()))
+            elif event.button() == Qt.RightButton:
+                self.parent_widget.slice_delete_at(self.mapToScene(event.pos()))
             return
         if event.button() == Qt.LeftButton and self.wb_pick_mode and self.parent_widget.pixmap_item is not None:
             scene_pos = self.mapToScene(event.pos())
@@ -207,6 +214,9 @@ class GraphicsImageView(QGraphicsView):
             else:
                 # Hover: show the transform cursor for the handle underneath
                 self.parent_widget.update_crop_hover_cursor(scene_pos)
+            return
+        if self.parent_widget.slice_mode:
+            self.parent_widget.slice_move(self.mapToScene(event.pos()))
             return
         if self.bwpoint_mode and self._bw_drag_start is not None:
             self._bw_drag_end = self.mapToScene(event.pos())
@@ -309,6 +319,10 @@ class GraphicsImageView(QGraphicsView):
         if self.parent_widget.crop_mode:
             if event.button() == Qt.LeftButton:
                 self.parent_widget.end_crop_drag(self.mapToScene(event.pos()))
+            return
+        if self.parent_widget.slice_mode:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.slice_release()
             return
         if self.bwpoint_mode and event.button() == Qt.LeftButton and self._bw_drag_start is not None:
             drag_start_scene = self._bw_drag_start
@@ -517,6 +531,14 @@ class GraphicsImageView(QGraphicsView):
             self._end_space_pan()
         super().focusOutEvent(event)
 
+    def leaveEvent(self, event):
+        # Don't leave a ghost slice line painted when the cursor exits the
+        # canvas (slice_move only fires while over the viewport).
+        pw = self.parent_widget
+        if pw is not None and pw.slice_mode:
+            pw._set_slice_ghost(None)
+        super().leaveEvent(event)
+
 class CenteringSlider(QSlider):
     def mouseDoubleClickEvent(self, event):
         super().mouseDoubleClickEvent(event)
@@ -692,6 +714,18 @@ class ImagePreview(QWidget):
         self._crop_display_transform = None
         self._crop_display_angle = 0.0
 
+        # Slice mode: split a scan containing several photos into separate
+        # images along user-placed cut lines. Lines live in un-rotated image
+        # coords: orient 'v' = vertical cut at an x-fraction, 'h' =
+        # horizontal cut at a y-fraction.
+        self.slice_mode = False
+        self._slice_rerender = False     # guards update_preview during entry
+        self._slice_lines = []           # {"orient": 'v'|'h', "frac": float, "item": item}
+        self._slice_ghost_item = None    # preview line following the cursor
+        self._slice_dim_item = None      # darker cast marking slice mode
+        self._slice_drag = None          # line dict being dragged, or None
+        self._slice_worker = None
+
         # Coalesce a fine-rotation drag into a single undo step
         self._fine_rot_burst_active = False
         self._fine_rot_burst_timer = QTimer(self)
@@ -733,16 +767,46 @@ class ImagePreview(QWidget):
         # Esc: leave crop mode without changing the crop
         QShortcut(QKeySequence(Qt.Key_Escape), self, self._on_escape_key)
 
+    def clear_preview(self):
+        """Empty the canvas after the last image is removed: drop all
+        references to the deleted image (incl. the hi-res cache memory) and
+        reset the view state."""
+        if self.crop_mode:
+            self._exit_crop_mode()
+        if self.slice_mode:
+            self._exit_slice_mode()
+        self._release_hires(refresh=False)
+        self.current_idx = None
+        self._current_image_ref = None
+        self.current_pixmap = None
+        self.pixmap_item = None
+        self.reference_rect_item = None
+        self.view._bw_rect_item = None
+        self.scene.clear()
+        self._crop_overlay_item = None
+        self._crop_handle_items = []
+        self._slice_ghost_item = None
+        self._slice_dim_item = None
+        self._zoom = 1.0
+        self._item_prescale = 1.0
+        self.rotation_slider.setEnabled(False)
+        self._sync_zoom_combo()
+        self._update_unconvert_action_state()
+
     def _on_enter_key(self):
         if self.crop_mode:
             # Confirming a crop is display-level only — never re-converts.
             self.confirm_crop()
+        elif self.slice_mode:
+            self.confirm_slices()
         else:
             self.convert_ccr()
 
     def _on_escape_key(self):
         if self.crop_mode:
             self.cancel_crop_mode()
+        elif self.slice_mode:
+            self.cancel_slice_mode()
 
     def update_preview(self, idx):
         ''' Update the UI image based on the backend, using the index from the thumbnail list. '''
@@ -753,6 +817,9 @@ class ImagePreview(QWidget):
         # (image switch, slider change, conversion, ...).
         if self.crop_mode and not self._crop_rerender:
             self._exit_crop_mode()
+        # Same for slice mode
+        if self.slice_mode and not self._slice_rerender:
+            self._exit_slice_mode()
         # Identity-based same-image check: indices shift when images are
         # removed from the list, so idx alone is not enough.
         img_obj_now = ccr_backend.images[idx]
@@ -786,7 +853,7 @@ class ImagePreview(QWidget):
         crop = getattr(ccr_backend.images[idx], "crop_rect", None)
         crop_angle = getattr(ccr_backend.images[idx], "crop_angle", 0.0) or 0.0
         if (preview_img is not None and not preview_img.isNull()
-                and crop is not None and not self.crop_mode
+                and crop is not None and not self.crop_mode and not self.slice_mode
                 and ccr_backend.images[idx].converted):
             if crop_angle:
                 extracted = self._extract_rotated_crop(preview_img, crop, crop_angle)
@@ -824,6 +891,10 @@ class ImagePreview(QWidget):
         self.view._bw_rect_item = None
         self._crop_overlay_item = None
         self._crop_handle_items = []
+        self._slice_ghost_item = None
+        self._slice_dim_item = None
+        for _slice_line in self._slice_lines:
+            _slice_line["item"] = None
 
         self.parent().parent().sliders_panel.set_current_idx(idx)
 
@@ -923,6 +994,14 @@ class ImagePreview(QWidget):
         # so the drawn handles keep matching their hit-test zones.
         if self.crop_mode and self._crop_overlay_item is not None:
             self._draw_crop_overlay()
+        # Slice overlay follows the (possibly changed) display transform; the
+        # ghost is simply dropped (it reappears on the next mouse move). The
+        # dim cast is rebuilt first so the lines render on top of it.
+        if self.slice_mode:
+            self._set_slice_ghost(None)
+            self._draw_slice_dim()
+            if self._slice_lines:
+                self._redraw_slice_lines()
 
     def apply_transformations(self):
         if not self.pixmap_item:
@@ -951,6 +1030,8 @@ class ImagePreview(QWidget):
         # the displayed image, the dim overlay, and the drag-to-rect mapping
         # (all base-transform-only) share the same coordinate space — the
         # selection then bounds exactly the pixels the crop keeps.
+        # (Slice mode keeps the fine rotation displayed: cuts are placed on
+        # the rotated frame and the rotation is baked into the slices.)
         img_transform = QTransform(base_transform)
         if self.current_fine_rotation and not self.crop_mode:
             img_transform.translate(cx, cy)
@@ -1063,6 +1144,7 @@ class ImagePreview(QWidget):
         self.update_preview(self.current_idx)
         self.parent().parent().thumbnail_list.update_thumbnail(self.current_idx)
         self._update_unconvert_action_state()
+        ccr_backend.save_catalog()
 
     def unconvert_ccr(self):
         if self.current_idx is None:
@@ -1072,6 +1154,7 @@ class ImagePreview(QWidget):
         self.update_preview(self.current_idx)
         self.parent().parent().thumbnail_list.update_thumbnail(self.current_idx)
         self._update_unconvert_action_state()
+        ccr_backend.save_catalog()
 
     def _update_unconvert_action_state(self):
         self.current_converted = ccr_backend.get_converted_state_by_index(self.current_idx) if self.current_idx is not None else False
@@ -1088,6 +1171,8 @@ class ImagePreview(QWidget):
         if mode and self.crop_mode:
             # Pick modes and crop mode are mutually exclusive in both directions
             self.cancel_crop_mode()
+        if mode and self.slice_mode:
+            self.cancel_slice_mode()
         self.view.bwpoint_mode = mode
         self.view.wb_pick_mode = False
         self.view.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
@@ -1097,6 +1182,8 @@ class ImagePreview(QWidget):
         for automatic temperature/tint adjustment."""
         if enabled and self.crop_mode:
             self.cancel_crop_mode()
+        if enabled and self.slice_mode:
+            self.cancel_slice_mode()
         self.view.wb_pick_mode = enabled
         self.view.bwpoint_mode = None
         self.view.setCursor(_eyedropper_cursor() if enabled else Qt.ArrowCursor)
@@ -1395,7 +1482,8 @@ class ImagePreview(QWidget):
             return None
         crop = getattr(img, "crop_rect", None)
         angle = getattr(img, "crop_angle", 0.0) or 0.0
-        crop_active = crop is not None and not self.crop_mode and img.converted
+        crop_active = (crop is not None and not self.crop_mode
+                       and not self.slice_mode and img.converted)
         crop_sig = (crop, angle) if crop_active else None
         if cache.get("display_pm") is not None and cache.get("crop_sig") == crop_sig:
             return cache["display_pm"]
@@ -1437,6 +1525,320 @@ class ImagePreview(QWidget):
         if had and refresh and self.pixmap_item is not None:
             self._refresh_item_pixmap()
             self.apply_transformations()
+
+    # --- Slice mode ------------------------------------------------------
+    # Splits one scan containing several photos into separate images. Moving
+    # the mouse near the top/bottom rim arms a VERTICAL cut line at the
+    # cursor's x; moving along the left/right rim arms a HORIZONTAL cut at
+    # the cursor's y. Click places the line (then drag to fine-tune,
+    # right-click to delete), Enter performs the slicing.
+
+    SLICE_EDGE_BAND_PX = 60.0   # rim proximity that arms a ghost line (view px)
+    SLICE_GRAB_PX = 10.0        # grab tolerance around a placed line (view px)
+
+    def enter_slice_mode(self) -> bool:
+        """Show the whole image at the fitted view and start placing cuts."""
+        if self.current_idx is None:
+            return False
+        img_obj = ccr_backend.get_image_by_index(self.current_idx)
+        if img_obj is None or self.current_pixmap is None or self.current_pixmap.isNull():
+            return False
+        ci = getattr(img_obj, "conversion_inputs", None)
+        if ci is not None and ci.get("mode") == "bw" and ci.get("fine_rot"):
+            # The B/W-point conversion baked this fine rotation into the
+            # preview pixels, so cut lines placed here would land offset in
+            # the source file. Steer to the supported workflow instead.
+            try:
+                self.parent().parent().sliders_panel.set_temporary_hint(
+                    "This image's B/W conversion has a fine rotation baked "
+                    "in — <b>Un-convert</b> first (or slice before "
+                    "converting) to slice it accurately.", duration=8000)
+            except AttributeError:
+                pass
+            return False
+        if self.crop_mode:
+            self._exit_crop_mode()
+        self.view.bwpoint_mode = None
+        self.view.wb_pick_mode = False
+        self.slice_mode = True
+        self._slice_lines = []
+        self._slice_drag = None
+        # Slice mode always starts at the fitted view of the entire image
+        self._zoom = 1.0
+        self._release_hires(refresh=False)
+        self._slice_rerender = True
+        try:
+            self.update_preview(self.current_idx)  # re-render full image
+        finally:
+            self._slice_rerender = False
+        self._draw_slice_dim()
+        self.view.setCursor(Qt.CrossCursor)
+        self._sync_zoom_combo()
+        return True
+
+    def cancel_slice_mode(self):
+        """Esc / toggling Slice: leave without slicing."""
+        if not self.slice_mode:
+            return
+        idx = self.current_idx
+        self._exit_slice_mode()
+        if idx is not None:
+            self.update_preview(idx)
+
+    def _exit_slice_mode(self):
+        self.slice_mode = False
+        self._slice_drag = None
+        self._teardown_slice_items()
+        self.view.setCursor(Qt.ArrowCursor)
+
+    def _slice_display_transform(self):
+        """Transform the PIXMAP and dim cast are displayed with in slice
+        mode: coarse flips/rotation PLUS the fine rotation (which stays
+        visible — the rotation gets baked into the slices)."""
+        t = self._base_transform()
+        if t is None or self.current_pixmap is None:
+            return None
+        if self.current_fine_rotation:
+            cx = self.current_pixmap.width() / 2
+            cy = self.current_pixmap.height() / 2
+            t = QTransform(t)
+            t.translate(cx, cy)
+            t.rotate(self.current_fine_rotation / 100.0)
+            t.translate(-cx, -cy)
+        return t if t.isInvertible() else None
+
+    def _slice_local(self, scene_pos):
+        """Map a scene point into the WARPED-CANVAS frame — the frame the
+        backend actually cuts. The backend rotates the decode about its
+        center into the same WxH canvas (identical to the on-screen warp),
+        so canvas coordinates relate to the scene through the BASE transform
+        only; cut fractions must be measured here, NOT in un-rotated content
+        coords, or the cuts would land offset from the placed lines."""
+        t = self._base_transform()
+        if t is None or self.current_pixmap is None:
+            return None
+        return t.inverted()[0].map(scene_pos)
+
+    def _slice_line_at(self, p):
+        """Placed line near local point p, or None."""
+        if self.current_pixmap is None:
+            return None
+        tol = self.SLICE_GRAB_PX / self._view_scale()
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        best, best_d = None, None
+        for line in self._slice_lines:
+            if line["orient"] == 'v':
+                d = abs(p.x() - line["frac"] * w)
+            else:
+                d = abs(p.y() - line["frac"] * h)
+            if d <= tol and (best_d is None or d < best_d):
+                best, best_d = line, d
+        return best
+
+    def _slice_ghost_spec(self, p):
+        """('v'|'h', frac) for a ghost line when the cursor is near a rim,
+        else None. Near top/bottom -> vertical cut; near left/right ->
+        horizontal cut. (In image-local coords, so a 90-degree-rotated view
+        still behaves as the user sees it.)"""
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        band = self.SLICE_EDGE_BAND_PX / self._view_scale()
+        if not (-band <= p.x() <= w + band and -band <= p.y() <= h + band):
+            return None
+        x = min(max(p.x(), 0.0), float(w))
+        y = min(max(p.y(), 0.0), float(h))
+        dist_tb = min(abs(p.y()), abs(h - p.y()))   # to top/bottom rim
+        dist_lr = min(abs(p.x()), abs(w - p.x()))   # to left/right rim
+        if dist_tb > band and dist_lr > band:
+            return None
+        if dist_tb <= dist_lr:
+            return ('v', min(max(x / w, 0.0), 1.0))
+        return ('h', min(max(y / h, 0.0), 1.0))
+
+    def slice_move(self, scene_pos):
+        p = self._slice_local(scene_pos)
+        if p is None:
+            return
+        if self._slice_drag is not None:
+            w, h = self.current_pixmap.width(), self.current_pixmap.height()
+            line = self._slice_drag
+            # Clamp matches the backend's keep-range (_clean_slice_cuts), so
+            # a visibly placed line can never be silently discarded at Enter.
+            if line["orient"] == 'v':
+                line["frac"] = min(max(p.x() / w, 0.01), 0.99)
+            else:
+                line["frac"] = min(max(p.y() / h, 0.01), 0.99)
+            self._redraw_slice_lines()
+            return
+        # Hover: grab cursor near an existing line, else rim ghost line
+        near = self._slice_line_at(p)
+        if near is not None:
+            self._set_slice_ghost(None)
+            # The grab cursor is screen-space: a 90/270-degree view rotation
+            # swaps which way the line runs on screen.
+            screen_vertical = ((near["orient"] == 'v')
+                               != (self.current_rotation % 180 == 90))
+            self.view.setCursor(Qt.SizeHorCursor if screen_vertical
+                                else Qt.SizeVerCursor)
+            return
+        self.view.setCursor(Qt.CrossCursor)
+        self._set_slice_ghost(self._slice_ghost_spec(p))
+
+    def slice_press(self, scene_pos):
+        p = self._slice_local(scene_pos)
+        if p is None:
+            return
+        near = self._slice_line_at(p)
+        if near is not None:
+            self._slice_drag = near
+            return
+        spec = self._slice_ghost_spec(p)
+        if spec is not None:
+            orient, frac = spec
+            line = {"orient": orient, "frac": min(max(frac, 0.01), 0.99),
+                    "item": None}
+            self._slice_lines.append(line)
+            self._slice_drag = line   # keep dragging while the button is held
+            self._set_slice_ghost(None)
+            self._redraw_slice_lines()
+
+    def slice_release(self):
+        self._slice_drag = None
+
+    def slice_delete_at(self, scene_pos):
+        p = self._slice_local(scene_pos)
+        if p is None:
+            return
+        line = self._slice_line_at(p)
+        if line is not None:
+            self._slice_lines.remove(line)
+            if line["item"] is not None:
+                try:
+                    self.scene.removeItem(line["item"])
+                except RuntimeError:
+                    pass
+            self._redraw_slice_lines()
+
+    def _make_slice_line_item(self, orient, frac, ghost=False):
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        if orient == 'v':
+            item = QGraphicsLineItem(frac * w, 0, frac * w, h)
+        else:
+            item = QGraphicsLineItem(0, frac * h, w, frac * h)
+        pen = QPen(QColor(0, 200, 255, 150 if ghost else 235), 2,
+                   Qt.DashLine if ghost else Qt.SolidLine)
+        pen.setCosmetic(True)  # constant on-screen width at any zoom
+        item.setPen(pen)
+        # Lines live in the warped-canvas frame (base transform only): they
+        # render screen-straight, exactly where the backend will cut.
+        t = self._base_transform()
+        if t is not None:
+            item.setTransform(t)
+        self.scene.addItem(item)
+        return item
+
+    def _draw_slice_dim(self):
+        """Darker cast over the whole image while in slice mode, so the mode
+        is unmistakable; cut lines render on top of it."""
+        if self._slice_dim_item is not None:
+            try:
+                self.scene.removeItem(self._slice_dim_item)
+            except RuntimeError:
+                pass
+            self._slice_dim_item = None
+        if not self.slice_mode or self.current_pixmap is None:
+            return
+        rect = QGraphicsRectItem(QRectF(0, 0, self.current_pixmap.width(),
+                                        self.current_pixmap.height()))
+        rect.setBrush(QBrush(QColor(0, 0, 0, 80)))
+        rect.setPen(QPen(Qt.NoPen))
+        t = self._slice_display_transform()
+        if t is not None:
+            rect.setTransform(t)
+        self.scene.addItem(rect)
+        self._slice_dim_item = rect
+
+    def _set_slice_ghost(self, spec):
+        if self._slice_ghost_item is not None:
+            try:
+                self.scene.removeItem(self._slice_ghost_item)
+            except RuntimeError:
+                pass
+            self._slice_ghost_item = None
+        if spec is None or self.current_pixmap is None:
+            return
+        self._slice_ghost_item = self._make_slice_line_item(spec[0], spec[1], ghost=True)
+
+    def _redraw_slice_lines(self):
+        for line in self._slice_lines:
+            if line["item"] is not None:
+                try:
+                    self.scene.removeItem(line["item"])
+                except RuntimeError:
+                    pass
+            line["item"] = self._make_slice_line_item(line["orient"], line["frac"])
+
+    def _teardown_slice_items(self):
+        self._set_slice_ghost(None)
+        if self._slice_dim_item is not None:
+            try:
+                self.scene.removeItem(self._slice_dim_item)
+            except RuntimeError:
+                pass
+            self._slice_dim_item = None
+        for line in self._slice_lines:
+            if line["item"] is not None:
+                try:
+                    self.scene.removeItem(line["item"])
+                except RuntimeError:
+                    pass
+            line["item"] = None
+        self._slice_lines = []
+
+    def confirm_slices(self):
+        """Enter pressed in slice mode: split the image along the placed
+        lines. The slices replace the original in the list, each reading its
+        own region of the source file at full quality."""
+        if not self.slice_mode:
+            return
+        x_cuts = [l["frac"] for l in self._slice_lines if l["orient"] == 'v']
+        y_cuts = [l["frac"] for l in self._slice_lines if l["orient"] == 'h']
+        idx = self.current_idx
+        self._exit_slice_mode()
+        if (not x_cuts and not y_cuts) or idx is None:
+            if idx is not None:
+                self.update_preview(idx)
+            try:
+                self.parent().parent().sliders_panel.set_temporary_hint(
+                    "No slice lines placed — nothing to slice.", duration=3000)
+            except AttributeError:
+                pass
+            return
+        dialog = SliceProgressDialog(self)
+        self._slice_worker = SliceWorker(idx, x_cuts, y_cuts)
+        self._slice_worker.progress.connect(dialog.set_progress)
+        self._slice_worker.finished_slice.connect(
+            lambda count: self._on_slice_done(dialog, idx, count))
+        self._slice_worker.start()
+        dialog.exec_()
+
+    def _on_slice_done(self, dialog, idx, count):
+        dialog.accept()
+        mw = self.parent().parent()
+        if count > 0:
+            # Rebuild the whole thumbnail list (the image count changed) and
+            # land on the first slice.
+            mw.thumbnail_list.load_thumbnails()
+            if idx < ccr_backend.get_image_count():
+                mw.thumbnail_list.thumbnail_list.setCurrentRow(idx)
+            mw.sliders_panel.set_temporary_hint(
+                f"Sliced into {count} images. Each can now be framed, "
+                f"converted, and exported separately.", duration=6000)
+            ccr_backend.save_catalog()
+        else:
+            self.update_preview(idx)
+            mw.sliders_panel.set_temporary_hint(
+                "Slicing did not produce multiple pieces (lines too close "
+                "to the edge?).", duration=5000)
 
     # --- Crop mode -----------------------------------------------------
 
@@ -1519,6 +1921,8 @@ class ImagePreview(QWidget):
         if img_obj is None or self.current_pixmap is None or self.current_pixmap.isNull():
             return False
         # Crop mode replaces any other interactive pick mode
+        if self.slice_mode:
+            self._exit_slice_mode()
         self.view.bwpoint_mode = None
         self.view.wb_pick_mode = False
         self.crop_mode = True
@@ -1967,7 +2371,8 @@ class ImagePreview(QWidget):
         self.parent().parent().thumbnail_list.update_all_thumbnails()
         if self.current_idx is not None:
             self.update_preview(self.current_idx)
-        
+        ccr_backend.save_catalog()
+
         # Show completion hint
         self.parent().parent().sliders_panel.set_temporary_hint("Auto frame conversion completed!", duration=2000)
 
@@ -2002,8 +2407,73 @@ class ImagePreview(QWidget):
             lines.append("Export was stopped before completion.")
         lines.append(f"\nFolder: {plan.destination}")
         QMessageBox.information(self, "Export Complete", "\n".join(lines))
+        ccr_backend.save_catalog()
         if plan.open_folder:
             QDesktopServices.openUrl(QUrl.fromLocalFile(plan.destination))
+
+class SliceWorker(QThread):
+    """Runs the backend slice (one shared decode + per-slice previews) off
+    the GUI thread."""
+    finished_slice = Signal(int)
+    progress = Signal(int, int)
+
+    def __init__(self, idx, x_cuts, y_cuts, parent=None):
+        super().__init__(parent)
+        self._idx = idx
+        self._x_cuts = list(x_cuts)
+        self._y_cuts = list(y_cuts)
+
+    def run(self):
+        try:
+            count = ccr_backend.slice_image_by_index(
+                self._idx, self._x_cuts, self._y_cuts,
+                progress_callback=lambda c, t: self.progress.emit(c, t))
+        except Exception as e:
+            print(f"Slice failed: {e}")
+            count = 0
+        self.finished_slice.emit(count)
+
+
+class SliceProgressDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Slicing...")
+        self.setModal(True)
+        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+        self.setWindowModality(Qt.ApplicationModal)
+        self.setMinimumWidth(240)
+
+        self.label = QLabel("Slicing image", self)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.progress_label = QLabel("", self)
+        self.progress_label.setAlignment(Qt.AlignCenter)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.label)
+        layout.addWidget(self.progress_label)
+        self.setLayout(layout)
+
+        self._dot_count = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._animate)
+        self._timer.start(400)
+
+    def _animate(self):
+        self._dot_count = (self._dot_count + 1) % 4
+        self.label.setText("Slicing image" + "." * self._dot_count)
+
+    def set_progress(self, current, total):
+        self.progress_label.setText(f"{current} / {total}")
+
+    def closeEvent(self, event):
+        event.ignore()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            event.ignore()
+        else:
+            super().keyPressEvent(event)
+
 
 class HiResDetailWorker(QThread):
     """Renders the zoom detail image off the GUI thread: decode the RAW at

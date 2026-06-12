@@ -1,6 +1,9 @@
 from typing import List, Optional
+import cv2
 from core.ccr_image import CCRImage
-from core.ccr_processor import ccr_normalize_with_reference, ccr_normalize_with_bwpoint, auto_fine_angle, auto_frame, auto_frame_v2
+from core.ccr_processor import (ccr_normalize_with_reference, ccr_normalize_with_bwpoint,
+                                ccr_normalize_with_refparams, auto_fine_angle, auto_frame,
+                                auto_frame_v2)
 import os
 import glob
 import concurrent.futures
@@ -21,19 +24,41 @@ class CCRBackend:
         self.file_paths: List[str] = []
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
+        # Catalog entries of ACTUAL images removed from the list this
+        # session: {file_path: {"signature": sig, "entries": {name: state}}}.
+        # Removal must not lose their stored edits, so saves merge these
+        # back into the records (duplicates, by contrast, are deleted).
+        self._catalog_preserved = {}
 
-    def load_images_from_files(self, file_paths: List[str], cancel_flag=None):
+    def load_images_from_files(self, file_paths: List[str], cancel_flag=None) -> int:
+        """Load files (with catalog restore). Returns the number of FILES
+        that produced at least one image (a sliced file yields several)."""
         self.images.clear()
         self.file_paths = file_paths
-        
+        # Preserved removal states belong to the previous batch (the open
+        # flows save the catalog before loading a new one)
+        self._catalog_preserved = {}
+
+        # Read the catalog ONCE for the whole batch — per-file reads would
+        # re-parse the entire JSON N times across the loader threads.
+        from core.catalog import create_images_for_path, load_catalog
+        try:
+            catalog_data = load_catalog()
+        except Exception:
+            catalog_data = None
+
         def load_single_image(path):
             try:
                 if cancel_flag and cancel_flag():
                     return path, None
                 print(f"Loading image: {os.path.basename(path)}")
-                img = CCRImage(path)
+                # Restores cataloged state (slices, conversion, adjustments)
+                # when this file was processed before; plain load otherwise.
+                imgs = create_images_for_path(path, catalog_data=catalog_data)
+                for order, img in enumerate(imgs):
+                    img._catalog_order = order  # keep slice order within a file
                 print(f"Successfully loaded: {os.path.basename(path)}")
-                return path, img
+                return path, imgs
             except Exception as e:
                 print(f"Failed to load {os.path.basename(path)}: {e}")
                 return path, None
@@ -41,19 +66,16 @@ class CCRBackend:
         # Use parallel loading with ThreadPoolExecutor
         max_workers = min(8, os.cpu_count() or 1)
         
+        loaded_file_count = 0
         if max_workers == 1:
             # Sequential fallback
             for path in file_paths:
                 if cancel_flag and cancel_flag():
                     break
-                try:
-                    print(f"Loading image: {os.path.basename(path)}")
-                    img = CCRImage(path)
-                    self.images.append(img)
-                    print(f"Successfully loaded: {os.path.basename(path)}")
-                except Exception as e:
-                    print(f"Failed to load {os.path.basename(path)}: {e}")
-                    continue
+                _path, imgs = load_single_image(path)
+                if imgs:
+                    self.images.extend(imgs)
+                    loaded_file_count += 1
         else:
             # Parallel loading - collect into local list to avoid concurrent modification
             results = []
@@ -63,15 +85,19 @@ class CCRBackend:
                 for future in concurrent.futures.as_completed(future_to_path):
                     if cancel_flag and cancel_flag():
                         break
-                    path, img = future.result()
-                    if img is not None:
-                        results.append(img)
+                    path, imgs = future.result()
+                    if imgs:
+                        results.extend(imgs)
+                        loaded_file_count += 1
 
-            results.sort(key=lambda img: os.path.basename(img.file_path))
+            # Slices of one file keep their catalog order within the file
+            results.sort(key=lambda img: (os.path.basename(img.file_path),
+                                          getattr(img, "_catalog_order", 0)))
             self.images = results
 
         # Keep file_paths derived from actually-loaded images so the two lists stay in sync
         self.file_paths = [img.file_path for img in self.images]
+        return loaded_file_count
 
     def clear(self):
         """
@@ -149,13 +175,13 @@ class CCRBackend:
         
         print(f"Found {len(file_paths)} files total: {file_paths[:5]}...")  # Show first 5 files
         
-        # Load images and track success/failure
-        initial_count = len(self.images)
-        self.load_images_from_files(sorted(file_paths), cancel_flag=cancel_flag)
-        loaded_count = len(self.images) - initial_count
-        failed_count = len(file_paths) - loaded_count
-        
-        print(f"Loading complete: {loaded_count} images loaded successfully, {failed_count} failed")
+        # Load images and track success/failure (counted in FILES — a sliced
+        # file restores as several images)
+        loaded_files = self.load_images_from_files(sorted(file_paths), cancel_flag=cancel_flag) or 0
+        failed_count = len(file_paths) - loaded_files
+
+        print(f"Loading complete: {loaded_files} files loaded successfully "
+              f"({len(self.images)} images), {failed_count} failed")
 
     def get_image_by_index(self, idx: int) -> Optional[CCRImage]:
         if idx is not None and 0 <= idx < len(self.images):
@@ -414,8 +440,26 @@ class CCRBackend:
         if idx is not None and 0 <= idx < len(self.images):
             image_obj = self.images[idx]
             try:
-                if image_obj.reference_frame is None and self.black_point_bgr is not None and self.white_point_bgr is not None:
-                    # B/W point conversion — re-process from original full-res file
+                ci = getattr(image_obj, "conversion_inputs", None)
+                if ci is not None and ci.get("mode") == "ref_params":
+                    # Sliced child of a reference-converted parent: replay the
+                    # stored conversion constants at full resolution.
+                    ccr_normalize_with_refparams(image_obj, ci["p_lo"], ci["p_hi"], ci["od"],
+                                                 output_path=output_path,
+                                                 water_mark=not self.software_activated,
+                                                 jpg_out=jpg_output, jpg_quality=jpg_quality,
+                                                 max_long_side=max_long_side)
+                elif ci is not None and ci.get("mode") == "bw":
+                    # Use the anchors BAKED at convert time — resampling the
+                    # global points later must not change this image's export.
+                    black_point, white_point = ci["bw"]
+                    ccr_normalize_with_bwpoint(image_obj, black_point, white_point,
+                                               output_path=output_path,
+                                               water_mark=not self.software_activated,
+                                               jpg_out=jpg_output, jpg_quality=jpg_quality,
+                                               max_long_side=max_long_side)
+                elif image_obj.reference_frame is None and self.black_point_bgr is not None and self.white_point_bgr is not None:
+                    # Legacy/un-snapshotted B/W point conversion — global anchors
                     ccr_normalize_with_bwpoint(image_obj, self.black_point_bgr, self.white_point_bgr,
                                                output_path=output_path, water_mark=not self.software_activated,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
@@ -534,6 +578,245 @@ class CCRBackend:
         if idx is not None and 0 <= idx < len(self.images):
             del self.images[idx]
             self.file_paths = [img.file_path for img in self.images]
+
+    def remove_images_by_indices(self, indices) -> int:
+        """Remove several images at once. Returns how many were removed.
+
+        Catalog semantics: a removed DUPLICATE also loses its catalog entry
+        (a deliberately discarded copy must not resurrect on the next open),
+        while a removed ACTUAL image keeps its stored edits — its latest
+        state is preserved so later saves don't silently drop it."""
+        removed_images = []
+        for idx in sorted(set(indices), reverse=True):
+            if 0 <= idx < len(self.images):
+                removed_images.append(self.images[idx])
+                del self.images[idx]
+        self.file_paths = [img.file_path for img in self.images]
+        if not removed_images:
+            return 0
+        try:
+            from core.catalog import serialize_image, remove_duplicate_entries
+            duplicate_removals = {}
+            for img in removed_images:
+                if getattr(img, "is_duplicate", False):
+                    if img.display_name:
+                        duplicate_removals.setdefault(img.file_path,
+                                                      set()).add(img.display_name)
+                else:
+                    record = self._catalog_preserved.setdefault(
+                        img.file_path,
+                        {"signature": getattr(img, "_catalog_signature", None),
+                         "entries": {}})
+                    record["entries"][img.display_name] = serialize_image(img)
+            if duplicate_removals:
+                remove_duplicate_entries(duplicate_removals)
+        except Exception as e:
+            print(f"Catalog removal bookkeeping failed: {e}")
+        return len(removed_images)
+
+    def duplicate_images_by_indices(self, indices) -> int:
+        """Insert a working copy right after each selected image. Copies are
+        instant (no file re-read — they reuse the in-memory pixels) and carry
+        the full edit state (conversion, crop, adjustments, orientation), so
+        each copy can then be edited independently, e.g. to crop the same
+        frame two different ways. Returns the number of copies made."""
+        created = 0
+        for idx in sorted({i for i in indices if 0 <= i < len(self.images)},
+                          reverse=True):
+            img = self.images[idx]
+            if img.resized_raw is None:
+                continue
+            stem, ext = os.path.splitext(img.display_name
+                                         or os.path.basename(img.file_path))
+            existing = {im.display_name for im in self.images if im.display_name}
+            n = 1
+            while f"{stem}_copy{n}{ext}" in existing:
+                n += 1
+            dup = CCRImage(
+                img.file_path,
+                adjustment_settings=dict(img.adjustment_settings),
+                rotation_angle=img.rotation_angle,
+                fine_rotation_angle=img.fine_rotation_angle,
+                horizontal_mirrored=img.horizontal_mirrored,
+                vertical_mirrored=img.vertical_mirrored,
+                converted=img.converted,
+                source_ops=list(img.source_ops),
+                preloaded_img=img.resized_raw.copy(),
+                preloaded_full_size=img.original_full_size,
+                display_name=f"{stem}_copy{n}{ext}",
+            )
+            dup.reference_frame = img.reference_frame
+            dup.conversion_inputs = (dict(img.conversion_inputs)
+                                     if img.conversion_inputs else None)
+            dup.crop_rect = img.crop_rect
+            dup.crop_angle = img.crop_angle
+            dup.contrast_base = img.contrast_base
+            dup.temperature_base = img.temperature_base
+            dup.brightness_base = img.brightness_base
+            dup.tint_balance_factor = getattr(img, "tint_balance_factor", 1.0)
+            dup._catalog_signature = getattr(img, "_catalog_signature", None)
+            dup.is_duplicate = True
+            if ((dup.contrast_base, dup.temperature_base, dup.brightness_base)
+                    != (0, 0, -8) or img.adjustment_settings.get("tint")):
+                dup.update_thumbnail_and_preview()
+            self.images.insert(idx + 1, dup)
+            created += 1
+        self.file_paths = [im.file_path for im in self.images]
+        return created
+
+    def save_catalog(self):
+        """Persist the edit state (conversion, slices, crop, adjustments) of
+        all loaded images so reopening the files restores it. Cheap; called
+        after significant operations and on app close."""
+        if not self.images and not self._catalog_preserved:
+            return
+        try:
+            from core.catalog import update_for_images
+            update_for_images(self.images, preserved=self._catalog_preserved)
+        except Exception as e:
+            print(f"Catalog save failed: {e}")
+
+    @staticmethod
+    def _clean_slice_cuts(cuts) -> list:
+        """Sorted cut fractions with 0/1 boundaries; drops cuts within 1% of
+        an edge or of each other."""
+        bounds = [0.0]
+        for value in sorted(c for c in cuts if 0.01 <= c <= 0.99):
+            if value - bounds[-1] >= 0.01:
+                bounds.append(value)
+        bounds.append(1.0)
+        return bounds
+
+    def slice_image_by_index(self, idx: int, x_cuts, y_cuts, progress_callback=None) -> int:
+        """
+        Split the image at idx into a grid of separate images along the given
+        cut positions (fractions of the image's displayed frame; x_cuts are
+        vertical lines, y_cuts horizontal). The slices replace the original
+        in the list, in reading order (left-to-right, top-to-bottom).
+
+        The parent's edits carry over: its fine rotation is BAKED into the
+        slices (cuts are made on the rotated frame, exactly as displayed),
+        its conversion is replayed on each slice with the parent's own
+        constants so colors match, and adjustments/bases/orientation are
+        inherited. Each slice's source_ops chain maps back to the ORIGINAL
+        file, so zoom detail and full-res export read the correct region at
+        full quality. The source is decoded only once.
+        Returns the number of slices created (0 = nothing done).
+        """
+        img_obj = self.get_image_by_index(idx)
+        if img_obj is None:
+            return 0
+        xs = self._clean_slice_cuts(x_cuts)
+        ys = self._clean_slice_cuts(y_cuts)
+        total = (len(xs) - 1) * (len(ys) - 1)
+        if total <= 1:
+            return 0
+
+        # One shared decode (the parent's own slice chain is applied inside)
+        full = img_obj.read_image(img_obj.file_path, preview=True)
+        if full is None:
+            return 0
+
+        # Conversion replay: derive the parent's conversion constants so each
+        # slice can be converted to look exactly like the parent did.
+        parent_ci = img_obj.conversion_inputs if img_obj.converted else None
+        norm_params = None
+        if parent_ci is not None and parent_ci.get("mode") == "ref":
+            from core.ccr_processor import compute_reference_norm_params
+            ref_small = img_obj.resize_image_to_max_pixel(full, 1080)
+            p_lo, p_hi, od = compute_reference_norm_params(
+                ref_small, parent_ci["ref"], parent_ci["fine_rot"])
+            norm_params = (tuple(float(v) for v in p_lo),
+                           tuple(float(v) for v in p_hi),
+                           tuple(float(v) for v in od))
+        elif parent_ci is not None and parent_ci.get("mode") == "ref_params":
+            norm_params = (parent_ci["p_lo"], parent_ci["p_hi"], parent_ci["od"])
+
+        # Bake the parent's current fine rotation: the cuts were placed on
+        # the rotated display, so the slices are cut from the rotated frame.
+        baked_rotation = img_obj.fine_rotation_angle or 0
+        if baked_rotation:
+            h0, w0 = full.shape[:2]
+            matrix = cv2.getRotationMatrix2D((w0 // 2, h0 // 2),
+                                             -baked_rotation / 100.0, 1.0)
+            full = cv2.warpAffine(full, matrix, (w0, h0), flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        h, w = full.shape[:2]
+        parent_full = img_obj.original_full_size or (h, w)
+        # Nested slices must extend the PARENT's name (scan_s2 -> scan_s2_s1):
+        # deriving from the file basename would make cousins collide and
+        # exports could silently overwrite each other.
+        stem, ext = os.path.splitext(img_obj.display_name
+                                     or os.path.basename(img_obj.file_path))
+
+        children = []
+        if progress_callback:
+            progress_callback(0, total)
+        for yi in range(len(ys) - 1):
+            for xi in range(len(xs) - 1):
+                fx1, fx2 = xs[xi], xs[xi + 1]
+                fy1, fy2 = ys[yi], ys[yi + 1]
+                cx1 = max(0, min(w - 1, int(round(fx1 * w))))
+                cy1 = max(0, min(h - 1, int(round(fy1 * h))))
+                cx2 = max(cx1 + 1, min(w, int(round(fx2 * w))))
+                cy2 = max(cy1 + 1, min(h, int(round(fy2 * h))))
+                crop = full[cy1:cy2, cx1:cx2]
+                child_full = (max(1, int(round((fy2 - fy1) * parent_full[0]))),
+                              max(1, int(round((fx2 - fx1) * parent_full[1]))))
+
+                # Replay the parent's conversion on this slice
+                child_ci = None
+                if norm_params is not None:
+                    from core.ccr_processor import apply_reference_normalization
+                    crop = apply_reference_normalization(crop, *norm_params)
+                    child_ci = {"mode": "ref_params", "p_lo": norm_params[0],
+                                "p_hi": norm_params[1], "od": norm_params[2]}
+                elif parent_ci is not None and parent_ci.get("mode") == "bw":
+                    from core.ccr_processor import apply_bwpoint_normalization
+                    black_point, white_point = parent_ci["bw"]
+                    crop = apply_bwpoint_normalization(crop, black_point, white_point)
+                    child_ci = {"mode": "bw", "bw": parent_ci["bw"], "fine_rot": 0}
+
+                index = len(children) + 1
+                child = CCRImage(
+                    img_obj.file_path,
+                    adjustment_settings=dict(img_obj.adjustment_settings),
+                    rotation_angle=img_obj.rotation_angle,
+                    horizontal_mirrored=img_obj.horizontal_mirrored,
+                    vertical_mirrored=img_obj.vertical_mirrored,
+                    converted=child_ci is not None,
+                    source_ops=img_obj.source_ops + [(baked_rotation, (fx1, fy1, fx2, fy2))],
+                    preloaded_img=crop,
+                    preloaded_full_size=child_full,
+                    display_name=f"{stem}_s{index}{ext}",
+                )
+                child.conversion_inputs = child_ci
+                # Slices descend from the parent's loaded content — carry its
+                # load-time file signature for the edit catalog.
+                child._catalog_signature = getattr(img_obj, "_catalog_signature", None)
+                # Inherit the parent's perceptual tint factor: the child's
+                # ctor derived one from CONVERTED pixels, which would render
+                # an inherited tint setting differently than the parent did.
+                child.tint_balance_factor = img_obj.tint_balance_factor
+                # Inherit the non-destructive base offsets; rebuild the
+                # preview when the inherited state differs from what the
+                # ctor already rendered with.
+                child.contrast_base = img_obj.contrast_base
+                child.temperature_base = img_obj.temperature_base
+                child.brightness_base = img_obj.brightness_base
+                if ((child.contrast_base, child.temperature_base,
+                        child.brightness_base) != (0, 0, -8)
+                        or img_obj.adjustment_settings.get("tint")):
+                    child.update_thumbnail_and_preview()
+                children.append(child)
+                if progress_callback:
+                    progress_callback(len(children), total)
+
+        self.images[idx:idx + 1] = children
+        self.file_paths = [im.file_path for im in self.images]
+        print(f"Sliced {os.path.basename(img_obj.file_path)} into {len(children)} images")
+        return len(children)
 
     def set_white_point(self, bgr_tuple):
         self.white_point_bgr = bgr_tuple
