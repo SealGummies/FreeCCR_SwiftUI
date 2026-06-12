@@ -68,6 +68,7 @@ def _initialize_opencl():
         __kernel void adjust(
             __global float *img,
             __global float *params,
+            __global float *band_lut,
             int n_pixels
         ) {
             int gid = get_global_id(0);
@@ -413,6 +414,94 @@ def _initialize_opencl():
                     float xb = (b / 65535.0f) * ig + bs;
                     xb = (xb - bbp) / ((1.0f - bg) - bbp);
                     b = clamp(xb, 0.0f, 1.0f) * 65535.0f;
+                }
+            }
+
+            // Per-color-band "Subtractive Saturations". Parameter deltas
+            // come from a 720-bin hue LUT computed on the CPU with the
+            // exact same blend math as the numpy path, so both paths agree
+            // by construction. band_lut layout: [bin*4 + (subsat,sat,
+            // bright,hue)]. params[24] != 0 enables the block. Pixels with
+            // HSV saturation below the gate floor are skipped untouched —
+            // the numpy path's gate zeroes every delta there too.
+            if (params[24] != 0.0f) {
+                float nr = clamp(r / 65535.0f, 0.0f, 1.0f);
+                float ng = clamp(g / 65535.0f, 0.0f, 1.0f);
+                float nb = clamp(b / 65535.0f, 0.0f, 1.0f);
+                float mx = fmax(nr, fmax(ng, nb));
+                float mn = fmin(nr, fmin(ng, nb));
+                float ch_delta = mx - mn;
+                float hsv_s = (mx > 1e-9f) ? (ch_delta / mx) : 0.0f;
+                if (hsv_s > 0.06f) {
+                    float hue;
+                    if (mx == nr) {
+                        hue = 60.0f * fmod((ng - nb) / ch_delta + 6.0f, 6.0f);
+                    } else if (mx == ng) {
+                        hue = 60.0f * ((nb - nr) / ch_delta + 2.0f);
+                    } else {
+                        hue = 60.0f * ((nr - ng) / ch_delta + 4.0f);
+                    }
+                    // Linear interpolation between bins (matching the
+                    // numpy path); the last bin wraps back to red.
+                    float pos = hue * 2.0f;
+                    int b0 = min((int)pos, 719);
+                    float frac = pos - (float)b0;
+                    int b1 = (b0 == 719) ? 0 : b0 + 1;
+                    float d_subsat = mix(band_lut[b0 * 4 + 0],
+                                         band_lut[b1 * 4 + 0], frac);
+                    float d_sat    = mix(band_lut[b0 * 4 + 1],
+                                         band_lut[b1 * 4 + 1], frac);
+                    float d_bright = mix(band_lut[b0 * 4 + 2],
+                                         band_lut[b1 * 4 + 2], frac);
+                    float d_hue    = mix(band_lut[b0 * 4 + 3],
+                                         band_lut[b1 * 4 + 3], frac);
+                    float gt = clamp((hsv_s - 0.06f) / 0.14f, 0.0f, 1.0f);
+                    float gate = gt * gt * (3.0f - 2.0f * gt);
+
+                    float hsv_v = mx;
+                    // 0.30f = _BAND_HUE_FULL_SCALE/100 — keep in sync with
+                    // the numpy path's constants.
+                    hue = fmod(hue + d_hue * 0.30f * gate + 360.0f, 360.0f);
+                    hsv_s = clamp(hsv_s * fmax(1.0f + d_sat / 100.0f * gate,
+                                               0.0f), 0.0f, 1.0f);
+                    hsv_v = clamp(hsv_v * exp2(d_bright / 100.0f * gate),
+                                  0.0f, 1.0f);
+
+                    // HSV -> RGB
+                    float cc = hsv_v * hsv_s;
+                    float hp = hue / 60.0f;
+                    float xx = cc * (1.0f - fabs(fmod(hp, 2.0f) - 1.0f));
+                    float mm = hsv_v - cc;
+                    if (hp < 1.0f)      { nr = cc; ng = xx; nb = 0.0f; }
+                    else if (hp < 2.0f) { nr = xx; ng = cc; nb = 0.0f; }
+                    else if (hp < 3.0f) { nr = 0.0f; ng = cc; nb = xx; }
+                    else if (hp < 4.0f) { nr = 0.0f; ng = xx; nb = cc; }
+                    else if (hp < 5.0f) { nr = xx; ng = 0.0f; nb = cc; }
+                    else                { nr = cc; ng = 0.0f; nb = xx; }
+                    nr += mm; ng += mm; nb += mm;
+
+                    // Film-density subsat with per-pixel strength: pin the
+                    // dominant channel, power down the others (the global
+                    // sub_saturation model; pow(0, gamma) stays 0).
+                    float strength = d_subsat * gate;
+                    if (strength != 0.0f) {
+                        float m2 = fmax(nr, fmax(ng, nb));
+                        if (m2 > 1e-6f) {
+                            float gam = exp2(strength / 100.0f);
+                            // Snap sub-1e-6 ratios to 0 before the pow, like
+                            // the CPU path: HSV round-trip noise on an
+                            // exactly-dark channel must stay dark (gam<1 has
+                            // unbounded slope at 0), so pow(0,gam)=0 instead
+                            // of lifting it tens of counts.
+                            float rr = nr / m2, rg = ng / m2, rb = nb / m2;
+                            nr = m2 * pow(rr < 1e-6f ? 0.0f : rr, gam);
+                            ng = m2 * pow(rg < 1e-6f ? 0.0f : rg, gam);
+                            nb = m2 * pow(rb < 1e-6f ? 0.0f : rb, gam);
+                        }
+                    }
+                    r = clamp(nr, 0.0f, 1.0f) * 65535.0f;
+                    g = clamp(ng, 0.0f, 1.0f) * 65535.0f;
+                    b = clamp(nb, 0.0f, 1.0f) * 65535.0f;
                 }
             }
 
@@ -1779,11 +1868,14 @@ def adjust_image(
     ch_b_gain: float = 0.0,
     ch_b_blackpoint: float = 0.0,
     sub_saturation: float = 0.0,
+    band_settings: dict = None,
 ) -> np.ndarray:
     """
     Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
     contrast, and saturation adjustments to a 16-bit image.
     All input factors are in range [-100, 100], 0 = no change.
+    band_settings optionally carries the per-color-band sliders
+    (band_<color>_<param> keys), applied as the final step.
     Returns a 16-bit image.
     """
     img = img16.astype(np.float32)
@@ -2067,8 +2159,201 @@ def adjust_image(
                 ch = (ch - black_val) / (white_val - black_val)
             img[..., c] = np.clip(ch, 0.0, 1.0) * 65535.0
 
+    if band_settings:
+        # Run the band step in float, pre-quantization — the same staging
+        # as the OpenCL kernel, so CPU and GPU renders stay aligned.
+        bin_deltas = _band_bin_lut(band_settings)
+        if bin_deltas is not None:
+            img_norm = np.clip(img / 65535.0, 0.0, 1.0).astype(np.float32)
+            img = _apply_color_bands_float(img_norm, bin_deltas) * 65535.0
+
     img = np.clip(img, 0, 65535)
     return img.astype(np.uint16)
+
+
+# --- Per-color-band "Subtractive Saturations" (Resolve-style six vector) ---
+# Each band is a hue sector with four sliders in [-100, 100]:
+#   subsat — film-density saturation (same model as the global slider),
+#   sat    — additive saturation,  bright — luminance gain,
+#   hue    — rotation toward the neighboring sectors (±30° at full scale).
+COLOR_BANDS = ("red", "skin", "yellow", "green", "blue", "purple")
+BAND_PARAMS = ("subsat", "sat", "bright", "hue")
+BAND_ADJUSTMENT_KEYS = tuple(f"band_{color}_{param}"
+                             for color in COLOR_BANDS for param in BAND_PARAMS)
+
+# Sector centers in degrees on the HSV wheel (red=0, green=120, blue=240),
+# in wheel order. "skin" sits in the orange range between red and yellow,
+# like Resolve's dedicated skin-tone vector.
+BAND_HUE_CENTERS = (
+    ("red", 0.0), ("skin", 28.0), ("yellow", 58.0),
+    ("green", 120.0), ("blue", 240.0), ("purple", 300.0),
+)
+
+# Near-neutral pixels carry hue noise, not color: fade every band effect in
+# over this HSV-saturation range so grays stay untouched.
+_BAND_SAT_GATE_LO = 0.06
+_BAND_SAT_GATE_HI = 0.20
+
+_BAND_HUE_FULL_SCALE = 30.0   # hue slider ±100 → ±30°
+
+_BAND_LUT_BINS = 720          # 0.5° hue resolution for the per-pixel lookup
+
+
+_BAND_CENTERS_ARR = np.array([center for _name, center in BAND_HUE_CENTERS],
+                             dtype=np.float32)
+
+
+def _band_param_deltas(hue_deg: np.ndarray, lut: np.ndarray) -> np.ndarray:
+    """Blend per-band parameter values over the hue wheel.
+
+    `lut` is (num_bands, num_params) in BAND_HUE_CENTERS order. Each pixel
+    sits in the sector between two adjacent band centers; the two bands'
+    values are bridged with a smoothstep ramp, so a pixel is influenced by
+    at most two bands and the blend weights always sum to 1. Returns
+    hue_deg.shape + (num_params,) float32.
+    """
+    flat_hue = hue_deg.ravel()
+    idx = np.searchsorted(_BAND_CENTERS_ARR, flat_hue, side="right") - 1
+    last = len(_BAND_CENTERS_ARR) - 1
+    wrap = idx == last                       # purple→red sector crosses 360
+    nxt = np.where(wrap, 0, idx + 1)
+    c0 = _BAND_CENTERS_ARR[idx]
+    c1 = np.where(wrap, np.float32(360.0), _BAND_CENTERS_ARR[nxt])
+    t = np.clip((flat_hue - c0) / (c1 - c0), 0.0, 1.0)
+    ramp = (t * t * (3.0 - 2.0 * t)).astype(np.float32)[:, np.newaxis]
+    out = lut[idx] * (1.0 - ramp) + lut[nxt] * ramp
+    return out.reshape(hue_deg.shape + (lut.shape[1],))
+
+
+def _band_bin_lut(settings: dict):
+    """The (_BAND_LUT_BINS, 4) float32 table of blended per-param deltas by
+    hue bin, or None when every band slider is 0. Shared by the numpy path
+    and the OpenCL kernel so both apply identical curves."""
+    names = [name for name, _center in BAND_HUE_CENTERS]
+    lut = np.zeros((len(names), len(BAND_PARAMS)), dtype=np.float32)
+    for color in COLOR_BANDS:
+        lut[names.index(color)] = [
+            float(settings.get(f"band_{color}_{param}", 0) or 0)
+            for param in BAND_PARAMS]
+    if not lut.any():
+        return None
+    bin_hues = np.arange(_BAND_LUT_BINS, dtype=np.float32) \
+        * (360.0 / _BAND_LUT_BINS)
+    return _band_param_deltas(bin_hues, lut)
+
+
+def _band_weights(hue_deg: np.ndarray, needed) -> dict:
+    """Per-band membership weight from the pixel hue (degrees, [0, 360)).
+    Thin wrapper over _band_param_deltas with one-hot columns; mainly for
+    tests — the pipeline blends parameters directly."""
+    names = [name for name, _center in BAND_HUE_CENTERS]
+    lut = np.zeros((len(names), len(needed)), dtype=np.float32)
+    order = list(needed)
+    for col, name in enumerate(order):
+        lut[names.index(name), col] = 1.0
+    blended = _band_param_deltas(hue_deg, lut)
+    return {name: blended[..., col] for col, name in enumerate(order)}
+
+
+def apply_color_band_adjustments(img16: np.ndarray, settings: dict) -> np.ndarray:
+    """Apply the per-color-band sliders to a 16-bit RGB image.
+    Returns img16 unchanged when every band slider is 0.
+
+    Quantizes by TRUNCATION to match exactly the in-pipeline band path
+    (adjust_image / the OpenCL kernel both truncate), so every entry point
+    produces identical output."""
+    bin_deltas = _band_bin_lut(settings)
+    if bin_deltas is None:
+        return img16
+    rgb = np.clip(img16.astype(np.float32) / 65535.0, 0.0, 1.0)
+    rgb = _apply_color_bands_float(rgb, bin_deltas)
+    return np.clip(rgb * 65535.0, 0.0, 65535.0).astype(np.uint16)
+
+
+def _apply_color_bands_float(rgb: np.ndarray, bin_deltas: np.ndarray) -> np.ndarray:
+    """Per-color-band core on a float32 RGB image in [0, 1].
+
+    Band selection happens on the ORIGINAL hue, so a band's own hue
+    rotation can't move pixels out of (or into) its influence. sat/bright/
+    hue act in HSV; subsat then reuses the global subtractive-saturation
+    (pin the dominant channel, power down the others) with a per-pixel
+    strength. Operating in float (callers quantize once at the end) keeps
+    the CPU path's staging identical to the OpenCL kernel's.
+
+    The exact band blend is evaluated once on a small hue table
+    (bin_deltas, from _band_bin_lut), then pixels look it up by hue bin —
+    one int index + one take per active parameter instead of full-
+    resolution interpolation math. 0.5° bins are far below visible
+    precision for curves this smooth. May modify rgb in place; use the
+    return value.
+    """
+    param_active = [bool(bin_deltas[:, p].any())
+                    for p in range(len(BAND_PARAMS))]
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)   # H in [0,360), S/V in [0,1]
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+
+    # Linear interpolation between bins keeps the response continuous in
+    # hue — nearest-bin steps would turn sub-LSB float drift into visible
+    # delta jumps at bin edges (and break CPU/GPU agreement).
+    pos = hue * (_BAND_LUT_BINS / 360.0)
+    bin0 = np.minimum(pos.astype(np.int32), _BAND_LUT_BINS - 1)
+    frac = pos - bin0
+    bin1 = np.where(bin0 == _BAND_LUT_BINS - 1, 0, bin0 + 1)  # wrap to red
+    del pos
+
+    def _lookup(p):
+        col = np.ascontiguousarray(bin_deltas[:, p])
+        return np.take(col, bin0) * (1.0 - frac) + np.take(col, bin1) * frac
+
+    subsat_d, sat_d, bright_d, hue_d = (
+        _lookup(p) if param_active[p] else None
+        for p in range(len(BAND_PARAMS)))
+    del bin0, bin1, frac
+
+    g = np.clip((sat - _BAND_SAT_GATE_LO) /
+                (_BAND_SAT_GATE_HI - _BAND_SAT_GATE_LO), 0.0, 1.0)
+    gate = g * g * (3.0 - 2.0 * g)
+    del g
+
+    if hue_d is not None:
+        hsv[..., 0] = np.mod(
+            hue + hue_d * (_BAND_HUE_FULL_SCALE / 100.0) * gate, 360.0)
+        del hue_d
+    if sat_d is not None:
+        hsv[..., 1] = np.clip(sat * np.maximum(1.0 + sat_d / 100.0 * gate, 0.0),
+                              0.0, 1.0)
+        del sat_d
+    if bright_d is not None:
+        hsv[..., 2] = np.clip(val * np.exp2(bright_d / 100.0 * gate), 0.0, 1.0)
+        del bright_d
+    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    strength = subsat_d * gate if subsat_d is not None else None
+    # Hi-res frames make these intermediates big — drop them before the pow
+    del hsv, hue, sat, val, gate, subsat_d
+
+    if strength is not None:
+        # Touch only affected pixels: the gather is linear in coverage, so
+        # a band that owns 1/6 of the image costs ~1/6 of a full-image pow.
+        active = np.flatnonzero(strength)
+        if active.size:
+            flat = rgb.reshape(-1, 3)
+            sub = flat[active]
+            gamma = np.exp2(strength.ravel()[active] / 100.0)[:, np.newaxis]
+            mx = np.max(sub, axis=1, keepdims=True)
+            ratio = np.clip(sub / np.maximum(mx, 1e-6), 1e-20, 1.0)
+            # Ratios below 1e-6 are HSV round-trip noise (a real 1-count
+            # channel is 1.5e-5): snap them to the 1e-20 floor, which is far
+            # enough down that even gamma 0.5 maps it below half an LSB —
+            # exactly-dark channels stay dark, like the global model's
+            # pow(0, gamma) == 0 and the OpenCL kernel.
+            ratio = np.where(ratio < 1e-6, np.float32(1e-20), ratio)
+            flat[active] = np.where(mx > 1e-6,
+                                    mx * np.exp(np.log(ratio) * gamma), sub)
+            rgb = flat.reshape(rgb.shape)
+
+    return rgb
+
 
 def adjust_image_opencl(
     img16: np.ndarray,
@@ -2096,6 +2381,7 @@ def adjust_image_opencl(
     ch_b_gain: float = 0.0,
     ch_b_blackpoint: float = 0.0,
     sub_saturation: float = 0.0,
+    band_settings: dict = None,
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
@@ -2113,7 +2399,8 @@ def adjust_image_opencl(
                           ch_r_shift, ch_r_gain, ch_r_blackpoint,
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
                           ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                          sub_saturation=sub_saturation)
+                          sub_saturation=sub_saturation,
+                          band_settings=band_settings)
 
     try:
       # Serialize GPU submissions: the hi-res zoom worker may run this
@@ -2132,8 +2419,19 @@ def adjust_image_opencl(
         img_flat = img.reshape(-1, 3)
         img_buf = cl_array.to_device(queue, img_flat)
 
+        # The per-color-band deltas ship as a hue-binned LUT (the same
+        # table the numpy path uses); a 4-float dummy keeps the kernel
+        # argument valid when the bands are inactive.
+        band_lut = _band_bin_lut(band_settings) if band_settings else None
+        band_active = 1.0 if band_lut is not None else 0.0
+        lut_flat = (np.ascontiguousarray(band_lut.ravel())
+                    if band_lut is not None
+                    else np.zeros(4, dtype=np.float32))
+        lut_buf = cl_array.to_device(queue, lut_flat)
+
         # Prepare parameters as numpy array (params[0..10] existing,
-        # params[11..22] channel levels, params[23] subtractive saturation)
+        # params[11..22] channel levels, params[23] subtractive saturation,
+        # params[24] per-color-band enable flag)
         params = np.array([
             kelvin_shift, tint_shift, exposure, brightness,
             blackpoint, whitepoint, contrast, saturation, balance_factor,
@@ -2143,18 +2441,20 @@ def adjust_image_opencl(
             ch_g_shift, ch_g_gain, ch_g_blackpoint,
             ch_b_shift, ch_b_gain, ch_b_blackpoint,
             sub_saturation,
+            band_active,
         ], dtype=np.float32)
 
         params_buf = cl_array.to_device(queue, params)
 
         # Execute the pre-compiled kernel
         n_pixels = img_flat.shape[0]
-        kernel(queue, (n_pixels,), None, img_buf.data, params_buf.data, np.int32(n_pixels))
-        
+        kernel(queue, (n_pixels,), None, img_buf.data, params_buf.data,
+               lut_buf.data, np.int32(n_pixels))
+
         # Get results and reshape
         result = img_buf.get().reshape(img.shape)
         return np.clip(result, 0, 65535).astype(np.uint16)
-        
+
     except Exception as e:
         print(f"OpenCL processing failed: {e}")
         # Fallback to CPU version
@@ -2165,7 +2465,8 @@ def adjust_image_opencl(
                           ch_r_shift, ch_r_gain, ch_r_blackpoint,
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
                           ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                          sub_saturation=sub_saturation)
+                          sub_saturation=sub_saturation,
+                          band_settings=band_settings)
 
 
 

@@ -291,5 +291,246 @@ class TestEditInheritance:
             assert child.temperature_base == 10
 
 
+class TestResetSlice:
+    @pytest.fixture(autouse=True)
+    def _catalog_to_tmp(self, tmp_path, monkeypatch):
+        from core import catalog
+        monkeypatch.setattr(catalog, "default_catalog_path",
+                            lambda: str(tmp_path / "catalog.json"))
+        ccr_backend._catalog_preserved = {}
+
+    def _load(self, tmp_path, **png_kwargs):
+        path, img = _coordinate_png(tmp_path, **png_kwargs)
+        ccr_backend.images = [CCRImage(path)]
+        ccr_backend.file_paths = [path]
+        return path, img
+
+    def test_reset_restores_original(self, tmp_path):
+        path, img = self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert ccr_backend.get_image_count() == 2
+        restored = ccr_backend.reset_slice_by_indices([0])
+        assert restored == 0
+        assert ccr_backend.get_image_count() == 1
+        parent = ccr_backend.images[0]
+        assert parent.source_ops == []
+        assert parent.display_name is None  # back to the file basename
+        assert not parent.converted
+        np.testing.assert_array_equal(parent.resized_raw, img)
+        assert ccr_backend.file_paths == [path]
+
+    def test_reset_inherits_template_adjustments(self, tmp_path):
+        self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        ccr_backend.images[1].adjustment_settings = {"temperature": 25}
+        restored = ccr_backend.reset_slice_by_indices([1])
+        assert restored == 0
+        assert ccr_backend.images[0].adjustment_settings == {"temperature": 25}
+
+    def test_reset_selecting_all_siblings_resets_once(self, tmp_path):
+        self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [1.0 / 3.0, 2.0 / 3.0], [])
+        restored = ccr_backend.reset_slice_by_indices([0, 1, 2])
+        assert restored == 0
+        assert ccr_backend.get_image_count() == 1
+
+    def test_reset_nested_restores_one_level(self, tmp_path):
+        path, img = self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [0.5], [])     # scan_s1, scan_s2
+        ccr_backend.slice_image_by_index(0, [], [0.5])     # scan_s1 -> _s1,_s2
+        assert ccr_backend.get_image_count() == 3
+        restored = ccr_backend.reset_slice_by_indices([0])
+        assert restored == 0
+        assert ccr_backend.get_image_count() == 2
+        # The middle level comes back; its top-level sibling is untouched
+        assert ccr_backend.images[0].display_name == "scan_s1.png"
+        assert len(ccr_backend.images[0].source_ops) == 1
+        np.testing.assert_array_equal(ccr_backend.images[0].resized_raw,
+                                      img[:, 0:300])
+        assert ccr_backend.images[1].display_name == "scan_s2.png"
+
+    def test_reset_top_round_removes_nested_descendants(self, tmp_path):
+        path, img = self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        ccr_backend.slice_image_by_index(0, [], [0.5])     # re-slice the left
+        # Resetting from the top-level sibling folds EVERYTHING back
+        restored = ccr_backend.reset_slice_by_indices([2])
+        assert restored == 0
+        assert ccr_backend.get_image_count() == 1
+        assert ccr_backend.images[0].source_ops == []
+        np.testing.assert_array_equal(ccr_backend.images[0].resized_raw, img)
+
+    def test_reset_restores_baked_fine_rotation(self, tmp_path):
+        path, img = self._load(tmp_path, w=400, h=400)
+        ccr_backend.images[0].fine_rotation_angle = 300   # 3°, baked by slice
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert ccr_backend.images[0].source_ops[-1][0] == 300
+        restored = ccr_backend.reset_slice_by_indices([0])
+        assert restored == 0
+        parent = ccr_backend.images[0]
+        assert parent.fine_rotation_angle == 300  # live again, not baked
+        assert parent.source_ops == []
+        np.testing.assert_array_equal(parent.resized_raw, img)
+
+    def test_reset_converted_slices_restores_conversion(self, tmp_path):
+        rng = np.random.default_rng(21)
+        yy, xx = np.mgrid[0:400, 0:600]
+        base = 20000 + 25000 * (xx / 600) + 10000 * (yy / 400)
+        img = np.stack([base * 1.2, base, base * 0.7], axis=-1)
+        img += rng.normal(0, 1500, img.shape)
+        img = np.clip(img, 1000, 64000).astype(np.uint16)
+        path = str(tmp_path / "negative.png")
+        cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        parent = CCRImage(path)
+        parent.reference_frame = (20, 20, 580, 380)
+        ccr_backend.images = [parent]
+        ccr_backend.file_paths = [path]
+        ccr_backend.convert_negative_by_index(0)
+        parent_converted = parent.resized_raw.copy()
+
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        restored = ccr_backend.reset_slice_by_indices([0])
+        assert restored == 0
+        back = ccr_backend.images[0]
+        assert back.converted
+        assert back.conversion_inputs["mode"] == "ref_params"
+        # Same conversion constants replayed -> colors match the original
+        np.testing.assert_allclose(back.resized_raw.astype(np.int64),
+                                   parent_converted.astype(np.int64), atol=3)
+
+    def test_reset_on_unsliced_returns_none(self, tmp_path):
+        self._load(tmp_path)
+        assert ccr_backend.reset_slice_by_indices([0]) is None
+        assert ccr_backend.get_image_count() == 1
+
+    def test_reset_updates_catalog(self, tmp_path):
+        from core import catalog
+        path, _ = self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        ccr_backend.save_catalog()
+        assert len(catalog.entries_for_path(path)) == 2
+        ccr_backend.reset_slice_by_indices([0])
+        entries = catalog.entries_for_path(path)
+        assert len(entries) == 1
+        assert entries[0]["source_ops"] == []
+
+    @staticmethod
+    def _is_copy_slice(im):
+        return bool(im.display_name and im.display_name.startswith("scan_copy1_s"))
+
+    def test_reset_does_not_destroy_independent_duplicate_round(self, tmp_path):
+        """Reset must collapse only the selected slice's lineage. A duplicate
+        of the original, sliced separately, is an independent round and must
+        survive — including any edits on its slices."""
+        self._load(tmp_path)
+        ccr_backend.duplicate_images_by_indices([0])       # scan + scan_copy1
+        ccr_backend.slice_image_by_index(0, [0.5], [])     # slice the original
+        # The copy is now at the end; slice it into 3 and edit one slice
+        copy_idx = next(i for i, im in enumerate(ccr_backend.images)
+                        if im.is_duplicate)
+        ccr_backend.slice_image_by_index(copy_idx, [1 / 3, 2 / 3], [])
+        copy_slices = [im for im in ccr_backend.images if self._is_copy_slice(im)]
+        assert len(copy_slices) == 3
+        copy_slices[0].adjustment_settings = {"temperature": 17}
+        assert ccr_backend.get_image_count() == 5  # 2 original + 3 copy
+
+        # Reset the ORIGINAL's round (one of its slices)
+        orig_slice = next(i for i, im in enumerate(ccr_backend.images)
+                          if im.source_ops and not self._is_copy_slice(im))
+        ccr_backend.reset_slice_by_indices([orig_slice])
+        # Original collapses to 1; the copy's 3 slices and their edits remain
+        survivors = ccr_backend.images
+        assert len([im for im in survivors if not im.source_ops]) == 1
+        remaining_copy = [im for im in survivors if self._is_copy_slice(im)]
+        assert len(remaining_copy) == 3
+        assert remaining_copy[0].adjustment_settings == {"temperature": 17}
+
+    def test_reset_duplicate_round_leaves_original_round(self, tmp_path):
+        """The mirror of the above: resetting the copy's round must not
+        touch the original's slices."""
+        self._load(tmp_path)
+        ccr_backend.duplicate_images_by_indices([0])
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        copy_idx = next(i for i, im in enumerate(ccr_backend.images)
+                        if im.is_duplicate)
+        ccr_backend.slice_image_by_index(copy_idx, [1 / 3, 2 / 3], [])
+        copy_slice = next(i for i, im in enumerate(ccr_backend.images)
+                          if self._is_copy_slice(im))
+        ccr_backend.reset_slice_by_indices([copy_slice])
+        # Copy collapses back to 1; original's 2 slices remain untouched
+        assert len([im for im in ccr_backend.images
+                    if self._is_copy_slice(im)]) == 0
+        original_slices = [im for im in ccr_backend.images
+                           if im.display_name in ("scan_s1.png", "scan_s2.png")]
+        assert len(original_slices) == 2
+
+    def test_reset_missing_file_fails_gracefully(self, tmp_path):
+        path, _ = self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        os.remove(path)  # source gone before reset re-decodes it
+        # Must not raise; nothing changes
+        result = ccr_backend.reset_slice_by_indices([0])
+        assert result is None
+        assert ccr_backend.get_image_count() == 2
+
+    def test_reset_from_duplicate_of_nested_slice_keeps_parent_name(self, tmp_path):
+        self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [0.5], [])     # scan_s1, scan_s2
+        # Re-slice scan_s2 -> scan_s2_s1, scan_s2_s2
+        s2_idx = next(i for i, im in enumerate(ccr_backend.images)
+                      if im.display_name == "scan_s2.png")
+        ccr_backend.slice_image_by_index(s2_idx, [0.5], [])
+        nested_idx = next(i for i, im in enumerate(ccr_backend.images)
+                          if im.display_name == "scan_s2_s1.png")
+        ccr_backend.duplicate_images_by_indices([nested_idx])
+        dup_idx = next(i for i, im in enumerate(ccr_backend.images)
+                       if im.display_name == "scan_s2_s1_copy1.png")
+        # Resetting the duplicate restores its parent canvas (scan_s2),
+        # NOT the whole file — the name must come from the stored snapshot.
+        ccr_backend.reset_slice_by_indices([dup_idx])
+        # The restored duplicate-lineage parent represents scan_s2
+        restored = [im for im in ccr_backend.images
+                    if im.is_duplicate and len(im.source_ops) == 1]
+        assert len(restored) == 1
+        assert restored[0].display_name == "scan_s2.png"
+
+    def test_reset_purges_preserved_removed_sibling(self, tmp_path):
+        """A sibling slice removed as an actual image is held in
+        _catalog_preserved; resetting the round must drop it so it doesn't
+        resurrect as a ghost on the next open."""
+        from core import catalog
+        path, _ = self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [1 / 3, 2 / 3], [])  # s1, s2, s3
+        s2_idx = next(i for i, im in enumerate(ccr_backend.images)
+                      if im.display_name == "scan_s2.png")
+        ccr_backend.remove_images_by_indices([s2_idx])  # preserved
+        assert path in ccr_backend._catalog_preserved
+        # Reset via a surviving sibling
+        s1_idx = next(i for i, im in enumerate(ccr_backend.images)
+                      if im.display_name == "scan_s1.png")
+        ccr_backend.reset_slice_by_indices([s1_idx])
+        # The preserved ghost is purged and the catalog holds only the parent
+        entries = catalog.entries_for_path(path)
+        assert len(entries) == 1
+        assert entries[0]["source_ops"] == []
+
+    def test_reset_then_reset_again_collapses_nested_stack(self, tmp_path):
+        path, img = self._load(tmp_path)
+        ccr_backend.slice_image_by_index(0, [0.5], [])     # scan_s1, scan_s2
+        ccr_backend.slice_image_by_index(0, [], [0.5])     # scan_s1 nested
+        # First reset: one level (scan_s1 restored)
+        ccr_backend.reset_slice_by_indices([0])
+        assert ccr_backend.get_image_count() == 2
+        s1 = next(im for im in ccr_backend.images
+                  if im.display_name == "scan_s1.png")
+        # The restored mid-level parent must re-join its own round so a
+        # second reset collapses to the original
+        idx = ccr_backend.images.index(s1)
+        ccr_backend.reset_slice_by_indices([idx])
+        assert ccr_backend.get_image_count() == 1
+        assert ccr_backend.images[0].source_ops == []
+        np.testing.assert_array_equal(ccr_backend.images[0].resized_raw, img)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

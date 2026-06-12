@@ -8,7 +8,8 @@ import logging
 import time
 from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage, QPixmap if you use PySide
 #import lensfunpy  # Make sure lensfunpy is installed
-from core.ccr_processor import adjust_image, adjust_image_opencl
+from core.ccr_processor import (adjust_image, adjust_image_opencl,
+                                BAND_ADJUSTMENT_KEYS)
 
 # Import optional libraries with fallbacks
 try:
@@ -43,6 +44,8 @@ class CCRImage:
         preloaded_img: Optional[np.ndarray] = None,
         preloaded_full_size: Optional[tuple[int, int]] = None,
         display_name: Optional[str] = None,
+        slice_group: Optional[str] = None,
+        slice_parent: Optional[Dict[str, Any]] = None,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
@@ -61,6 +64,15 @@ class CCRImage:
         # artifacts: removing one from the list also removes its catalog
         # entry, whereas removing an ACTUAL image keeps its stored edits.
         self.is_duplicate = False
+        # Slice lineage. All slices produced by one slicing operation share
+        # the same slice_group id, and carry slice_parent — a snapshot of the
+        # canvas they were cut from ({display_name, is_duplicate,
+        # slice_group}). "Reset Slice" uses the group to find exactly the
+        # round's members (never conflating independent rounds of the same
+        # file, e.g. a duplicate sliced separately) and slice_parent to
+        # restore the original canvas in their place. None for non-slices.
+        self.slice_group: Optional[str] = slice_group
+        self.slice_parent: Optional[Dict[str, Any]] = slice_parent
         self.thumbnail = thumbnail
         self.resized_raw = resized_raw
         self.reference_frame = reference_frame
@@ -502,7 +514,10 @@ class CCRImage:
                      s.get('temperature', 0) + tb,
                      s.get('tint', 0),
                      s.get('exposure', 0),
-                     s.get('brightness', 0) + bb,
+                     # Brightness slider is half-strength per click; the
+                     # always-on base offset (bb) keeps full weight so the
+                     # default look is unchanged.
+                     0.5 * s.get('brightness', 0) + bb,
                      s.get('black_point', 0),
                      s.get('white_point', 0),
                      s.get('contrast', 0) + cb,
@@ -522,7 +537,12 @@ class CCRImage:
                      ch_b_shift=s.get('ch_b_shift', 0),
                      ch_b_gain=s.get('ch_b_gain', 0),
                      ch_b_blackpoint=s.get('ch_b_blackpoint', 0),
-                     sub_saturation=s.get('sub_saturation', 0))
+                     sub_saturation=s.get('sub_saturation', 0),
+                     # Per-color-band sliders ride the same GPU pass (or the
+                     # CPU fallback); None keeps the inactive case free.
+                     band_settings=(s if any(s.get(k, 0)
+                                             for k in BAND_ADJUSTMENT_KEYS)
+                                    else None))
         return adjusted
 
     def render_hires_base(self, max_long_side: Optional[int] = None,

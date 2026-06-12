@@ -241,11 +241,23 @@ class ThumbnailList(QWidget):
         menu = QMenu(self)
         duplicate_action = menu.addAction(f"Duplicate{suffix}")
         remove_action = menu.addAction(f"Remove from list{suffix}")
+        # Offered only when the selection contains slices: restores the
+        # un-sliced parent image(s) in place of all their slices.
+        reset_slice_action = None
+        slice_count = sum(
+            1 for i in indices
+            if i < len(ccr_backend.images) and ccr_backend.images[i].source_ops
+            and ccr_backend.images[i].slice_group is not None)
+        if slice_count:
+            slice_suffix = f" ({slice_count})" if slice_count > 1 else ""
+            reset_slice_action = menu.addAction(f"Reset Slice{slice_suffix}")
         action = menu.exec_(self.thumbnail_list.mapToGlobal(pos))
         if action == duplicate_action:
             self.duplicate_images(indices)
         elif action == remove_action:
             self.remove_images(indices)
+        elif reset_slice_action is not None and action == reset_slice_action:
+            self.reset_slices(indices)
 
     def duplicate_images(self, indices):
         created = ccr_backend.duplicate_images_by_indices(indices)
@@ -278,6 +290,20 @@ class ThumbnailList(QWidget):
     def remove_image(self, idx):
         """Single-image removal (kept for compatibility)."""
         self.remove_images([idx])
+
+    def reset_slices(self, indices):
+        # Reset re-decodes the source file(s) synchronously; show a busy
+        # cursor so the brief GUI-thread freeze reads as work, not a hang.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            restored = ccr_backend.reset_slice_by_indices(indices)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if restored is None:
+            return
+        self.load_thumbnails()
+        if restored != 0:  # load_thumbnails already selected row 0
+            self.thumbnail_list.setCurrentRow(restored)
 
     def apply_frontend_transformations(self, thumbnail, idx):
         """

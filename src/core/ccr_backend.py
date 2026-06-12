@@ -8,6 +8,15 @@ import os
 import glob
 import concurrent.futures
 import time
+import uuid
+
+
+def _new_slice_group() -> str:
+    """A globally-unique id shared by all slices of one slicing operation.
+    Used to identify a slice round for 'Reset Slice' without relying on
+    geometry or display names (both of which collide across duplicated
+    lineages)."""
+    return uuid.uuid4().hex
 
 class CCRBackend:
     _instance = None
@@ -656,6 +665,18 @@ class CCRBackend:
             dup.tint_balance_factor = getattr(img, "tint_balance_factor", 1.0)
             dup._catalog_signature = getattr(img, "_catalog_signature", None)
             dup.is_duplicate = True
+            # A duplicated slice becomes its OWN one-image round: a fresh
+            # group means resetting the source's round never reaches into
+            # this copy. Resetting the copy itself restores its parent
+            # canvas (as a duplicate). Non-slice copies carry no lineage.
+            if img.source_ops:
+                dup.slice_group = _new_slice_group()
+                parent_snap = dict(img.slice_parent) if img.slice_parent else {}
+                parent_snap["is_duplicate"] = True
+                dup.slice_parent = parent_snap
+            else:
+                dup.slice_group = None
+                dup.slice_parent = None
             if ((dup.contrast_base, dup.temperature_base, dup.brightness_base)
                     != (0, 0, -8) or img.adjustment_settings.get("tint")):
                 dup.update_thumbnail_and_preview()
@@ -750,6 +771,17 @@ class CCRBackend:
         stem, ext = os.path.splitext(img_obj.display_name
                                      or os.path.basename(img_obj.file_path))
 
+        # One id for the whole round, plus a snapshot of the canvas being
+        # sliced, so "Reset Slice" can collapse exactly these children back
+        # into this parent — even after a catalog round trip, and without
+        # confusing them with an independently-sliced duplicate of the file.
+        slice_group = _new_slice_group()
+        slice_parent = {
+            "display_name": img_obj.display_name,
+            "is_duplicate": bool(getattr(img_obj, "is_duplicate", False)),
+            "slice_group": getattr(img_obj, "slice_group", None),
+        }
+
         children = []
         if progress_callback:
             progress_callback(0, total)
@@ -790,6 +822,8 @@ class CCRBackend:
                     preloaded_img=crop,
                     preloaded_full_size=child_full,
                     display_name=f"{stem}_s{index}{ext}",
+                    slice_group=slice_group,
+                    slice_parent=dict(slice_parent),
                 )
                 child.conversion_inputs = child_ci
                 # Slices descend from the parent's loaded content — carry its
@@ -817,6 +851,170 @@ class CCRBackend:
         self.file_paths = [im.file_path for im in self.images]
         print(f"Sliced {os.path.basename(img_obj.file_path)} into {len(children)} images")
         return len(children)
+
+    def reset_slice_by_indices(self, indices) -> Optional[int]:
+        """Undo the slicing round each selected slice came from.
+
+        For every selected sliced image, ALL slices produced by the same
+        slicing operation (identified by a shared slice_group id, so an
+        independently-sliced duplicate of the same file is never touched)
+        are removed and the original canvas is restored in their place:
+        re-decoded from the source file, with the selected slice's edits
+        carried back — conversion replayed with the same constants,
+        adjustments / orientation / bases inherited, and the fine rotation
+        that slicing baked into the cuts restored as a live setting. The
+        restored canvas re-joins its OWN round (if it was itself a slice),
+        so a nested stack can be reset one level at a time. Returns the list
+        index of the first restored parent, or None when nothing was reset.
+        """
+        selected = [self.images[i] for i in sorted(set(indices))
+                    if 0 <= i < len(self.images)
+                    and self.images[i].source_ops
+                    and self.images[i].slice_group is not None]
+        first_restored = None
+        for template in selected:
+            if not any(im is template for im in self.images):
+                continue  # this round was already reset via a sibling
+            restored_at = self._reset_one_slice_round(template)
+            if restored_at is not None and first_restored is None:
+                first_restored = restored_at
+        if first_restored is not None:
+            self.file_paths = [im.file_path for im in self.images]
+            self.save_catalog()
+        return first_restored
+
+    def _reset_one_slice_round(self, template) -> Optional[int]:
+        from core.ccr_processor import (apply_reference_normalization,
+                                        apply_bwpoint_normalization,
+                                        compute_reference_norm_params)
+        group = template.slice_group
+        parent_ops = list(template.source_ops[:-1])
+        baked_rotation = template.source_ops[-1][0]
+        # Membership is the shared round id — never geometry or names, both
+        # of which collide across duplicated lineages. Collapsing a round
+        # also collapses every round nested INSIDE its pieces: a nested
+        # round's slice_parent points back (by group) to the member it was
+        # cut from, so grow the set of groups to a fixpoint. A separately
+        # sliced duplicate never links back in (its parent snapshot carries
+        # a different group), so its lineage is left untouched.
+        subtree = {group}
+        changed = True
+        while changed:
+            changed = False
+            for im in self.images:
+                g = im.slice_group
+                if g is not None and g not in subtree:
+                    parent_g = (im.slice_parent or {}).get("slice_group")
+                    if parent_g in subtree:
+                        subtree.add(g)
+                        changed = True
+        members = [im for im in self.images
+                   if im.slice_group is not None and im.slice_group in subtree]
+        member_ids = {id(im) for im in members}
+        insert_at = next(i for i, im in enumerate(self.images)
+                         if id(im) in member_ids)
+
+        # The canvas this round was cut from, captured at slice time.
+        snapshot = template.slice_parent or {}
+        parent_name = snapshot.get("display_name")
+        parent_is_duplicate = bool(snapshot.get("is_duplicate", False))
+        parent_group = snapshot.get("slice_group")
+        # If the restored canvas was itself a slice, let it re-join its round
+        # so it can be reset again — recover that round's parent snapshot
+        # from a surviving sibling.
+        parent_slice_parent = None
+        if parent_group is not None:
+            parent_slice_parent = next(
+                (im.slice_parent for im in self.images
+                 if im.slice_group == parent_group
+                 and id(im) not in member_ids), None)
+
+        # Conversion constants from the template slice, mirroring what
+        # slicing does in the parent→child direction. "ref" coordinates
+        # live in the slice's own frame, so derive transferable per-channel
+        # params from the slice's unconverted pixels first.
+        ci = template.conversion_inputs if template.converted else None
+        norm_params = None
+        bw_points = None
+        if ci is not None and ci.get("mode") == "ref":
+            child_full = template.read_image(template.file_path, preview=True)
+            if child_full is not None:
+                small = template.resize_image_to_max_pixel(child_full, 1080)
+                p_lo, p_hi, od = compute_reference_norm_params(
+                    small, ci["ref"], ci.get("fine_rot", 0))
+                norm_params = (tuple(float(v) for v in p_lo),
+                               tuple(float(v) for v in p_hi),
+                               tuple(float(v) for v in od))
+        elif ci is not None and ci.get("mode") == "ref_params":
+            norm_params = (ci["p_lo"], ci["p_hi"], ci["od"])
+        elif ci is not None and ci.get("mode") == "bw":
+            bw_points = ci["bw"]
+
+        # Re-decode the source canvas. The constructor raises if the file is
+        # gone/unreadable; fail the reset gracefully and leave the list
+        # untouched (nothing is removed until the decode succeeds).
+        try:
+            parent = CCRImage(
+                template.file_path,
+                adjustment_settings=dict(template.adjustment_settings),
+                rotation_angle=template.rotation_angle,
+                fine_rotation_angle=baked_rotation,
+                horizontal_mirrored=template.horizontal_mirrored,
+                vertical_mirrored=template.vertical_mirrored,
+                converted=False,
+                source_ops=parent_ops,
+                display_name=parent_name,
+                slice_group=parent_group,
+                slice_parent=(dict(parent_slice_parent)
+                              if parent_slice_parent else None),
+            )
+        except Exception as e:
+            print(f"Reset slice failed: could not re-decode "
+                  f"{template.file_path}: {e}")
+            return None
+        parent.is_duplicate = parent_is_duplicate
+        if norm_params is not None:
+            parent.resized_raw = apply_reference_normalization(
+                parent.resized_raw, *norm_params)
+            parent.converted = True
+            parent.conversion_inputs = {
+                "mode": "ref_params", "p_lo": norm_params[0],
+                "p_hi": norm_params[1], "od": norm_params[2]}
+        elif bw_points is not None:
+            parent.resized_raw = apply_bwpoint_normalization(
+                parent.resized_raw, *bw_points)
+            parent.converted = True
+            parent.conversion_inputs = {"mode": "bw", "bw": bw_points,
+                                        "fine_rot": 0}
+        parent.tint_balance_factor = template.tint_balance_factor
+        parent.contrast_base = template.contrast_base
+        parent.temperature_base = template.temperature_base
+        parent.brightness_base = template.brightness_base
+        parent._catalog_signature = getattr(template, "_catalog_signature", None)
+        parent.update_thumbnail_and_preview()
+
+        self.images = [im for im in self.images if id(im) not in member_ids]
+        self.images.insert(insert_at, parent)
+        # Drop preserved catalog entries for members that were earlier
+        # removed (as actuals): otherwise update_for_images would merge those
+        # stale slices back in and resurrect them on the next open.
+        self._purge_preserved_slice_round(template.file_path, subtree)
+        print(f"Reset slice: {len(members)} slice(s) of "
+              f"{os.path.basename(template.file_path)} replaced by "
+              f"{parent_name or os.path.basename(template.file_path)}")
+        return insert_at
+
+    def _purge_preserved_slice_round(self, file_path, groups) -> None:
+        record = self._catalog_preserved.get(file_path)
+        if not record:
+            return
+        entries = record.get("entries", {})
+        stale = [name for name, state in entries.items()
+                 if state.get("slice_group") in groups]
+        for name in stale:
+            del entries[name]
+        if not entries:
+            self._catalog_preserved.pop(file_path, None)
 
     def set_white_point(self, bgr_tuple):
         self.white_point_bgr = bgr_tuple
