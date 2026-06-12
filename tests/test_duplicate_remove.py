@@ -129,6 +129,21 @@ class TestRemoveMultiple:
         assert remaining == ["b.png", "d.png"]
         assert len(ccr_backend.file_paths) == 2
 
+    def test_next_selection_target(self):
+        from widgets.thumbnail_list import ThumbnailList
+        target = ThumbnailList._next_selection_target
+        # Removing index 1 of (then) 4: the old index-2 image now sits at 1
+        assert target([1], 3) == 1
+        # Removing the last image: land on the new last one
+        assert target([2], 2) == 1
+        # Multi-removal: land where the first removed image was
+        assert target([0, 2], 2) == 0
+        assert target([1, 3], 2) == 1
+        # Removing the tail block clamps to the new last image
+        assert target([2, 3], 2) == 1
+        # Everything removed: nothing to select
+        assert target([0], 0) is None
+
     def test_remove_out_of_range_ignored(self, tmp_path):
         p, _ = _scan_png(tmp_path)
         ccr_backend.images = [CCRImage(p)]

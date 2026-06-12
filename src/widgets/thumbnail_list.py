@@ -257,10 +257,23 @@ class ThumbnailList(QWidget):
             self.thumbnail_list.setCurrentRow(first_copy)
         ccr_backend.save_catalog()
 
+    @staticmethod
+    def _next_selection_target(removed_indices, new_count):
+        """Row to select after a removal: the image that followed the
+        removed one(s) — it now occupies the lowest removed index — clamped
+        to the new last image when the tail was removed."""
+        if new_count <= 0:
+            return None
+        return min(min(removed_indices), new_count - 1)
+
     def remove_images(self, indices):
-        if ccr_backend.remove_images_by_indices(indices):
-            self.load_thumbnails()
-            ccr_backend.save_catalog()
+        if not ccr_backend.remove_images_by_indices(indices):
+            return
+        self.load_thumbnails()
+        target = self._next_selection_target(indices, ccr_backend.get_image_count())
+        if target is not None and target != 0:  # load_thumbnails already selected row 0
+            self.thumbnail_list.setCurrentRow(target)
+        ccr_backend.save_catalog()
 
     def remove_image(self, idx):
         """Single-image removal (kept for compatibility)."""
