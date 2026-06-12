@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QMainWindow, QHBoxLayout, QWidget, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel, QLineEdit
 from PySide6.QtGui import QIcon, QShortcut, QKeySequence
-from PySide6.QtCore import Qt, QEvent, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QEvent, QThread, Signal, QObject, QSettings
 from widgets.thumbnail_list import ThumbnailList
 from widgets.image_preview import ImagePreview
 from widgets.sliders_panel import SlidersPanel
@@ -65,6 +65,9 @@ class MainWindow(QMainWindow):
         self.layout.addWidget(self.image_preview, 3)
         self.layout.addWidget(self.sliders_panel, 0)
 
+        # Persisted UI preferences (last-open location etc.)
+        self._settings = QSettings("FreeCCR", "FreeCCR")
+
         self.installEventFilter(self)
         self.create_menu()
 
@@ -88,6 +91,9 @@ class MainWindow(QMainWindow):
             QMessageBox.No
         )
         if reply == QMessageBox.Yes:
+            # Persist the edit catalog so reopening these files restores
+            # their conversion/slices/crop/adjustments.
+            ccr_backend.save_catalog()
             event.accept()
         else:
             event.ignore()
@@ -232,14 +238,16 @@ class MainWindow(QMainWindow):
             self._loader_worker = None
 
     def open_files(self):
-        # options = QFileDialog.Options()
+        start_dir = self._settings.value("files/last_open_dir", "", type=str)
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Images",
-            "",
+            start_dir,
             "Images (*.dng *.tif *.tiff *.arw *.nef *.cr2 *.cr3 *.raf *.png *.jpg *.jpeg *.rw2 *.3fr *.fff);;All Files (*)"
         )
         if files:
+            # Remember where the user browses to (survives restarts)
+            self._settings.setValue("files/last_open_dir", os.path.dirname(files[0]))
             # Validate and normalize Unicode paths
             valid_files = []
             invalid_files = []
@@ -281,13 +289,15 @@ class MainWindow(QMainWindow):
                 )
 
     def open_folder(self):
-        # options = QFileDialog.Options()
+        start_dir = self._settings.value("files/last_open_dir", "", type=str)
         folder = QFileDialog.getExistingDirectory(
             self,
             "Select Folder",
-            ""
+            start_dir
         )
         if folder:
+            # Remember where the user browses to (survives restarts)
+            self._settings.setValue("files/last_open_dir", folder)
             # Validate and normalize Unicode path
             normalized_folder = normalize_unicode_path(folder)
             if not validate_unicode_path(normalized_folder):

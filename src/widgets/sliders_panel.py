@@ -822,6 +822,7 @@ class SlidersPanel(QWidget):
             mw.thumbnail_list.update_all_thumbnails()
             mw.image_preview.update_preview(self.current_idx)
             mw.image_preview._update_unconvert_action_state()
+            ccr_backend.save_catalog()
             self.set_temporary_hint("Current image converted!", duration=3000)
         except Exception as e:
             QMessageBox.critical(self, "Conversion Error", str(e))
@@ -849,6 +850,7 @@ class SlidersPanel(QWidget):
                 mw.image_preview._update_unconvert_action_state()
         except AttributeError:
             pass
+        ccr_backend.save_catalog()
         self.set_temporary_hint("B/W Point conversion complete!", duration=3000)
 
     def copy_adjustment_settings(self):

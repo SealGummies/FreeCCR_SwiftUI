@@ -34,9 +34,14 @@ class CCRBackend:
                 if cancel_flag and cancel_flag():
                     return path, None
                 print(f"Loading image: {os.path.basename(path)}")
-                img = CCRImage(path)
+                # Restores cataloged state (slices, conversion, adjustments)
+                # when this file was processed before; plain load otherwise.
+                from core.catalog import create_images_for_path
+                imgs = create_images_for_path(path)
+                for order, img in enumerate(imgs):
+                    img._catalog_order = order  # keep slice order within a file
                 print(f"Successfully loaded: {os.path.basename(path)}")
-                return path, img
+                return path, imgs
             except Exception as e:
                 print(f"Failed to load {os.path.basename(path)}: {e}")
                 return path, None
@@ -49,14 +54,9 @@ class CCRBackend:
             for path in file_paths:
                 if cancel_flag and cancel_flag():
                     break
-                try:
-                    print(f"Loading image: {os.path.basename(path)}")
-                    img = CCRImage(path)
-                    self.images.append(img)
-                    print(f"Successfully loaded: {os.path.basename(path)}")
-                except Exception as e:
-                    print(f"Failed to load {os.path.basename(path)}: {e}")
-                    continue
+                _path, imgs = load_single_image(path)
+                if imgs:
+                    self.images.extend(imgs)
         else:
             # Parallel loading - collect into local list to avoid concurrent modification
             results = []
@@ -66,11 +66,13 @@ class CCRBackend:
                 for future in concurrent.futures.as_completed(future_to_path):
                     if cancel_flag and cancel_flag():
                         break
-                    path, img = future.result()
-                    if img is not None:
-                        results.append(img)
+                    path, imgs = future.result()
+                    if imgs:
+                        results.extend(imgs)
 
-            results.sort(key=lambda img: os.path.basename(img.file_path))
+            # Slices of one file keep their catalog order within the file
+            results.sort(key=lambda img: (os.path.basename(img.file_path),
+                                          getattr(img, "_catalog_order", 0)))
             self.images = results
 
         # Keep file_paths derived from actually-loaded images so the two lists stay in sync
@@ -555,6 +557,18 @@ class CCRBackend:
         if idx is not None and 0 <= idx < len(self.images):
             del self.images[idx]
             self.file_paths = [img.file_path for img in self.images]
+
+    def save_catalog(self):
+        """Persist the edit state (conversion, slices, crop, adjustments) of
+        all loaded images so reopening the files restores it. Cheap; called
+        after significant operations and on app close."""
+        if not self.images:
+            return
+        try:
+            from core.catalog import update_for_images
+            update_for_images(self.images)
+        except Exception as e:
+            print(f"Catalog save failed: {e}")
 
     @staticmethod
     def _clean_slice_cuts(cuts) -> list:

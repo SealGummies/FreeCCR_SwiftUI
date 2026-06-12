@@ -1118,6 +1118,7 @@ class ImagePreview(QWidget):
         self.update_preview(self.current_idx)
         self.parent().parent().thumbnail_list.update_thumbnail(self.current_idx)
         self._update_unconvert_action_state()
+        ccr_backend.save_catalog()
 
     def unconvert_ccr(self):
         if self.current_idx is None:
@@ -1127,6 +1128,7 @@ class ImagePreview(QWidget):
         self.update_preview(self.current_idx)
         self.parent().parent().thumbnail_list.update_thumbnail(self.current_idx)
         self._update_unconvert_action_state()
+        ccr_backend.save_catalog()
 
     def _update_unconvert_action_state(self):
         self.current_converted = ccr_backend.get_converted_state_by_index(self.current_idx) if self.current_idx is not None else False
@@ -1805,6 +1807,7 @@ class ImagePreview(QWidget):
             mw.sliders_panel.set_temporary_hint(
                 f"Sliced into {count} images. Each can now be framed, "
                 f"converted, and exported separately.", duration=6000)
+            ccr_backend.save_catalog()
         else:
             self.update_preview(idx)
             mw.sliders_panel.set_temporary_hint(
@@ -2377,6 +2380,7 @@ class ImagePreview(QWidget):
             lines.append("Export was stopped before completion.")
         lines.append(f"\nFolder: {plan.destination}")
         QMessageBox.information(self, "Export Complete", "\n".join(lines))
+        ccr_backend.save_catalog()
         if plan.open_folder:
             QDesktopServices.openUrl(QUrl.fromLocalFile(plan.destination))
 
