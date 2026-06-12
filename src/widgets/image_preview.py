@@ -1564,10 +1564,9 @@ class ImagePreview(QWidget):
         self.view.setCursor(Qt.ArrowCursor)
 
     def _slice_display_transform(self):
-        """Transform of the slice-mode display: coarse flips/rotation PLUS
-        the fine rotation (which stays visible in slice mode — cuts are
-        placed on the rotated frame and the rotation is baked into the
-        slices, matching the backend's warp exactly)."""
+        """Transform the PIXMAP and dim cast are displayed with in slice
+        mode: coarse flips/rotation PLUS the fine rotation (which stays
+        visible — the rotation gets baked into the slices)."""
         t = self._base_transform()
         if t is None or self.current_pixmap is None:
             return None
@@ -1581,9 +1580,14 @@ class ImagePreview(QWidget):
         return t if t.isInvertible() else None
 
     def _slice_local(self, scene_pos):
-        """Map a scene point into the slice frame (rotated image coords)."""
-        t = self._slice_display_transform()
-        if t is None:
+        """Map a scene point into the WARPED-CANVAS frame — the frame the
+        backend actually cuts. The backend rotates the decode about its
+        center into the same WxH canvas (identical to the on-screen warp),
+        so canvas coordinates relate to the scene through the BASE transform
+        only; cut fractions must be measured here, NOT in un-rotated content
+        coords, or the cuts would land offset from the placed lines."""
+        t = self._base_transform()
+        if t is None or self.current_pixmap is None:
             return None
         return t.inverted()[0].map(scene_pos)
 
@@ -1696,7 +1700,9 @@ class ImagePreview(QWidget):
                    Qt.DashLine if ghost else Qt.SolidLine)
         pen.setCosmetic(True)  # constant on-screen width at any zoom
         item.setPen(pen)
-        t = self._slice_display_transform()
+        # Lines live in the warped-canvas frame (base transform only): they
+        # render screen-straight, exactly where the backend will cut.
+        t = self._base_transform()
         if t is not None:
             item.setTransform(t)
         self.scene.addItem(item)

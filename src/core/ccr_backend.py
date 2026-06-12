@@ -1,7 +1,9 @@
 from typing import List, Optional
 import cv2
 from core.ccr_image import CCRImage
-from core.ccr_processor import ccr_normalize_with_reference, ccr_normalize_with_bwpoint, auto_fine_angle, auto_frame, auto_frame_v2
+from core.ccr_processor import (ccr_normalize_with_reference, ccr_normalize_with_bwpoint,
+                                ccr_normalize_with_refparams, auto_fine_angle, auto_frame,
+                                auto_frame_v2)
 import os
 import glob
 import concurrent.futures
@@ -415,8 +417,26 @@ class CCRBackend:
         if idx is not None and 0 <= idx < len(self.images):
             image_obj = self.images[idx]
             try:
-                if image_obj.reference_frame is None and self.black_point_bgr is not None and self.white_point_bgr is not None:
-                    # B/W point conversion — re-process from original full-res file
+                ci = getattr(image_obj, "conversion_inputs", None)
+                if ci is not None and ci.get("mode") == "ref_params":
+                    # Sliced child of a reference-converted parent: replay the
+                    # stored conversion constants at full resolution.
+                    ccr_normalize_with_refparams(image_obj, ci["p_lo"], ci["p_hi"], ci["od"],
+                                                 output_path=output_path,
+                                                 water_mark=not self.software_activated,
+                                                 jpg_out=jpg_output, jpg_quality=jpg_quality,
+                                                 max_long_side=max_long_side)
+                elif ci is not None and ci.get("mode") == "bw":
+                    # Use the anchors BAKED at convert time — resampling the
+                    # global points later must not change this image's export.
+                    black_point, white_point = ci["bw"]
+                    ccr_normalize_with_bwpoint(image_obj, black_point, white_point,
+                                               output_path=output_path,
+                                               water_mark=not self.software_activated,
+                                               jpg_out=jpg_output, jpg_quality=jpg_quality,
+                                               max_long_side=max_long_side)
+                elif image_obj.reference_frame is None and self.black_point_bgr is not None and self.white_point_bgr is not None:
+                    # Legacy/un-snapshotted B/W point conversion — global anchors
                     ccr_normalize_with_bwpoint(image_obj, self.black_point_bgr, self.white_point_bgr,
                                                output_path=output_path, water_mark=not self.software_activated,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
@@ -652,13 +672,19 @@ class CCRBackend:
                     display_name=f"{stem}_s{index}{ext}",
                 )
                 child.conversion_inputs = child_ci
+                # Inherit the parent's perceptual tint factor: the child's
+                # ctor derived one from CONVERTED pixels, which would render
+                # an inherited tint setting differently than the parent did.
+                child.tint_balance_factor = img_obj.tint_balance_factor
                 # Inherit the non-destructive base offsets; rebuild the
-                # preview when they differ from the ctor-time defaults.
+                # preview when the inherited state differs from what the
+                # ctor already rendered with.
                 child.contrast_base = img_obj.contrast_base
                 child.temperature_base = img_obj.temperature_base
                 child.brightness_base = img_obj.brightness_base
-                if (child.contrast_base, child.temperature_base,
-                        child.brightness_base) != (0, 0, -8):
+                if ((child.contrast_base, child.temperature_base,
+                        child.brightness_base) != (0, 0, -8)
+                        or img_obj.adjustment_settings.get("tint")):
                     child.update_thumbnail_and_preview()
                 children.append(child)
                 if progress_callback:

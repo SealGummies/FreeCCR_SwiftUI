@@ -238,6 +238,38 @@ class TestEditInheritance:
             ccr_backend.images[0].resized_raw.astype(np.int64),
             left.astype(np.int64), atol=3)
 
+    def test_ref_converted_child_exports(self, tmp_path):
+        """ref_params children must export through the full-res path (this
+        used to raise 'reference_frame is None' and fail every export)."""
+        path, img = self._scan_png(tmp_path)
+        parent = CCRImage(path)
+        parent.reference_frame = (20, 20, 580, 380)
+        ccr_backend.images = [parent]
+        ccr_backend.file_paths = [path]
+        ccr_backend.black_point_bgr = None
+        ccr_backend.white_point_bgr = None
+        ccr_backend.convert_negative_by_index(0)
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        out = str(tmp_path / "slice_export.tiff")
+        ok = ccr_backend.export_image_by_index(0, out, jpg_output=False)
+        assert ok
+        import tifffile
+        exported = tifffile.imread(out)
+        # Full-res export of the left half of a 600x400 source
+        assert exported.shape == (400, 300, 3)
+
+    def test_tint_balance_factor_inherited(self, tmp_path):
+        path, img = self._scan_png(tmp_path)
+        parent = CCRImage(path)
+        parent.reference_frame = (20, 20, 580, 380)
+        ccr_backend.images = [parent]
+        ccr_backend.file_paths = [path]
+        ccr_backend.convert_negative_by_index(0)
+        parent_factor = parent.tint_balance_factor
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        for child in ccr_backend.images:
+            assert child.tint_balance_factor == pytest.approx(parent_factor)
+
     def test_bases_inherited(self, tmp_path):
         path, img = self._scan_png(tmp_path)
         parent = CCRImage(path)

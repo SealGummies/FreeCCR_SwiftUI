@@ -1081,6 +1081,103 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     return rgb_result
 
 
+def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
+                                 output_path=None, water_mark=True, jpg_out=False,
+                                 jpg_quality=95, max_long_side=None):
+    """
+    Conversion/export pipeline for sliced children carrying precomputed
+    reference-conversion constants (conversion_inputs mode "ref_params").
+    The constants were derived from the parent's reference frame at slice
+    time; read_image applies the child's source_ops chain, so the identical
+    conversion replays at any resolution. Fine rotation set AFTER slicing is
+    applied at the end like the reference pipeline (display semantics).
+    """
+    total_start_time = time.time()
+    if output_path is not None:
+        img = ccr_image.read_image(ccr_image.file_path, preview=False)
+    else:
+        img = ccr_image.resized_raw
+    if img is None:
+        raise ValueError("CCRImage: could not load image data for ref-params conversion")
+
+    rgb_result = apply_reference_normalization(img, p_lo, p_hi, od_factors)
+
+    if output_path is None:
+        print(f"TOTAL ref-params normalization time: {time.time() - total_start_time:.3f}s")
+        return rgb_result
+
+    # --- Export path: adjustments, crop, flips, rotation, watermark, write ---
+    rgb_result = ccr_image.apply_adjustments(rgb_result)
+    rgb_result = apply_crop_to_image(rgb_result, getattr(ccr_image, 'crop_rect', None),
+                                     getattr(ccr_image, 'crop_angle', 0.0))
+
+    h_flip = ccr_image.horizontal_mirrored
+    v_flip = ccr_image.vertical_mirrored
+    if h_flip and v_flip:
+        rgb_result = cv2.flip(rgb_result, -1)
+    elif h_flip:
+        rgb_result = cv2.flip(rgb_result, 1)
+    elif v_flip:
+        rgb_result = cv2.flip(rgb_result, 0)
+
+    angle = ccr_image.rotation_angle % 360
+    if angle == 90:
+        rgb_result = np.rot90(rgb_result, k=3)
+    elif angle == 180:
+        rgb_result = np.rot90(rgb_result, k=2)
+    elif angle == 270:
+        rgb_result = np.rot90(rgb_result, k=1)
+
+    if water_mark:
+        rgb_result = np.ascontiguousarray(rgb_result)
+        h_out, w_out = rgb_result.shape[:2]
+        watermark_text = "FreeCCR Unpaid Demo"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = w_out / (30 * 32)
+        font_thickness = max(3, int(font_scale * 2))
+        text_size = cv2.getTextSize(watermark_text, font, font_scale, font_thickness)[0]
+        text_x = max(0, w_out - text_size[0] - 10)
+        text_y = max(text_size[1], h_out - text_size[1] - 10)
+        cv2.putText(rgb_result, watermark_text, (text_x, text_y),
+                    font, font_scale, (30000, 30000, 30000), font_thickness)
+
+    fine_angle = ccr_image.fine_rotation_angle / 100.0
+    if fine_angle != 0:
+        h_r, w_r = rgb_result.shape[:2]
+        center_r = (w_r // 2, h_r // 2)
+        rot_mat = cv2.getRotationMatrix2D(center_r, -fine_angle, 1.0)
+        abs_cos = abs(rot_mat[0, 0])
+        abs_sin = abs(rot_mat[0, 1])
+        new_w = int(w_r * abs_cos + h_r * abs_sin)
+        new_h = int(h_r * abs_cos + w_r * abs_sin)
+        rot_mat[0, 2] += (new_w - w_r) / 2
+        rot_mat[1, 2] += (new_h - h_r) / 2
+        try:
+            rgb_result = cv2.warpAffine(rgb_result, rot_mat, (new_w, new_h),
+                                        flags=cv2.INTER_LINEAR,
+                                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        except Exception as e:
+            print(f"Warning: warpAffine failed: {e}")
+
+    output_path = safe_unicode_path(output_path)
+    if max_long_side:
+        rgb_result = ccr_image.resize_image_to_max_pixel(rgb_result, max_long_side)
+    if jpg_out:
+        output_path = os.path.splitext(output_path)[0] + ".jpg"
+        img_8 = to_8bit(rgb_result)
+        img_8 = cv2.cvtColor(img_8, cv2.COLOR_RGB2BGR)
+        if not safe_cv2_imwrite(output_path, img_8,
+                                [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)]):
+            raise IOError(f"Failed to save image to {output_path}")
+    else:
+        output_path = os.path.splitext(output_path)[0] + ".tiff"
+        if not safe_tifffile_imwrite(output_path, rgb_result, compression='deflate'):
+            raise IOError(f"Failed to save image to {output_path}")
+    print(f"TOTAL ref-params normalization time: {time.time() - total_start_time:.3f}s")
+    gc.collect()
+    return None
+
+
 def to_8bit(img16: np.ndarray) -> np.ndarray:
     # Clip to 16-bit range, then scale to 8-bit
     img16 = np.clip(img16, 0, 65535)
