@@ -127,6 +127,15 @@ class ThumbnailList(QWidget):
         QApplication.processEvents()
 
     def load_thumbnails(self):
+        # Guard re-entrancy: the per-5-items processEvents below can deliver
+        # a right-click whose menu mutates the backend and re-enters here.
+        self._rebuilding = True
+        try:
+            self._load_thumbnails_inner()
+        finally:
+            self._rebuilding = False
+
+    def _load_thumbnails_inner(self):
         self.thumbnail_list.clear()
         image_count = ccr_backend.get_image_count()
         logging.info(f"Loading {image_count} images from backend")
@@ -159,8 +168,14 @@ class ThumbnailList(QWidget):
             # Clear any existing hint when images are loaded
             self._main_window().sliders_panel.clear_hint()
         else:
-            # Set hint when no images are loaded
+            # Set hint when no images are loaded, and clear the preview —
+            # otherwise the last removed image stays on the canvas with
+            # stale state (and its memory pinned).
             self._main_window().sliders_panel.set_hint("<b>Hint:</b><br>Use file menu to import folder or files.")
+            try:
+                self._main_window().image_preview.clear_preview()
+            except AttributeError:
+                pass
 
         if hasattr(self, 'loading_dialog') and self.loading_dialog is not None:
             self.loading_dialog.accept()  # Close the dialog
@@ -207,11 +222,17 @@ class ThumbnailList(QWidget):
                        for item in self.thumbnail_list.selectedItems()})
 
     def show_context_menu(self, pos):
+        if getattr(self, "_rebuilding", False):
+            return  # list is mid-rebuild; stale items must not act
         item = self.thumbnail_list.itemAt(pos)
         if item is None:
             return
-        # Right-clicking outside the current selection targets just that item
+        # Right-clicking outside the current selection targets just that
+        # item. clearSelection() is required: with Ctrl/Shift still held,
+        # setCurrentItem alone KEEPS committed selection ranges and would
+        # make the menu act on a wrong multi-item set.
         if not item.isSelected():
+            self.thumbnail_list.clearSelection()
             self.thumbnail_list.setCurrentItem(item)
         indices = self.selected_indices()
         if not indices:

@@ -767,6 +767,32 @@ class ImagePreview(QWidget):
         # Esc: leave crop mode without changing the crop
         QShortcut(QKeySequence(Qt.Key_Escape), self, self._on_escape_key)
 
+    def clear_preview(self):
+        """Empty the canvas after the last image is removed: drop all
+        references to the deleted image (incl. the hi-res cache memory) and
+        reset the view state."""
+        if self.crop_mode:
+            self._exit_crop_mode()
+        if self.slice_mode:
+            self._exit_slice_mode()
+        self._release_hires(refresh=False)
+        self.current_idx = None
+        self._current_image_ref = None
+        self.current_pixmap = None
+        self.pixmap_item = None
+        self.reference_rect_item = None
+        self.view._bw_rect_item = None
+        self.scene.clear()
+        self._crop_overlay_item = None
+        self._crop_handle_items = []
+        self._slice_ghost_item = None
+        self._slice_dim_item = None
+        self._zoom = 1.0
+        self._item_prescale = 1.0
+        self.rotation_slider.setEnabled(False)
+        self._sync_zoom_combo()
+        self._update_unconvert_action_state()
+
     def _on_enter_key(self):
         if self.crop_mode:
             # Confirming a crop is display-level only — never re-converts.

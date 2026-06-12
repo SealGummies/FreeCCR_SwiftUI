@@ -76,7 +76,8 @@ class TestDuplicate:
         dup.resized_raw[0, 0] = 0
         assert img.adjustment_settings == {"contrast": 5}
         assert img.crop_rect is None
-        assert img.resized_raw[0, 0, 0] != 0 or True  # pixels not shared
+        # The dup pixel write must not alias the original (scan pixels >= 1000)
+        assert img.resized_raw[0, 0, 0] != 0
         assert dup.resized_raw.base is None
         assert dup.resized_raw is not img.resized_raw
 
@@ -133,6 +134,30 @@ class TestRemoveMultiple:
         ccr_backend.images = [CCRImage(p)]
         assert ccr_backend.remove_images_by_indices([5, -1]) == 0
         assert ccr_backend.get_image_count() == 1
+
+    def test_full_removal_deletes_catalog_record(self, tmp_path, monkeypatch):
+        """Explicitly removing ALL images of a file must also drop its
+        catalog record — otherwise a deleted duplicate resurrects on the
+        next open."""
+        cat = str(tmp_path / "catalog.json")
+        monkeypatch.setattr(catalog, "default_catalog_path", lambda: cat)
+        path, _ = _scan_png(tmp_path)
+        ccr_backend.images = [CCRImage(path)]
+        ccr_backend.duplicate_images_by_indices([0])
+        catalog.update_for_images(ccr_backend.images, path=cat)
+        assert catalog.entries_for_path(path, path=cat) is not None
+        ccr_backend.remove_images_by_indices([0, 1])
+        assert catalog.entries_for_path(path, path=cat) is None
+
+    def test_partial_removal_keeps_record(self, tmp_path, monkeypatch):
+        cat = str(tmp_path / "catalog.json")
+        monkeypatch.setattr(catalog, "default_catalog_path", lambda: cat)
+        path, _ = _scan_png(tmp_path)
+        ccr_backend.images = [CCRImage(path)]
+        ccr_backend.duplicate_images_by_indices([0])
+        catalog.update_for_images(ccr_backend.images, path=cat)
+        ccr_backend.remove_images_by_indices([1])  # remove only the dup
+        assert catalog.entries_for_path(path, path=cat) is not None
 
 
 if __name__ == "__main__":

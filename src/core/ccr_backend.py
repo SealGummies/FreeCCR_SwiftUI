@@ -572,13 +572,27 @@ class CCRBackend:
             self.file_paths = [img.file_path for img in self.images]
 
     def remove_images_by_indices(self, indices) -> int:
-        """Remove several images at once. Returns how many were removed."""
+        """Remove several images at once. Returns how many were removed.
+        When the removal covers ALL images of a file, that file's catalog
+        record is deleted too — an explicit discard must not resurrect the
+        removed images (e.g. duplicates) on the next open."""
+        affected_paths = set()
         removed = 0
         for idx in sorted(set(indices), reverse=True):
             if 0 <= idx < len(self.images):
+                affected_paths.add(self.images[idx].file_path)
                 del self.images[idx]
                 removed += 1
         self.file_paths = [img.file_path for img in self.images]
+        if removed:
+            surviving_paths = set(self.file_paths)
+            emptied = {p for p in affected_paths if p not in surviving_paths}
+            if emptied:
+                try:
+                    from core.catalog import remove_records_for_files
+                    remove_records_for_files(emptied)
+                except Exception as e:
+                    print(f"Catalog record removal failed: {e}")
         return removed
 
     def duplicate_images_by_indices(self, indices) -> int:

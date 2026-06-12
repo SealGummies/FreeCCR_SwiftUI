@@ -165,6 +165,21 @@ def update_for_images(images, path: str = None) -> None:
     save_catalog(catalog, path)
 
 
+def remove_records_for_files(file_paths, path: str = None) -> None:
+    """Delete the catalog records for files whose images the user explicitly
+    removed entirely — otherwise reopening them would resurrect images
+    (e.g. duplicates) that were deliberately discarded."""
+    catalog = load_catalog(path)
+    changed = False
+    for file_path in file_paths:
+        fkey = _file_key(file_path)
+        if fkey in catalog["files"]:
+            del catalog["files"][fkey]
+            changed = True
+    if changed:
+        save_catalog(catalog, path)
+
+
 def entries_for_path(file_path: str, path: str = None, catalog_data: dict = None):
     """Catalog entries for a file, or None when absent or when the file has
     changed since it was cataloged (stale edits must not be misapplied).
