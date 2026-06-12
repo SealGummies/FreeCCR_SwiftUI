@@ -36,6 +36,7 @@ def _conversion_stub(img, ref_rect, fine_rot=0):
     s.brightness_base = -8
     s.adjustment_settings = {}
     s.conversion_inputs = None
+    s.source_region = None
     return s
 
 

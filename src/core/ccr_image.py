@@ -39,9 +39,21 @@ class CCRImage:
         horizontal_mirrored: bool = False,
         vertical_mirrored: bool = False,
         converted: bool = False,
+        source_region: Optional[tuple[float, float, float, float]] = None,
+        preloaded_img: Optional[np.ndarray] = None,
+        preloaded_full_size: Optional[tuple[int, int]] = None,
+        display_name: Optional[str] = None,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
+        # Sliced images own only a region of the source file: normalized
+        # (x1, y1, x2, y2) fractions in ORIGINAL-file coordinates, applied by
+        # read_image in every path (preview load, hi-res zoom, full-res
+        # export, B/W sampling). None = whole file.
+        self.source_region = source_region
+        # Display/export name override (e.g. "scan_s2.ARW" for slice #2);
+        # None = use the file's basename.
+        self.display_name = display_name
         self.thumbnail = thumbnail
         self.resized_raw = resized_raw
         self.reference_frame = reference_frame
@@ -74,10 +86,19 @@ class CCRImage:
         self.original_full_size: Optional[tuple[int, int]] = None  # (height, width) of the full-res source, set by read_image
 
         self.info = self.get_camera_and_lens_for_lensfun(self.file_path)  # Extract camera and lens info for lensfun
-        
+
         # Read image from file and populate resized_raw (downsized to 1080
-        # long side inside the reader, before white-level scaling)
-        img = self.read_image(self.file_path, max_long_side=1080)
+        # long side inside the reader, before white-level scaling). Slicing
+        # passes preloaded_img (the shared parent decode, already cropped to
+        # this slice's region) so N slices don't re-decode the file N times.
+        if preloaded_img is not None:
+            self.original_full_size = preloaded_full_size
+            img = self.resize_image_to_max_pixel(preloaded_img, 1080)
+            if img is preloaded_img or img.base is not None:
+                # Never retain a view of the shared parent decode
+                img = img.copy()
+        else:
+            img = self.read_image(self.file_path, max_long_side=1080)
         if img is not None:
             self.resized_raw = img
             #correct lens distortion and vignetting if possible
@@ -130,6 +151,27 @@ class CCRImage:
             self.update_thumbnail_and_preview()
         else:
             logging.error(f"Failed to reload image: {self.file_path}")
+
+    def _apply_source_region(self, img: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Crop a decoded image to this CCRImage's source_region (normalized
+        fractions of the source file). Identity when no region is set."""
+        if self.source_region is None or img is None:
+            return img
+        h, w = img.shape[:2]
+        fx1, fy1, fx2, fy2 = self.source_region
+        x1 = max(0, min(w - 1, int(round(fx1 * w))))
+        y1 = max(0, min(h - 1, int(round(fy1 * h))))
+        x2 = max(x1 + 1, min(w, int(round(fx2 * w))))
+        y2 = max(y1 + 1, min(h, int(round(fy2 * h))))
+        return img[y1:y2, x1:x2]
+
+    def _region_full_size(self, full_hw: tuple) -> tuple:
+        """Full-resolution (height, width) of this image's source_region."""
+        if self.source_region is None:
+            return full_hw
+        fx1, fy1, fx2, fy2 = self.source_region
+        return (max(1, int(round((fy2 - fy1) * full_hw[0]))),
+                max(1, int(round((fx2 - fx1) * full_hw[1]))))
 
     def resize_image_to_max_pixel(self, image: np.ndarray, max_long_side: int) -> np.ndarray:
         """
@@ -229,6 +271,12 @@ class CCRImage:
                             four_color_rgb=False,     # Standard 3-color processing
                         )
 
+                    # Sliced images read only their region of the source
+                    if self.source_region is not None:
+                        rgb = self._apply_source_region(rgb)
+                        if self.original_full_size:
+                            self.original_full_size = self._region_full_size(self.original_full_size)
+
                     # Downsize before white-level scaling when a target size is
                     # known (see docstring — measured ~100 ms saved per image).
                     if max_long_side:
@@ -325,6 +373,8 @@ class CCRImage:
             # Convert to 16-bit if needed
             if img.dtype != np.uint16:
                 img = img.astype(np.uint16) * 257 if img.dtype == np.uint8 else img
+            # Sliced images read only their region of the source
+            img = self._apply_source_region(img)
             # This branch always reads at full resolution regardless of `preview`
             self.original_full_size = (img.shape[0], img.shape[1])
             if max_long_side:

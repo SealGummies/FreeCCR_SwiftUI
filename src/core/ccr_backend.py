@@ -535,6 +535,81 @@ class CCRBackend:
             del self.images[idx]
             self.file_paths = [img.file_path for img in self.images]
 
+    @staticmethod
+    def _clean_slice_cuts(cuts) -> list:
+        """Sorted cut fractions with 0/1 boundaries; drops cuts within 1% of
+        an edge or of each other."""
+        bounds = [0.0]
+        for value in sorted(c for c in cuts if 0.01 <= c <= 0.99):
+            if value - bounds[-1] >= 0.01:
+                bounds.append(value)
+        bounds.append(1.0)
+        return bounds
+
+    def slice_image_by_index(self, idx: int, x_cuts, y_cuts, progress_callback=None) -> int:
+        """
+        Split the image at idx into a grid of separate images along the given
+        cut positions (fractions of the image's own coordinates; x_cuts are
+        vertical lines, y_cuts horizontal). The slices replace the original
+        in the list, in reading order (left-to-right, top-to-bottom). Each
+        slice is a fresh un-converted CCRImage whose source_region maps back
+        to the ORIGINAL file, so conversion, zoom detail, and export all read
+        the correct region at full quality. The source is decoded only once.
+        Returns the number of slices created (0 = nothing done).
+        """
+        img_obj = self.get_image_by_index(idx)
+        if img_obj is None:
+            return 0
+        xs = self._clean_slice_cuts(x_cuts)
+        ys = self._clean_slice_cuts(y_cuts)
+        total = (len(xs) - 1) * (len(ys) - 1)
+        if total <= 1:
+            return 0
+
+        # One shared decode (region-aware when slicing an existing slice)
+        full = img_obj.read_image(img_obj.file_path, preview=True)
+        if full is None:
+            return 0
+        h, w = full.shape[:2]
+        px1, py1, px2, py2 = img_obj.source_region or (0.0, 0.0, 1.0, 1.0)
+        parent_w_frac, parent_h_frac = px2 - px1, py2 - py1
+        parent_full = img_obj.original_full_size or (h, w)
+        stem, ext = os.path.splitext(os.path.basename(img_obj.file_path))
+
+        children = []
+        if progress_callback:
+            progress_callback(0, total)
+        for yi in range(len(ys) - 1):
+            for xi in range(len(xs) - 1):
+                fx1, fx2 = xs[xi], xs[xi + 1]
+                fy1, fy2 = ys[yi], ys[yi + 1]
+                cx1 = max(0, min(w - 1, int(round(fx1 * w))))
+                cy1 = max(0, min(h - 1, int(round(fy1 * h))))
+                cx2 = max(cx1 + 1, min(w, int(round(fx2 * w))))
+                cy2 = max(cy1 + 1, min(h, int(round(fy2 * h))))
+                # Compose into ORIGINAL-file coordinates (parents may
+                # themselves already be slices)
+                region = (px1 + fx1 * parent_w_frac, py1 + fy1 * parent_h_frac,
+                          px1 + fx2 * parent_w_frac, py1 + fy2 * parent_h_frac)
+                child_full = (max(1, int(round((fy2 - fy1) * parent_full[0]))),
+                              max(1, int(round((fx2 - fx1) * parent_full[1]))))
+                index = len(children) + 1
+                child = CCRImage(
+                    img_obj.file_path,
+                    source_region=region,
+                    preloaded_img=full[cy1:cy2, cx1:cx2],
+                    preloaded_full_size=child_full,
+                    display_name=f"{stem}_s{index}{ext}",
+                )
+                children.append(child)
+                if progress_callback:
+                    progress_callback(len(children), total)
+
+        self.images[idx:idx + 1] = children
+        self.file_paths = [im.file_path for im in self.images]
+        print(f"Sliced {os.path.basename(img_obj.file_path)} into {len(children)} images")
+        return len(children)
+
     def set_white_point(self, bgr_tuple):
         self.white_point_bgr = bgr_tuple
 

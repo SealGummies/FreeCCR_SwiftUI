@@ -291,9 +291,20 @@ class SlidersPanel(QWidget):
             "Crop the image. Drag to draw a box; drag the handles to resize, "
             "the top knob to rotate, the center to move. Enter confirms, "
             "Esc cancels, right-click clears the crop.")
+        # Slice: split one scan containing several photos into separate
+        # images. Not conversion-gated — slicing is most useful BEFORE
+        # converting, so each frame gets its own reference/conversion.
+        self.slice_btn = QPushButton("Slice")
+        self.slice_btn.setToolTip(
+            "Split a scan containing multiple photos into separate images. "
+            "Move along the top/bottom edge for a vertical cut or the "
+            "left/right edge for a horizontal cut; click to place a line, "
+            "drag to adjust, right-click to delete, Enter to slice, "
+            "Esc to cancel.")
         wb_crop_row = QHBoxLayout()
         wb_crop_row.addWidget(self.wb_picker_btn)
         wb_crop_row.addWidget(self.crop_btn)
+        wb_crop_row.addWidget(self.slice_btn)
         wb_crop_row.addStretch()
         scroll_layout.addLayout(wb_crop_row)
 
@@ -388,6 +399,7 @@ class SlidersPanel(QWidget):
         self.sync_to_all_button.clicked.connect(self.on_sync_to_all_clicked)
         self.wb_picker_btn.clicked.connect(self._on_pick_neutral_point)
         self.crop_btn.clicked.connect(self._on_crop_clicked)
+        self.slice_btn.clicked.connect(self._on_slice_clicked)
         self.white_point_btn.clicked.connect(self._on_set_white_point)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
         self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
@@ -726,6 +738,20 @@ class SlidersPanel(QWidget):
                 "top knob to rotate, center to move. <b>Enter</b> = confirm, "
                 "<b>Esc</b> = cancel, right-click = clear crop, "
                 "<b>Crop</b> again = exit.", duration=12000)
+
+    def _on_slice_clicked(self):
+        if not (hasattr(self, 'image_preview') and self.image_preview):
+            return
+        # Toggle: clicking Slice again leaves slice mode without slicing
+        if self.image_preview.slice_mode:
+            self.image_preview.cancel_slice_mode()
+            return
+        if self.image_preview.enter_slice_mode():
+            self.set_temporary_hint(
+                "<b>Slice:</b> move near the top/bottom rim for a vertical "
+                "cut, the left/right rim for a horizontal cut. Click = place "
+                "line, drag = adjust, right-click = delete, <b>Enter</b> = "
+                "slice, <b>Esc</b> = cancel.", duration=12000)
 
     def on_wb_sampled(self, temp_value, tint_value):
         """Apply the auto-computed temperature/tint from the WB eyedropper."""

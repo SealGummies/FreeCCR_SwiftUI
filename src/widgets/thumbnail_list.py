@@ -130,9 +130,14 @@ class ThumbnailList(QWidget):
         logging.info(f"Loading {image_count} images from backend")
         for idx in range(image_count):
             thumbnail = ccr_backend.get_thumbnail_by_index(idx)
-            # Get filename from the CCRImage object itself (always in sync)
+            # Get filename from the CCRImage object itself (always in sync);
+            # sliced images carry a distinguishing display name (e.g. _s2)
             img_obj = ccr_backend.get_image_by_index(idx)
-            filename = os.path.basename(img_obj.file_path) if img_obj is not None else ""
+            if img_obj is None:
+                filename = ""
+            else:
+                filename = (getattr(img_obj, "display_name", None)
+                            or os.path.basename(img_obj.file_path))
             item = QListWidgetItem(filename)  # Set filename as item text
             # Apply rotations and flips using PySide6 transformations
             transformed_thumbnail = self.apply_frontend_transformations(thumbnail, idx)
