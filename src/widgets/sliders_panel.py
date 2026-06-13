@@ -23,7 +23,8 @@ SYNC_GROUPS = [
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint")),
-    ("bands", "Subtractive Saturations (per color)", BAND_ADJUSTMENT_KEYS),
+    ("bands", "Subtractive Saturations (per color)",
+     tuple(BAND_ADJUSTMENT_KEYS) + ("band_feather",)),
 ]
 
 
@@ -186,7 +187,11 @@ class SlidersPanel(QWidget):
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
         # Per-color-band sliders (Subtractive Saturations section, created
         # last): band_<color>_<param> for the color bands × 4 params
-    ] + list(BAND_ADJUSTMENT_KEYS)
+    ] + list(BAND_ADJUSTMENT_KEYS) + [
+        # Global spatial-feather amount for the band effect (created after the
+        # per-band sliders, so it stays last in the positional zip).
+        "band_feather",
+    ]
 
     # Color Profile combo: row index -> CCRImage.color_profile value.
     COLOR_PROFILES = ("color", "bw")
@@ -458,6 +463,13 @@ class SlidersPanel(QWidget):
             page.setVisible(False)
             self.band_section.add_widget(page)
             self._band_pages[color] = page
+
+        # Global feather (softness): spatially low-passes the band correction
+        # to soften hard colour-selection edges. 0 = off. Applies to all
+        # bands, so it lives below the per-band pages. Created LAST so it maps
+        # to the trailing "band_feather" key in ADJUSTMENT_KEYS.
+        self.band_section.add_layout(
+            self.create_slider("Feather", min_value=0, max_value=100))
         self._show_band_page("red")
 
         # --- Signal connections ---
@@ -511,10 +523,10 @@ class SlidersPanel(QWidget):
             self.histogram_label.clear()
             self.histogram_label.setText("")
 
-    def create_slider(self, label_text):
+    def create_slider(self, label_text, min_value=-100, max_value=100):
         slider = ResettableSlider(Qt.Horizontal)
-        slider.setMinimum(-100)
-        slider.setMaximum(100)
+        slider.setMinimum(min_value)
+        slider.setMaximum(max_value)
         slider.setValue(0)
         slider.setOrientation(Qt.Horizontal)
         slider.setTickInterval(10)
