@@ -1,177 +1,219 @@
+<div align="center">
+
+<img src="src/icons/freeccr_logo.png" width="130" alt="FreeCCR logo">
+
 # FreeCCR
 
-**FreeCCR** is a cross-platform desktop application for batch image preview, selection, negative conversion, and color correction, supporting a wide range of RAW and standard image formats.
+**Turn your color-negative film scans into beautiful, accurate positives — free, local, and physics-based.**
+
+No subscriptions. No license keys. No cloud. Your images never leave your computer.
+
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue?style=flat-square)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey?style=flat-square)
+![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)
+![Built with PySide6](https://img.shields.io/badge/built%20with-PySide6-41CD52?style=flat-square&logo=qt&logoColor=white)
+![Price: Free](https://img.shields.io/badge/price-free-success?style=flat-square)
+
+[**Download**](#-download--install) · [Quick Start](#-quick-start) · [How conversion works](#-how-film-conversion-works) · [Build from source](#-build-from-source)
+
+</div>
+
+<div align="center">
+  <img src="docs/screenshot.png" width="900" alt="FreeCCR converting a roll of color negative film — thumbnail strip, large preview, histogram, and adjustment panel">
+</div>
 
 ---
 
-## Features
+## What is FreeCCR?
 
-- Accurate Negative Image conversion based on physics
-- Fast thumbnail preview for RAW and standard image files
-- Batch image loading from folders or file selection
-- Image preview with color correction sliders
-- Modern, responsive UI built with PySide6 (Qt for Python)
-- Unlocked build: no activation or verification required
+FreeCCR is a free, open-source desktop app for photographers who shoot color negative film. Load a whole roll, set two reference points, and it converts every frame consistently — using a **physics-based pipeline** that models how film actually responds to light, instead of a naive `255 − value` invert.
+
+It runs entirely on your machine, handles RAW straight out of your scanner, and includes a full set of color-correction tools for fine-tuning. The output is scientific and color-accurate — a clean starting point you can take into your editor of choice.
+
+## ✨ Features
+
+- 🎞️ **Physics-based negative conversion** — accounts for film's non-linear response, dye characteristics, and density range, not just a pixel flip.
+- 🎯 **Two-point anchoring** — sample the film's white and black references once, then convert the entire roll consistently regardless of scene content.
+- ⚡ **Auto mode** — automatic frame detection and conversion for a fast first pass.
+- 📂 **Batch everything** — load a whole folder or roll at once. Supports RAW (CR3, CR2, NEF, ARW, DNG, …) and standard formats (TIFF, JPEG, PNG).
+- 🎚️ **Full color correction** — temperature, tint, exposure, brightness, contrast, saturation, and white/black points, with live histogram and zoom.
+- 🔁 **Sync & copy/paste adjustments** across frames so a whole roll matches in seconds.
+- 🚀 **Optional OpenCL GPU acceleration** for faster processing on supported hardware.
+- 🔒 **Completely offline** — all processing is local; nothing is ever uploaded.
+- 🆓 **Free & open source** (AGPL-3.0) — no activation, no watermark gate, no strings.
 
 ---
 
-## Installation
+## 📥 Download & Install
 
-Download the latest release from the [Releases page](https://github.com/toonoumi/FreeCCR/releases).
+Grab the latest build from the [**Releases page**](https://github.com/toonoumi/FreeCCR/releases).
 
-**Windows** — run `FreeCCR_Install_<version>.exe` and follow the installer.
+### Windows
 
-**macOS** — unzip `FreeCCR_macOS_<version>.zip` and move `FreeCCR.app` to your Applications folder. Because the app is not notarized, macOS Gatekeeper will block it on first launch with a *"damaged and can't be opened"* message. This is expected — the app is not damaged. Run this command once in Terminal to clear the quarantine flag:
+Run `FreeCCR_Install_<version>.exe` and follow the installer. That's it.
+
+### macOS
+
+Unzip `FreeCCR_macOS_<version>.zip` and move `FreeCCR.app` to your **Applications** folder.
+
+Because the app isn't notarized, Gatekeeper may block the first launch with a *"damaged and can't be opened"* message. **The app isn't damaged** — macOS just flags unsigned downloads. Clear the quarantine flag once in Terminal:
 
 ```bash
 xattr -r -d com.apple.quarantine /Applications/FreeCCR.app
 ```
 
-Then double-click the app normally. Alternatively, right-click the app → **Open** → **Open** in the dialog.
+Then open it normally. (Alternatively: right-click the app → **Open** → **Open**.)
 
 ---
 
-## Film Development & Scanning Labs
+## 🚀 Quick Start
 
-If you need a lab to develop and scan your film before using FreeCCR, check the global film developing and scanning lab directory at [FilmPhotoDeveloping.com](http://filmphotodeveloping.com/).
+The fastest path from scan to finished positive:
+
+1. **Load your scans** — *File → Load Images from Folder* (or *Load Individual Images*).
+2. **Click Auto** — FreeCCR detects frames and converts the batch in one pass.
+3. **Check the frames** — redraw any reference frame that caught a sprocket hole, the film holder, or a neighboring frame. Including a little film base around the image gives the best result.
+4. **Convert** — press **Enter** or click **Convert** to re-run a frame after adjusting it.
+5. **Fine-tune** with the right-hand sliders, then use **Sync to All** (or `Ctrl/Cmd+C` / `Ctrl/Cmd+V`) to carry adjustments across the roll.
+6. **Export** — *Export* or *Export All* to your chosen folder (tick **Export JPG** for web-ready files).
+
+> 💡 For the most accurate, roll-wide consistency, use the **B/W Point** workflow below instead of relying on Auto alone.
 
 ---
 
-## Film Negative Conversion
+## 🎞️ How Film Conversion Works
 
-FreeCCR converts color negative film scans to positive images. It does not guess — it maps what the scanner actually captured. **The software cannot compensate for a bad scan.**
+FreeCCR doesn't guess — it maps what your scanner actually captured. That means a good scan in gives a good positive out, and **the software can't compensate for a bad scan**.
 
-> **Process one roll at a time.** The B/W point anchors are physical properties of a specific film stock, development, and scan session. Mixing frames from different rolls — or even the same roll scanned in separate sessions — will produce inconsistent results.
-
----
+> ⚠️ **Process one roll at a time.** The black/white anchors are physical properties of a specific film stock, development, and scan session. Mixing frames from different rolls — or the same roll scanned in separate sessions — produces inconsistent results.
 
 ### Workflow 1 — B/W Point (recommended)
 
-This is the most accurate method. You sample two anchor values directly from the scan: the fully exposed head or tail (white point) and the clear film base (black point). FreeCCR then maps the entire roll using those absolute anchors, so every frame inverts consistently regardless of scene content.
+The most accurate method. You sample two anchor values directly from the scan: the **fully exposed head or tail** (white point) and the **clear film base** (black point). FreeCCR maps the whole roll from those absolute anchors, so every frame inverts consistently regardless of scene content.
 
-> **Scanning requirement for this workflow:** You must scan a frame (or partial frame) that includes the **fully exposed area** of the roll — typically the head or tail leader that was exposed to light before or after shooting. Without it, there is no physical reference to set the white point from.
+> 📷 **Scanning requirement:** You must scan a frame (or partial frame) that includes the **fully exposed area** of the roll — usually the head or tail leader exposed to light before or after shooting. Without it, there's no physical reference for the white point.
 
-**Step-by-step:**
+<div align="center">
+  <img src="docs/bw-point-workflow.png" width="900" alt="FreeCCR B/W Point workflow: setting the white point on the fully exposed leader and the black point on the clear film base, then Convert All">
+  <br>
+  <sub><b>①</b> Set White Point → <b>②</b> sample the fully exposed leader &nbsp;·&nbsp; <b>③</b> Set Black Point → <b>④</b> sample the clear film base &nbsp;·&nbsp; <b>⑤</b> Convert All</sub>
+</div>
+
+**Step by step:**
 
 1. Load an entire roll — one roll at a time.
-2. Find the scan that contains the **fully exposed head or tail** of the roll. On the scanner it appears as the darkest area of the film, because maximum exposure creates maximum dye density.
-3. Right-click on that fully exposed area and **set the white point**. This is the densest point the film can reach and anchors the top of the positive tonal range.
-4. Find a clear strip of **film base** — the unexposed rebate between frames or the edge of the frame. This is the lightest area on the scan.
-5. Right-click on the film base and **set the black point**. This anchors the bottom of the positive tonal range.
-6. Click **Convert All**. Every frame on the roll is inverted using the same two anchors.
-7. Use the sliders (exposure, contrast, white balance) for per-image fine-tuning after conversion.
+2. Find the scan containing the **fully exposed head or tail** of the roll — the leader that was blown out to light. FreeCCR shows it as the bright, washed-out strip.
+3. **①** Click **Set White Point**, then **②** sample that fully exposed area. It's the most light the film ever saw, so it anchors the top (white) of the tonal range.
+4. Find a patch of **clear film base** — the unexposed rebate beside the frame, which FreeCCR shows as the dark area.
+5. **③** Click **Set Black Point**, then **④** sample the film base to anchor the bottom (black) of the tonal range.
+6. **⑤** Click **Convert All (B/W Point)**. Every frame on the roll inverts from those same two anchors.
+7. Use the sliders for per-image fine-tuning afterward.
 
-**Why this works:** The fully exposed leader defines the absolute maximum density for that film stock and development. The film base defines the absolute minimum. By anchoring to these two physical references, every frame inverts consistently — regardless of how bright or dark each scene was.
+**Why it works:** the fully exposed leader is the most light the film could possibly record, so it defines the absolute maximum for that stock and development; the clear film base defines the absolute minimum. Anchoring to these two physical references makes every frame invert consistently — no matter how bright or dark each scene was.
 
-**What can go wrong:**
-- If no fully exposed area was scanned, you have no valid white point reference. Rescan to include the leader or tail.
-- If the film base sample lands on a scratched or fogged area, the black point will be off — resample from a clean edge.
-- If the scanner used auto-exposure, the raw values differ between frames and batch conversion will be inconsistent. Rescan with a fixed exposure setting.
+**If something looks off:**
 
----
+- *No fully exposed area was scanned* → there's no valid white-point reference. Rescan to include the leader or tail.
+- *Film base sample landed on a scratch or fog* → resample the black point from a clean edge.
+- *The scanner used auto-exposure* → raw values differ frame to frame and batch conversion will be inconsistent. Rescan with a fixed exposure.
 
 ### Workflow 2 — Auto
 
-The auto workflow analyzes each frame's histogram independently and attempts to set the black and white points automatically. It requires no manual sampling, which makes it faster for simple rolls, but it is inherently per-frame — it has no knowledge of the film base or the physical density range of the stock being used.
+Auto analyzes each frame's histogram independently and sets black/white points for you. No manual sampling, so it's faster for simple rolls — but it's inherently per-frame and has no knowledge of the film base or the stock's physical density range.
 
-Use auto when:
-- Frames are simple and well-exposed with no extreme shadows or highlights.
-- You want a quick first-pass preview before committing to B/W point work.
+**Reach for Auto when:**
 
-Do not rely on auto when:
-- Frames vary widely in scene brightness (e.g. interiors next to bright exteriors on the same roll).
-- You need consistent tones across multiple frames for stitching or comparison.
+- Frames are simple and well-exposed, with no extreme shadows or highlights.
+- You want a quick first-pass preview before committing to B/W-point work.
+
+**Avoid Auto when:**
+
+- Brightness varies widely across the roll (e.g. interiors next to bright exteriors).
+- You need consistent tones across frames for stitching or comparison.
 - The roll includes underexposed or push-processed film.
 
----
-
-### Scanning requirements (applies to both workflows)
+### Scanning Requirements (both workflows)
 
 | Setting | Requirement |
 |---|---|
-| Exposure | **Fixed, manual** — do not use auto-exposure. Every frame on the roll must be scanned at exactly the same exposure setting. Auto-exposure changes the raw values frame-by-frame, destroying the absolute density information the conversion depends on. |
-| Auto-brightness / Auto-correction | **Off** |
-| Per-frame color correction | **Off** |
-| Bit depth | 16-bit preferred, 14-bit minimum |
-| Output color space | Linear or no ICC profile applied |
-| Roll handling | **Scan one complete roll per session.** Do not mix frames from different rolls or separate scan sessions. |
+| **Exposure** | **Fixed / manual.** Every frame must be scanned at exactly the same exposure. Auto-exposure changes raw values frame-by-frame and destroys the absolute density information conversion depends on. |
+| **Auto-brightness / auto-correction** | **Off** |
+| **Per-frame color correction** | **Off** |
+| **Bit depth** | 16-bit preferred, 14-bit minimum |
+| **Output color space** | Linear, or no ICC profile applied |
+| **Roll handling** | **One complete roll per session.** Don't mix frames from different rolls or separate scan sessions. |
 
-**A scan that violates any of these cannot be reliably converted by FreeCCR or any other software.** The physical density information is either absent or corrupted at the point of scanning — no software can recover it after the fact.
-
----
-
-## Requirements
-
-- Python 3.11.0 exactly (newer versions are incompatible with Nuitka compilation)
+> A scan that violates any of these can't be reliably converted by FreeCCR — or any other software. Once the physical density information is absent or corrupted at scan time, no tool can recover it afterward.
 
 ---
 
-## Running in development
+## 🧪 Need a Lab First?
+
+If you need somewhere to develop and scan your film before using FreeCCR, browse the global lab directory at [FilmPhotoDeveloping.com](http://filmphotodeveloping.com/).
+
+---
+
+## 🛠️ Build From Source
+
+### Run in development
+
+> **Requires Python 3.11.0 exactly** — newer versions fail to compile with Nuitka.
 
 ```bash
-git clone https://github.com/yourusername/freeccr.git
-cd freeccr
+git clone https://github.com/toonoumi/FreeCCR.git
+cd FreeCCR
 pip install -r requirements.txt
 python write_version.py   # required on first run or after tagging
 python src/main.py
 ```
 
----
+<details>
+<summary><strong>Build a standalone Windows executable + installer</strong></summary>
 
-## Building for Windows
-
-### Step 1 — Build the standalone executable
+#### Step 1 — Standalone executable
 
 ```bat
 build_exe.bat
 ```
 
-This generates the version file from the current git tag, then compiles `src/main.py` into a self-contained executable using Nuitka with MinGW64. All dependencies, PyOpenCL kernels, and icon assets are bundled automatically.
+Generates the version file from the current git tag, then compiles `src/main.py` into a self-contained executable with Nuitka + MinGW64. All dependencies, PyOpenCL kernels, and icon assets are bundled automatically.
 
-Output: `main.dist/` directory containing `freeccr.exe` and all required files.
+**Output:** `main.dist/` containing `freeccr.exe` and everything it needs.
 
-### Step 2 — Build the installer
+#### Step 2 — Installer
 
-Requires **[Inno Setup 6](https://jrsoftware.org/isinfo.php)** installed at `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`. If installed elsewhere, update `ISCC_PATH` in `windows_build_scripts/build_inno_installer.bat`.
+Requires **[Inno Setup 6](https://jrsoftware.org/isinfo.php)** at `C:\Program Files (x86)\Inno Setup 6\ISCC.exe` (update `ISCC_PATH` in `windows_build_scripts/build_inno_installer.bat` if it lives elsewhere).
 
-Before running, open `windows_build_scripts/inno_setup.iss` and update the `Source:` paths under `[Files]` to point to your local `main.dist\` directory.
+Before running, open `windows_build_scripts/inno_setup.iss` and point the `Source:` paths under `[Files]` to your local `main.dist\` directory.
 
 ```bat
 windows_build_scripts\build_inno_installer.bat
 ```
 
-The script reads the version from `git describe --tags`, injects it into the Inno Setup script, and compiles the installer. Output is written to `win_installer/FreeCCR_Install_<version>.exe`.
+The script reads the version from `git describe --tags`, injects it into the Inno Setup script, and compiles the installer to `win_installer/FreeCCR_Install_<version>.exe`.
 
----
+</details>
 
-## Building for macOS
+<details>
+<summary><strong>Build a macOS app bundle (signed / notarized)</strong></summary>
 
-### Prerequisites
+**Prerequisites:**
 
 - Xcode command line tools
-- An Apple Developer ID certificate (for distribution) or Apple Development certificate (for local testing)
+- An Apple Developer ID certificate (distribution) or Apple Development certificate (local testing)
 - `dmgbuild`: `pip install dmgbuild`
 
-Update the `SIGN_CERTIFICATE` variable at the top of the build script to match your certificate name as it appears in Keychain Access.
+Set the `SIGN_CERTIFICATE` variable at the top of the build script to your certificate name as it appears in Keychain Access.
 
-### Distribution build — signed and notarized DMG
+#### Distribution build — signed & notarized DMG
 
 ```bash
 bash macos_build_scripts/build_compatible.sh
 ```
 
-This script:
-1. Installs/upgrades dependencies and Nuitka
-2. Runs `write_version.py`
-3. Compiles with Nuitka targeting macOS 10.15+
-4. Assembles `FreeCCR.app` with `Info.plist` and icon
-5. Strips extended attributes (required for Gatekeeper)
-6. Code-signs all binaries and the app bundle with hardened runtime
-7. Packages into `FreeCCR.dmg` via dmgbuild
-8. Submits the DMG to Apple for notarization
-9. On success, moves the notarized DMG to `release/<version>/FreeCCR.dmg`
+This script installs/upgrades dependencies and Nuitka, runs `write_version.py`, compiles targeting macOS 10.15+, assembles `FreeCCR.app` with `Info.plist` and icon, strips extended attributes, code-signs with hardened runtime, packages into `FreeCCR.dmg` via dmgbuild, submits it to Apple for notarization, and on success moves the notarized DMG to `release/<version>/FreeCCR.dmg`.
 
-Notarization credentials must be stored in the keychain under the profile name `notaryccr`. Run this once to set it up:
+Store notarization credentials in the keychain under the profile name `notaryccr` once:
 
 ```bash
 xcrun notarytool store-credentials "notaryccr" \
@@ -180,30 +222,34 @@ xcrun notarytool store-credentials "notaryccr" \
   --password "app-specific-password"
 ```
 
-### Development build — local signing only
+#### Development build — local signing only
 
 ```bash
 bash macos_build_scripts/create_bundle.sh
 ```
 
-Assembles and locally signs the `.app` bundle and DMG without notarization. Suitable for internal testing.
+Assembles and locally signs the `.app` and DMG without notarization — fine for internal testing.
 
-## Activation
+</details>
 
-This build does not require activation. Startup verification and license checks are disabled.
+---
 
-## Releases
+## 🔒 Privacy
 
-Release links are not published in this repository.
+Everything happens on your computer. Images are never uploaded, there's no tracking or analytics of your workflow, and core features work fully offline.
 
-## License
+## 💬 Support
 
-FreeCCR is licensed under the [GNU Affero General Public License v3.0](LICENSE) (**AGPL-3.0**). Like GPLv3, it is **copyleft**: if you distribute modified versions, you must license those changes under the same terms and provide corresponding source code.
+Questions, bug reports, and feature requests are all welcome — open an [issue](https://github.com/toonoumi/FreeCCR/issues) right here on GitHub.
 
-AGPL adds a **network use** rule: if you **run** a modified version as a **service** (including SaaS) so users interact with it **remotely over a network**, you must offer those users the corresponding source—including for code you only deploy on servers. (Plain GPLv3 does not impose that obligation for typical SaaS.)
+## 📄 License
+
+FreeCCR is licensed under the [GNU Affero General Public License v3.0](LICENSE) (**AGPL-3.0**). Like GPLv3, it's **copyleft**: if you distribute modified versions, you must license your changes under the same terms and provide the corresponding source.
+
+AGPL adds a **network-use** clause: if you **run** a modified version as a **service** (including SaaS) where users interact with it remotely over a network, you must offer those users the corresponding source — including code you only deploy on servers. (Plain GPLv3 doesn't require this for typical SaaS.)
 
 Bundled third-party libraries remain under their own licenses in [`LICENSES/`](LICENSES/).
 
-## Notes
-
-- The previous activation test key is no longer needed.
+<div align="center">
+<sub>Made for film photographers · by Halo Imagery</sub>
+</div>
