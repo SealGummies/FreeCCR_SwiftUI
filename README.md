@@ -68,16 +68,19 @@ Then open it normally. (Alternatively: right-click the app → **Open** → **Op
 
 ## 🚀 Quick Start
 
-The fastest path from scan to finished positive:
+The recommended path is the **B/W Point** workflow — you anchor the whole roll to two physical reference points on the film, so every frame converts consistently:
 
-1. **Load your scans** — *File → Load Images from Folder* (or *Load Individual Images*).
-2. **Click Auto** — FreeCCR detects frames and converts the batch in one pass.
-3. **Check the frames** — redraw any reference frame that caught a sprocket hole, the film holder, or a neighboring frame. Including a little film base around the image gives the best result.
-4. **Convert** — press **Enter** or click **Convert** to re-run a frame after adjusting it.
-5. **Fine-tune** with the right-hand sliders, then use **Sync to All** (or `Ctrl/Cmd+C` / `Ctrl/Cmd+V`) to carry adjustments across the roll.
-6. **Export** — *Export* or *Export All* to your chosen folder (tick **Export JPG** for web-ready files).
+1. **Load a roll** — *File → Load Images from Folder* (work one roll at a time).
+2. **Frame each image** — draw a box around the image plus a little film base, steering clear of sprocket holes, the film holder, and any backlight.
+3. **Set White Point** — find the fully exposed leader (the bright, washed-out strip) and sample it.
+4. **Set Black Point** — sample a patch of clear film base.
+5. **Convert All (B/W Point)** — every frame inverts from those two anchors.
+6. **Fine-tune** with the right-hand sliders, then **Sync to All** (or `Ctrl/Cmd+C` / `Ctrl/Cmd+V`) to carry adjustments across the roll.
+7. **Export** — *Export* or *Export All* to your chosen folder (tick **Export JPG** for web-ready files).
 
-> 💡 For the most accurate, roll-wide consistency, use the **B/W Point** workflow below instead of relying on Auto alone.
+> 📖 Full walkthrough and scanning requirements: **[How Film Conversion Works](#-how-film-conversion-works)**.
+>
+> 🔁 **No exposed leader in your scans?** Fall back to the **Auto** workflow below — it sets the points per frame automatically. It's less consistent across a roll, but it doesn't need a physical white point.
 
 ---
 
@@ -117,12 +120,13 @@ The most accurate method. You sample two anchor values directly from the scan: t
 - *Film base sample landed on a scratch or fog* → resample the black point from a clean edge.
 - *The scanner used auto-exposure* → raw values differ frame to frame and batch conversion will be inconsistent. Rescan with a fixed exposure.
 
-### Workflow 2 — Auto
+### Workflow 2 — Auto (fallback)
 
-Auto analyzes each frame's histogram independently and sets black/white points for you. No manual sampling, so it's faster for simple rolls — but it's inherently per-frame and has no knowledge of the film base or the stock's physical density range.
+**Use this when your scans don't include a fully exposed leader**, so there's no physical white point to sample. Auto analyzes each frame's histogram independently and sets black/white points for you — no manual sampling required. Because it's per-frame, it has no knowledge of the film base or the stock's physical density range, and it won't match the roll-wide consistency of the B/W Point workflow.
 
 **Reach for Auto when:**
 
+- Your scans don't include a fully exposed leader to anchor a white point.
 - Frames are simple and well-exposed, with no extreme shadows or highlights.
 - You want a quick first-pass preview before committing to B/W-point work.
 
