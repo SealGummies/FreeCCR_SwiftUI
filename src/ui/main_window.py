@@ -217,6 +217,8 @@ class MainWindow(QMainWindow):
         # displayed content — a preserved zoom would strand the viewport.
         self.image_preview._reset_zoom()
         img.update_thumbnail_and_preview()
+        # Keep the Color Profile dropdown in step with the restored state.
+        self.sliders_panel._sync_color_profile_combo(idx)
         self.thumbnail_list.update_thumbnail(idx)
         self.image_preview.update_preview(idx)
         remaining = len(img.undo_stack)

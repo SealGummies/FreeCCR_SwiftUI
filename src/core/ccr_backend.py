@@ -653,6 +653,7 @@ class CCRBackend:
                 preloaded_img=img.resized_raw.copy(),
                 preloaded_full_size=img.original_full_size,
                 display_name=f"{stem}_copy{n}{ext}",
+                color_profile=img.color_profile,
             )
             dup.reference_frame = img.reference_frame
             dup.conversion_inputs = (dict(img.conversion_inputs)
@@ -824,6 +825,7 @@ class CCRBackend:
                     display_name=f"{stem}_s{index}{ext}",
                     slice_group=slice_group,
                     slice_parent=dict(slice_parent),
+                    color_profile=img_obj.color_profile,
                 )
                 child.conversion_inputs = child_ci
                 # Slices descend from the parent's loaded content — carry its
@@ -967,6 +969,7 @@ class CCRBackend:
                 slice_group=parent_group,
                 slice_parent=(dict(parent_slice_parent)
                               if parent_slice_parent else None),
+                color_profile=template.color_profile,
             )
         except Exception as e:
             print(f"Reset slice failed: could not re-decode "

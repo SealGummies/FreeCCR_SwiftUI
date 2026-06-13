@@ -46,6 +46,7 @@ class CCRImage:
         display_name: Optional[str] = None,
         slice_group: Optional[str] = None,
         slice_parent: Optional[Dict[str, Any]] = None,
+        color_profile: str = "color",
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
@@ -78,6 +79,10 @@ class CCRImage:
         self.reference_frame = reference_frame
         self.resized_preview = None  # Placeholder for resized preview, if needed later
         self.adjustment_settings = adjustment_settings if adjustment_settings is not None else {}
+        # Color profile: "color" = full RGB (the original behaviour), "bw" =
+        # map the adjusted result to a single luminance channel. Affects both
+        # the preview/thumbnail and the exported file.
+        self.color_profile = color_profile if color_profile in ("color", "bw") else "color"
         self.rotation_angle = rotation_angle
         self.fine_rotation_angle = fine_rotation_angle
         self.horizontal_mirrored = horizontal_mirrored
@@ -499,8 +504,18 @@ class CCRImage:
         )
         return qimage
 
+    @staticmethod
+    def _to_grayscale(image: np.ndarray) -> np.ndarray:
+        """Map an RGB image to a single luminance channel (Rec.601 weights:
+        0.299R + 0.587G + 0.114B) replicated across all three channels, so it
+        renders/exports as black & white while keeping the RGB shape and dtype
+        every downstream stage expects. Returns a new array."""
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
-                          temperature_base=None, brightness_base=None) -> np.ndarray:
+                          temperature_base=None, brightness_base=None,
+                          color_profile=None) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
         live state the GUI thread may be mutating concurrently."""
@@ -508,8 +523,11 @@ class CCRImage:
         cb = self.contrast_base if contrast_base is None else contrast_base
         tb = self.temperature_base if temperature_base is None else temperature_base
         bb = self.brightness_base if brightness_base is None else brightness_base
+        profile = self.color_profile if color_profile is None else color_profile
         if not s and cb == 0 and tb == 0 and bb == 0:
-            return image
+            # No slider/base adjustments — but Black & White still has to map
+            # the image to a single luminance channel.
+            return self._to_grayscale(image) if profile == "bw" else image
         adjusted = adjust_image_opencl(image,
                      s.get('temperature', 0) + tb,
                      s.get('tint', 0),
@@ -543,6 +561,8 @@ class CCRImage:
                      band_settings=(s if any(s.get(k, 0)
                                              for k in BAND_ADJUSTMENT_KEYS)
                                     else None))
+        if profile == "bw":
+            adjusted = self._to_grayscale(adjusted)
         return adjusted
 
     def render_hires_base(self, max_long_side: Optional[int] = None,
@@ -607,6 +627,7 @@ class CCRImage:
         """Snapshot of every user-editable, non-destructive setting."""
         return {
             "adjustment_settings": dict(self.adjustment_settings),
+            "color_profile": self.color_profile,
             "crop_rect": self.crop_rect,
             "crop_angle": self.crop_angle,
             "rotation_angle": self.rotation_angle,
@@ -633,6 +654,7 @@ class CCRImage:
             return False
         state = self.undo_stack.pop()
         self.adjustment_settings = state["adjustment_settings"]
+        self.color_profile = state.get("color_profile", "color")
         self.crop_rect = state["crop_rect"]
         self.crop_angle = state.get("crop_angle", 0.0)
         self.rotation_angle = state["rotation_angle"]

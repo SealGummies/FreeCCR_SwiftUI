@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayout,
                                 QSizePolicy, QStyleOptionSlider, QFrame, QStyle,
                                 QPushButton, QDialog, QMessageBox, QScrollArea,
-                                QCheckBox)
+                                QCheckBox, QComboBox)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
 from core.ccr_backend import ccr_backend
@@ -11,6 +11,7 @@ from core.ccr_processor import COLOR_BANDS, BAND_PARAMS, BAND_ADJUSTMENT_KEYS
 # groups partition SlidersPanel.ADJUSTMENT_KEYS exactly; "crop" syncs the
 # image's crop box (rect + angle) instead of adjustment keys.
 SYNC_GROUPS = [
+    ("profile", "Color Profile (Color / B&W)", ()),
     ("wb", "White Balance / Tint", ("temperature", "tint")),
     ("tone", "Tone (exposure, brightness, contrast, ...)",
      ("exposure", "brightness", "highlights", "white_point",
@@ -187,6 +188,9 @@ class SlidersPanel(QWidget):
         # last): band_<color>_<param> for the 6 bands × 4 params
     ] + list(BAND_ADJUSTMENT_KEYS)
 
+    # Color Profile combo: row index -> CCRImage.color_profile value.
+    COLOR_PROFILES = ("color", "bw")
+
     def __init__(self, parent=None):
         super().__init__()
         self.sliders = []
@@ -312,6 +316,11 @@ class SlidersPanel(QWidget):
         wb_crop_row.addStretch()
         scroll_layout.addLayout(wb_crop_row)
 
+        # Color Profile dropdown — sits right above Temperature. "Color" keeps
+        # the full-RGB pipeline; "Black & White" maps the result to a single
+        # luminance channel (preview and export). Per-image, like the sliders.
+        self.color_profile_row = self._create_color_profile_row()
+
         self.temperature_slider_layout = self.create_slider("Temperature")
         self.tint_slider_layout = self.create_slider("Tint")
         self.exposure_slider_layout = self.create_slider("Exposure")
@@ -324,6 +333,7 @@ class SlidersPanel(QWidget):
         self.saturation_slider_layout = self.create_slider("Saturation")
         self.sub_saturation_slider_layout = self.create_slider("Subtracted Sat")
 
+        scroll_layout.addLayout(self.color_profile_row)
         scroll_layout.addLayout(self.temperature_slider_layout)
         scroll_layout.addLayout(self.tint_slider_layout)
         scroll_layout.addLayout(self.exposure_slider_layout)
@@ -536,6 +546,62 @@ class SlidersPanel(QWidget):
 
         return slider_layout
 
+    def _create_color_profile_row(self):
+        """Build the 'Color Profile' label + dropdown row (Color / Black &
+        White). Laid out like a slider row so it lines up with Temperature."""
+        label = QLabel("Color Profile")
+        label.setMinimumWidth(70)
+        label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        label.setFixedHeight(30)
+        label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.color_profile_combo = QComboBox()
+        self.color_profile_combo.addItems(["Color", "Black & White"])
+        self.color_profile_combo.setFixedHeight(28)
+        self.color_profile_combo.currentIndexChanged.connect(self.on_color_profile_changed)
+
+        row = QHBoxLayout()
+        row.addWidget(label, alignment=Qt.AlignVCenter)
+        row.addWidget(self.color_profile_combo, alignment=Qt.AlignVCenter)
+        return row
+
+    def _sync_color_profile_combo(self, idx):
+        """Reflect the image's stored color profile in the dropdown without
+        firing the change handler."""
+        img = ccr_backend.get_image_by_index(idx) if idx is not None else None
+        profile = getattr(img, "color_profile", "color") if img is not None else "color"
+        try:
+            row = self.COLOR_PROFILES.index(profile)
+        except ValueError:
+            row = 0
+        self.color_profile_combo.blockSignals(True)
+        self.color_profile_combo.setCurrentIndex(row)
+        self.color_profile_combo.blockSignals(False)
+
+    def on_color_profile_changed(self, index):
+        """Switch the current image between Color and Black & White. A single
+        undoable action; reprocesses the preview/thumbnail (and invalidates
+        the hi-res zoom cache via the adjustment signature)."""
+        if self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        profile = self.COLOR_PROFILES[index] if 0 <= index < len(self.COLOR_PROFILES) else "color"
+        if img.color_profile == profile:
+            return
+        # Discrete action — don't merge into an in-progress slider undo burst.
+        self.end_undo_burst()
+        img.push_undo_state()
+        img.color_profile = profile
+        img.update_thumbnail_and_preview()
+        mw = self.parent().parent()
+        try:
+            mw.thumbnail_list.update_thumbnail(self.current_idx)
+        except AttributeError:
+            pass
+        mw.image_preview.update_preview(self.current_idx)
+
     def _show_band_page(self, color: str):
         """Show one color band's slider page in the Subtractive Saturations
         section; the others stay hidden (but keep their values)."""
@@ -547,6 +613,7 @@ class SlidersPanel(QWidget):
         print(f"Setting sliders enabled: {enabled}")
         self.wb_picker_btn.setEnabled(enabled)
         self.crop_btn.setEnabled(enabled)
+        self.color_profile_combo.setEnabled(enabled)
         for slider in self.sliders:
             slider.setEnabled(enabled)
             if not enabled:
@@ -570,6 +637,9 @@ class SlidersPanel(QWidget):
             self._undo_burst_timer.stop()
 
         self.current_idx = idx
+        # Reflect this image's color profile (independent of the slider dict,
+        # so it must be synced on both the empty and populated paths below).
+        self._sync_color_profile_combo(idx)
         adjustment = ccr_backend.get_adjustment_by_index(idx)
         print(f"Setting current index: {idx}, adjustment: {adjustment}")
         if adjustment is None or not adjustment:
@@ -740,10 +810,12 @@ class SlidersPanel(QWidget):
         keys = [k for gid, _label, group_keys in SYNC_GROUPS
                 if selection.get(gid) for k in group_keys]
         sync_crop = bool(selection.get("crop"))
+        sync_profile = bool(selection.get("profile"))
         current_adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
         src = ccr_backend.get_image_by_index(self.current_idx)
         crop_rect = src.crop_rect if src is not None else None
         crop_angle = getattr(src, "crop_angle", 0.0) if src is not None else 0.0
+        src_profile = getattr(src, "color_profile", "color") if src is not None else "color"
         print(f"Syncing groups {sorted(g for g, on in selection.items() if on)} to all images")
 
         for img in ccr_backend.images:
@@ -751,7 +823,8 @@ class SlidersPanel(QWidget):
                               for k in keys)
             crop_changes = sync_crop and (img.crop_rect != crop_rect
                                           or getattr(img, "crop_angle", 0.0) != crop_angle)
-            if not adj_changes and not crop_changes:
+            profile_changes = sync_profile and getattr(img, "color_profile", "color") != src_profile
+            if not adj_changes and not crop_changes and not profile_changes:
                 continue  # nothing to change — and no dead undo snapshot
             img.push_undo_state()
             if adj_changes:
@@ -766,9 +839,12 @@ class SlidersPanel(QWidget):
             if sync_crop:
                 img.crop_rect = crop_rect
                 img.crop_angle = crop_angle
-            if adj_changes:
+            if profile_changes:
+                img.color_profile = src_profile
+            if adj_changes or profile_changes:
                 # Crop is display/export-level only — no reprocessing needed
-                # when nothing but the crop changed.
+                # when nothing but the crop changed. Adjustments and the color
+                # profile both change pixels, so they do.
                 try:
                     img.update_thumbnail_and_preview()
                 except Exception as e:
