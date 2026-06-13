@@ -1390,7 +1390,8 @@ class ImagePreview(QWidget):
         if img is None:
             return None
         return (tuple(sorted(img.adjustment_settings.items())),
-                img.contrast_base, img.temperature_base, img.brightness_base)
+                img.contrast_base, img.temperature_base, img.brightness_base,
+                getattr(img, "color_profile", "color"))
 
     HIRES_MAX_LONG_SIDE = 4500   # bounds non-RAW decodes (RAW half-size passes through)
 

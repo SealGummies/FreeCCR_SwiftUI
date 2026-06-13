@@ -232,6 +232,7 @@ class TestPipelineIntegration:
         from core.ccr_image import CCRImage
         img_obj = CCRImage.__new__(CCRImage)
         img_obj.adjustment_settings = {"band_red_sat": -100}
+        img_obj.color_profile = "color"
         img_obj.contrast_base = 0
         img_obj.temperature_base = 0
         img_obj.brightness_base = 0
@@ -243,6 +244,7 @@ class TestPipelineIntegration:
         from core.ccr_image import CCRImage
         img_obj = CCRImage.__new__(CCRImage)
         img_obj.adjustment_settings = {"saturation": 0}
+        img_obj.color_profile = "color"
         img_obj.contrast_base = 0
         img_obj.temperature_base = 0
         img_obj.brightness_base = 0

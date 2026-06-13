@@ -108,6 +108,7 @@ def serialize_image(img) -> dict:
         "converted": bool(img.converted),
         "conversion_inputs": _ci_to_json(img.conversion_inputs),
         "adjustment_settings": dict(img.adjustment_settings),
+        "color_profile": getattr(img, "color_profile", "color"),
         "crop_rect": list(img.crop_rect) if img.crop_rect else None,
         "crop_angle": float(img.crop_angle or 0.0),
         "rotation_angle": int(img.rotation_angle),
@@ -125,7 +126,9 @@ def serialize_image(img) -> dict:
 def _is_pristine(state: dict) -> bool:
     """True when a serialized state carries no user edits worth saving."""
     return (not state["converted"] and not state["source_ops"]
-            and not state["adjustment_settings"] and state["crop_rect"] is None
+            and not state["adjustment_settings"]
+            and state.get("color_profile", "color") == "color"
+            and state["crop_rect"] is None
             and state["rotation_angle"] == 0 and state["fine_rotation_angle"] == 0
             and not state["horizontal_mirrored"] and not state["vertical_mirrored"]
             and state["reference_frame"] is None)
@@ -316,6 +319,7 @@ def _restore_image(file_path: str, state: dict):
                       if state.get("slice_parent") else None),
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
+    img.color_profile = state.get("color_profile", "color")
     ref = state.get("reference_frame")
     img.reference_frame = tuple(ref) if ref else None
     crop = state.get("crop_rect")

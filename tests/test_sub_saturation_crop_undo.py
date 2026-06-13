@@ -164,13 +164,14 @@ class TestSyncGroups:
     def test_expected_group_ids(self):
         from widgets.sliders_panel import SYNC_GROUPS
         assert [gid for gid, _l, _k in SYNC_GROUPS] == [
-            "wb", "tone", "sat", "crop", "channels", "bands"]
+            "profile", "wb", "tone", "sat", "crop", "channels", "bands"]
 
 
 def _stub_image():
     """CCRImage without the heavy file-loading __init__."""
     img = CCRImage.__new__(CCRImage)
     img.adjustment_settings = {}
+    img.color_profile = "color"
     img.crop_rect = None
     img.crop_angle = 0.0
     img.rotation_angle = 0
