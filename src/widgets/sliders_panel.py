@@ -185,7 +185,7 @@ class SlidersPanel(QWidget):
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
         # Per-color-band sliders (Subtractive Saturations section, created
-        # last): band_<color>_<param> for the 6 bands × 4 params
+        # last): band_<color>_<param> for the color bands × 4 params
     ] + list(BAND_ADJUSTMENT_KEYS)
 
     # Color Profile combo: row index -> CCRImage.color_profile value.
@@ -419,7 +419,8 @@ class SlidersPanel(QWidget):
         # all 24 sliders exist (and feed adjustment_settings) regardless.
         band_swatch_colors = {
             "red": "#c0392b", "skin": "#d8956b", "yellow": "#c8b900",
-            "green": "#27ae60", "blue": "#2f6fd0", "purple": "#8e44ad",
+            "green": "#27ae60", "cyan": "#17a8b4", "blue": "#2f6fd0",
+            "purple": "#8e44ad",
         }
         self._band_buttons = {}
         self._band_pages = {}
