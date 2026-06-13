@@ -17,6 +17,25 @@ except ImportError:
     cl = None
     cl_array = None
 
+# --- Experimental negative-inversion algorithm selection -------------------
+# The original pipeline inverts the scanned negative in LINEAR space
+# (out = 65535 - v) after a per-channel optical-density mean-equalisation that
+# is used only for cast balance. Film records density as a roughly linear
+# function of *log* exposure (the Hurter-Driffield characteristic curve), so
+# the physically faithful inversion happens in optical-density (log) space:
+# subtract the per-channel film base (Dmin / orange mask) as an offset, divide
+# by a per-channel gamma, then encode for display. See _invert_negative_density.
+#
+# Toggle at runtime by setting the module global, or via env var:
+#   FREECCR_DENSITY_INVERT=1   -> use the density-space inversion
+#   FREECCR_DENSITY_GAMMA=0.55 -> film contrast (gamma) used by that path
+def _env_flag(name, default=False):
+    return os.environ.get(name, "1" if default else "0").strip().lower() \
+        not in ("0", "", "false", "no", "off")
+
+USE_DENSITY_INVERSION = _env_flag("FREECCR_DENSITY_INVERT", False)
+DENSITY_FILM_GAMMA = float(os.environ.get("FREECCR_DENSITY_GAMMA", "0.55"))
+
 # The hi-res zoom worker can call adjust_image_opencl concurrently with the
 # GUI thread; pyopencl command queues are not safe for concurrent submission.
 _opencl_lock = threading.Lock()
@@ -594,6 +613,134 @@ def safe_tifffile_imwrite(output_path: str, image: np.ndarray, **kwargs) -> bool
 
 
 
+def _invert_negative_standard(img, img_ref, ref_crop, x1, y1, x2, y2):
+    """Original FreeCCR inversion (the default).
+
+    Per-channel linear black/white-point normalisation against the reference
+    crop's 1st/99th percentiles, then an optical-density mean-equalisation
+    (per-channel density *scaling*) for cast balance, then a LINEAR
+    ``65535 - v`` inversion. Returns the inverted positive as uint16.
+    """
+    step_start = time.time()
+    norm = np.empty_like(img, dtype=np.float32)
+    norm_ref = np.empty_like(img_ref, dtype=np.float32)
+    for c in range(3):
+        ch_crop = ref_crop[..., c]
+        p10 = np.percentile(ch_crop, 1)     # 1st percentile
+        p90 = np.percentile(ch_crop, 99)    # 99th percentile
+
+        ch_full = img[..., c]
+        ch_full_ref = img_ref[..., c]
+
+        # Linear mapping: p10 -> 8192, p90 -> 65535
+        np.subtract(ch_full, p10, out=norm[..., c])
+        np.divide(norm[..., c], (p90 - p10), out=norm[..., c])
+        np.multiply(norm[..., c], (65535 - 8192), out=norm[..., c])
+        np.add(norm[..., c], 8192, out=norm[..., c])
+        np.clip(norm[..., c], 0, 65535, out=norm[..., c])
+
+        np.subtract(ch_full_ref, p10, out=norm_ref[..., c])
+        np.divide(norm_ref[..., c], (p90 - p10), out=norm_ref[..., c])
+        np.multiply(norm_ref[..., c], (65535 - 8192), out=norm_ref[..., c])
+        np.add(norm_ref[..., c], 8192, out=norm_ref[..., c])
+        np.clip(norm_ref[..., c], 0, 65535, out=norm_ref[..., c])
+    print(f"BWPN: {time.time() - step_start:.3f}s")
+
+    # Optical density alignment (per-channel mean-density equalisation)
+    step_start = time.time()
+    ref_norm_crop = norm_ref[y1:y2, x1:x2]
+    np.add(ref_norm_crop, 1e-6, out=ref_norm_crop)
+    od_crop = -np.log10(ref_norm_crop / 65535.0)
+    mean_od_crop = np.mean(od_crop, axis=(0, 1))
+    target_mean_od = np.mean(mean_od_crop)
+    scaling_factors = target_mean_od / (mean_od_crop + 1e-12)
+
+    norm_full = norm
+    np.add(norm_full, 1e-6, out=norm_full)
+    od_full = -np.log10(norm_full / 65535.0)
+    od_aligned_full = od_full * scaling_factors
+    del ref_norm_crop, od_crop, mean_od_crop, scaling_factors, od_full
+
+    np.power(10, -od_aligned_full, out=od_aligned_full)
+    od_aligned_full *= 65535.0
+    np.clip(od_aligned_full, 0, 65535, out=od_aligned_full)
+    rgb_aligned_full = od_aligned_full.astype(np.uint16, copy=False)
+
+    rgb_inverted_full = 65535 - rgb_aligned_full
+    del od_aligned_full, rgb_aligned_full, norm, norm_ref
+    print(f"ODAI: {time.time() - step_start:.3f}s")
+    return rgb_inverted_full
+
+
+def _srgb_encode(x):
+    """Linear [0,1] -> sRGB display values [0,1] (the standard OETF)."""
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(x <= 0.0031308, x * 12.92,
+                    1.055 * np.power(x, 1.0 / 2.4) - 0.055)
+
+
+def _invert_negative_density(img, ref_crop, film_gamma=None):
+    """Density-space (Cineon / darktable-negadoctor-style) inversion.
+
+    Works in optical density rather than linear light, because film density is
+    ~linear in *log* exposure (the H&D characteristic curve):
+
+      1. D = -log10(v / white)                  per-channel optical density
+      2. Dmin[c] from the clear-film percentile  (film base / orange mask)
+      3. d = D - Dmin[c]                          relative density (>= 0)
+      4. gamma[c] = film_gamma * mean_d[c]/mean   per-channel gray-world balance
+                                                  x film contrast
+      5. H[c] = 10^(d / gamma[c])                 recovered scene-linear exposure
+      6. luminance level-stretch + sRGB encode    -> display-referred positive
+
+    Unlike the standard path this removes the orange mask as a per-channel
+    density OFFSET (step 2-3) and performs the inversion in log space, so the
+    tonal transfer follows the film curve rather than a linear 65535 - v.
+    Returns the inverted positive as uint16.
+    """
+    if film_gamma is None:
+        film_gamma = DENSITY_FILM_GAMMA
+    white = 65535.0
+    t0 = time.time()
+
+    base_density = np.zeros(3, dtype=np.float64)
+    mean_rel = np.zeros(3, dtype=np.float64)
+    for c in range(3):
+        ch_ref = ref_crop[..., c].astype(np.float32)
+        # Clear film (orange-mask base) is the brightest = least-dense end.
+        v_base = max(float(np.percentile(ch_ref, 99.0)), 1.0)
+        d_base = -np.log10(v_base / white)
+        base_density[c] = d_base
+        d_ref = -np.log10(np.clip(ch_ref, 1.0, white) / white) - d_base
+        np.clip(d_ref, 0.0, None, out=d_ref)
+        mean_rel[c] = max(float(d_ref.mean()), 1e-6)
+
+    # Gray-world: the per-channel ratio of mean densities sets the balance;
+    # film_gamma sets the absolute contrast (typical C-41 taking gamma ~0.55).
+    target = float(np.mean(mean_rel))
+    gamma_ch = film_gamma * (mean_rel / target)
+
+    pos = np.empty_like(img, dtype=np.float32)
+    for c in range(3):
+        d = -np.log10(np.clip(img[..., c], 1.0, white) / white) - base_density[c]
+        np.clip(d, 0.0, None, out=d)
+        pos[..., c] = np.power(10.0, d / gamma_ch[c])
+
+    # White/black anchored by a single luminance level-stretch (scalar offset
+    # + scale applied to all channels) so neutrals stay neutral.
+    lum = 0.299 * pos[..., 0] + 0.587 * pos[..., 1] + 0.114 * pos[..., 2]
+    black = float(np.percentile(lum, 0.5))
+    whitep = float(np.percentile(lum, 99.5))
+    denom = max(whitep - black, 1e-6)
+    pos -= black
+    pos /= denom
+
+    out = _srgb_encode(pos)
+    out = np.clip(out * white, 0, 65535).astype(np.uint16)
+    print(f"Density inversion (gamma={film_gamma:.2f}): {time.time() - t0:.3f}s")
+    return out
+
+
 def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_out=False,jpg_quality=95,max_long_side=None) -> np.ndarray:
     """
     Normalize and align the image using the CCR algorithm, using a reference rectangle
@@ -674,64 +821,17 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
     # plt.axis('off')
     # plt.show()
 
-    # Black/white point normalization per channel with three-segment linear compression
-    step_start = time.time()
-    norm = np.empty_like(img, dtype=np.float32)
-    norm_ref = np.empty_like(img_ref, dtype=np.float32)
-    for c in range(3):
-        ch_crop = ref_crop[..., c]
-        # Get percentiles for linear mapping with compressed extremes
-        p10 = np.percentile(ch_crop, 1)    # 1st percentile
-        p90 = np.percentile(ch_crop, 99)    # 99th percentile  
-        
-        ch_full = img[..., c]
-        ch_full_ref = img_ref[..., c]
-        
-        # Linear mapping: p10->6086, p90->43882:
-        # Formula: output = (input - p10) / (p90 - p10) * (43882 - 6086) + 6086
-        np.subtract(ch_full, p10, out=norm[..., c])
-        np.divide(norm[..., c], (p90 - p10), out=norm[..., c])
-        np.multiply(norm[..., c], (65535 - 8192), out=norm[..., c])
-        np.add(norm[..., c], 8192, out=norm[..., c])
-        np.clip(norm[..., c], 0, 65535, out=norm[..., c])
-
-        np.subtract(ch_full_ref, p10, out=norm_ref[..., c])
-        np.divide(norm_ref[..., c], (p90 - p10), out=norm_ref[..., c])
-        np.multiply(norm_ref[..., c], (65535 - 8192), out=norm_ref[..., c])
-        np.add(norm_ref[..., c], 8192, out=norm_ref[..., c])
-        np.clip(norm_ref[..., c], 0, 65535, out=norm_ref[..., c])
-    
-    # Clean up intermediate arrays
+    # --- Negative inversion -------------------------------------------------
+    # standard: per-channel linear normalisation + OD cast-balance + linear
+    #           65535 - v inversion (the original FreeCCR algorithm).
+    # density : Cineon/negadoctor-style inversion in optical-density space.
+    # Selected by USE_DENSITY_INVERSION (env FREECCR_DENSITY_INVERT).
+    if USE_DENSITY_INVERSION:
+        rgb_inverted_full = _invert_negative_density(img, ref_crop)
+    else:
+        rgb_inverted_full = _invert_negative_standard(
+            img, img_ref, ref_crop, x1, y1, x2, y2)
     del ref_crop
-    print(f"BWPN: {time.time() - step_start:.3f}s")
-      # Optical density alignment (conservative optimization)
-    step_start = time.time()
-    ref_norm_crop = norm_ref[y1:y2, x1:x2]
-    np.add(ref_norm_crop, 1e-6, out=ref_norm_crop)
-    od_crop = -np.log10(ref_norm_crop / 65535.0)
-    mean_od_crop = np.mean(od_crop, axis=(0, 1))
-    target_mean_od = np.mean(mean_od_crop)
-    scaling_factors = target_mean_od / (mean_od_crop + 1e-12)  # Only add division by zero protection
-
-    # Apply scaling to full image (keep original approach)
-    norm_full = norm
-    np.add(norm_full, 1e-6, out=norm_full)
-    od_full = -np.log10(norm_full / 65535.0)
-    od_aligned_full = od_full * scaling_factors
-      # Clean up intermediate arrays
-    del ref_norm_crop, od_crop, mean_od_crop, scaling_factors, od_full
-    
-    np.power(10, -od_aligned_full, out=od_aligned_full)
-    od_aligned_full *= 65535.0
-    np.clip(od_aligned_full, 0, 65535, out=od_aligned_full)
-    rgb_aligned_full = od_aligned_full.astype(np.uint16, copy=False)
-
-    # Invert
-    rgb_inverted_full = 65535 - rgb_aligned_full
-    
-    # Clean up more intermediate arrays
-    del od_aligned_full, rgb_aligned_full, norm, norm_ref
-    print(f"ODAI: {time.time() - step_start:.3f}s")
 
     # # --- Brightness normalization using grayscale ---
     # # Convert to grayscale using standard luminance weights
