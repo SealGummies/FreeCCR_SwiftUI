@@ -2386,13 +2386,18 @@ class ImagePreview(QWidget):
         # Show completion hint
         self.parent().parent().sliders_panel.set_temporary_hint("Auto frame conversion completed!", duration=2000)
 
-    def open_export_dialog(self):
+    def open_export_dialog(self, checked=False, default_scope=None):
+        # `checked` absorbs the bool QAction.triggered emits; `default_scope`
+        # is passed by callers (e.g. the thumbnail right-click "Export").
         if not any(img.converted for img in ccr_backend.images):
             QMessageBox.information(self, "Nothing to Export",
                                     "Convert at least one image before exporting.")
             return
 
-        settings_dialog = ExportSettingsDialog(self, current_idx=self.current_idx)
+        selected_indices = self.parent().parent().thumbnail_list.selected_indices()
+        settings_dialog = ExportSettingsDialog(self, current_idx=self.current_idx,
+                                               selected_indices=selected_indices,
+                                               default_scope=default_scope)
         if settings_dialog.exec_() != QDialog.Accepted or settings_dialog.plan is None:
             return
         plan = settings_dialog.plan

@@ -241,6 +241,8 @@ class ThumbnailList(QWidget):
         menu = QMenu(self)
         duplicate_action = menu.addAction(f"Duplicate{suffix}")
         remove_action = menu.addAction(f"Remove from list{suffix}")
+        menu.addSeparator()
+        export_action = menu.addAction("Export…")
         # Offered only when the selection contains slices: restores the
         # un-sliced parent image(s) in place of all their slices.
         reset_slice_action = None
@@ -256,6 +258,9 @@ class ThumbnailList(QWidget):
             self.duplicate_images(indices)
         elif action == remove_action:
             self.remove_images(indices)
+        elif action == export_action:
+            # Open the export dialog pre-scoped to the right-clicked selection.
+            self._main_window().image_preview.open_export_dialog(default_scope="selected")
         elif reset_slice_action is not None and action == reset_slice_action:
             self.reset_slices(indices)
 
