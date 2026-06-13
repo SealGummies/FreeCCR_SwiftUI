@@ -39,7 +39,8 @@ class ExportSettingsDialog(QDialog):
     resolved ExportPlan; the caller runs the actual export worker.
     """
 
-    def __init__(self, parent=None, current_idx=None):
+    def __init__(self, parent=None, current_idx=None, selected_indices=None,
+                 default_scope=None):
         super().__init__(parent)
         self.setWindowTitle("Export")
         self.setModal(True)
@@ -47,12 +48,17 @@ class ExportSettingsDialog(QDialog):
 
         self.plan: Optional[ExportPlan] = None
         self._current_idx = current_idx
+        self._default_scope = default_scope
         self._converted_indices = [idx for idx, img in enumerate(ccr_backend.images) if img.converted]
         self._current_converted = (
             current_idx is not None
             and 0 <= current_idx < len(ccr_backend.images)
             and ccr_backend.images[current_idx].converted
         )
+        # Selected thumbnails that are converted — export only handles
+        # converted images, so non-converted selections are dropped here.
+        converted_set = set(self._converted_indices)
+        self._selected_converted = [i for i in (selected_indices or []) if i in converted_set]
         self._bpp_cache = {}  # quality -> bytes per pixel sample
 
         self._settings = QSettings("FreeCCR", "FreeCCR")
@@ -68,16 +74,25 @@ class ExportSettingsDialog(QDialog):
 
         # Scope
         scope_group = QGroupBox("Export scope")
-        scope_layout = QHBoxLayout(scope_group)
+        scope_layout = QVBoxLayout(scope_group)
         self.scope_all_radio = QRadioButton(f"All converted images ({len(self._converted_indices)})")
         self.scope_all_radio.setChecked(True)
         self.scope_current_radio = QRadioButton("Current image only")
         if not self._current_converted:
             self.scope_current_radio.setEnabled(False)
             self.scope_current_radio.setToolTip("The current image has not been converted yet.")
+        self.scope_selected_radio = QRadioButton(f"Selected images ({len(self._selected_converted)})")
+        if not self._selected_converted:
+            self.scope_selected_radio.setEnabled(False)
+            self.scope_selected_radio.setToolTip("No converted images are selected.")
         scope_layout.addWidget(self.scope_all_radio)
         scope_layout.addWidget(self.scope_current_radio)
+        scope_layout.addWidget(self.scope_selected_radio)
+        # Connect every radio: switching between current and selected does not
+        # toggle the "all" radio, so listening to "all" alone misses changes.
         self.scope_all_radio.toggled.connect(self._on_scope_changed)
+        self.scope_current_radio.toggled.connect(self._on_scope_changed)
+        self.scope_selected_radio.toggled.connect(self._on_scope_changed)
         layout.addWidget(scope_group)
 
         # Destination
@@ -180,8 +195,14 @@ class ExportSettingsDialog(QDialog):
                 destination = os.path.dirname(ccr_backend.images[scoped[0]].file_path)
         self.dest_edit.setText(destination)
 
-        if s.value("export/scope", "all", type=str) == "current" and self._current_converted:
+        # An explicit default_scope (e.g. from the thumbnail right-click menu)
+        # wins over the persisted choice; both fall back to "all" when the
+        # requested scope has nothing to export.
+        scope = self._default_scope or s.value("export/scope", "all", type=str)
+        if scope == "current" and self._current_converted:
             self.scope_current_radio.setChecked(True)
+        elif scope == "selected" and self._selected_converted:
+            self.scope_selected_radio.setChecked(True)
         self.filename_edit.setText(s.value("export/filename_template", "{name}_ccr", type=str))
         fmt_index = self.format_combo.findData(s.value("export/format", "tiff", type=str))
         if fmt_index >= 0:
@@ -199,7 +220,13 @@ class ExportSettingsDialog(QDialog):
     def _save_settings(self):
         s = self._settings
         s.setValue("export/destination", self.dest_edit.text().strip())
-        s.setValue("export/scope", "current" if self.scope_current_radio.isChecked() else "all")
+        if self.scope_current_radio.isChecked():
+            scope = "current"
+        elif self.scope_selected_radio.isChecked():
+            scope = "selected"
+        else:
+            scope = "all"
+        s.setValue("export/scope", scope)
         s.setValue("export/filename_template", self.filename_edit.text())
         s.setValue("export/format", self.format_combo.currentData())
         s.setValue("export/jpeg_quality", self.quality_slider.value())
@@ -212,6 +239,8 @@ class ExportSettingsDialog(QDialog):
     def _scope_indices(self) -> List[int]:
         if self.scope_current_radio.isChecked() and self._current_converted:
             return [self._current_idx]
+        if self.scope_selected_radio.isChecked() and self._selected_converted:
+            return list(self._selected_converted)
         return list(self._converted_indices)
 
     def _base_names(self, indices) -> List[str]:
