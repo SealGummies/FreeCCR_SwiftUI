@@ -635,30 +635,46 @@ def _density_params_from_ref(ref_crop, film_gamma=None):
     return base_density, gamma_ch
 
 
-def _density_apply(img, base_density, gamma_ch):
-    """Apply density-space inversion with precomputed per-channel params.
-
-    H[c] = 10^((D[c] - Dmin[c]) / gamma[c]) recovers scene-linear exposure;
-    a single luminance level-stretch sets the black/white points, then sRGB
-    encode -> display-referred positive (uint16). Pure faithful: no saturation
-    boost or shadow-warmth styling.
-    """
+def _density_scene_linear(img, base_density, gamma_ch):
+    """Per-channel density inversion to scene-linear exposure (pre
+    level-stretch): H[c] = 10^((D[c] - Dmin[c]) / gamma[c])."""
     white = 65535.0
     pos = np.empty(img.shape, dtype=np.float32)
     for c in range(3):
         d = -np.log10(np.clip(img[..., c], 1.0, white) / white) - base_density[c]
         np.clip(d, 0.0, None, out=d)
         pos[..., c] = np.power(10.0, d / gamma_ch[c])
-    # White/black anchored by a single luminance level-stretch (scalar offset
-    # + scale applied to all channels) so neutrals stay neutral.
+    return pos
+
+
+def _density_levels(pos):
+    """The (black, denom) luminance level-stretch for a scene-linear positive
+    `pos`. Precomputed once from the full frame so crops/replays reuse the same
+    anchors and match exactly (a per-crop stretch would diverge)."""
     lum = 0.299 * pos[..., 0] + 0.587 * pos[..., 1] + 0.114 * pos[..., 2]
     black = float(np.percentile(lum, 0.5))
     whitep = float(np.percentile(lum, 99.5))
-    denom = max(whitep - black, 1e-6)
+    return black, max(whitep - black, 1e-6)
+
+
+def _density_apply(img, base_density, gamma_ch, levels=None):
+    """Apply density-space inversion with precomputed per-channel params.
+
+    Recovers scene-linear exposure, applies a single luminance level-stretch
+    for black/white, then sRGB-encodes -> display-referred positive (uint16).
+    Pure faithful: no saturation boost or shadow-warmth styling.
+
+    levels: optional (black, denom) from _density_levels. When None it is
+    derived from this image; pass the full-frame levels so a crop or hi-res
+    replay reproduces the full conversion exactly.
+    """
+    pos = _density_scene_linear(img, base_density, gamma_ch)
+    black, denom = _density_levels(pos) if levels is None else \
+        (float(levels[0]), max(float(levels[1]), 1e-6))
     pos -= black
     pos /= denom
     out = _srgb_encode(pos)
-    return np.clip(out * white, 0, 65535).astype(np.uint16)
+    return np.clip(out * 65535.0, 0, 65535).astype(np.uint16)
 
 
 def _srgb_encode(x):
@@ -1146,7 +1162,7 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     return rgb_result
 
 
-def ccr_normalize_with_refparams(ccr_image, base_density, gamma_ch,
+def ccr_normalize_with_refparams(ccr_image, base_density, gamma_ch, levels=None,
                                  output_path=None, water_mark=True, jpg_out=False,
                                  jpg_quality=95, max_long_side=None):
     """
@@ -1165,7 +1181,7 @@ def ccr_normalize_with_refparams(ccr_image, base_density, gamma_ch,
     if img is None:
         raise ValueError("CCRImage: could not load image data for ref-params conversion")
 
-    rgb_result = apply_reference_normalization(img, base_density, gamma_ch)
+    rgb_result = apply_reference_normalization(img, base_density, gamma_ch, levels)
 
     if output_path is None:
         print(f"TOTAL ref-params normalization time: {time.time() - total_start_time:.3f}s")
@@ -1304,8 +1320,10 @@ def compute_reference_norm_params(ref_img: np.ndarray, reference_rect,
                                   fine_rotation_angle: int):
     """Derive the per-channel density parameters that
     ccr_normalize_with_reference computes from the reference frame of ref_img
-    (the 1080px scan), so the conversion can be replayed at any resolution.
-    Returns (base_density[3], gamma_ch[3]) — see _density_params_from_ref."""
+    (the 1080px scan), so the conversion can be replayed (or cropped) at any
+    resolution and match exactly. Returns (base_density[3], gamma_ch[3],
+    levels) where levels = (black, denom) is the full-frame luminance
+    level-stretch — see _density_params_from_ref / _density_levels."""
     img_ref = ref_img
     fine_angle = fine_rotation_angle / 100.0
     if fine_angle != 0:
@@ -1315,14 +1333,21 @@ def compute_reference_norm_params(ref_img: np.ndarray, reference_rect,
                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     x1, y1, x2, y2 = map_rect_to_original(ref_img.shape, img_ref.shape, reference_rect)
     ref_crop = img_ref[y1:y2, x1:x2].astype(np.float32)
-    return _density_params_from_ref(ref_crop)
+    base_density, gamma_ch = _density_params_from_ref(ref_crop)
+    # Level-stretch from the UNROTATED full frame — the pipeline computes it
+    # from the unrotated working image, so children/replays must too.
+    levels = _density_levels(
+        _density_scene_linear(ref_img.astype(np.float32), base_density, gamma_ch))
+    return base_density, gamma_ch, levels
 
 
-def apply_reference_normalization(img: np.ndarray, base_density, gamma_ch) -> np.ndarray:
+def apply_reference_normalization(img: np.ndarray, base_density, gamma_ch,
+                                  levels=None) -> np.ndarray:
     """Apply the reference-frame density inversion to an image of any
-    resolution, using params precomputed by compute_reference_norm_params.
-    Matches ccr_normalize_with_reference (both go through _density_apply)."""
-    return _density_apply(img, base_density, gamma_ch)
+    resolution (or a crop of it), using params precomputed by
+    compute_reference_norm_params. Passing the full-frame `levels` makes the
+    result match ccr_normalize_with_reference exactly."""
+    return _density_apply(img, base_density, gamma_ch, levels)
 
 
 def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bgr) -> np.ndarray:

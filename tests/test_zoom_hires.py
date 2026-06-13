@@ -58,8 +58,8 @@ class TestHiResColorMatch:
         img = _scan_like_image()
         ref = (20, 20, 280, 180)
         expected = ccr_normalize_with_reference(_conversion_stub(img.copy(), ref))
-        base_density, gamma_ch = compute_reference_norm_params(img, ref, 0)
-        got = apply_reference_normalization(img, base_density, gamma_ch)
+        base_density, gamma_ch, levels = compute_reference_norm_params(img, ref, 0)
+        got = apply_reference_normalization(img, base_density, gamma_ch, levels)
         np.testing.assert_allclose(got.astype(np.int64),
                                    expected.astype(np.int64), atol=2)
 
@@ -68,8 +68,8 @@ class TestHiResColorMatch:
         ref = (40, 30, 260, 170)
         fine_rot = 250  # 2.5 degrees
         expected = ccr_normalize_with_reference(_conversion_stub(img.copy(), ref, fine_rot))
-        base_density, gamma_ch = compute_reference_norm_params(img, ref, fine_rot)
-        got = apply_reference_normalization(img, base_density, gamma_ch)
+        base_density, gamma_ch, levels = compute_reference_norm_params(img, ref, fine_rot)
+        got = apply_reference_normalization(img, base_density, gamma_ch, levels)
         np.testing.assert_allclose(got.astype(np.int64),
                                    expected.astype(np.int64), atol=2)
 
@@ -90,9 +90,9 @@ class TestHiResColorMatch:
         img2x = _scan_like_image(h=400, w=600, seed=11)
         img1x = cv2.resize(img2x, (300, 200), interpolation=cv2.INTER_AREA)
         ref = (20, 20, 280, 180)
-        base_density, gamma_ch = compute_reference_norm_params(img1x, ref, 0)
-        out1x = apply_reference_normalization(img1x, base_density, gamma_ch)
-        out2x = apply_reference_normalization(img2x, base_density, gamma_ch)
+        base_density, gamma_ch, levels = compute_reference_norm_params(img1x, ref, 0)
+        out1x = apply_reference_normalization(img1x, base_density, gamma_ch, levels)
+        out2x = apply_reference_normalization(img2x, base_density, gamma_ch, levels)
         out2x_down = cv2.resize(out2x, (300, 200), interpolation=cv2.INTER_AREA)
         # Interpolation through the nonlinear look costs a little accuracy;
         # the images must still be visually identical (small mean error).
