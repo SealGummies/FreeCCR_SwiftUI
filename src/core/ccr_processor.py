@@ -2171,22 +2171,24 @@ def adjust_image(
     return img.astype(np.uint16)
 
 
-# --- Per-color-band "Subtractive Saturations" (Resolve-style six vector) ---
+# --- Per-color-band "Subtractive Saturations" (Resolve-style color vectors) ---
 # Each band is a hue sector with four sliders in [-100, 100]:
 #   subsat — film-density saturation (same model as the global slider),
 #   sat    — additive saturation,  bright — luminance gain,
 #   hue    — rotation toward the neighboring sectors (±30° at full scale).
-COLOR_BANDS = ("red", "skin", "yellow", "green", "blue", "purple")
+COLOR_BANDS = ("red", "skin", "yellow", "green", "cyan", "blue", "purple")
 BAND_PARAMS = ("subsat", "sat", "bright", "hue")
 BAND_ADJUSTMENT_KEYS = tuple(f"band_{color}_{param}"
                              for color in COLOR_BANDS for param in BAND_PARAMS)
 
 # Sector centers in degrees on the HSV wheel (red=0, green=120, blue=240),
 # in wheel order. "skin" sits in the orange range between red and yellow,
-# like Resolve's dedicated skin-tone vector.
+# like Resolve's dedicated skin-tone vector. "cyan" centers the wide
+# green->blue span (true cyan = 180), splitting it into two even sectors.
+# MUST stay sorted ascending by center — _band_param_deltas searchsorts it.
 BAND_HUE_CENTERS = (
     ("red", 0.0), ("skin", 28.0), ("yellow", 58.0),
-    ("green", 120.0), ("blue", 240.0), ("purple", 300.0),
+    ("green", 120.0), ("cyan", 180.0), ("blue", 240.0), ("purple", 300.0),
 )
 
 # Near-neutral pixels carry hue noise, not color: fade every band effect in
