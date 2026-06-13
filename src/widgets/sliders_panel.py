@@ -23,7 +23,8 @@ SYNC_GROUPS = [
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint")),
-    ("bands", "Subtractive Saturations (per color)", BAND_ADJUSTMENT_KEYS),
+    ("bands", "Subtractive Saturations (per color)",
+     tuple(BAND_ADJUSTMENT_KEYS) + ("band_feather",)),
 ]
 
 
@@ -186,7 +187,21 @@ class SlidersPanel(QWidget):
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
         # Per-color-band sliders (Subtractive Saturations section, created
         # last): band_<color>_<param> for the color bands × 4 params
-    ] + list(BAND_ADJUSTMENT_KEYS)
+    ] + list(BAND_ADJUSTMENT_KEYS) + [
+        # Global spatial-feather amount for the band effect (created after the
+        # per-band sliders, so it stays last in the positional zip).
+        "band_feather",
+    ]
+
+    # Non-zero default values for specific adjustment keys. Keys not listed
+    # default to 0. band_feather defaults to 10 so band edits get a gentle
+    # edge-softening out of the box (matches _BAND_FEATHER_DEFAULT in
+    # ccr_processor). Used everywhere a slider is populated from a (possibly
+    # partial) adjustment dict, so UI and render agree on the default.
+    SLIDER_DEFAULTS = {"band_feather": 10}
+
+    def _default_for(self, key):
+        return self.SLIDER_DEFAULTS.get(key, 0)
 
     # Color Profile combo: row index -> CCRImage.color_profile value.
     COLOR_PROFILES = ("color", "bw")
@@ -458,6 +473,14 @@ class SlidersPanel(QWidget):
             page.setVisible(False)
             self.band_section.add_widget(page)
             self._band_pages[color] = page
+
+        # Global feather (softness): spatially low-passes the band correction
+        # to soften hard colour-selection edges. 0 = off. Applies to all
+        # bands, so it lives below the per-band pages. Created LAST so it maps
+        # to the trailing "band_feather" key in ADJUSTMENT_KEYS.
+        self.band_section.add_layout(
+            self.create_slider("Feather", min_value=0, max_value=100,
+                               default_value=self._default_for("band_feather")))
         self._show_band_page("red")
 
         # --- Signal connections ---
@@ -511,11 +534,12 @@ class SlidersPanel(QWidget):
             self.histogram_label.clear()
             self.histogram_label.setText("")
 
-    def create_slider(self, label_text):
+    def create_slider(self, label_text, min_value=-100, max_value=100,
+                      default_value=0):
         slider = ResettableSlider(Qt.Horizontal)
-        slider.setMinimum(-100)
-        slider.setMaximum(100)
-        slider.setValue(0)
+        slider.setMinimum(min_value)
+        slider.setMaximum(max_value)
+        slider.setValue(default_value)
         slider.setOrientation(Qt.Horizontal)
         slider.setTickInterval(10)
         slider.setFixedHeight(30)
@@ -644,19 +668,22 @@ class SlidersPanel(QWidget):
         adjustment = ccr_backend.get_adjustment_by_index(idx)
         print(f"Setting current index: {idx}, adjustment: {adjustment}")
         if adjustment is None or not adjustment:
-            # Set all sliders and labels to 0 if no adjustment
+            # No adjustment yet: show each slider's default (0 for most,
+            # 10 for band_feather).
             for i, slider in enumerate(self.sliders):
+                key = self.adjustment_keys[i] if i < len(self.adjustment_keys) else None
+                default = self._default_for(key)
                 slider.blockSignals(True)
-                slider.setValue(0)
+                slider.setValue(default)
                 slider.blockSignals(False)
-                self.slider_value_labels[i].setText("0")
+                self.slider_value_labels[i].setText(str(default))
             return
 
-        # Missing keys count as 0 so a partial dict can never leave a slider
-        # showing the previously selected image's value.
+        # Missing keys fall back to the slider default so a partial dict can
+        # never leave a slider showing the previously selected image's value.
         for i, key in enumerate(self.adjustment_keys):
             if i < len(self.sliders):
-                val = adjustment.get(key, 0)
+                val = adjustment.get(key, self._default_for(key))
                 self.sliders[i].blockSignals(True)
                 self.sliders[i].setValue(val)
                 self.sliders[i].blockSignals(False)
@@ -742,12 +769,14 @@ class SlidersPanel(QWidget):
         img = ccr_backend.get_image_by_index(self.current_idx) if self.current_idx is not None else None
         if img is not None:
             img.push_undo_state()
-        # Set all sliders to 0 and update preview
+        # Reset every slider to its default (0 for most, 10 for band_feather).
         for i, slider in enumerate(self.sliders):
+            key = self.adjustment_keys[i] if i < len(self.adjustment_keys) else None
+            default = self._default_for(key)
             slider.blockSignals(True)
-            slider.setValue(0)
+            slider.setValue(default)
             slider.blockSignals(False)
-            self.slider_value_labels[i].setText("0")
+            self.slider_value_labels[i].setText(str(default))
         # Save adjustment to backend and update preview
         if self.current_idx is not None:
             adjustment = {key: 0 for key in self.adjustment_keys}
@@ -773,7 +802,7 @@ class SlidersPanel(QWidget):
         if self.current_idx is not None and hasattr(self, "_original_adjustment"):
             adjustment = self._original_adjustment or {}
             for i, key in enumerate(self.adjustment_keys):
-                val = adjustment.get(key, 0)
+                val = adjustment.get(key, self._default_for(key))
                 self.sliders[i].blockSignals(True)
                 self.sliders[i].setValue(val)
                 self.sliders[i].blockSignals(False)
@@ -820,7 +849,8 @@ class SlidersPanel(QWidget):
         print(f"Syncing groups {sorted(g for g, on in selection.items() if on)} to all images")
 
         for img in ccr_backend.images:
-            adj_changes = any(img.adjustment_settings.get(k, 0) != current_adjustment.get(k, 0)
+            adj_changes = any(img.adjustment_settings.get(k, self._default_for(k))
+                              != current_adjustment.get(k, self._default_for(k))
                               for k in keys)
             crop_changes = sync_crop and (img.crop_rect != crop_rect
                                           or getattr(img, "crop_angle", 0.0) != crop_angle)
@@ -833,9 +863,10 @@ class SlidersPanel(QWidget):
                 # rest of the app keeps its invariant that a non-empty
                 # adjustment dict carries every key — set_current_idx and
                 # friends rely on it.
-                merged = {k: img.adjustment_settings.get(k, 0) for k in self.adjustment_keys}
+                merged = {k: img.adjustment_settings.get(k, self._default_for(k))
+                          for k in self.adjustment_keys}
                 for k in keys:
-                    merged[k] = current_adjustment.get(k, 0)
+                    merged[k] = current_adjustment.get(k, self._default_for(k))
                 img.adjustment_settings = merged
             if sync_crop:
                 img.crop_rect = crop_rect

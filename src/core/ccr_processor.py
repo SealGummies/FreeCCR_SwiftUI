@@ -2164,8 +2164,9 @@ def adjust_image(
         # as the OpenCL kernel, so CPU and GPU renders stay aligned.
         bin_deltas = _band_bin_lut(band_settings)
         if bin_deltas is not None:
+            feather = float(band_settings.get('band_feather', _BAND_FEATHER_DEFAULT) or 0)
             img_norm = np.clip(img / 65535.0, 0.0, 1.0).astype(np.float32)
-            img = _apply_color_bands_float(img_norm, bin_deltas) * 65535.0
+            img = _apply_color_bands_float(img_norm, bin_deltas, feather) * 65535.0
 
     img = np.clip(img, 0, 65535)
     return img.astype(np.uint16)
@@ -2267,12 +2268,52 @@ def apply_color_band_adjustments(img16: np.ndarray, settings: dict) -> np.ndarra
     bin_deltas = _band_bin_lut(settings)
     if bin_deltas is None:
         return img16
+    feather = float(settings.get('band_feather', _BAND_FEATHER_DEFAULT) or 0)
     rgb = np.clip(img16.astype(np.float32) / 65535.0, 0.0, 1.0)
-    rgb = _apply_color_bands_float(rgb, bin_deltas)
+    rgb = _apply_color_bands_float(rgb, bin_deltas, feather)
     return np.clip(rgb * 65535.0, 0.0, 65535.0).astype(np.uint16)
 
 
-def _apply_color_bands_float(rgb: np.ndarray, bin_deltas: np.ndarray) -> np.ndarray:
+# Spatial feathering: at feather=100 the band correction is low-passed with a
+# Gaussian of this fraction of the image's long edge. Scaling by image size
+# keeps the softness visually consistent between the 1080px preview and the
+# full-resolution export.
+_BAND_FEATHER_MAX_FRAC = 0.012
+
+# Default feather amount when a settings dict carries no explicit band_feather
+# (new edits and pre-feathering catalogs): a gentle edge-softening baseline.
+# Mirrors SlidersPanel.SLIDER_DEFAULTS["band_feather"] so UI and render agree.
+_BAND_FEATHER_DEFAULT = 10.0
+
+
+def _feather_band_effect(orig: np.ndarray, adjusted: np.ndarray,
+                         feather: float) -> np.ndarray:
+    """Soften the band effect's hard spatial edges (the DaVinci-qualifier
+    "blur radius" idea): the bands key per pixel from hue/sat, so the effect
+    can jump abruptly across a colour boundary. Rather than blur the image
+    (which would lose detail), low-pass only the *correction* the bands
+    introduced and re-add it to the untouched original — detail is preserved,
+    only the effect's transition is feathered.
+
+    orig / adjusted: float32 RGB in [0, 1]. feather in 0..100 (0 = off).
+    Like any matte blur this can bleed the correction slightly across
+    high-contrast colour edges (a faint halo), so keep the amount modest.
+    """
+    if feather <= 0:
+        return adjusted
+    h, w = orig.shape[:2]
+    sigma = (min(feather, 100.0) / 100.0) * _BAND_FEATHER_MAX_FRAC * max(h, w)
+    if sigma < 0.5:
+        return adjusted
+    delta = adjusted - orig
+    cv2.GaussianBlur(delta, (0, 0), sigmaX=sigma, sigmaY=sigma, dst=delta)
+    out = orig + delta
+    np.clip(out, 0.0, 1.0, out=out)
+    return out
+
+
+def _apply_color_bands_float(rgb: np.ndarray, bin_deltas: np.ndarray,
+                             feather: float = 0.0) -> np.ndarray:
     """Per-color-band core on a float32 RGB image in [0, 1].
 
     Band selection happens on the ORIGINAL hue, so a band's own hue
@@ -2287,8 +2328,10 @@ def _apply_color_bands_float(rgb: np.ndarray, bin_deltas: np.ndarray) -> np.ndar
     one int index + one take per active parameter instead of full-
     resolution interpolation math. 0.5° bins are far below visible
     precision for curves this smooth. May modify rgb in place; use the
-    return value.
+    return value. When feather > 0 the band correction is spatially
+    low-passed (see _feather_band_effect) before being returned.
     """
+    orig = rgb.copy() if feather > 0 else None
     param_active = [bool(bin_deltas[:, p].any())
                     for p in range(len(BAND_PARAMS))]
 
@@ -2354,6 +2397,8 @@ def _apply_color_bands_float(rgb: np.ndarray, bin_deltas: np.ndarray) -> np.ndar
                                     mx * np.exp(np.log(ratio) * gamma), sub)
             rgb = flat.reshape(rgb.shape)
 
+    if orig is not None:
+        rgb = _feather_band_effect(orig, rgb, feather)
     return rgb
 
 
@@ -2391,9 +2436,14 @@ def adjust_image_opencl(
     """
     global _opencl_cache
 
-    # Initialize OpenCL if not already done
-    if not _initialize_opencl():
-        # Fallback to CPU version
+    # Spatial band feathering is a CPU post-blur the per-pixel kernel can't
+    # do, so run the whole adjustment on the CPU when it is active (keeps the
+    # band + feather staging identical). This is also the normal fallback when
+    # OpenCL is unavailable.
+    feather_active = bool(band_settings) and \
+        (float(band_settings.get('band_feather', _BAND_FEATHER_DEFAULT) or 0) > 0) and \
+        any(band_settings.get(k, 0) for k in BAND_ADJUSTMENT_KEYS)
+    if feather_active or not _initialize_opencl():
         return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
                           blackpoint, whitepoint, contrast, saturation, tint_balance_factor,
                           highlights, shadows,
