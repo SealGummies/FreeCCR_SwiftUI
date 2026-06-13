@@ -2164,7 +2164,7 @@ def adjust_image(
         # as the OpenCL kernel, so CPU and GPU renders stay aligned.
         bin_deltas = _band_bin_lut(band_settings)
         if bin_deltas is not None:
-            feather = float(band_settings.get('band_feather', 0) or 0)
+            feather = float(band_settings.get('band_feather', _BAND_FEATHER_DEFAULT) or 0)
             img_norm = np.clip(img / 65535.0, 0.0, 1.0).astype(np.float32)
             img = _apply_color_bands_float(img_norm, bin_deltas, feather) * 65535.0
 
@@ -2268,7 +2268,7 @@ def apply_color_band_adjustments(img16: np.ndarray, settings: dict) -> np.ndarra
     bin_deltas = _band_bin_lut(settings)
     if bin_deltas is None:
         return img16
-    feather = float(settings.get('band_feather', 0) or 0)
+    feather = float(settings.get('band_feather', _BAND_FEATHER_DEFAULT) or 0)
     rgb = np.clip(img16.astype(np.float32) / 65535.0, 0.0, 1.0)
     rgb = _apply_color_bands_float(rgb, bin_deltas, feather)
     return np.clip(rgb * 65535.0, 0.0, 65535.0).astype(np.uint16)
@@ -2279,6 +2279,11 @@ def apply_color_band_adjustments(img16: np.ndarray, settings: dict) -> np.ndarra
 # keeps the softness visually consistent between the 1080px preview and the
 # full-resolution export.
 _BAND_FEATHER_MAX_FRAC = 0.012
+
+# Default feather amount when a settings dict carries no explicit band_feather
+# (new edits and pre-feathering catalogs): a gentle edge-softening baseline.
+# Mirrors SlidersPanel.SLIDER_DEFAULTS["band_feather"] so UI and render agree.
+_BAND_FEATHER_DEFAULT = 10.0
 
 
 def _feather_band_effect(orig: np.ndarray, adjusted: np.ndarray,
@@ -2436,7 +2441,7 @@ def adjust_image_opencl(
     # band + feather staging identical). This is also the normal fallback when
     # OpenCL is unavailable.
     feather_active = bool(band_settings) and \
-        (float(band_settings.get('band_feather', 0) or 0) > 0) and \
+        (float(band_settings.get('band_feather', _BAND_FEATHER_DEFAULT) or 0) > 0) and \
         any(band_settings.get(k, 0) for k in BAND_ADJUSTMENT_KEYS)
     if feather_active or not _initialize_opencl():
         return adjust_image(img16, kelvin_shift, tint_shift, exposure, brightness,
