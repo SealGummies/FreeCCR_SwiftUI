@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from core.ccr_processor import (  # noqa: E402
     ccr_normalize_with_reference, ccr_normalize_with_bwpoint,
     compute_reference_norm_params, apply_reference_normalization,
-    apply_bwpoint_normalization, apply_postinvert_look,
+    apply_bwpoint_normalization,
 )
 from core.ccr_image import CCRImage  # noqa: E402
 
@@ -58,8 +58,8 @@ class TestHiResColorMatch:
         img = _scan_like_image()
         ref = (20, 20, 280, 180)
         expected = ccr_normalize_with_reference(_conversion_stub(img.copy(), ref))
-        p_lo, p_hi, od = compute_reference_norm_params(img, ref, 0)
-        got = apply_reference_normalization(img, p_lo, p_hi, od)
+        base_density, gamma_ch = compute_reference_norm_params(img, ref, 0)
+        got = apply_reference_normalization(img, base_density, gamma_ch)
         np.testing.assert_allclose(got.astype(np.int64),
                                    expected.astype(np.int64), atol=2)
 
@@ -68,8 +68,8 @@ class TestHiResColorMatch:
         ref = (40, 30, 260, 170)
         fine_rot = 250  # 2.5 degrees
         expected = ccr_normalize_with_reference(_conversion_stub(img.copy(), ref, fine_rot))
-        p_lo, p_hi, od = compute_reference_norm_params(img, ref, fine_rot)
-        got = apply_reference_normalization(img, p_lo, p_hi, od)
+        base_density, gamma_ch = compute_reference_norm_params(img, ref, fine_rot)
+        got = apply_reference_normalization(img, base_density, gamma_ch)
         np.testing.assert_allclose(got.astype(np.int64),
                                    expected.astype(np.int64), atol=2)
 
@@ -90,20 +90,14 @@ class TestHiResColorMatch:
         img2x = _scan_like_image(h=400, w=600, seed=11)
         img1x = cv2.resize(img2x, (300, 200), interpolation=cv2.INTER_AREA)
         ref = (20, 20, 280, 180)
-        p_lo, p_hi, od = compute_reference_norm_params(img1x, ref, 0)
-        out1x = apply_reference_normalization(img1x, p_lo, p_hi, od)
-        out2x = apply_reference_normalization(img2x, p_lo, p_hi, od)
+        base_density, gamma_ch = compute_reference_norm_params(img1x, ref, 0)
+        out1x = apply_reference_normalization(img1x, base_density, gamma_ch)
+        out2x = apply_reference_normalization(img2x, base_density, gamma_ch)
         out2x_down = cv2.resize(out2x, (300, 200), interpolation=cv2.INTER_AREA)
         # Interpolation through the nonlinear look costs a little accuracy;
         # the images must still be visually identical (small mean error).
         diff = np.abs(out2x_down.astype(np.int64) - out1x.astype(np.int64))
         assert diff.mean() < 600   # < ~1% of full scale on average
-
-    def test_postinvert_look_output_range(self):
-        img = _scan_like_image()
-        out = apply_postinvert_look(img)
-        assert out.dtype == np.uint16
-        assert out.shape == img.shape
 
 
 class TestRenderHiresBaseRouting:

@@ -70,7 +70,7 @@ def _ci_to_json(ci):
         out["ref"] = list(out["ref"])
     if out.get("bw") is not None:
         out["bw"] = [list(out["bw"][0]), list(out["bw"][1])]
-    for key in ("p_lo", "p_hi", "od"):
+    for key in ("base_density", "gamma_ch"):
         if out.get(key) is not None:
             out[key] = list(out[key])
     return out
@@ -84,7 +84,7 @@ def _ci_from_json(ci):
         out["ref"] = tuple(out["ref"])
     if out.get("bw") is not None:
         out["bw"] = (tuple(out["bw"][0]), tuple(out["bw"][1]))
-    for key in ("p_lo", "p_hi", "od"):
+    for key in ("base_density", "gamma_ch"):
         if out.get(key) is not None:
             out[key] = tuple(out[key])
     return out
@@ -361,8 +361,14 @@ def _replay_conversion(img, ci) -> None:
             img.reference_frame = saved_ref
         img.resized_raw = processed
     elif mode == "ref_params":
+        if ci.get("base_density") is None:
+            # Pre-density catalog (old linear ref_params child): the legacy
+            # params can't be migrated to density, so leave the decoded frame
+            # as-is rather than crash. Re-slice to reconvert.
+            print("Skipping legacy ref_params replay (re-slice to reconvert).")
+            return
         img.resized_raw = apply_reference_normalization(
-            img.resized_raw, ci["p_lo"], ci["p_hi"], ci["od"])
+            img.resized_raw, ci["base_density"], ci["gamma_ch"])
     elif mode == "bw":
         saved_fine = img.fine_rotation_angle
         img.fine_rotation_angle = ci.get("fine_rot", 0)
