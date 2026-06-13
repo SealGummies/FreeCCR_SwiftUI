@@ -65,6 +65,8 @@ src/utils/unicode_path_utils.py → Cross-platform Unicode filename handling
 
 **Image processing pipeline**: RAW files decoded via rawpy → 16-bit numpy arrays → resized to 1080px max side → `ccr_processor.adjust_image()` applies color corrections. OpenCL GPU acceleration is optional and conditionally compiled. Thumbnails (8-bit) are generated separately from full previews.
 
+**Negative conversion**: Inversion is done in optical-density (log) space (Cineon/negadoctor-style) — the only method; the old linear `65535 - v` inversion was removed. The **B/W-point tool** (`ccr_normalize_with_bwpoint`, user samples a clear-film point + a dense point) is the primary path; the auto reference-frame path (`ccr_normalize_with_reference`) also runs density. `FREECCR_DENSITY_GAMMA` (default 0.55) tunes film contrast. See `docs/conversion-pipeline.md`.
+
 **Unicode path handling**: Windows non-ASCII filenames require `normalize_unicode_path()` and `validate_unicode_path()` from `src/utils/unicode_path_utils.py`. Always validate paths before passing to image loaders.
 
 **Resource resolution**: `resource_path()` in `image_preview.py` handles both dev and Nuitka-bundled contexts. Nuitka embeds `src/icons/` and `LICENSES/` directories at build time.
