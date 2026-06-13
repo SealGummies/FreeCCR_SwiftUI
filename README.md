@@ -242,6 +242,12 @@ Assembles and locally signs the `.app` and DMG without notarization — fine for
 
 Everything happens on your computer. Images are never uploaded, there's no tracking or analytics of your workflow, and core features work fully offline.
 
+## 🤖 Use of AI
+
+FreeCCR started years ago as a personal project, then sat idle for a long while. It was revived and refined with heavy use of AI coding tools — the recent code, fixes, and docs are a collaboration between a human author and AI working together.
+
+I think that's a good thing, but I'd rather be upfront about it: if you'd prefer not to use software co-authored by a human and AI, this project may not be for you — and that's completely fine.
+
 ## 💬 Support
 
 Questions, bug reports, and feature requests are all welcome — open an [issue](https://github.com/toonoumi/FreeCCR/issues) right here on GitHub.
