@@ -1085,8 +1085,8 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     gc.collect()
 
     # Non-destructive base offsets applied through the adjustment pipeline (UI shows 0).
-    ccr_image.contrast_base = 60
-    ccr_image.temperature_base = 10
+    ccr_image.contrast_base = 40
+    ccr_image.temperature_base = 0
 
     # --- User adjustments (export only) ---
     if output_path is not None:
