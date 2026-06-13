@@ -107,18 +107,35 @@ def convert(rgb, ref, density):
     return P.ccr_normalize_with_reference(FakeImage(rgb.copy(), ref))
 
 
+def convert_bw(rgb, black, white, density):
+    P.USE_DENSITY_INVERSION = density
+    return P.ccr_normalize_with_bwpoint(FakeImage(rgb.copy(), None), black, white)
+
+
+def _triple(s):
+    vals = [float(v) for v in s.split(",")]
+    if len(vals) != 3:
+        raise SystemExit("expected three comma-separated values B,G,R")
+    return vals
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="?", help="negative file (RAW/TIFF/PNG/JPG)")
     ap.add_argument("--synthetic", action="store_true",
                     help="run on a simulated negative instead of a file")
     ap.add_argument("--ref", default=None, help="x1,y1,x2,y2 in resized px")
+    ap.add_argument("--black", default=None,
+                    help="B/W-point tool: clear-film sample as B,G,R sensor values")
+    ap.add_argument("--white", default=None,
+                    help="B/W-point tool: dense-area sample as B,G,R sensor values")
     ap.add_argument("--gamma", type=float, default=None, help="density film gamma")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
     if a.gamma is not None:
         P.DENSITY_FILM_GAMMA = a.gamma
+    bw = a.black is not None and a.white is not None
 
     extras = []
     if a.synthetic:
@@ -138,10 +155,16 @@ def main():
     else:
         x1, y1, x2, y2 = int(w * 0.2), int(h * 0.2), int(w * 0.8), int(h * 0.8)
     ref = (x1, y1, x2, y2)
-    print(f"image {w}x{h}, reference frame {ref}, film_gamma={P.DENSITY_FILM_GAMMA}")
+    mode = "B/W-point" if bw else "reference"
+    print(f"image {w}x{h}, {mode} mode, film_gamma={P.DENSITY_FILM_GAMMA}")
 
-    std8 = to_bgr8(convert(rgb, ref, density=False))
-    den8 = to_bgr8(convert(rgb, ref, density=True))
+    if bw:
+        black, white = _triple(a.black), _triple(a.white)
+        std8 = to_bgr8(convert_bw(rgb, black, white, density=False))
+        den8 = to_bgr8(convert_bw(rgb, black, white, density=True))
+    else:
+        std8 = to_bgr8(convert(rgb, ref, density=False))
+        den8 = to_bgr8(convert(rgb, ref, density=True))
 
     os.makedirs(outdir, exist_ok=True)
     cv2.imwrite(os.path.join(outdir, f"{base}_standard.png"), std8)

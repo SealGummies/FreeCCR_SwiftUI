@@ -741,6 +741,54 @@ def _invert_negative_density(img, ref_crop, film_gamma=None):
     return out
 
 
+def _density_invert_points(img, black_point_bgr, white_point_bgr, film_gamma=None):
+    """Density-space inversion for the explicit B/W-point workflow.
+
+    The two sampled points pin the optical-density mapping directly, which is
+    exactly what the density model needs:
+      * black_point = clear/transparent film  -> the per-channel film base Dmin
+        (the orange mask), subtracted as a log-space OFFSET.
+      * white_point = densest exposed area     -> the per-channel Dmax, which
+        fixes the density range, hence the per-channel gamma.
+
+    Per channel: gamma is set so the dense point lands on a common neutral
+    white, and Dmin subtraction puts the clear point at neutral black, so both
+    endpoints are colour-balanced without any gray-world guess. Recovers
+    scene-linear exposure H = 10^((D - Dmin)/gamma), maps [base, dense] -> [0,1]
+    and sRGB-encodes. Returns a display-referred positive (uint16), pure
+    faithful (no saturation/shadow styling). Clear film -> black, dense ->
+    white, matching the linear B/W-point path's polarity.
+    """
+    if film_gamma is None:
+        film_gamma = DENSITY_FILM_GAMMA
+    white = 65535.0
+    img_f = img.astype(np.float32)
+
+    base_density = np.zeros(3, dtype=np.float64)
+    d_dense = np.zeros(3, dtype=np.float64)
+    for c in range(3):
+        b = max(float(black_point_bgr[c]), 1.0)    # clear film (high value) -> Dmin
+        w_ = max(float(white_point_bgr[c]), 1.0)   # dense film (low value)  -> Dmax
+        base_density[c] = -np.log10(b / white)
+        d_dense[c] = max(-np.log10(w_ / white) - base_density[c], 1e-6)
+
+    mean_dd = max(float(np.mean(d_dense)), 1e-6)
+    gamma_ch = film_gamma * (d_dense / mean_dd)        # per-channel; neutralises white
+    white_anchor = 10.0 ** (mean_dd / film_gamma)      # equal across channels at dense
+    denom = max(white_anchor - 1.0, 1e-6)
+
+    pos = np.empty_like(img_f)
+    for c in range(3):
+        d = -np.log10(np.clip(img_f[..., c], 1.0, white) / white) - base_density[c]
+        np.clip(d, 0.0, None, out=d)
+        h = np.power(10.0, d / gamma_ch[c])
+        pos[..., c] = (h - 1.0) / denom                # base -> 0, dense -> 1
+    np.clip(pos, 0.0, 1.0, out=pos)
+
+    out = _srgb_encode(pos)
+    return np.clip(out * white, 0, 65535).astype(np.uint16)
+
+
 def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_out=False,jpg_quality=95,max_long_side=None) -> np.ndarray:
     """
     Normalize and align the image using the CCR algorithm, using a reference rectangle
@@ -856,68 +904,15 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
     # else:
     #     stretch_scale = 1.0    # rgb_brightness_normalized = np.clip(rgb_scaled * stretch_scale, 0, 65535).astype(np.uint16)    # Apply inverted gamma correction for inverted linear data
     # Since we have inverted linear data, apply inverted gamma 1.5
-    rgb_norm = rgb_inverted_full.astype(np.float32) / 65535.0
-      # Apply inverted gamma 2.2 (use gamma = 2.2 for inverted image)
-    gamma_corrected = np.power(np.clip(rgb_norm, 0.0, 1.0), 1.0)
-    del rgb_norm
-
-    # Convert to LAB-like processing for saturation
-    # Calculate luminance using standard weights
-    luminance = np.dot(gamma_corrected[..., :3], [0.299, 0.587, 0.114])
-    luminance_expanded = np.expand_dims(luminance, axis=-1)
-    
-    # Create saturation curve that has minimal effect in shadows and stronger effect in midtones/highlights
-    # Using power curve: luminance^0.8 gives gentle increase from shadows to highlights
-    saturation_curve = np.power(luminance, 0.8)  # Smooth curve from 0 to 1
-    del luminance  # Clean up luminance as it's no longer needed
-    base_saturation = 1.15  # 15% maximum saturation increase
-
-    # Calculate dynamic saturation factor: minimal in shadows (1.02), full in highlights (1.12)
-    min_saturation = 1.00  # 2% minimum saturation in pure shadows
-    saturation_range = base_saturation - min_saturation  # 0.10 range
-    dynamic_saturation = min_saturation + saturation_range * saturation_curve
-    del saturation_curve
-    dynamic_saturation = np.expand_dims(dynamic_saturation, axis=-1)
-    
-    # Apply luminance-aware saturation by blending between grayscale and color
-    gamma_corrected = luminance_expanded + dynamic_saturation * (gamma_corrected - luminance_expanded)
-    del luminance_expanded, dynamic_saturation
-    gamma_corrected = np.clip(gamma_corrected, 0.0, 1.0)
-    
-    # Convert back to 16-bit and assign to rgb_brightness_normalized
-    # rgb_brightness_normalized = np.clip(gamma_corrected * 65535.0, 0, 65535).astype(np.uint16)
-
-        # Shadow-specific color correction: add warmth and green to dark shadows only
-    # Convert back to normalized for shadow correction
-    shadow_corrected = gamma_corrected
-    # Calculate luminance for curve-based shadow correction
-    shadow_luminance = np.dot(shadow_corrected[..., :3], [0.299, 0.587, 0.114])
-    
-    # Create smooth exponential curves that naturally target shadows
-    # These curves provide maximum effect in deep shadows and fade smoothly to highlights
-    
-    # Warmth curve: exponential decay from shadows (stronger effect in darker areas)
-    warmth_curve = np.exp(-shadow_luminance * 4.0)  # Exponential decay, strong in shadows
-    warmth_strength = 0.35 * warmth_curve  # 30% max correction in pure black
-    del warmth_curve  # Clean up as it's no longer needed
-    # Green tint curve: similar but with different decay rate for natural look
-    green_curve = np.exp(-shadow_luminance * 3.5)  # Slightly different curve shape
-    del shadow_luminance  # Clean up as it's no longer needed
-    green_strength = 0.15 * green_curve  # 12% max correction in pure black
-    del green_curve  # Clean up as it's no longer needed
-
-    # Apply corrections using smooth curves (no masks or conditionals)
-    shadow_corrected[..., 0] *= (1.0 + warmth_strength * 0.8)  # Red: moderate warmth boost
-    shadow_corrected[..., 1] *= (1.0 + green_strength)  # Green: boost to counter magenta
-    shadow_corrected[..., 2] *= (1.0 - warmth_strength)  # Blue: reduce to counter blue cast
-    del warmth_strength, green_strength  # Clean up as they're no longer needed
-    
-    # Convert back to 16-bit
-    rgb_brightness_normalized = np.clip(shadow_corrected * 65535.0, 0, 65535).astype(np.uint16)
-
-    del shadow_corrected, gamma_corrected  # Clean up as they're no longer needed
-
-    # Clean up rgb_inverted_full as it's no longer needed
+    # --- Post-invert styling -----------------------------------------------
+    # density: pure faithful — the density inversion already produced a
+    #          display-referred positive, so NO saturation boost or shadow
+    #          warmth is applied (it would re-introduce a colour cast).
+    # standard: the legacy saturation-boost + shadow-warmth look.
+    if USE_DENSITY_INVERSION:
+        rgb_brightness_normalized = rgb_inverted_full
+    else:
+        rgb_brightness_normalized = apply_postinvert_look(rgb_inverted_full)
     del rgb_inverted_full
     gc.collect()
     # --- End of brightness normalization ---
@@ -1096,8 +1091,14 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     white_point_bgr: (B,G,R) scan values of dense/exposed film area (LOW values).
                      Dense areas → output white (65535) after inversion.
 
-    Pipeline: BWPN (user B/W points) → inversion → saturation boost → shadow correction
-    ODAI is skipped because per-channel B/W point mapping already normalises channels.
+    Inversion algorithm selected by USE_DENSITY_INVERSION (env
+    FREECCR_DENSITY_INVERT):
+      * density  — optical-density (log) space inversion, pure faithful, no
+                   styling. See _density_invert_points.
+      * standard — legacy per-channel linear stretch + 65535 - v inversion +
+                   saturation/shadow look.
+    ODAI is skipped because per-channel B/W point mapping already normalises
+    channels.
     """
     total_start_time = time.time()
 
@@ -1121,67 +1122,35 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         del rot_mat
 
-    # --- BWPN: B/W point values are absolute anchors, constant across the whole roll ---
-    #
-    # With no_auto_bright=True in rawpy, film base and dense-area values are identical in every
-    # frame. The sampled B/W points are applied directly as fixed per-channel anchors.
-    img_f = img.astype(np.float32)
-    norm = np.empty_like(img_f)
-    for c in range(3):
-        p_hi = max(float(black_point_bgr[c]), 1.0)   # transparent film (film base) → maps to black
-        p_lo = max(float(white_point_bgr[c]), 1.0)   # dense film (exposed area) → maps to white
-
-        denom = p_hi - p_lo
-        if abs(denom) < 1.0:
-            norm[..., c] = 0.0
-            continue
-        np.subtract(img_f[..., c], p_lo, out=norm[..., c])
-        np.divide(norm[..., c], denom, out=norm[..., c])
-        np.multiply(norm[..., c], 65535.0, out=norm[..., c])
-        np.clip(norm[..., c], 0, 65535, out=norm[..., c])
-    del img_f
-    print(f"BWPN (user points): {time.time() - total_start_time:.3f}s")
-
-    # --- Inversion (ODAI skipped: per-channel B/W points already equalise channels) ---
-    rgb_inverted = (65535.0 - norm).clip(0, 65535).astype(np.uint16)
-    del norm
-    gc.collect()
-
-    # --- Saturation boost (identical to main pipeline) ---
-    rgb_norm = rgb_inverted.astype(np.float32) / 65535.0
-    gamma_corrected = np.power(np.clip(rgb_norm, 0.0, 1.0), 1.0)
-    del rgb_norm
-
-    luminance = np.dot(gamma_corrected[..., :3], [0.299, 0.587, 0.114])
-    luminance_expanded = np.expand_dims(luminance, axis=-1)
-    saturation_curve = np.power(luminance, 0.8)
-    del luminance
-    base_saturation = 1.15
-    min_saturation = 1.00
-    dynamic_saturation = min_saturation + (base_saturation - min_saturation) * saturation_curve
-    del saturation_curve
-    dynamic_saturation = np.expand_dims(dynamic_saturation, axis=-1)
-    gamma_corrected = luminance_expanded + dynamic_saturation * (gamma_corrected - luminance_expanded)
-    del luminance_expanded, dynamic_saturation
-    gamma_corrected = np.clip(gamma_corrected, 0.0, 1.0)
-
-    # --- Shadow warmth correction (identical to main pipeline) ---
-    shadow_corrected = gamma_corrected
-    shadow_luminance = np.dot(shadow_corrected[..., :3], [0.299, 0.587, 0.114])
-    warmth_curve = np.exp(-shadow_luminance * 4.0)
-    warmth_strength = 0.35 * warmth_curve
-    del warmth_curve
-    green_curve = np.exp(-shadow_luminance * 3.5)
-    del shadow_luminance
-    green_strength = 0.15 * green_curve
-    del green_curve
-    shadow_corrected[..., 0] *= (1.0 + warmth_strength * 0.8)
-    shadow_corrected[..., 1] *= (1.0 + green_strength)
-    shadow_corrected[..., 2] *= (1.0 - warmth_strength)
-    del warmth_strength, green_strength
-
-    rgb_result = np.clip(shadow_corrected * 65535.0, 0, 65535).astype(np.uint16)
-    del shadow_corrected, gamma_corrected, rgb_inverted
+    # --- Inversion: density (pure faithful) or legacy linear ----------------
+    # The sampled points are absolute per-channel anchors, constant across the
+    # roll (no_auto_bright=True keeps film-base/dense values identical between
+    # frames). The clear-film point is the per-channel Dmin (orange mask).
+    if USE_DENSITY_INVERSION:
+        # Density-space inversion in optical density; no styling applied.
+        rgb_result = _density_invert_points(img, black_point_bgr, white_point_bgr)
+        print(f"Density inversion (B/W points): {time.time() - total_start_time:.3f}s")
+    else:
+        # Legacy: per-channel linear stretch + 65535 - v inversion + look.
+        img_f = img.astype(np.float32)
+        norm = np.empty_like(img_f)
+        for c in range(3):
+            p_hi = max(float(black_point_bgr[c]), 1.0)   # transparent film → black
+            p_lo = max(float(white_point_bgr[c]), 1.0)   # dense film → white
+            denom = p_hi - p_lo
+            if abs(denom) < 1.0:
+                norm[..., c] = 0.0
+                continue
+            np.subtract(img_f[..., c], p_lo, out=norm[..., c])
+            np.divide(norm[..., c], denom, out=norm[..., c])
+            np.multiply(norm[..., c], 65535.0, out=norm[..., c])
+            np.clip(norm[..., c], 0, 65535, out=norm[..., c])
+        del img_f
+        rgb_inverted = (65535.0 - norm).clip(0, 65535).astype(np.uint16)
+        del norm
+        rgb_result = apply_postinvert_look(rgb_inverted)
+        del rgb_inverted
+        print(f"BWPN (user points): {time.time() - total_start_time:.3f}s")
     gc.collect()
 
     # Non-destructive base offsets applied through the adjustment pipeline (UI shows 0).
@@ -1514,13 +1483,22 @@ def apply_reference_normalization(img: np.ndarray, p_lo, p_hi, od_factors) -> np
     norm *= np.float32(65535.0)
     np.clip(norm, 0, 65535, out=norm)
     inverted = 65535 - norm.astype(np.uint16)
+    # The reference (auto) path is legacy; in density mode we only drop the
+    # styling here. Its hi-res replay still uses the linear inversion, so the
+    # density auto path is exact only in the B/W-point tool (the focus). See
+    # docs/conversion-pipeline.md.
+    if USE_DENSITY_INVERSION:
+        return inverted
     return apply_postinvert_look(inverted)
 
 
 def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bgr) -> np.ndarray:
     """B/W-point conversion at any resolution: absolute per-channel anchors +
-    inversion + standard look — mirrors ccr_normalize_with_bwpoint's preview
-    path (the anchors are global constants, so no rescaling is needed)."""
+    inversion — mirrors ccr_normalize_with_bwpoint's preview path (the anchors
+    are global constants, so no rescaling is needed). Honours
+    USE_DENSITY_INVERSION so hi-res zoom/export match the preview exactly."""
+    if USE_DENSITY_INVERSION:
+        return _density_invert_points(img, black_point_bgr, white_point_bgr)
     img_f = img.astype(np.float32)
     norm = np.empty_like(img_f)
     for c in range(3):
