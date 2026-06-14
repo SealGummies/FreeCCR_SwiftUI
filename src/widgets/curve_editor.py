@@ -109,6 +109,9 @@ class CurveCanvas(QWidget):
     def active_channel(self) -> str:
         return self._channel
 
+    def is_dragging(self) -> bool:
+        return self._drag_index is not None
+
     def get_curves(self):
         """Return a fresh dict of non-identity channels, or None if every
         channel is identity."""
@@ -383,6 +386,9 @@ class CurveEditor(QWidget):
 
     def set_curves(self, curves):
         self.canvas.set_curves(curves)
+
+    def is_dragging(self) -> bool:
+        return self.canvas.is_dragging()
 
     def reset(self):
         self.canvas.reset()

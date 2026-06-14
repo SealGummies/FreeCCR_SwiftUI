@@ -690,8 +690,12 @@ class SlidersPanel(QWidget):
         adjustment = ccr_backend.get_adjustment_by_index(idx)
         print(f"Setting current index: {idx}, adjustment: {adjustment}")
         # Tone curves live inside the adjustment dict; load them into the editor
-        # regardless of whether any sliders are set.
-        self.curve_editor.set_curves(adjustment.get("curves") if adjustment else None)
+        # regardless of whether any sliders are set. Skip while a curve drag is
+        # active: update_preview() re-enters set_current_idx for the SAME image,
+        # and reloading would clear the drag mid-gesture (the editor is already
+        # the source of truth during a drag).
+        if not self.curve_editor.is_dragging():
+            self.curve_editor.set_curves(adjustment.get("curves") if adjustment else None)
         if adjustment is None or not adjustment:
             # No adjustment yet: show each slider's default (0 for most,
             # 10 for band_feather).
