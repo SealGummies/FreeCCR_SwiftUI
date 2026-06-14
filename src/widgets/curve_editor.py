@@ -153,7 +153,11 @@ class CurveCanvas(QWidget):
     def reset(self):
         self._points = identity_curves()
         self._release_grab()
-        self.update()
+        # repaint() (synchronous) rather than update() (deferred): the
+        # curveChanged handler below reprocesses the image preview synchronously
+        # and would otherwise block the event loop before the scheduled canvas
+        # repaint runs, making the curve appear to reset only after a lag.
+        self.repaint()
         self.curveChanged.emit()
         self.editFinished.emit()
 
