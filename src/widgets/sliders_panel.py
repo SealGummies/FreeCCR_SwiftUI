@@ -379,16 +379,37 @@ class SlidersPanel(QWidget):
         sync_layout.addWidget(self.sync_to_all_button)
         scroll_layout.addLayout(sync_layout)
 
-        # --- Channel Levels collapsible section (sliders[10]–[21]) ---
-        od_separator = QFrame()
-        od_separator.setFrameShape(QFrame.HLine)
-        od_separator.setFrameShadow(QFrame.Sunken)
-        od_separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
-        scroll_layout.addWidget(od_separator)
+        # --- Collapsible sections ---
+        # Display order (top→bottom): Curves, Subtractive Saturations, Channel
+        # Levels (last). The section WIDGETS are placed here in display order,
+        # but their SLIDERS are created further below in the strict order that
+        # ADJUSTMENT_KEYS requires (Channel Levels before bands). Placement and
+        # population are decoupled because each CollapsibleSection holds its own
+        # content layout, so create_slider() append order is independent of where
+        # the section sits in scroll_layout.
+        def _section_separator():
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setFrameShadow(QFrame.Sunken)
+            sep.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
+            return sep
 
+        scroll_layout.addWidget(_section_separator())
+        self.curves_section = CollapsibleSection("Curves")
+        scroll_layout.addWidget(self.curves_section)
+
+        scroll_layout.addWidget(_section_separator())
+        self.band_section = CollapsibleSection("Subtractive Saturations")
+        scroll_layout.addWidget(self.band_section)
+
+        scroll_layout.addWidget(_section_separator())
         self.od_section = CollapsibleSection("Channel Levels")
         scroll_layout.addWidget(self.od_section)
 
+        # --- Populate Channel Levels (sliders[10]–[21]) ---
+        # MUST be created before the band sliders to keep the ADJUSTMENT_KEYS
+        # positional mapping (channel keys precede band keys), regardless of the
+        # section's display position above.
         # Master group
         master_label = QLabel("Master")
         master_label.setStyleSheet("color: #888; font-size: 11px; margin-top: 4px;")
@@ -425,16 +446,7 @@ class SlidersPanel(QWidget):
         self.od_section.add_layout(self.create_slider("B Gain"))
         self.od_section.add_layout(self.create_slider("B Blackpoint"))
 
-        # --- Subtractive Saturations collapsible section (per-color bands) ---
-        band_separator = QFrame()
-        band_separator.setFrameShape(QFrame.HLine)
-        band_separator.setFrameShadow(QFrame.Sunken)
-        band_separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
-        scroll_layout.addWidget(band_separator)
-
-        self.band_section = CollapsibleSection("Subtractive Saturations")
-        scroll_layout.addWidget(self.band_section)
-
+        # --- Populate Subtractive Saturations (per-color bands) ---
         # A swatch button per color selects which band's sliders are shown;
         # all 24 sliders exist (and feed adjustment_settings) regardless.
         band_swatch_colors = {
@@ -488,15 +500,7 @@ class SlidersPanel(QWidget):
                                default_value=self._default_for("band_feather")))
         self._show_band_page("red")
 
-        # --- Curves collapsible section ---
-        curves_separator = QFrame()
-        curves_separator.setFrameShape(QFrame.HLine)
-        curves_separator.setFrameShadow(QFrame.Sunken)
-        curves_separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
-        scroll_layout.addWidget(curves_separator)
-
-        self.curves_section = CollapsibleSection("Curves")
-        scroll_layout.addWidget(self.curves_section)
+        # --- Populate Curves ---
         self.curve_editor = CurveEditor()
         self.curves_section.add_widget(self.curve_editor)
         self.curve_editor.curveChanged.connect(self._on_curve_changed)
