@@ -777,8 +777,27 @@ class SlidersPanel(QWidget):
         self._debounce_timer.start(150)
 
     def _on_curve_edit_finished(self):
-        """End the undo burst so the next discrete curve edit is its own step."""
+        """Settle a finished curve edit (drag release, add/remove, Reset Curve).
+
+        update_preview() displays the cached resized_preview and only
+        regenerates it *afterwards* (via set_current_idx), so the live
+        _on_curve_changed path leaves the final state one render behind — for a
+        discrete edit nothing redraws it, so the image looked unchanged until the
+        user clicked the canvas. Mirror on_reset_clicked: regenerate the preview
+        first, then display it, so the result is shown immediately."""
         self.end_undo_burst()
+        if self.current_idx is None or not (0 <= self.current_idx < len(ccr_backend.images)):
+            return
+        # Cancel the pending debounced reprocess — we render the final state now.
+        self._debounce_timer.stop()
+        self._pending_adjustment = None
+        self._pending_idx = None
+        ccr_backend.images[self.current_idx].update_thumbnail_and_preview()
+        self.parent().parent().image_preview.update_preview(self.current_idx)
+        try:
+            self.parent().parent().thumbnail_list.update_thumbnail(self.current_idx)
+        except AttributeError:
+            pass
 
     def _process_pending_adjustment(self):
         """Process the pending adjustment if not already processing."""
