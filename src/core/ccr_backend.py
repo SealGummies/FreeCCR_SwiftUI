@@ -363,7 +363,10 @@ class CCRBackend:
     def reset_images_by_indices(self, indices) -> bool:
         """Reset each image in indices to its freshly-loaded state.
         Returns True if at least one image was reset."""
-        return any(self.reset_image_by_index(i) for i in sorted(set(indices)))
+        # Materialize the results first: any() over a generator short-circuits
+        # on the first True and would leave the rest of the selection un-reset.
+        results = [self.reset_image_by_index(i) for i in sorted(set(indices))]
+        return any(results)
 
     def convert_negative_by_index(self, idx: int):
         """
