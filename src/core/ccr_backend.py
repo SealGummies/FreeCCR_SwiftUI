@@ -331,6 +331,43 @@ class CCRBackend:
             else:
                 print(f"Image at index {idx} is not converted.")
 
+    def reset_image_by_index(self, idx: int) -> bool:
+        """Reset the image at idx to its freshly-loaded state: undo the
+        conversion and clear every non-destructive edit (adjustments,
+        reference frame, crop, orientation, colour profile) so it matches a
+        just-imported image. Slicing (source_ops/lineage) is preserved — a
+        slice resets to its un-edited region, not back to the whole file
+        (use "Reset Slice" for that). Returns False if idx is out of range."""
+        if idx is None or not (0 <= idx < len(self.images)):
+            return False
+        image_obj = self.images[idx]
+        # Clear edit state BEFORE reloading so the rebuilt preview reflects
+        # the pristine settings. reload_image() re-decodes resized_raw and
+        # resets the base offsets + conversion_inputs.
+        image_obj.converted = False
+        image_obj.adjustment_settings = {}
+        image_obj.reference_frame = None
+        image_obj.crop_rect = None
+        image_obj.crop_angle = 0.0
+        image_obj.rotation_angle = 0
+        image_obj.fine_rotation_angle = 0
+        image_obj.horizontal_mirrored = False
+        image_obj.vertical_mirrored = False
+        image_obj.color_profile = "color"
+        # The conversion is gone, so the undo history (which never captured
+        # the conversion anyway) would be inconsistent — drop it.
+        image_obj.undo_stack = []
+        image_obj.reload_image()
+        return True
+
+    def reset_images_by_indices(self, indices) -> bool:
+        """Reset each image in indices to its freshly-loaded state.
+        Returns True if at least one image was reset."""
+        # Materialize the results first: any() over a generator short-circuits
+        # on the first True and would leave the rest of the selection un-reset.
+        results = [self.reset_image_by_index(i) for i in sorted(set(indices))]
+        return any(results)
+
     def convert_negative_by_index(self, idx: int):
         """
         Converts the negative image at the given index using CCR normalization with reference.
