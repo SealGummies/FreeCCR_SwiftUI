@@ -77,6 +77,7 @@ class CurveCanvas(QWidget):
 
     POINT_HIT = 11          # px square hit area ("button size") around a point
     POINT_RADIUS = 4
+    CURVE_HIT = 8           # px vertical tolerance for "clicked on the line"
 
     curveChanged = Signal()      # live, during a drag / on add / on remove
     editFinished = Signal()      # drag released / edit settled
@@ -96,6 +97,7 @@ class CurveCanvas(QWidget):
         self._channel = "rgb"
         self._points = identity_curves()
         self._drag_index = None
+        self._grabbed = False
         self._enabled = True
 
     # --- public API -------------------------------------------------------
@@ -136,12 +138,18 @@ class CurveCanvas(QWidget):
                     if len(cleaned) >= 2:
                         new[ch] = cleaned
         self._points = new
-        self._drag_index = None
+        self._release_grab()
         self.update()
+
+    def _release_grab(self):
+        self._drag_index = None
+        if self._grabbed:
+            self.releaseMouse()
+            self._grabbed = False
 
     def reset(self):
         self._points = identity_curves()
-        self._drag_index = None
+        self._release_grab()
         self.update()
         self.curveChanged.emit()
         self.editFinished.emit()
@@ -153,8 +161,20 @@ class CurveCanvas(QWidget):
 
     # --- geometry helpers -------------------------------------------------
     def _plot_rect(self) -> QRectF:
-        m = 8.0
-        return QRectF(m, m, self.width() - 2 * m, self.height() - 2 * m)
+        # Larger right inset keeps the x=255 edge clear of the panel's vertical
+        # scrollbar, which overlays the canvas's rightmost pixels.
+        left = top = bottom = 10.0
+        right = 22.0
+        return QRectF(left, top,
+                      self.width() - left - right,
+                      self.height() - top - bottom)
+
+    def _curve_y_at(self, x_curve: float) -> float:
+        """Output (0..255) of the active channel's curve at input x_curve."""
+        pts = self._points[self._channel]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return _monotone_cubic(xs, ys, [x_curve])[0]
 
     def _to_widget(self, x, y) -> QPointF:
         r = self._plot_rect()
@@ -183,7 +203,8 @@ class CurveCanvas(QWidget):
         if not self._enabled:
             return
         pts = self._points[self._channel]
-        idx = self._point_at(event.position())
+        pos = event.position()
+        idx = self._point_at(pos)
 
         if event.button() == Qt.RightButton:
             # Remove an interior point; ignore endpoints / empty canvas.
@@ -193,6 +214,7 @@ class CurveCanvas(QWidget):
                 self.update()
                 self.curveChanged.emit()
                 self.editFinished.emit()
+            event.accept()
             return
 
         if event.button() != Qt.LeftButton:
@@ -202,17 +224,28 @@ class CurveCanvas(QWidget):
             # Grab the existing point (no new point created).
             self._drag_index = idx
         else:
-            # Create a new point at the click and start dragging it.
-            x, y = self._to_curve(event.position())
-            # Keep strictly inside the endpoints.
-            x = min(254.0, max(1.0, x))
+            # Create a point ONLY when the click lands on the curve line.
+            xc, yc = self._to_curve(pos)
+            curve_y = self._curve_y_at(xc)
+            on_line = abs(pos.y() - self._to_widget(xc, curve_y).y()) <= self.CURVE_HIT
+            if not on_line:
+                event.accept()
+                return  # empty space away from the line — do nothing
+            # New point sits exactly on the existing curve, strictly between
+            # the endpoints, then the drag reshapes it.
+            x = min(254.0, max(1.0, xc))
             insert_at = 0
             while insert_at < len(pts) and pts[insert_at][0] < x:
                 insert_at += 1
-            pts.insert(insert_at, [x, y])
+            pts.insert(insert_at, [x, curve_y])
             self._drag_index = insert_at
+        # The canvas sits inside the panel's QScrollArea; grab the mouse so move
+        # events keep coming to us for the whole drag instead of being stolen.
+        self.grabMouse()
+        self._grabbed = True
         self.update()
         self.curveChanged.emit()
+        event.accept()
 
     def mouseMoveEvent(self, event):
         if not self._enabled or self._drag_index is None:
@@ -232,11 +265,18 @@ class CurveCanvas(QWidget):
         pts[i] = [x, min(255.0, max(0.0, y))]
         self.update()
         self.curveChanged.emit()
+        event.accept()
 
     def mouseReleaseEvent(self, event):
+        # Always drop the grab if we hold it, even if _drag_index was cleared
+        # mid-drag (e.g. by a set_curves refresh), so the mouse can't get stuck.
+        if self._grabbed:
+            self.releaseMouse()
+            self._grabbed = False
         if self._drag_index is not None:
             self._drag_index = None
             self.editFinished.emit()
+            event.accept()
 
     # --- painting ---------------------------------------------------------
     def paintEvent(self, event):

@@ -65,11 +65,18 @@ preceded by a horizontal separator, matching the existing pattern.
 ### 3.4 Mouse behaviour
 - **Hit area**: each control point has a square hit/"button" area of
   `POINT_HIT = 11 px` (radius ~5–6 px) around its center.
-- **Left-press on empty canvas** (not within any point's hit area): create a new
-  control point at the clicked position and immediately begin dragging it.
 - **Left-press on an existing point's hit area**: grab that point and drag it
   (no new point is created — this is the "button area won't create a new point"
   rule).
+- **Left-press on the curve line** (within `CURVE_HIT = 8 px` of the drawn
+  curve, vertically) but not on an existing point: create a new control point
+  **on the curve** at that input x and immediately begin dragging it.
+- **Left-press on empty canvas** away from both the curve and any point: does
+  nothing (no point is created). New points only come from clicking the line.
+- **Mouse grab**: on starting a drag (create or grab) the canvas calls
+  `grabMouse()` and releases it on mouse-release. This is required because the
+  curve canvas lives inside the panel's `QScrollArea`, which otherwise steals
+  the move events mid-drag (the point would not follow the cursor).
 - **Drag**: moves the grabbed point.
   - Endpoints (`x==0` and `x==255`): X is locked; Y is draggable `[0,255]`.
   - Interior points: X clamped to stay strictly between the two neighbour points
@@ -307,6 +314,11 @@ into the editor via `curve_editor.set_curves(...)`.
   with the panel. Dark theme to match (`#2b2b2b` canvas, `#555` grid, `#888`
   identity diagonal, channel-tinted curve line: white for All, `#c66`/`#6a6`/
   `#66c` for R/G/B mirroring the Channel-Levels labels).
+- **Plot inset / scrollbar clearance**: the interactive plot rect is inset from
+  the canvas edges (left/top/bottom 10 px, **right 22 px**). The larger right
+  inset keeps the `x=255` endpoint and the whole right edge of the curve clear
+  of the panel's vertical scrollbar, which overlays the canvas's rightmost
+  pixels — otherwise the top-right control point is unclickable.
 - Channel buttons reuse the small checkable style used by the band swatches.
 
 ### 9.8 Catalog note
