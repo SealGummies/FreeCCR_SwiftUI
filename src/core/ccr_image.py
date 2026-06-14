@@ -595,14 +595,14 @@ class CCRImage:
         t0 = time.time()
         if ci.get("mode") == "ref":
             ref_small = self.resize_image_to_max_pixel(img, 1080)
-            base_density, gamma_ch, levels = compute_reference_norm_params(
+            p_lo, p_hi, od_factors = compute_reference_norm_params(
                 ref_small, ci["ref"], ci["fine_rot"])
-            out = apply_reference_normalization(img, base_density, gamma_ch, levels)
+            out = apply_reference_normalization(img, p_lo, p_hi, od_factors)
         elif ci.get("mode") == "ref_params":
             # Sliced children of a reference-converted parent carry the
             # parent's precomputed conversion constants directly (the
             # parent's frame coordinates would be meaningless here).
-            out = apply_reference_normalization(img, ci["base_density"], ci["gamma_ch"], ci.get("levels"))
+            out = apply_reference_normalization(img, ci["p_lo"], ci["p_hi"], ci["od"])
         elif ci.get("mode") == "bw":
             # The bwpoint pipeline bakes the fine rotation into the preview
             # pixels BEFORE normalization — replicate that here so the

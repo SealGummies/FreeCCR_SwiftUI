@@ -453,8 +453,7 @@ class CCRBackend:
                 if ci is not None and ci.get("mode") == "ref_params":
                     # Sliced child of a reference-converted parent: replay the
                     # stored conversion constants at full resolution.
-                    ccr_normalize_with_refparams(image_obj, ci["base_density"], ci["gamma_ch"],
-                                                 ci.get("levels"),
+                    ccr_normalize_with_refparams(image_obj, ci["p_lo"], ci["p_hi"], ci["od"],
                                                  output_path=output_path,
                                                  water_mark=not self.software_activated,
                                                  jpg_out=jpg_output, jpg_quality=jpg_quality,
@@ -747,14 +746,13 @@ class CCRBackend:
         if parent_ci is not None and parent_ci.get("mode") == "ref":
             from core.ccr_processor import compute_reference_norm_params
             ref_small = img_obj.resize_image_to_max_pixel(full, 1080)
-            base_density, gamma_ch, levels = compute_reference_norm_params(
+            p_lo, p_hi, od = compute_reference_norm_params(
                 ref_small, parent_ci["ref"], parent_ci["fine_rot"])
-            norm_params = (tuple(float(v) for v in base_density),
-                           tuple(float(v) for v in gamma_ch),
-                           tuple(float(v) for v in levels))
+            norm_params = (tuple(float(v) for v in p_lo),
+                           tuple(float(v) for v in p_hi),
+                           tuple(float(v) for v in od))
         elif parent_ci is not None and parent_ci.get("mode") == "ref_params":
-            norm_params = (parent_ci["base_density"], parent_ci["gamma_ch"],
-                           parent_ci.get("levels"))
+            norm_params = (parent_ci["p_lo"], parent_ci["p_hi"], parent_ci["od"])
 
         # Bake the parent's current fine rotation: the cuts were placed on
         # the rotated display, so the slices are cut from the rotated frame.
@@ -805,8 +803,8 @@ class CCRBackend:
                 if norm_params is not None:
                     from core.ccr_processor import apply_reference_normalization
                     crop = apply_reference_normalization(crop, *norm_params)
-                    child_ci = {"mode": "ref_params", "base_density": norm_params[0],
-                                "gamma_ch": norm_params[1], "levels": norm_params[2]}
+                    child_ci = {"mode": "ref_params", "p_lo": norm_params[0],
+                                "p_hi": norm_params[1], "od": norm_params[2]}
                 elif parent_ci is not None and parent_ci.get("mode") == "bw":
                     from core.ccr_processor import apply_bwpoint_normalization
                     black_point, white_point = parent_ci["bw"]
@@ -944,13 +942,13 @@ class CCRBackend:
             child_full = template.read_image(template.file_path, preview=True)
             if child_full is not None:
                 small = template.resize_image_to_max_pixel(child_full, 1080)
-                base_density, gamma_ch, levels = compute_reference_norm_params(
+                p_lo, p_hi, od = compute_reference_norm_params(
                     small, ci["ref"], ci.get("fine_rot", 0))
-                norm_params = (tuple(float(v) for v in base_density),
-                               tuple(float(v) for v in gamma_ch),
-                               tuple(float(v) for v in levels))
+                norm_params = (tuple(float(v) for v in p_lo),
+                               tuple(float(v) for v in p_hi),
+                               tuple(float(v) for v in od))
         elif ci is not None and ci.get("mode") == "ref_params":
-            norm_params = (ci["base_density"], ci["gamma_ch"], ci.get("levels"))
+            norm_params = (ci["p_lo"], ci["p_hi"], ci["od"])
         elif ci is not None and ci.get("mode") == "bw":
             bw_points = ci["bw"]
 
@@ -983,8 +981,8 @@ class CCRBackend:
                 parent.resized_raw, *norm_params)
             parent.converted = True
             parent.conversion_inputs = {
-                "mode": "ref_params", "base_density": norm_params[0],
-                "gamma_ch": norm_params[1], "levels": norm_params[2]}
+                "mode": "ref_params", "p_lo": norm_params[0],
+                "p_hi": norm_params[1], "od": norm_params[2]}
         elif bw_points is not None:
             parent.resized_raw = apply_bwpoint_normalization(
                 parent.resized_raw, *bw_points)
