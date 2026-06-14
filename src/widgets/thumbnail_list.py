@@ -243,6 +243,7 @@ class ThumbnailList(QWidget):
         remove_action = menu.addAction(f"Remove from list{suffix}")
         menu.addSeparator()
         export_action = menu.addAction("Export…")
+        reset_action = menu.addAction(f"Reset{suffix}")
         # Offered only when the selection contains slices: restores the
         # un-sliced parent image(s) in place of all their slices.
         reset_slice_action = None
@@ -261,6 +262,8 @@ class ThumbnailList(QWidget):
         elif action == export_action:
             # Open the export dialog pre-scoped to the right-clicked selection.
             self._main_window().image_preview.open_export_dialog(default_scope="selected")
+        elif action == reset_action:
+            self.reset_images(indices)
         elif reset_slice_action is not None and action == reset_slice_action:
             self.reset_slices(indices)
 
@@ -295,6 +298,29 @@ class ThumbnailList(QWidget):
     def remove_image(self, idx):
         """Single-image removal (kept for compatibility)."""
         self.remove_images([idx])
+
+    def reset_images(self, indices):
+        # Reset re-decodes the source file(s) synchronously; show a busy
+        # cursor so the brief GUI-thread freeze reads as work, not a hang.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            changed = ccr_backend.reset_images_by_indices(indices)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not changed:
+            return
+        for idx in indices:
+            self.update_thumbnail(idx)
+        # Refresh the preview, sliders, and convert/unconvert state for the
+        # currently selected image (the list itself is unchanged).
+        current = self.thumbnail_list.currentItem()
+        if current is not None:
+            cur_idx = current.data(Qt.UserRole)
+            main_window = self._main_window()
+            main_window.image_preview.update_preview(cur_idx)
+            main_window.sliders_panel.set_current_idx(cur_idx)
+            main_window.image_preview._update_unconvert_action_state()
+        ccr_backend.save_catalog()
 
     def reset_slices(self, indices):
         # Reset re-decodes the source file(s) synchronously; show a busy
