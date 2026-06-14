@@ -94,3 +94,5 @@ src/utils/unicode_path_utils.py → Cross-platform Unicode filename handling
 ## Workflow
 
 For every major change: create a new branch, make the changes, then open a PR back to `main`.
+
+**New features**: before writing code, author a spec in the `spec/` folder (e.g. `spec/<feature>.md`) covering goals/non-goals, UX/interaction, data model, processing/math, integration points, and a test plan. Refine that spec once more (resolve open questions, tighten integration details) before implementing. Then implement against the refined spec, with tests. See `spec/curves-tone-control.md` for the reference shape.
