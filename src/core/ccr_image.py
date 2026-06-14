@@ -9,7 +9,7 @@ import time
 from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage, QPixmap if you use PySide
 #import lensfunpy  # Make sure lensfunpy is installed
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
-                                BAND_ADJUSTMENT_KEYS)
+                                BAND_ADJUSTMENT_KEYS, apply_curves)
 
 # Import optional libraries with fallbacks
 try:
@@ -561,6 +561,11 @@ class CCRImage:
                      band_settings=(s if any(s.get(k, 0)
                                              for k in BAND_ADJUSTMENT_KEYS)
                                     else None))
+        # Tone curves run after the slider pass, in RGB, before any B&W
+        # luminance collapse (Photoshop-like). No-op for identity curves.
+        curves = s.get('curves')
+        if curves:
+            adjusted = apply_curves(adjusted, curves)
         if profile == "bw":
             adjusted = self._to_grayscale(adjusted)
         return adjusted

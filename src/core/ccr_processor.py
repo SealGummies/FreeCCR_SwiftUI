@@ -2545,3 +2545,147 @@ def cleanup_opencl():
         print("OpenCL resources cleaned up")
     except Exception as e:
         print(f"Error cleaning up OpenCL resources: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Tone curves (Photoshop-style Curves control)
+#
+# Curve state is a dict of channel -> list of [x, y] control points in the
+# 0..255 display domain, e.g.
+#   {"rgb": [[0,0],[255,255]], "r": [...], "g": [...], "b": [...]}
+# "rgb" is the composite ("All") curve applied to every channel before the
+# per-channel r/g/b curves (matching Photoshop's compose order). Missing or
+# malformed channels are treated as identity. See spec/curves-tone-control.md.
+# ---------------------------------------------------------------------------
+
+_CURVE_CHANNELS = ("rgb", "r", "g", "b")
+_IDENTITY_POINTS = [[0.0, 0.0], [255.0, 255.0]]
+
+
+def _normalize_points(points):
+    """Sanitize a control-point list: keep finite [x,y] pairs, clamp to
+    [0,255], sort by x, drop duplicate-x points. Returns None if the result is
+    effectively the 2-point identity (so callers can skip it)."""
+    if not points:
+        return None
+    cleaned = []
+    for p in points:
+        try:
+            x = float(p[0]); y = float(p[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        cleaned.append([min(255.0, max(0.0, x)), min(255.0, max(0.0, y))])
+    if len(cleaned) < 2:
+        return None
+    cleaned.sort(key=lambda q: q[0])
+    # Drop points sharing an x with the previous one (keep the first).
+    dedup = [cleaned[0]]
+    for q in cleaned[1:]:
+        if q[0] > dedup[-1][0]:
+            dedup.append(q)
+    if len(dedup) < 2:
+        return None
+    # Exactly the identity diagonal? Treat as no-op.
+    if dedup == _IDENTITY_POINTS:
+        return None
+    return dedup
+
+
+def _is_identity_curves(curves) -> bool:
+    """True when curves is None/empty or every channel is the identity."""
+    if not curves:
+        return True
+    for ch in _CURVE_CHANNELS:
+        if _normalize_points(curves.get(ch)) is not None:
+            return False
+    return True
+
+
+def _monotone_cubic(xs, ys, xq):
+    """Fritsch-Carlson monotone cubic interpolation of (xs, ys) at xq.
+    Prevents overshoot so the tone curve never inverts local contrast.
+    xs must be strictly increasing. Returns a float array shaped like xq."""
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    n = len(xs)
+    if n == 2:
+        # Straight line — exact, and the common (identity / single move) case.
+        return np.interp(xq, xs, ys)
+    h = np.diff(xs)
+    delta = np.diff(ys) / h
+    # Tangents
+    m = np.empty(n, dtype=np.float64)
+    m[1:-1] = (delta[:-1] + delta[1:]) / 2.0
+    m[0] = delta[0]
+    m[-1] = delta[-1]
+    # Enforce monotonicity (Fritsch-Carlson)
+    for i in range(n - 1):
+        if delta[i] == 0.0:
+            m[i] = 0.0
+            m[i + 1] = 0.0
+        else:
+            a = m[i] / delta[i]
+            b = m[i + 1] / delta[i]
+            s = a * a + b * b
+            if s > 9.0:
+                t = 3.0 / np.sqrt(s)
+                m[i] = t * a * delta[i]
+                m[i + 1] = t * b * delta[i]
+    xq = np.asarray(xq, dtype=np.float64)
+    # Segment index for each query point
+    idx = np.clip(np.searchsorted(xs, xq) - 1, 0, n - 2)
+    x0 = xs[idx]; x1 = xs[idx + 1]
+    y0 = ys[idx]; y1 = ys[idx + 1]
+    m0 = m[idx]; m1 = m[idx + 1]
+    hh = (x1 - x0)
+    t = (xq - x0) / hh
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2 * t3 - 3 * t2 + 1
+    h10 = t3 - 2 * t2 + t
+    h01 = -2 * t3 + 3 * t2
+    h11 = t3 - t2
+    return h00 * y0 + h10 * hh * m0 + h01 * y1 + h11 * hh * m1
+
+
+def build_channel_lut(points) -> np.ndarray:
+    """Build a 256-entry float curve (output 0..255) from control points in the
+    0..255 domain using monotone cubic interpolation. Returns the identity ramp
+    for an identity/invalid point set."""
+    pts = _normalize_points(points)
+    x = np.arange(256, dtype=np.float64)
+    if pts is None:
+        return x.astype(np.float32)
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    y = _monotone_cubic(xs, ys, x)
+    return np.clip(y, 0.0, 255.0).astype(np.float32)
+
+
+def apply_curves(img16: np.ndarray, curves) -> np.ndarray:
+    """Apply Photoshop-style tone curves to a 16-bit RGB image.
+
+    curves: dict of channel ("rgb"/"r"/"g"/"b") -> list of [x,y] points in the
+    0..255 domain. The composite "rgb" curve is applied first, then the
+    per-channel curve. Identity channels are skipped. Returns a uint16 array;
+    the input is returned unchanged when every channel is identity.
+    """
+    if _is_identity_curves(curves):
+        return img16
+
+    rgb_lut = build_channel_lut(curves.get("rgb"))     # 256 -> 0..255 float
+    sample = np.arange(65536, dtype=np.float32)
+    src_idx = np.arange(256, dtype=np.float32) * (65535.0 / 255.0)
+
+    out = np.empty_like(img16)
+    for c, key in enumerate(("r", "g", "b")):
+        # Compose per-channel curve over the composite curve in 0..255 space.
+        ch_lut = build_channel_lut(curves.get(key))
+        composed = ch_lut[np.clip(np.rint(rgb_lut), 0, 255).astype(np.intp)]
+        # Expand the 256-point composed curve to a full 16-bit LUT.
+        lut16 = np.interp(sample, src_idx,
+                          composed * (65535.0 / 255.0)).astype(np.uint16)
+        out[..., c] = lut16[img16[..., c]]
+    return out

@@ -6,6 +6,8 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
 from core.ccr_backend import ccr_backend
 from core.ccr_processor import COLOR_BANDS, BAND_PARAMS, BAND_ADJUSTMENT_KEYS
+from widgets.curve_editor import CurveEditor
+import copy
 
 # Setting groups offered by the "Sync to All" dialog. The adjustment-key
 # groups partition SlidersPanel.ADJUSTMENT_KEYS exactly; "crop" syncs the
@@ -25,6 +27,9 @@ SYNC_GROUPS = [
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint")),
     ("bands", "Subtractive Saturations (per color)",
      tuple(BAND_ADJUSTMENT_KEYS) + ("band_feather",)),
+    # "curves" lives outside ADJUSTMENT_KEYS (it's a nested structure, not a
+    # slider), so it's synced specially in _perform_sync_to_all, like crop.
+    ("curves", "Curves", ()),
 ]
 
 
@@ -374,16 +379,37 @@ class SlidersPanel(QWidget):
         sync_layout.addWidget(self.sync_to_all_button)
         scroll_layout.addLayout(sync_layout)
 
-        # --- Channel Levels collapsible section (sliders[10]–[21]) ---
-        od_separator = QFrame()
-        od_separator.setFrameShape(QFrame.HLine)
-        od_separator.setFrameShadow(QFrame.Sunken)
-        od_separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
-        scroll_layout.addWidget(od_separator)
+        # --- Collapsible sections ---
+        # Display order (top→bottom): Curves, Subtractive Saturations, Channel
+        # Levels (last). The section WIDGETS are placed here in display order,
+        # but their SLIDERS are created further below in the strict order that
+        # ADJUSTMENT_KEYS requires (Channel Levels before bands). Placement and
+        # population are decoupled because each CollapsibleSection holds its own
+        # content layout, so create_slider() append order is independent of where
+        # the section sits in scroll_layout.
+        def _section_separator():
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setFrameShadow(QFrame.Sunken)
+            sep.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
+            return sep
 
+        scroll_layout.addWidget(_section_separator())
+        self.curves_section = CollapsibleSection("Curves")
+        scroll_layout.addWidget(self.curves_section)
+
+        scroll_layout.addWidget(_section_separator())
+        self.band_section = CollapsibleSection("Subtractive Saturations")
+        scroll_layout.addWidget(self.band_section)
+
+        scroll_layout.addWidget(_section_separator())
         self.od_section = CollapsibleSection("Channel Levels")
         scroll_layout.addWidget(self.od_section)
 
+        # --- Populate Channel Levels (sliders[10]–[21]) ---
+        # MUST be created before the band sliders to keep the ADJUSTMENT_KEYS
+        # positional mapping (channel keys precede band keys), regardless of the
+        # section's display position above.
         # Master group
         master_label = QLabel("Master")
         master_label.setStyleSheet("color: #888; font-size: 11px; margin-top: 4px;")
@@ -420,16 +446,7 @@ class SlidersPanel(QWidget):
         self.od_section.add_layout(self.create_slider("B Gain"))
         self.od_section.add_layout(self.create_slider("B Blackpoint"))
 
-        # --- Subtractive Saturations collapsible section (per-color bands) ---
-        band_separator = QFrame()
-        band_separator.setFrameShape(QFrame.HLine)
-        band_separator.setFrameShadow(QFrame.Sunken)
-        band_separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
-        scroll_layout.addWidget(band_separator)
-
-        self.band_section = CollapsibleSection("Subtractive Saturations")
-        scroll_layout.addWidget(self.band_section)
-
+        # --- Populate Subtractive Saturations (per-color bands) ---
         # A swatch button per color selects which band's sliders are shown;
         # all 24 sliders exist (and feed adjustment_settings) regardless.
         band_swatch_colors = {
@@ -482,6 +499,12 @@ class SlidersPanel(QWidget):
             self.create_slider("Feather", min_value=0, max_value=100,
                                default_value=self._default_for("band_feather")))
         self._show_band_page("red")
+
+        # --- Populate Curves ---
+        self.curve_editor = CurveEditor()
+        self.curves_section.add_widget(self.curve_editor)
+        self.curve_editor.curveChanged.connect(self._on_curve_changed)
+        self.curve_editor.editFinished.connect(self._on_curve_edit_finished)
 
         # --- Signal connections ---
         self.reset_button.clicked.connect(self.on_reset_clicked)
@@ -639,6 +662,9 @@ class SlidersPanel(QWidget):
         self.wb_picker_btn.setEnabled(enabled)
         self.crop_btn.setEnabled(enabled)
         self.color_profile_combo.setEnabled(enabled)
+        self.curve_editor.setEnabled(enabled)
+        if not enabled:
+            self.curve_editor.set_curves(None)
         for slider in self.sliders:
             slider.setEnabled(enabled)
             if not enabled:
@@ -667,6 +693,13 @@ class SlidersPanel(QWidget):
         self._sync_color_profile_combo(idx)
         adjustment = ccr_backend.get_adjustment_by_index(idx)
         print(f"Setting current index: {idx}, adjustment: {adjustment}")
+        # Tone curves live inside the adjustment dict; load them into the editor
+        # regardless of whether any sliders are set. Skip while a curve drag is
+        # active: update_preview() re-enters set_current_idx for the SAME image,
+        # and reloading would clear the drag mid-gesture (the editor is already
+        # the source of truth during a drag).
+        if not self.curve_editor.is_dragging():
+            self.curve_editor.set_curves(adjustment.get("curves") if adjustment else None)
         if adjustment is None or not adjustment:
             # No adjustment yet: show each slider's default (0 for most,
             # 10 for band_feather).
@@ -699,6 +732,7 @@ class SlidersPanel(QWidget):
         """
         if self.current_idx is not None:
             adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
+            self._attach_curves(adjustment)
 
             # Immediate lightweight feedback - just store the adjustment settings
             if 0 <= self.current_idx < len(ccr_backend.images):
@@ -716,6 +750,55 @@ class SlidersPanel(QWidget):
             self._debounce_timer.stop()
             self._debounce_timer.start(150)  # Slightly longer debounce for heavy processing
     
+    def _attach_curves(self, adjustment: dict) -> dict:
+        """Re-attach the live tone-curve state from the editor onto a freshly
+        rebuilt adjustment dict (the slider->dict rebuild drops the nested
+        'curves' key otherwise). No-op for identity curves."""
+        curves = self.curve_editor.get_curves()
+        if curves:
+            adjustment["curves"] = curves
+        return adjustment
+
+    def _on_curve_changed(self):
+        """Live tone-curve edit — mirror on_slider_changed's feedback +
+        debounced heavy-processing path so a curve drag behaves like a slider
+        drag (single undo burst, coalesced reprocessing)."""
+        if self.current_idx is None:
+            return
+        adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
+        self._attach_curves(adjustment)
+        if 0 <= self.current_idx < len(ccr_backend.images):
+            self._begin_undo_burst(ccr_backend.images[self.current_idx])
+            ccr_backend.images[self.current_idx].adjustment_settings = adjustment
+        self.parent().parent().image_preview.update_preview(self.current_idx)
+        self._pending_adjustment = adjustment
+        self._pending_idx = self.current_idx
+        self._debounce_timer.stop()
+        self._debounce_timer.start(150)
+
+    def _on_curve_edit_finished(self):
+        """Settle a finished curve edit (drag release, add/remove, Reset Curve).
+
+        update_preview() displays the cached resized_preview and only
+        regenerates it *afterwards* (via set_current_idx), so the live
+        _on_curve_changed path leaves the final state one render behind — for a
+        discrete edit nothing redraws it, so the image looked unchanged until the
+        user clicked the canvas. Mirror on_reset_clicked: regenerate the preview
+        first, then display it, so the result is shown immediately."""
+        self.end_undo_burst()
+        if self.current_idx is None or not (0 <= self.current_idx < len(ccr_backend.images)):
+            return
+        # Cancel the pending debounced reprocess — we render the final state now.
+        self._debounce_timer.stop()
+        self._pending_adjustment = None
+        self._pending_idx = None
+        ccr_backend.images[self.current_idx].update_thumbnail_and_preview()
+        self.parent().parent().image_preview.update_preview(self.current_idx)
+        try:
+            self.parent().parent().thumbnail_list.update_thumbnail(self.current_idx)
+        except AttributeError:
+            pass
+
     def _process_pending_adjustment(self):
         """Process the pending adjustment if not already processing."""
         if not self._processing and self._pending_adjustment is not None:
@@ -777,6 +860,10 @@ class SlidersPanel(QWidget):
             slider.setValue(default)
             slider.blockSignals(False)
             self.slider_value_labels[i].setText(str(default))
+        # Full reset clears tone curves too (the dedicated "Reset Curve" button
+        # is the curve-only path). set_curves does not emit, so it won't start a
+        # competing undo burst here.
+        self.curve_editor.set_curves(None)
         # Save adjustment to backend and update preview
         if self.current_idx is not None:
             adjustment = {key: 0 for key in self.adjustment_keys}
@@ -841,6 +928,8 @@ class SlidersPanel(QWidget):
                 if selection.get(gid) for k in group_keys]
         sync_crop = bool(selection.get("crop"))
         sync_profile = bool(selection.get("profile"))
+        sync_curves = bool(selection.get("curves"))
+        src_curves = self.curve_editor.get_curves()  # None when identity
         current_adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
         src = ccr_backend.get_image_by_index(self.current_idx)
         crop_rect = src.crop_rect if src is not None else None
@@ -855,7 +944,8 @@ class SlidersPanel(QWidget):
             crop_changes = sync_crop and (img.crop_rect != crop_rect
                                           or getattr(img, "crop_angle", 0.0) != crop_angle)
             profile_changes = sync_profile and getattr(img, "color_profile", "color") != src_profile
-            if not adj_changes and not crop_changes and not profile_changes:
+            curves_changes = sync_curves and img.adjustment_settings.get("curves") != src_curves
+            if not adj_changes and not crop_changes and not profile_changes and not curves_changes:
                 continue  # nothing to change — and no dead undo snapshot
             img.push_undo_state()
             if adj_changes:
@@ -867,13 +957,23 @@ class SlidersPanel(QWidget):
                           for k in self.adjustment_keys}
                 for k in keys:
                     merged[k] = current_adjustment.get(k, self._default_for(k))
+                # Preserve the target's own tone curves across the slider-only
+                # rebuild (they're synced separately, just below).
+                existing_curves = img.adjustment_settings.get("curves")
+                if existing_curves is not None:
+                    merged["curves"] = existing_curves
                 img.adjustment_settings = merged
+            if curves_changes:
+                if src_curves:
+                    img.adjustment_settings["curves"] = copy.deepcopy(src_curves)
+                else:
+                    img.adjustment_settings.pop("curves", None)
             if sync_crop:
                 img.crop_rect = crop_rect
                 img.crop_angle = crop_angle
             if profile_changes:
                 img.color_profile = src_profile
-            if adj_changes or profile_changes:
+            if adj_changes or profile_changes or curves_changes:
                 # Crop is display/export-level only — no reprocessing needed
                 # when nothing but the crop changed. Adjustments and the color
                 # profile both change pixels, so they do.
@@ -1033,6 +1133,7 @@ class SlidersPanel(QWidget):
         if self.current_idx is not None:
             # Get the current adjustment settings from sliders
             self.copied_adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
+            self._attach_curves(self.copied_adjustment)
             print(f"Copied adjustment settings: {self.copied_adjustment}")
             self.set_temporary_hint("Adjustments Copied!", duration=4000)
         else:
@@ -1057,7 +1158,10 @@ class SlidersPanel(QWidget):
                     self.sliders[i].setValue(self.copied_adjustment[key])
                     self.sliders[i].blockSignals(False)
                     self.slider_value_labels[i].setText(str(self.copied_adjustment[key]))
-            
+            # Mirror the pasted tone curves into the editor (set_curves does not
+            # emit, so it won't re-trigger a save).
+            self.curve_editor.set_curves(self.copied_adjustment.get("curves"))
+
             # Save the adjustment to backend and update preview
             ccr_backend.set_adjustment_by_index(self.current_idx, self.copied_adjustment)
             self.parent().parent().image_preview.update_preview(self.current_idx)
