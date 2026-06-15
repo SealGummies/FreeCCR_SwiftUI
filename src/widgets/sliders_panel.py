@@ -798,7 +798,12 @@ class SlidersPanel(QWidget):
             item = layout.takeAt(0)
             w = item.widget()
             if w is not None:
+                # deleteLater (not immediate free): a rebuild can be triggered
+                # from inside a row widget's own signal (e.g. the enable
+                # checkbox's toggled), and freeing that widget synchronously
+                # would crash with a use-after-free. Detach now, delete later.
                 w.setParent(None)
+                w.deleteLater()
             else:
                 sub = item.layout()
                 if sub is not None:
@@ -811,9 +816,12 @@ class SlidersPanel(QWidget):
         img = ccr_backend.get_image_by_index(idx) if idx is not None else None
         if img is None:
             return None
+        # NOTE: 'enabled' is intentionally excluded — toggling a checkbox does
+        # not change the list STRUCTURE, so it must not trigger a rebuild (the
+        # rebuild would tear down the checkbox mid-signal). Only add/remove/
+        # reorder/active-change/image-switch should rebuild.
         return (id(img), img.active_area_id,
-                tuple((a.get("id"), bool(a.get("enabled", True)), a.get("kind"))
-                      for a in img.area_layers))
+                tuple((a.get("id"), a.get("kind")) for a in img.area_layers))
 
     def _rebuild_layers_list(self, idx):
         """Rebuild the Layers rows (Whole Image + one per area) and sync the
@@ -1101,21 +1109,25 @@ class SlidersPanel(QWidget):
 
     def on_compare_pressed(self):
         # Temporarily show the fully UNADJUSTED positive while the button is
-        # held: zero the global sliders AND drop all area layers (without
-        # saving). `_original_adjustment` doubles as the guard main_window
-        # checks to suppress Undo during a compare hold.
+        # held: zero the global sliders AND suppress every area layer (without
+        # saving). Areas are DISABLED in place (not removed) so the area stays
+        # present — keeping area-edit mode and its overlay alive during compare.
+        # `_original_adjustment` doubles as the guard main_window checks to
+        # suppress Undo during a compare hold.
         if self.current_idx is None:
             return
         img = ccr_backend.get_image_by_index(self.current_idx)
         if img is None:
             return
         # Remember what to restore: the active layer's settings (to refill the
-        # sliders) and the live global dict + area list (to restore the render).
+        # sliders), the live global dict, and each area's enabled state.
         self._original_adjustment = self._read_active_settings(self.current_idx)
         self._compare_global = img.adjustment_settings
-        self._compare_areas = img.area_layers
+        self._compare_area_enabled = [(a, a.get("enabled", True))
+                                      for a in img.area_layers]
         img.adjustment_settings = {}
-        img.area_layers = []
+        for a in img.area_layers:
+            a["enabled"] = False
         for i, slider in enumerate(self.sliders):
             slider.blockSignals(True)
             slider.setValue(0)
@@ -1125,13 +1137,14 @@ class SlidersPanel(QWidget):
         self.parent().parent().image_preview.update_preview(self.current_idx)
 
     def on_compare_released(self):
-        # Restore the global dict + areas and refill sliders from the active layer
+        # Restore the global dict + area enabled states and refill sliders.
         if self.current_idx is None or not hasattr(self, "_original_adjustment"):
             return
         img = ccr_backend.get_image_by_index(self.current_idx)
         if img is not None and hasattr(self, "_compare_global"):
             img.adjustment_settings = self._compare_global
-            img.area_layers = self._compare_areas
+            for a, enabled in self._compare_area_enabled:
+                a["enabled"] = enabled
             img.update_thumbnail_and_preview()
         adjustment = self._original_adjustment or {}
         for i, key in enumerate(self.adjustment_keys):
@@ -1144,7 +1157,7 @@ class SlidersPanel(QWidget):
         del self._original_adjustment
         if hasattr(self, "_compare_global"):
             del self._compare_global
-            del self._compare_areas
+            del self._compare_area_enabled
 
     def on_sync_to_all_clicked(self):
         """

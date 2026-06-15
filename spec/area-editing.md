@@ -300,9 +300,11 @@ def build_gradient_mask(h, w, g, feather):
     bx, by = g["x1"] * w, g["y1"] * h
     vx, vy = bx - ax, by - ay
     L2 = max(vx * vx + vy * vy, 1e-6)
-    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-    t = ((xs - ax) * vx + (ys - ay) * vy) / L2     # projection param along the axis
-    return _smoothstep(t).astype(np.float32)       # clip+ease handles 0..1 band
+    # arange broadcasting (not mgrid) — one (h,w) array, memory-lean at export res
+    ys = np.arange(h, dtype=np.float32)[:, None] - ay
+    xs = np.arange(w, dtype=np.float32)[None, :] - ax
+    t = (xs * vx + ys * vy) / L2                    # projection param along the axis
+    return _smoothstep(t).astype(np.float32)        # clip+ease handles 0..1 band
 ```
 
 Notes:
@@ -542,3 +544,49 @@ compare by equality (lists/dicts of primitives — no unhashable-but-unequal obj
 6. **Feather control surface — RESOLVED: panel slider primary.** A Feather slider in
    the panel header (shown only when an area layer is selected) is the primary control;
    an on-overlay feather-ring drag for the circle is a post-v1 nicety.
+
+## 11. Interaction corner cases (v2.1 — implementation hardening)
+
+These were found and fixed during implementation/QA; they are the non-obvious
+behaviours the area-edit mode must guarantee.
+
+1. **Enable/disable must not rebuild the row mid-signal.** The enable checkbox's
+   `toggled` handler triggers a preview refresh → `set_current_idx`. If the Layers
+   list rebuilt there, it would free the very checkbox whose signal is on the stack
+   (C++ use-after-free → crash). Two guards: (a) the Layers signature
+   (`_layers_signature`) **excludes** `enabled` so a toggle never triggers a rebuild;
+   (b) `_clear_layout` detaches rows with `setParent(None)` + **`deleteLater()`** (never
+   a synchronous free), so any rebuild triggered from inside a row widget's own signal
+   is safe.
+2. **Mutually-exclusive modes are symmetric.** `enter_area_mode` exits crop/slice, and
+   `enter_crop_mode`/`enter_slice_mode` now exit area mode. No two canvas modes can be
+   active at once.
+3. **Area mode persists across same-image refreshes, exits on context loss.**
+   Editing the area's sliders/feather/geometry calls `update_preview`, which must keep
+   the overlay up — area mode is NOT torn down on a same-image refresh. It exits only
+   on: image switch, the active area disappearing (e.g. an undo that removed it), or the
+   image becoming un-converted. The deliberate in-mode re-renders (enter, drag-commit)
+   set the `_area_rerender` guard so they don't self-exit.
+4. **Live effect during a geometry drag.** `update_area_drag` redraws the overlay
+   immediately and starts a short (40 ms) coalescing timer that recomputes the masked
+   preview and swaps it **surgically** (`pixmap_item.setPixmap`, no scene rebuild/refit)
+   so the effect follows the handles instead of snapping on release. The live swap is
+   skipped while a hi-res (prescaled) pixmap is shown (zoomed in) — it would be the
+   wrong scale — and `end_area_drag` does the full, scale-correct refresh.
+5. **Middle-button pan works in area mode.** The pan guard keys off an *active* area
+   drag (`_area_drag is not None`), not the persistent `area_mode` flag, so the user
+   can pan a zoomed image between handle drags. (Crop, which forces fit, still blocks
+   pan.)
+6. **Overlay handles track the view scale.** Handle glyph size and hit-test tolerance
+   are both `<px>/_view_scale()`, so the overlay is redrawn on every zoom
+   (`_apply_zoom_scale`), fit/resize/rotate (`apply_transformations`), and after the
+   scene rebuild in `update_preview` — keeping drawn handles aligned with their
+   clickable zones.
+7. **Compare suppresses areas without leaving area mode.** `on_compare_pressed`
+   empties the global dict and **disables each area in place** (saving prior `enabled`
+   states) rather than removing them, so the active area still exists and the overlay
+   survives the compare hold; `on_compare_released` restores the enabled states and the
+   global dict. (Removing them would trip corner case #3's active-area-gone exit.)
+8. **Mask rasterization is memory-lean.** `build_circle_mask`/`build_gradient_mask`
+   use `arange` broadcasting (not `np.mgrid`) so a full-resolution export mask holds a
+   single `(h,w)` float32 array rather than two extra int64 grids.

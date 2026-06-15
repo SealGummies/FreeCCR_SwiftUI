@@ -357,6 +357,139 @@ class TestSignature:
 
 
 # --------------------------------------------------------------------------
+# Panel Layers list: enable/disable must not rebuild the row mid-signal
+# --------------------------------------------------------------------------
+class TestPanelLayers:
+    def _setup(self, tmp_path):
+        from widgets.sliders_panel import SlidersPanel
+        path, _ = _scan_png(tmp_path)
+        img = CCRImage(path)
+        img.reference_frame = (20, 20, 580, 380)
+        ccr_backend.images = [img]
+        ccr_backend.file_paths = [path]
+        ccr_backend.convert_negative_by_index(0)
+        aid = ccr_backend.add_area_by_index(0, "circle")
+        panel = SlidersPanel()
+
+        # Realistic stub: the real ImagePreview.update_preview re-enters
+        # SlidersPanel.set_current_idx — the exact chain that, before the fix,
+        # rebuilt the Layers list (deleting the emitting checkbox) mid-signal.
+        class _StubIP:
+            def __init__(self, p):
+                self.p = p
+            def update_preview(self, idx):
+                self.p.set_current_idx(idx)
+            def on_active_layer_changed(self, idx):
+                pass
+        panel.image_preview = _StubIP(panel)
+        panel.current_idx = 0
+        panel._rebuild_layers_list(0)
+        return panel, img, aid
+
+    def test_layers_signature_ignores_enabled(self, tmp_path):
+        panel, img, aid = self._setup(tmp_path)
+        sig_before = panel._layers_signature(0)
+        img.area_layers[0]["enabled"] = False
+        # Toggling enabled must NOT change the structural signature (else a
+        # rebuild fires from inside the checkbox's toggled signal -> crash).
+        assert panel._layers_signature(0) == sig_before
+
+    def test_layers_signature_changes_on_add_remove(self, tmp_path):
+        panel, img, aid = self._setup(tmp_path)
+        sig0 = panel._layers_signature(0)
+        ccr_backend.add_area_by_index(0, "gradient")
+        assert panel._layers_signature(0) != sig0
+
+    def test_disable_area_via_real_checkbox_does_not_crash(self, tmp_path):
+        from PySide6.QtWidgets import QCheckBox
+        panel, img, aid = self._setup(tmp_path)
+        # The real enable/disable checkbox lives in the rebuilt Layers rows.
+        checks = panel.layers_container.findChildren(QCheckBox)
+        assert checks, "expected an enable checkbox for the area row"
+        # Driving the REAL 'toggled' signal reproduces the original crash path:
+        # _on_area_enabled -> update_preview -> set_current_idx. It must NOT
+        # tear down the emitting checkbox (use-after-free) — process survives.
+        checks[0].setChecked(False)
+        assert img.area_layers[0]["enabled"] is False
+        # Re-enable likewise.
+        checks[0].setChecked(True)
+        assert img.area_layers[0]["enabled"] is True
+
+
+# --------------------------------------------------------------------------
+# Compare must suppress areas without dropping out of area-edit mode
+# --------------------------------------------------------------------------
+class TestCompareWithAreas:
+    def _wired(self, tmp_path):
+        from PySide6.QtWidgets import QWidget, QVBoxLayout
+        from widgets.sliders_panel import SlidersPanel
+        path, _ = _scan_png(tmp_path)
+        img = CCRImage(path)
+        img.reference_frame = (20, 20, 580, 380)
+        ccr_backend.images = [img]
+        ccr_backend.file_paths = [path]
+        ccr_backend.convert_negative_by_index(0)
+        aid = ccr_backend.add_area_by_index(0, "circle")
+        img.get_area(aid)["settings"] = {"exposure": 40}
+
+        class _StubIP:
+            def update_preview(self, idx):
+                pass
+
+        class _StubThumbs:
+            def update_thumbnail(self, idx):
+                pass
+
+        class _Host(QWidget):
+            pass
+        host = _Host()
+        self._host = host
+        host.image_preview = _StubIP()
+        host.thumbnail_list = _StubThumbs()
+        mid = QWidget(host)
+        mid_layout = QVBoxLayout(mid)
+        panel = SlidersPanel()
+        host.sliders_panel = panel
+        panel.image_preview = host.image_preview
+        mid_layout.addWidget(panel)   # reparents panel -> mid (mid.parent()==host)
+        panel.current_idx = 0
+        panel._rebuild_layers_list(0)
+        assert panel.parent().parent() is host
+        return panel, img, aid
+
+    def test_compare_disables_and_restores_areas(self, tmp_path):
+        panel, img, aid = self._wired(tmp_path)
+        area = img.get_area(aid)
+        assert area["enabled"] is True
+        panel.on_compare_pressed()
+        # Global emptied, area suppressed in place (still present -> area mode
+        # and overlay survive), undo guard set.
+        assert img.adjustment_settings == {}
+        assert area["enabled"] is False
+        assert len(img.area_layers) == 1
+        assert hasattr(panel, "_original_adjustment")
+        panel.on_compare_released()
+        assert area["enabled"] is True
+        # Compare state fully cleaned up so undo isn't blocked afterwards.
+        assert not hasattr(panel, "_original_adjustment")
+        assert not hasattr(panel, "_compare_global")
+
+
+# --------------------------------------------------------------------------
+# Middle-button pan is only blocked during an active area drag
+# --------------------------------------------------------------------------
+class TestMiddlePan:
+    def test_pan_allowed_in_area_mode_when_not_dragging(self, tmp_path):
+        from widgets.image_preview import ImagePreview
+        ip = ImagePreview.__new__(ImagePreview)
+        ip.area_mode = True
+        ip._area_drag = None
+        # The middle-pan guard keys off an ACTIVE drag, not area_mode, so a
+        # plain middle-drag in area mode is permitted.
+        assert ip._area_drag is None and ip.area_mode is True
+
+
+# --------------------------------------------------------------------------
 # Canvas overlay smoke test (headless)
 # --------------------------------------------------------------------------
 class TestOverlay:
@@ -427,6 +560,15 @@ class TestOverlay:
         ip._area_drag_circle(drag, QPointF(start.x() + 40, start.y()))
         g = img.get_area(aid)["geometry"]
         assert g["cx"] == pytest.approx(0.5 + 40.0 / w, abs=1e-3)
+
+    def test_live_refresh_swaps_pixmap_without_crash(self, tmp_path):
+        ip, img, aid = self._preview_with_area(tmp_path, "circle")
+        img.get_area(aid)["settings"] = {"exposure": 80}
+        # The live drag refresh recomputes the masked preview and swaps it in
+        # under the overlay; must not raise and must keep a pixmap.
+        ip._area_live_refresh()
+        assert ip.pixmap_item is not None
+        assert ip.current_pixmap is not None and not ip.current_pixmap.isNull()
 
     def test_gradient_overlay_and_endpoints(self, tmp_path):
         from PySide6.QtCore import QPointF

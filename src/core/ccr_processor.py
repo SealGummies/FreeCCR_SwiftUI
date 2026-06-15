@@ -2717,11 +2717,13 @@ def build_circle_mask(h, w, geom, angle_deg=0.0, feather=0.25) -> np.ndarray:
     ry = max(float(geom.get("ry", 0.3)) * h, 1e-3)
     t = np.deg2rad(float(angle_deg))
     cs, sn = np.cos(t), np.sin(t)
-    ys, xs = np.mgrid[0:h, 0:w]
-    dx = xs.astype(np.float32) - cx
-    dy = ys.astype(np.float32) - cy
-    xr = cs * dx + sn * dy          # rotate into the ellipse-local frame
-    yr = -sn * dx + cs * dy
+    # arange broadcasting (not mgrid) keeps the big intermediates to one (h,w)
+    # float32 array — at full export resolution mgrid's two int64 grids would
+    # waste hundreds of MB per area.
+    ys = np.arange(h, dtype=np.float32)[:, None] - cy
+    xs = np.arange(w, dtype=np.float32)[None, :] - cx
+    xr = cs * xs + sn * ys          # rotate into the ellipse-local frame
+    yr = -sn * xs + cs * ys
     d = np.sqrt((xr / rx) ** 2 + (yr / ry) ** 2)   # 1.0 == ellipse boundary
     f = max(float(feather), 1e-4)
     return _smoothstep((1.0 - d) / f).astype(np.float32)
@@ -2741,8 +2743,9 @@ def build_gradient_mask(h, w, geom, feather=0.25) -> np.ndarray:
     by = float(geom.get("y1", 0.5)) * h
     vx, vy = bx - ax, by - ay
     L2 = max(vx * vx + vy * vy, 1e-6)
-    ys, xs = np.mgrid[0:h, 0:w]
-    t = ((xs.astype(np.float32) - ax) * vx + (ys.astype(np.float32) - ay) * vy) / L2
+    ys = np.arange(h, dtype=np.float32)[:, None] - ay
+    xs = np.arange(w, dtype=np.float32)[None, :] - ax
+    t = (xs * vx + ys * vy) / L2
     return _smoothstep(t).astype(np.float32)
 
 

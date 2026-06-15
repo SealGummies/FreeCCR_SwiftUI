@@ -137,7 +137,7 @@ class GraphicsImageView(QGraphicsView):
             interaction_active = (self.drawing_reference or self._space_pan
                                   or self._bw_drag_start is not None
                                   or self.parent_widget.crop_mode
-                                  or self.parent_widget.area_mode
+                                  or self.parent_widget._area_drag is not None
                                   or self.parent_widget._slice_drag is not None)
             if not interaction_active:
                 self._mid_pan = True
@@ -759,6 +759,12 @@ class ImagePreview(QWidget):
         self._area_rerender = False          # guards update_preview while entering
         self._area_drag = None               # in-progress handle drag state
         self._area_overlay_items = []
+        # Coalesce the live masked-effect recompute during an area drag so the
+        # effect follows the overlay (not just on release) without recomputing
+        # on every single mouse-move.
+        self._area_live_timer = QTimer(self)
+        self._area_live_timer.setSingleShot(True)
+        self._area_live_timer.timeout.connect(self._area_live_refresh)
 
         # Slice mode: split a scan containing several photos into separate
         # images along user-placed cut lines. Lines live in un-rotated image
@@ -878,10 +884,14 @@ class ImagePreview(QWidget):
                       and img_obj_now is self._current_image_ref)
         # Area-edit mode PERSISTS across same-image refreshes (so editing the
         # area's sliders/feather/geometry keeps the overlay visible); an image
-        # switch leaves it. _area_rerender guards the deliberate in-mode
+        # switch leaves it, and so does the active area disappearing (e.g. an
+        # undo that removed it). _area_rerender guards the deliberate in-mode
         # re-renders (enter / drag-commit).
-        if self.area_mode and not self._area_rerender and not same_image:
-            self._exit_area_mode()
+        if self.area_mode and not self._area_rerender:
+            active_gone = img_obj_now.get_area(
+                getattr(img_obj_now, "active_area_id", None)) is None
+            if not same_image or active_gone or not img_obj_now.converted:
+                self._exit_area_mode()
         if not same_image:
             # The fine-rotation burst belongs to the previous image; a switch
             # must end it so the next image's first drag gets its own snapshot.
@@ -992,10 +1002,8 @@ class ImagePreview(QWidget):
 
 
             # Apply transformations which will handle fitting consistently
+            # (it also redraws the crop/area overlay after the scene.clear()).
             self.apply_transformations()
-            # Redraw the area-edit overlay (scene.clear() wiped it above)
-            if self.area_mode:
-                self._draw_area_overlay()
             histogram = ccr_backend.get_histogram_image_by_index(idx)
             self.parent().parent().sliders_panel.set_histogram(histogram)
             
@@ -1056,6 +1064,9 @@ class ImagePreview(QWidget):
         # so the drawn handles keep matching their hit-test zones.
         if self.crop_mode and self._crop_overlay_item is not None:
             self._draw_crop_overlay()
+        # Same for the area-edit overlay (handles sized from the view scale).
+        if self.area_mode:
+            self._draw_area_overlay()
         # Slice overlay follows the (possibly changed) display transform; the
         # ghost is simply dropped (it reappears on the next mouse move). The
         # dim cast is rebuilt first so the lines render on top of it.
@@ -1345,6 +1356,8 @@ class ImagePreview(QWidget):
         self.view.translate(delta.x(), delta.y())
         if self.crop_mode and self._crop_overlay_item is not None:
             self._draw_crop_overlay()  # handle sizes track the view scale
+        if self.area_mode:
+            self._draw_area_overlay()  # area handle sizes track the view scale too
 
     def zoom_to_percent(self, pct):
         """Zoom to an absolute percentage of the source's ACTUAL size (1.0 =
@@ -1628,6 +1641,8 @@ class ImagePreview(QWidget):
             return False
         if self.crop_mode:
             self._exit_crop_mode()
+        if self.area_mode:
+            self._exit_area_mode()
         self.view.bwpoint_mode = None
         self.view.wb_pick_mode = False
         self.slice_mode = True
@@ -1993,6 +2008,8 @@ class ImagePreview(QWidget):
         # Crop mode replaces any other interactive pick mode
         if self.slice_mode:
             self._exit_slice_mode()
+        if self.area_mode:
+            self._exit_area_mode()
         self.view.bwpoint_mode = None
         self.view.wb_pick_mode = False
         self.crop_mode = True
@@ -2695,12 +2712,39 @@ class ImagePreview(QWidget):
         else:
             self._area_drag_circle(drag, p)
         self._draw_area_overlay()
+        # Recompute the masked EFFECT live (coalesced) so it follows the drag
+        # rather than only snapping into place on release.
+        self._area_live_timer.start(40)
+
+    def _area_live_refresh(self):
+        """Recompute the masked preview during a drag and swap it under the
+        existing overlay — surgical (no scene rebuild / refit), so it stays
+        smooth and the handles don't flicker."""
+        if not self.area_mode or self.current_idx is None:
+            return
+        if not (0 <= self.current_idx < len(ccr_backend.images)):
+            return
+        # When a hi-res (prescaled) pixmap is displayed (zoomed in), a
+        # preview-size swap would render at the wrong scale — skip the live
+        # swap; end_area_drag does the full, scale-correct refresh on release.
+        if self._item_prescale != 1.0:
+            return
+        img = ccr_backend.images[self.current_idx]
+        img.update_thumbnail_and_preview()
+        preview = ccr_backend.get_preview_by_index(self.current_idx)
+        if (preview is not None and not preview.isNull()
+                and self.pixmap_item is not None
+                and (self.current_pixmap is None
+                     or preview.size() == self.current_pixmap.size())):
+            self.current_pixmap = preview
+            self.pixmap_item.setPixmap(preview)
 
     def end_area_drag(self, scene_pos):
         if self._area_drag is None:
             return
         self.update_area_drag(scene_pos)
         self._area_drag = None
+        self._area_live_timer.stop()
         # Commit: render the masked effect (heavy) and refresh the thumbnail.
         if self.current_idx is not None and 0 <= self.current_idx < len(ccr_backend.images):
             ccr_backend.images[self.current_idx].update_thumbnail_and_preview()
