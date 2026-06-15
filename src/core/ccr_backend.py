@@ -34,6 +34,11 @@ class CCRBackend:
         self.file_paths: List[str] = []
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
+        # Global input ICC profile (one app-wide setting; applied to every
+        # decode before conversion/adjustments). The parsed profile lives in
+        # color_management's module-level holder; these mirror it for the UI.
+        self.input_icc_path: Optional[str] = None
+        self.input_icc_name: Optional[str] = None
         # Catalog entries of ACTUAL images removed from the list this
         # session: {file_path: {"signature": sig, "entries": {name: state}}}.
         # Removal must not lose their stored edits, so saves merge these
@@ -515,6 +520,83 @@ class CCRBackend:
             except Exception as e:
                 print(f"Failed to convert image at index {idx}: {e}")
 
+    # --- Global input ICC profile -----------------------------------------
+    def _input_icc_storage_path(self) -> str:
+        """Persistent working-copy path inside the app-data folder (next to the
+        edit catalog), so the profile survives the user moving/deleting the
+        original .icc."""
+        from core.catalog import default_catalog_path
+        return os.path.join(os.path.dirname(default_catalog_path()), "input_profile.icc")
+
+    def set_input_icc(self, src_path: str) -> str:
+        """Assign a global input ICC profile from src_path. Parses it first
+        (raising UnsupportedICCError / OSError on failure, leaving the current
+        profile untouched), copies it into app data as the persistent working
+        copy, activates it, and returns its description name. The caller persists
+        the storage path (self.input_icc_path) and triggers reprocessing."""
+        from core import color_management
+        import shutil
+        profile = color_management.load_input_profile(src_path)  # parse before mutating
+        storage = self._input_icc_storage_path()
+        if (os.path.normcase(os.path.abspath(src_path))
+                != os.path.normcase(os.path.abspath(storage))):
+            shutil.copyfile(src_path, storage)
+        color_management.set_active_input_profile(profile)
+        self.input_icc_path = storage
+        self.input_icc_name = profile.description or os.path.basename(src_path)
+        return self.input_icc_name
+
+    def load_input_icc_from_storage(self, storage_path: str) -> Optional[str]:
+        """Startup restore: activate a previously-saved working copy. Returns the
+        profile name, or None if it could not be loaded (e.g. file gone)."""
+        from core import color_management
+        try:
+            profile = color_management.load_input_profile(storage_path)
+        except Exception as e:
+            print(f"Could not load saved input ICC {storage_path}: {e}")
+            return None
+        color_management.set_active_input_profile(profile)
+        self.input_icc_path = storage_path
+        self.input_icc_name = profile.description or os.path.basename(storage_path)
+        return self.input_icc_name
+
+    def clear_input_icc(self) -> None:
+        """Remove the global input ICC profile and its working copy."""
+        from core import color_management
+        color_management.set_active_input_profile(None)
+        self.input_icc_path = None
+        self.input_icc_name = None
+        try:
+            storage = self._input_icc_storage_path()
+            if os.path.exists(storage):
+                os.remove(storage)
+        except OSError:
+            pass
+
+    def reprocess_all_for_input_icc_change(self, progress_callback=None) -> None:
+        """Re-decode and re-convert every loaded image so a change to the global
+        input ICC takes effect immediately. Re-decoding runs through read_image,
+        which re-applies the (new) global profile; converted images then replay
+        their stored conversion against the freshly-decoded scan."""
+        from core.catalog import _replay_conversion
+        total = len(self.images)
+        for i, img in enumerate(self.images):
+            ci = img.conversion_inputs
+            was_converted = img.converted
+            cb, tb, bb = img.contrast_base, img.temperature_base, img.brightness_base
+            try:
+                img.reload_image()                 # re-decode (ICC re-applied)
+                if was_converted and ci is not None:
+                    _replay_conversion(img, ci)    # re-convert from the new scan
+                # Preserve the user's non-destructive look offsets across the
+                # re-decode (reload_image / replay reset them to defaults).
+                img.contrast_base, img.temperature_base, img.brightness_base = cb, tb, bb
+                img.update_thumbnail_and_preview()
+            except Exception as e:
+                print(f"Reprocess after input ICC change failed for {img.file_path}: {e}")
+            if progress_callback:
+                progress_callback(i + 1, total)
+
     def update_thumbnail_by_index(self, idx: int):
         """
         Updates the thumbnail for the image at the given index.
@@ -599,7 +681,8 @@ class CCRBackend:
                 print(f"Failed to convert image at index {idx}: {e}")
 
     def export_image_by_index(self, idx: int, output_path: str, jpg_output: bool = False,
-                              jpg_quality: int = 95, max_long_side: int = None) -> bool:
+                              jpg_quality: int = 95, max_long_side: int = None,
+                              output_colorspace: str = "srgb") -> bool:
         """
         Exports the processed image at the given index to the specified output path.
         Routes to bwpoint or reference-frame pipeline depending on how the image was converted.
@@ -616,7 +699,8 @@ class CCRBackend:
                                                  output_path=output_path,
                                                  water_mark=not self.software_activated,
                                                  jpg_out=jpg_output, jpg_quality=jpg_quality,
-                                                 max_long_side=max_long_side)
+                                                 max_long_side=max_long_side,
+                                                 output_colorspace=output_colorspace)
                 elif ci is not None and ci.get("mode") == "bw":
                     # Use the anchors BAKED at convert time — resampling the
                     # global points later must not change this image's export.
@@ -625,24 +709,28 @@ class CCRBackend:
                                                output_path=output_path,
                                                water_mark=not self.software_activated,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
-                                               max_long_side=max_long_side)
+                                               max_long_side=max_long_side,
+                                               output_colorspace=output_colorspace)
                 elif image_obj.reference_frame is None and self.black_point_bgr is not None and self.white_point_bgr is not None:
                     # Legacy/un-snapshotted B/W point conversion — global anchors
                     ccr_normalize_with_bwpoint(image_obj, self.black_point_bgr, self.white_point_bgr,
                                                output_path=output_path, water_mark=not self.software_activated,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
-                                               max_long_side=max_long_side)
+                                               max_long_side=max_long_side,
+                                               output_colorspace=output_colorspace)
                 else:
                     ccr_normalize_with_reference(image_obj, output_path=output_path,
                                                  water_mark=not self.software_activated, jpg_out=jpg_output,
-                                                 jpg_quality=jpg_quality, max_long_side=max_long_side)
+                                                 jpg_quality=jpg_quality, max_long_side=max_long_side,
+                                                 output_colorspace=output_colorspace)
                 return True
             except Exception as e:
                 print(f"Failed to export image at index {idx}: {e}")
         return False
 
     def export_items(self, items, jpg_output: bool = False, jpg_quality: int = 95,
-                     max_long_side: int = None, progress_callback=None, cancel_check=None) -> dict:
+                     max_long_side: int = None, output_colorspace: str = "srgb",
+                     progress_callback=None, cancel_check=None) -> dict:
         """
         Exports specific images to explicit output paths using parallel processing.
 
@@ -675,7 +763,8 @@ class CCRBackend:
                 return idx, None, None  # None success = not attempted
             start_time = time.time()
             success = self.export_image_by_index(idx, output_path, jpg_output=jpg_output,
-                                                 jpg_quality=jpg_quality, max_long_side=max_long_side)
+                                                 jpg_quality=jpg_quality, max_long_side=max_long_side,
+                                                 output_colorspace=output_colorspace)
             elapsed = time.time() - start_time
             base_name = os.path.basename(output_path)
             if success:

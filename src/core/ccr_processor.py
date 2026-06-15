@@ -6,6 +6,8 @@ import time
 import tifffile
 import gc
 
+from core.color_management import apply_export_colorspace, inject_jpeg_icc
+
 # Try to import PyOpenCL, but handle gracefully if not available
 try:
     import pyopencl as cl
@@ -628,7 +630,7 @@ def _load_export_source(ccr_image, output_path, max_long_side):
     return ccr_image.read_image(ccr_image.file_path, preview=False)
 
 
-def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_out=False,jpg_quality=95,max_long_side=None) -> np.ndarray:
+def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_out=False,jpg_quality=95,max_long_side=None,output_colorspace="srgb") -> np.ndarray:
     """
     Normalize and align the image using the CCR algorithm, using a reference rectangle
     for percentile calculations instead of a crop factor.
@@ -971,29 +973,8 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
 
         # Ensure output_path has proper extension and handle Unicode
         step_start = time.time()
-        output_path = safe_unicode_path(output_path)
-        if max_long_side:
-            rgb_brightness_normalized = ccr_image.resize_image_to_max_pixel(rgb_brightness_normalized, max_long_side)
-        if jpg_out:
-            output_path = os.path.splitext(output_path)[0] + ".jpg"
-            # Convert to 8-bit for JPEG output
-            rgb_brightness_normalized_8 = to_8bit(rgb_brightness_normalized)
-            # Ensure output is RGB, not BGR
-            rgb_brightness_normalized_8 = cv2.cvtColor(rgb_brightness_normalized_8, cv2.COLOR_RGB2BGR)
-            success = safe_cv2_imwrite(output_path, rgb_brightness_normalized_8,
-                                       [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)])
-            del rgb_brightness_normalized_8  # Clean up 8-bit copy
-            if success:
-                print(f"Normalized image saved to {output_path}")
-            else:
-                raise IOError(f"Failed to save normalized image to {output_path}")
-        else:
-            output_path = os.path.splitext(output_path)[0] + ".tiff"
-            success = safe_tifffile_imwrite(output_path, rgb_brightness_normalized, compression='deflate')
-            if success:
-                print(f"Normalized image saved to {output_path}")
-            else:
-                raise IOError(f"Failed to save normalized image to {output_path}")
+        write_export_image(ccr_image, rgb_brightness_normalized, output_path,
+                           jpg_out, jpg_quality, max_long_side, output_colorspace)
         print(f"File saving: {time.time() - step_start:.3f}s")
         #debug ----------------------v
 
@@ -1019,7 +1000,8 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
 
 def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
                                output_path=None, water_mark=True, jpg_out=False,
-                               jpg_quality=95, max_long_side=None):
+                               jpg_quality=95, max_long_side=None,
+                               output_colorspace="srgb"):
     """
     Film negative conversion using the same pipeline as ccr_normalize_with_reference
     but with explicit per-channel B/W points instead of auto-detected percentiles.
@@ -1180,20 +1162,8 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
                 print(f"Warning: warpAffine failed: {e}")
 
         # Write file
-        output_path = safe_unicode_path(output_path)
-        if max_long_side:
-            rgb_result = ccr_image.resize_image_to_max_pixel(rgb_result, max_long_side)
-        if jpg_out:
-            output_path = os.path.splitext(output_path)[0] + ".jpg"
-            img_8 = to_8bit(rgb_result)
-            img_8 = cv2.cvtColor(img_8, cv2.COLOR_RGB2BGR)
-            if not safe_cv2_imwrite(output_path, img_8,
-                                    [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)]):
-                raise IOError(f"Failed to save image to {output_path}")
-        else:
-            output_path = os.path.splitext(output_path)[0] + ".tiff"
-            if not safe_tifffile_imwrite(output_path, rgb_result, compression='deflate'):
-                raise IOError(f"Failed to save image to {output_path}")
+        write_export_image(ccr_image, rgb_result, output_path, jpg_out,
+                           jpg_quality, max_long_side, output_colorspace)
         print(f"TOTAL bwpoint normalization time: {time.time() - total_start_time:.3f}s")
         gc.collect()
         return None
@@ -1204,7 +1174,8 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
 
 def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
                                  output_path=None, water_mark=True, jpg_out=False,
-                                 jpg_quality=95, max_long_side=None):
+                                 jpg_quality=95, max_long_side=None,
+                                 output_colorspace="srgb"):
     """
     Conversion/export pipeline for sliced children carrying precomputed
     reference-conversion constants (conversion_inputs mode "ref_params").
@@ -1277,20 +1248,8 @@ def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
         except Exception as e:
             print(f"Warning: warpAffine failed: {e}")
 
-    output_path = safe_unicode_path(output_path)
-    if max_long_side:
-        rgb_result = ccr_image.resize_image_to_max_pixel(rgb_result, max_long_side)
-    if jpg_out:
-        output_path = os.path.splitext(output_path)[0] + ".jpg"
-        img_8 = to_8bit(rgb_result)
-        img_8 = cv2.cvtColor(img_8, cv2.COLOR_RGB2BGR)
-        if not safe_cv2_imwrite(output_path, img_8,
-                                [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)]):
-            raise IOError(f"Failed to save image to {output_path}")
-    else:
-        output_path = os.path.splitext(output_path)[0] + ".tiff"
-        if not safe_tifffile_imwrite(output_path, rgb_result, compression='deflate'):
-            raise IOError(f"Failed to save image to {output_path}")
+    write_export_image(ccr_image, rgb_result, output_path, jpg_out,
+                       jpg_quality, max_long_side, output_colorspace)
     print(f"TOTAL ref-params normalization time: {time.time() - total_start_time:.3f}s")
     gc.collect()
     return None
@@ -1301,6 +1260,44 @@ def to_8bit(img16: np.ndarray) -> np.ndarray:
     img16 = np.clip(img16, 0, 65535)
     img8 = (img16 / 257).astype(np.uint8)
     return img8
+
+
+def write_export_image(ccr_image, rgb_u16, output_path, jpg_out, jpg_quality,
+                       max_long_side, output_colorspace="srgb"):
+    """Single export write chokepoint shared by all three conversion pipelines.
+
+    Resizes to the requested long edge, maps the (sRGB-encoded) result into the
+    chosen output colour space, then writes a 16-bit TIFF (deflate) or 8-bit
+    JPEG with the matching ICC profile embedded so a colour-managed viewer
+    interprets the file correctly. Returns the resolved output path.
+    """
+    if max_long_side:
+        rgb_u16 = ccr_image.resize_image_to_max_pixel(rgb_u16, max_long_side)
+    # Re-encode to the target colour space and get the ICC bytes to embed.
+    rgb_u16, icc = apply_export_colorspace(rgb_u16, output_colorspace)
+    output_path = safe_unicode_path(output_path)
+    if jpg_out:
+        output_path = os.path.splitext(output_path)[0] + ".jpg"
+        img_8 = cv2.cvtColor(to_8bit(rgb_u16), cv2.COLOR_RGB2BGR)  # RGB -> BGR for cv2
+        ok, buf = cv2.imencode(".jpg", img_8,
+                               [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)])
+        if not ok:
+            raise IOError(f"Failed to encode JPEG for {output_path}")
+        # cv2 can't embed ICC, so inject an APP2 ICC_PROFILE segment and write
+        # the bytes ourselves (also the Unicode-safe path, like safe_cv2_imwrite).
+        data = inject_jpeg_icc(buf.tobytes(), icc)
+        try:
+            with open(output_path, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            raise IOError(f"Failed to save image to {output_path}: {e}")
+    else:
+        output_path = os.path.splitext(output_path)[0] + ".tiff"
+        if not safe_tifffile_imwrite(output_path, rgb_u16, photometric="rgb",
+                                     compression="deflate", iccprofile=icc):
+            raise IOError(f"Failed to save image to {output_path}")
+    print(f"Normalized image saved to {output_path}")
+    return output_path
 
 
 def apply_crop_to_image(img: np.ndarray, crop_rect_norm, crop_angle: float = 0.0) -> np.ndarray:
