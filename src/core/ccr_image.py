@@ -11,7 +11,7 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 #import lensfunpy  # Make sure lensfunpy is installed
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
-                                apply_area_layers)
+                                apply_area_layers, apply_crop_to_image)
 
 # Import optional libraries with fallbacks
 try:
@@ -470,11 +470,17 @@ class CCRImage:
         preview_img = self.resize_image_to_max_pixel(display_img, preview_size)
         qimage = self.generate_qimage_from_np_array_8(to_8bit(preview_img))
         self.resized_preview = QPixmap.fromImage(qimage)
-        # Calculate histogram for the 8-bit thumbnail (RGB)
+        # Calculate histogram for the 8-bit preview (RGB). When a crop is set,
+        # the histogram is computed over only the kept (cropped) region so it
+        # matches what the canvas shows. Same normalized-rect + angle contract
+        # as the display/export crop path; apply_crop_to_image returns the
+        # input unchanged when crop_rect is None.
         hist = {}
         preview_img_8bit = to_8bit(preview_img)
+        hist_source = apply_crop_to_image(
+            preview_img_8bit, self.crop_rect, getattr(self, "crop_angle", 0.0) or 0.0)
         for i, color in enumerate(['r', 'g', 'b']):
-            hist[color] = cv2.calcHist([preview_img_8bit], [i], None, [256], [0, 256]).flatten()
+            hist[color] = cv2.calcHist([hist_source], [i], None, [256], [0, 256]).flatten()
 
         # Generate a histogram image (RGB channels overlaid). Fully vectorized:
         # the previous per-column cv2.addWeighted loop took ~55 ms per call
