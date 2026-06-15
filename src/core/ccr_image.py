@@ -289,7 +289,12 @@ class CCRImage:
         if positive:
             return dict(
                 output_bps=16,
-                no_auto_bright=False,                              # auto-exposed
+                # Auto-brightness OFF: rawpy's auto-bright scales until ~1% of
+                # the brightest pixels saturate, CLIPPING highlights to white.
+                # rawpy's auto-scale (no_auto_scale left at its default, off) still
+                # maps the sensor white level to full range — a proper, non-clipping
+                # exposure that preserves highlight headroom (raise Exposure to taste).
+                no_auto_bright=True,
                 gamma=(2.222, 4.5),                               # sRGB-ish TRC
                 user_flip=0,
                 demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,

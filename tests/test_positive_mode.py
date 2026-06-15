@@ -46,10 +46,11 @@ class TestRawPostprocessKwargs:
         assert kw["output_color"] == rawpy.ColorSpace.sRGB
         assert kw["gamma"] == (2.222, 4.5)
         assert kw["use_camera_wb"] is True
-        assert kw["no_auto_bright"] is False        # auto-exposed
+        # Auto-brightness OFF so highlights are not clipped to white; rawpy's
+        # auto-scale (no_auto_scale left absent/off) still gives a full-range
+        # exposure.
+        assert kw["no_auto_bright"] is True
         assert kw["demosaic_algorithm"] == rawpy.DemosaicAlgorithm.AHD
-        # The positive decode is already full-range/auto-scaled — it must NOT
-        # ask rawpy to disable auto-scale (that's a negative-only flag).
         assert "no_auto_scale" not in kw
 
     def test_negative_is_the_original_raw_readout(self):

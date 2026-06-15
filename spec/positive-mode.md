@@ -85,9 +85,12 @@ the choice is unit-testable and the negative path is provably unchanged:
   `no_auto_bright=True`, `use_camera_wb=False`, `use_auto_wb=False`,
   `no_auto_scale=True`, AHD, `half_size=preview`.
 - **Positive (mode on):** `output_color=sRGB`, `gamma=(2.222, 4.5)`,
-  `no_auto_bright=False` (auto-exposed), `use_camera_wb=True`, AHD,
-  `half_size=preview`. (No `no_auto_scale` — the positive decode is already
-  full-range, gamma-encoded.)
+  `use_camera_wb=True`, AHD, `half_size=preview`, **`no_auto_bright=True`**.
+  Auto-brightness is OFF on purpose: rawpy's auto-bright scales until ~1% of the
+  brightest pixels saturate, which CLIPS highlights to white. With it off,
+  rawpy's auto-scale (`no_auto_scale` left absent/off) still maps the sensor
+  white level to full range — a proper, non-clipping exposure that preserves
+  highlight headroom (the user raises Exposure to taste). (No `no_auto_scale`.)
 
 Two follow-on steps are gated on the mode:
 - **White-level scaling** (`rgb *= 65535/white_level`) is applied only in the
