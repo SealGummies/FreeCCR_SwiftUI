@@ -13,6 +13,8 @@ import logging
 import os
 import tempfile
 import time
+import copy
+import uuid
 
 CATALOG_VERSION = 1
 MAX_CATALOG_ENTRIES = 2000  # bounds growth; oldest records pruned beyond this
@@ -97,6 +99,45 @@ def _slice_parent_to_json(parent):
     return dict(parent) if parent else None
 
 
+def _areas_to_json(areas):
+    """Serialize the per-image area-editing layers. Geometry is normalized
+    floats and each area's settings reuses the adjustment-dict shape (all
+    JSON-safe), but copy defensively and coerce types so the stored catalog
+    never aliases live state."""
+    out = []
+    for a in (areas or []):
+        out.append({
+            "id": a.get("id"),
+            "kind": a.get("kind", "circle"),
+            "enabled": bool(a.get("enabled", True)),
+            "feather": float(a.get("feather", 0.25)),
+            "angle": float(a.get("angle", 0.0)),
+            "geometry": {k: float(v)
+                         for k, v in (a.get("geometry") or {}).items()},
+            "settings": copy.deepcopy(a.get("settings") or {}),
+        })
+    return out
+
+
+def _areas_from_json(areas):
+    """Inverse of _areas_to_json; defensive against legacy/partial records."""
+    out = []
+    for a in (areas or []):
+        if not isinstance(a, dict):
+            continue
+        out.append({
+            "id": a.get("id") or uuid.uuid4().hex,
+            "kind": a.get("kind", "circle"),
+            "enabled": bool(a.get("enabled", True)),
+            "feather": float(a.get("feather", 0.25)),
+            "angle": float(a.get("angle", 0.0)),
+            "geometry": {k: float(v)
+                         for k, v in (a.get("geometry") or {}).items()},
+            "settings": dict(a.get("settings") or {}),
+        })
+    return out
+
+
 def serialize_image(img) -> dict:
     """Everything needed to bring a CCRImage back to its current state."""
     return {
@@ -108,6 +149,7 @@ def serialize_image(img) -> dict:
         "converted": bool(img.converted),
         "conversion_inputs": _ci_to_json(img.conversion_inputs),
         "adjustment_settings": dict(img.adjustment_settings),
+        "areas": _areas_to_json(getattr(img, "area_layers", None)),
         "color_profile": getattr(img, "color_profile", "color"),
         "crop_rect": list(img.crop_rect) if img.crop_rect else None,
         "crop_angle": float(img.crop_angle or 0.0),
@@ -127,6 +169,7 @@ def _is_pristine(state: dict) -> bool:
     """True when a serialized state carries no user edits worth saving."""
     return (not state["converted"] and not state["source_ops"]
             and not state["adjustment_settings"]
+            and not state.get("areas")
             and state.get("color_profile", "color") == "color"
             and state["crop_rect"] is None
             and state["rotation_angle"] == 0 and state["fine_rotation_angle"] == 0
@@ -317,6 +360,7 @@ def _restore_image(file_path: str, state: dict):
         slice_group=state.get("slice_group"),
         slice_parent=(dict(state["slice_parent"])
                       if state.get("slice_parent") else None),
+        areas=_areas_from_json(state.get("areas")),
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
     img.color_profile = state.get("color_profile", "color")

@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, Q
 from core.ccr_backend import ccr_backend
 from widgets.export_dialog import ExportSettingsDialog
 import math
+import copy
 import sys
 import os
 
@@ -136,6 +137,7 @@ class GraphicsImageView(QGraphicsView):
             interaction_active = (self.drawing_reference or self._space_pan
                                   or self._bw_drag_start is not None
                                   or self.parent_widget.crop_mode
+                                  or self.parent_widget.area_mode
                                   or self.parent_widget._slice_drag is not None)
             if not interaction_active:
                 self._mid_pan = True
@@ -151,6 +153,11 @@ class GraphicsImageView(QGraphicsView):
                 self.parent_widget.begin_crop_drag(self.mapToScene(event.pos()))
             elif event.button() == Qt.RightButton:
                 self.parent_widget.clear_crop()
+            return
+        if self.parent_widget.area_mode and self.parent_widget.pixmap_item is not None:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.begin_area_drag(self.mapToScene(event.pos()))
+            # Swallow both buttons so area editing never starts a reference draw.
             return
         if self.parent_widget.slice_mode and self.parent_widget.pixmap_item is not None:
             if event.button() == Qt.LeftButton:
@@ -214,6 +221,13 @@ class GraphicsImageView(QGraphicsView):
             else:
                 # Hover: show the transform cursor for the handle underneath
                 self.parent_widget.update_crop_hover_cursor(scene_pos)
+            return
+        if self.parent_widget.area_mode:
+            scene_pos = self.mapToScene(event.pos())
+            if self.parent_widget._area_drag is not None:
+                self.parent_widget.update_area_drag(scene_pos)
+            else:
+                self.parent_widget.update_area_hover_cursor(scene_pos)
             return
         if self.parent_widget.slice_mode:
             self.parent_widget.slice_move(self.mapToScene(event.pos()))
@@ -319,6 +333,10 @@ class GraphicsImageView(QGraphicsView):
         if self.parent_widget.crop_mode:
             if event.button() == Qt.LeftButton:
                 self.parent_widget.end_crop_drag(self.mapToScene(event.pos()))
+            return
+        if self.parent_widget.area_mode:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.end_area_drag(self.mapToScene(event.pos()))
             return
         if self.parent_widget.slice_mode:
             if event.button() == Qt.LeftButton:
@@ -622,6 +640,26 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(mirror_h_action)
         add_spacer()
 
+        # Area-editing mask pickers — create a local masked adjustment area
+        # (the global panel is the implicit whole-image layer). Guarded to
+        # converted images inside add_area().
+        self.add_circle_action = QAction("◯ Area", self)
+        self.add_circle_action.setToolTip(
+            "Add a circular local-adjustment area (squishable ellipse). "
+            "Edit its adjustments in the right panel; drag on the canvas to "
+            "move/resize/rotate it.")
+        self.add_circle_action.triggered.connect(lambda: self.add_area("circle"))
+        self.toolbar.addAction(self.add_circle_action)
+        add_spacer()
+
+        self.add_gradient_action = QAction("▤ Gradient", self)
+        self.add_gradient_action.setToolTip(
+            "Add a linear-gradient local-adjustment area. Drag its endpoints "
+            "on the canvas to aim the ramp.")
+        self.add_gradient_action.triggered.connect(lambda: self.add_area("gradient"))
+        self.toolbar.addAction(self.add_gradient_action)
+        add_spacer()
+
         convert_action = QAction("Convert", self)
         convert_action.triggered.connect(self.convert_ccr)
         self.toolbar.addAction(convert_action)
@@ -714,6 +752,14 @@ class ImagePreview(QWidget):
         self._crop_display_transform = None
         self._crop_display_angle = 0.0
 
+        # Area editing (local masked adjustment layers). Like crop, area mode
+        # shows the FULL un-cropped image so the active area's normalized mask
+        # geometry maps directly; the overlay reflects/edits that area's mask.
+        self.area_mode = False
+        self._area_rerender = False          # guards update_preview while entering
+        self._area_drag = None               # in-progress handle drag state
+        self._area_overlay_items = []
+
         # Slice mode: split a scan containing several photos into separate
         # images along user-placed cut lines. Lines live in un-rotated image
         # coords: orient 'v' = vertical cut at an x-fraction, 'h' =
@@ -775,6 +821,8 @@ class ImagePreview(QWidget):
             self._exit_crop_mode()
         if self.slice_mode:
             self._exit_slice_mode()
+        if self.area_mode:
+            self._exit_area_mode()
         self._release_hires(refresh=False)
         self.current_idx = None
         self._current_image_ref = None
@@ -807,6 +855,9 @@ class ImagePreview(QWidget):
             self.cancel_crop_mode()
         elif self.slice_mode:
             self.cancel_slice_mode()
+        elif self.area_mode:
+            # Esc leaves area editing: deselect back to the Whole Image layer.
+            self._select_whole_image_layer()
 
     def update_preview(self, idx):
         ''' Update the UI image based on the backend, using the index from the thumbnail list. '''
@@ -825,6 +876,12 @@ class ImagePreview(QWidget):
         img_obj_now = ccr_backend.images[idx]
         same_image = (idx == self.current_idx
                       and img_obj_now is self._current_image_ref)
+        # Area-edit mode PERSISTS across same-image refreshes (so editing the
+        # area's sliders/feather/geometry keeps the overlay visible); an image
+        # switch leaves it. _area_rerender guards the deliberate in-mode
+        # re-renders (enter / drag-commit).
+        if self.area_mode and not self._area_rerender and not same_image:
+            self._exit_area_mode()
         if not same_image:
             # The fine-rotation burst belongs to the previous image; a switch
             # must end it so the next image's first drag gets its own snapshot.
@@ -854,6 +911,7 @@ class ImagePreview(QWidget):
         crop_angle = getattr(ccr_backend.images[idx], "crop_angle", 0.0) or 0.0
         if (preview_img is not None and not preview_img.isNull()
                 and crop is not None and not self.crop_mode and not self.slice_mode
+                and not self.area_mode
                 and ccr_backend.images[idx].converted):
             if crop_angle:
                 extracted = self._extract_rotated_crop(preview_img, crop, crop_angle)
@@ -891,6 +949,7 @@ class ImagePreview(QWidget):
         self.view._bw_rect_item = None
         self._crop_overlay_item = None
         self._crop_handle_items = []
+        self._area_overlay_items = []
         self._slice_ghost_item = None
         self._slice_dim_item = None
         for _slice_line in self._slice_lines:
@@ -934,6 +993,9 @@ class ImagePreview(QWidget):
 
             # Apply transformations which will handle fitting consistently
             self.apply_transformations()
+            # Redraw the area-edit overlay (scene.clear() wiped it above)
+            if self.area_mode:
+                self._draw_area_overlay()
             histogram = ccr_backend.get_histogram_image_by_index(idx)
             self.parent().parent().sliders_panel.set_histogram(histogram)
             
@@ -1389,9 +1451,16 @@ class ImagePreview(QWidget):
         img = ccr_backend.get_image_by_index(self.current_idx)
         if img is None:
             return None
+        areas_sig = tuple(
+            (a.get("id"), a.get("kind"), bool(a.get("enabled", True)),
+             float(a.get("feather", 0.25)), float(a.get("angle", 0.0)),
+             tuple(sorted((a.get("geometry") or {}).items())),
+             tuple(sorted((a.get("settings") or {}).items())))
+            for a in getattr(img, "area_layers", []))
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
-                getattr(img, "color_profile", "color"))
+                getattr(img, "color_profile", "color"),
+                areas_sig)
 
     HIRES_MAX_LONG_SIDE = 4500   # bounds non-RAW decodes (RAW half-size passes through)
 
@@ -2362,6 +2431,478 @@ class ImagePreview(QWidget):
         self._remove_crop_overlay_items()
         self.view.setCursor(Qt.ArrowCursor)
 
+    # ===== Area editing (local masked adjustment layers) ==================
+    # Mirrors the crop tool: a scene-item overlay with constant-size handles,
+    # hit-tested on the un-rotated box frame, dragged via a state dict (no
+    # grabMouse). Geometry is stored NORMALIZED on the area; area mode shows
+    # the full un-cropped image so geometry maps directly through _base_transform.
+
+    def _sliders_panel(self):
+        try:
+            return self.parent().parent().sliders_panel
+        except AttributeError:
+            return None
+
+    def _area_hint(self, msg, duration=5000):
+        panel = self._sliders_panel()
+        if panel is not None:
+            try:
+                panel.set_temporary_hint(msg, duration=duration)
+            except AttributeError:
+                pass
+
+    def _area_active(self):
+        """The area dict currently being edited (active layer), or None."""
+        if self.current_idx is None:
+            return None
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return None
+        return img.get_area(img.active_area_id)
+
+    def add_area(self, kind):
+        """Toolbar handler: create a local area of `kind` ('circle'|'gradient'),
+        select it, and enter area-edit mode. Requires a converted image."""
+        if self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        if not getattr(img, "converted", False):
+            self._area_hint("Convert the image before adding a local area.")
+            return
+        aid = ccr_backend.add_area_by_index(self.current_idx, kind)
+        if aid is None:
+            return
+        panel = self._sliders_panel()
+        if panel is not None and hasattr(panel, "refresh_layers"):
+            panel.refresh_layers(self.current_idx)
+        self.enter_area_mode()
+        self._area_hint(
+            "Local area added. Drag it on the canvas to move/resize/rotate; "
+            "edit its adjustments in the panel. Pick 'Whole Image' (or Esc) "
+            "to finish.")
+
+    def enter_area_mode(self) -> bool:
+        """Show the full un-cropped image with the active area's overlay."""
+        if self.current_idx is None:
+            return False
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if (img is None or self.current_pixmap is None
+                or self.current_pixmap.isNull() or img.active_area_id is None):
+            return False
+        # Mutually exclusive with the other interaction modes.
+        if self.crop_mode:
+            self._exit_crop_mode()
+        if self.slice_mode:
+            self._exit_slice_mode()
+        self.view.bwpoint_mode = None
+        self.view.wb_pick_mode = False
+        self.area_mode = True
+        self._area_drag = None
+        self._zoom = 1.0
+        self._release_hires(refresh=False)
+        self._area_rerender = True
+        try:
+            self.update_preview(self.current_idx)  # re-render un-cropped
+        finally:
+            self._area_rerender = False
+        self._sync_zoom_combo()
+        self._draw_area_overlay()
+        self.view.setCursor(Qt.CrossCursor)
+        return True
+
+    def _exit_area_mode(self):
+        self.area_mode = False
+        self._area_drag = None
+        self._remove_area_overlay_items()
+        self.view.setCursor(Qt.ArrowCursor)
+
+    def exit_area_mode(self):
+        """Leave area mode and restore the normal (possibly cropped) display."""
+        if not self.area_mode:
+            return
+        self._exit_area_mode()
+        self.update_preview(self.current_idx)
+
+    def _select_whole_image_layer(self):
+        panel = self._sliders_panel()
+        if panel is not None and hasattr(panel, "_select_layer"):
+            panel._select_layer(None)
+        elif self.current_idx is not None:
+            ccr_backend.set_active_area_by_index(self.current_idx, None)
+            self.exit_area_mode()
+
+    def on_active_layer_changed(self, idx):
+        """Called by the panel when the active layer changes: show the area's
+        overlay, or leave area mode when the Whole Image layer is selected."""
+        if idx != self.current_idx:
+            return
+        img = ccr_backend.get_image_by_index(idx)
+        active_id = getattr(img, "active_area_id", None) if img else None
+        if active_id is None:
+            if self.area_mode:
+                self.exit_area_mode()
+        elif not self.area_mode:
+            self.enter_area_mode()
+        else:
+            self._draw_area_overlay()
+
+    # ---- geometry <-> pixmap conversions --------------------------------
+    def _area_circle_sel(self, area):
+        """The ellipse's un-rotated bounding box (QRectF) in pixmap pixels."""
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        g = area.get("geometry") or {}
+        cx = float(g.get("cx", 0.5)) * w
+        cy = float(g.get("cy", 0.5)) * h
+        rx = float(g.get("rx", 0.25)) * w
+        ry = float(g.get("ry", 0.25)) * h
+        return QRectF(cx - rx, cy - ry, 2 * rx, 2 * ry)
+
+    def _area_gradient_points(self, area):
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        g = area.get("geometry") or {}
+        p0 = QPointF(float(g.get("x0", 0.3)) * w, float(g.get("y0", 0.5)) * h)
+        p1 = QPointF(float(g.get("x1", 0.7)) * w, float(g.get("y1", 0.5)) * h)
+        return p0, p1
+
+    @staticmethod
+    def _point_seg_dist(p, a, b):
+        vx, vy = b.x() - a.x(), b.y() - a.y()
+        wx, wy = p.x() - a.x(), p.y() - a.y()
+        seg2 = vx * vx + vy * vy
+        t = 0.0 if seg2 < 1e-9 else max(0.0, min(1.0, (wx * vx + wy * vy) / seg2))
+        dx, dy = a.x() + t * vx - p.x(), a.y() + t * vy - p.y()
+        return math.hypot(dx, dy)
+
+    def _area_handle_at(self, p, area):
+        """Handle name under local point p for the area's overlay, or None."""
+        scale = self._view_scale()
+        tol = self.HANDLE_VIEW_PX / scale
+        if area.get("kind") == "gradient":
+            p0, p1 = self._area_gradient_points(area)
+            mid = QPointF((p0.x() + p1.x()) / 2.0, (p0.y() + p1.y()) / 2.0)
+            best, best_d2 = None, None
+            for name, pt in (("p0", p0), ("p1", p1), ("move", mid)):
+                dx, dy = p.x() - pt.x(), p.y() - pt.y()
+                if abs(dx) <= tol and abs(dy) <= tol:
+                    d2 = dx * dx + dy * dy
+                    if best_d2 is None or d2 < best_d2:
+                        best, best_d2 = name, d2
+            if best is not None:
+                return best
+            # Clicking on the gradient line itself moves the whole gradient.
+            if self._point_seg_dist(p, p0, p1) <= tol:
+                return "move"
+            return None
+        # circle / ellipse
+        sel = self._area_circle_sel(area)
+        angle = float(area.get("angle", 0.0))
+        c = sel.center()
+        unrot = QTransform()
+        unrot.rotate(-angle)
+        q = unrot.map(QPointF(p.x() - c.x(), p.y() - c.y()))
+        hw, hh = sel.width() / 2.0, sel.height() / 2.0
+        rot_off = self.ROTATE_HANDLE_VIEW_PX / scale
+        handles = [
+            ("corner-tl", -hw, -hh), ("corner-tr", hw, -hh),
+            ("corner-bl", -hw, hh), ("corner-br", hw, hh),
+            ("rotate", 0.0, -hh - rot_off),
+            ("edge-t", 0.0, -hh), ("edge-b", 0.0, hh),
+            ("edge-l", -hw, 0.0), ("edge-r", hw, 0.0),
+            ("move", 0.0, 0.0),
+        ]
+        best, best_d2 = None, None
+        for name, hx, hy in handles:
+            dx, dy = q.x() - hx, q.y() - hy
+            if abs(dx) <= tol and abs(dy) <= tol:
+                d2 = dx * dx + dy * dy
+                if best_d2 is None or d2 < best_d2:
+                    best, best_d2 = name, d2
+        if best is None:
+            # Inside the ellipse body -> move.
+            if (q.x() / max(hw, 1e-6)) ** 2 + (q.y() / max(hh, 1e-6)) ** 2 <= 1.0:
+                return "move"
+        return best
+
+    def _area_cursor_for_handle(self, handle, angle):
+        if handle is None:
+            return Qt.CrossCursor
+        if handle in ("move", "p0", "p1"):
+            return Qt.SizeAllCursor
+        if handle == "rotate":
+            return _rotate_cursor()
+        base = self._HANDLE_BASE_ANGLE.get(handle)
+        if base is None:
+            return Qt.CrossCursor
+        a = (base + angle) % 180.0
+        if a < 22.5:
+            return Qt.SizeHorCursor
+        elif a < 67.5:
+            return Qt.SizeFDiagCursor
+        elif a < 112.5:
+            return Qt.SizeVerCursor
+        elif a < 157.5:
+            return Qt.SizeBDiagCursor
+        return Qt.SizeHorCursor
+
+    def update_area_hover_cursor(self, scene_pos):
+        base = self._base_transform()
+        area = self._area_active()
+        if base is None or area is None:
+            self.view.setCursor(Qt.CrossCursor)
+            return
+        p = base.inverted()[0].map(scene_pos)
+        handle = self._area_handle_at(p, area)
+        self.view.setCursor(
+            self._area_cursor_for_handle(handle, float(area.get("angle", 0.0))))
+
+    # ---- drag interaction ------------------------------------------------
+    def begin_area_drag(self, scene_pos):
+        base = self._base_transform()
+        area = self._area_active()
+        if base is None or area is None or self.current_pixmap is None:
+            return
+        p = base.inverted()[0].map(scene_pos)
+        mode = self._area_handle_at(p, area)
+        if mode is None:
+            self._area_drag = None
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is not None:
+            img.push_undo_state()  # one undo step per geometry drag
+        self._area_drag = {
+            "mode": mode,
+            "id": area["id"],
+            "kind": area.get("kind", "circle"),
+            "start": QPointF(p),
+            "geom0": dict(area.get("geometry") or {}),
+            "angle0": float(area.get("angle", 0.0)),
+        }
+        self.view.setCursor(
+            self._area_cursor_for_handle(mode, float(area.get("angle", 0.0))))
+
+    def update_area_drag(self, scene_pos):
+        drag = self._area_drag
+        if drag is None or self.current_pixmap is None:
+            return
+        base = self._base_transform()
+        if base is None:
+            return
+        p = base.inverted()[0].map(scene_pos)
+        if drag["kind"] == "gradient":
+            self._area_drag_gradient(drag, p)
+        else:
+            self._area_drag_circle(drag, p)
+        self._draw_area_overlay()
+
+    def end_area_drag(self, scene_pos):
+        if self._area_drag is None:
+            return
+        self.update_area_drag(scene_pos)
+        self._area_drag = None
+        # Commit: render the masked effect (heavy) and refresh the thumbnail.
+        if self.current_idx is not None and 0 <= self.current_idx < len(ccr_backend.images):
+            ccr_backend.images[self.current_idx].update_thumbnail_and_preview()
+        self._area_rerender = True
+        try:
+            self.update_preview(self.current_idx)
+        finally:
+            self._area_rerender = False
+        try:
+            self.parent().parent().thumbnail_list.update_thumbnail(self.current_idx)
+        except AttributeError:
+            pass
+
+    def _resize_box_corner(self, box0, angle, p, which):
+        sx, sy = self._CORNER_SIGNS[which]
+        fwd = QTransform()
+        fwd.rotate(angle)
+        unrot = QTransform()
+        unrot.rotate(-angle)
+        hw0, hh0 = box0.width() / 2.0, box0.height() / 2.0
+        anchor = box0.center() + fwd.map(QPointF(-sx * hw0, -sy * hh0))
+        d = unrot.map(p - anchor)
+        min_sz = 6.0
+        dx = sx * max(sx * d.x(), min_sz)
+        dy = sy * max(sy * d.y(), min_sz)
+        c = anchor + fwd.map(QPointF(dx / 2.0, dy / 2.0))
+        bw, bh = abs(dx), abs(dy)
+        return QRectF(c.x() - bw / 2.0, c.y() - bh / 2.0, bw, bh)
+
+    def _resize_box_edge(self, box0, angle, p, which):
+        fwd = QTransform()
+        fwd.rotate(angle)
+        unrot = QTransform()
+        unrot.rotate(-angle)
+        c0 = box0.center()
+        hw0, hh0 = box0.width() / 2.0, box0.height() / 2.0
+        d = unrot.map(p - c0)
+        min_sz = 6.0
+        left, right, top, bottom = -hw0, hw0, -hh0, hh0
+        if which == "r":
+            right = max(d.x(), left + min_sz)
+        elif which == "l":
+            left = min(d.x(), right - min_sz)
+        elif which == "b":
+            bottom = max(d.y(), top + min_sz)
+        elif which == "t":
+            top = min(d.y(), bottom - min_sz)
+        c = c0 + fwd.map(QPointF((left + right) / 2.0, (top + bottom) / 2.0))
+        bw, bh = right - left, bottom - top
+        return QRectF(c.x() - bw / 2.0, c.y() - bh / 2.0, bw, bh)
+
+    def _area_drag_circle(self, drag, p):
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        g0 = drag["geom0"]
+        cx = float(g0.get("cx", 0.5)) * w
+        cy = float(g0.get("cy", 0.5)) * h
+        rx = float(g0.get("rx", 0.25)) * w
+        ry = float(g0.get("ry", 0.25)) * h
+        box0 = QRectF(cx - rx, cy - ry, 2 * rx, 2 * ry)
+        angle = drag["angle0"]
+        mode = drag["mode"]
+        sel = QRectF(box0)
+        new_angle = angle
+        if mode == "move":
+            delta = p - drag["start"]
+            c = box0.center() + delta
+            sel = QRectF(box0)
+            sel.moveCenter(QPointF(min(max(c.x(), 0.0), float(w)),
+                                   min(max(c.y(), 0.0), float(h))))
+        elif mode == "rotate":
+            c = box0.center()
+            v0 = drag["start"] - c
+            v1 = p - c
+            if (abs(v1.x()) + abs(v1.y())) >= 1e-6:
+                a0 = math.degrees(math.atan2(v0.y(), v0.x()))
+                a1 = math.degrees(math.atan2(v1.y(), v1.x()))
+                na = angle + (a1 - a0)
+                na = (na + 180.0) % 360.0 - 180.0
+                if abs(na) < 0.75:
+                    na = 0.0
+                new_angle = na
+        elif mode.startswith("corner-"):
+            sel = self._resize_box_corner(box0, angle, p, mode[len("corner-"):])
+        elif mode.startswith("edge-"):
+            sel = self._resize_box_edge(box0, angle, p, mode[len("edge-"):])
+        c = sel.center()
+        g = {"cx": c.x() / w, "cy": c.y() / h,
+             "rx": (sel.width() / 2.0) / w, "ry": (sel.height() / 2.0) / h}
+        ccr_backend.update_area_geometry_by_index(
+            self.current_idx, drag["id"], geometry=g, angle=new_angle,
+            reprocess=False)
+
+    def _area_drag_gradient(self, drag, p):
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        g0 = drag["geom0"]
+        x0 = float(g0.get("x0", 0.3)) * w
+        y0 = float(g0.get("y0", 0.5)) * h
+        x1 = float(g0.get("x1", 0.7)) * w
+        y1 = float(g0.get("y1", 0.5)) * h
+        mode = drag["mode"]
+        if mode == "p0":
+            x0, y0 = p.x(), p.y()
+        elif mode == "p1":
+            x1, y1 = p.x(), p.y()
+        elif mode == "move":
+            delta = p - drag["start"]
+            x0 += delta.x(); y0 += delta.y()
+            x1 += delta.x(); y1 += delta.y()
+        g = {"x0": x0 / w, "y0": y0 / h, "x1": x1 / w, "y1": y1 / h}
+        ccr_backend.update_area_geometry_by_index(
+            self.current_idx, drag["id"], geometry=g, reprocess=False)
+
+    # ---- overlay drawing -------------------------------------------------
+    def _remove_area_overlay_items(self):
+        for item in self._area_overlay_items:
+            try:
+                self.scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._area_overlay_items = []
+
+    def _draw_area_overlay(self):
+        self._remove_area_overlay_items()
+        if not self.area_mode or self.current_pixmap is None:
+            return
+        base = self._base_transform()
+        area = self._area_active()
+        if base is None or area is None:
+            return
+        scale = self._view_scale()
+        hs = self.HANDLE_DRAW_PX / scale
+        handle_pen = QPen(QColor(30, 30, 30, 230), max(1.0 / scale, 0.5))
+        handle_brush = QBrush(QColor(255, 255, 255, 235))
+        line_pen = QPen(QColor(255, 255, 255, 220), max(2.0 / scale, 0.5), Qt.DashLine)
+
+        if area.get("kind") == "gradient":
+            p0, p1 = self._area_gradient_points(area)
+            line = QGraphicsLineItem(p0.x(), p0.y(), p1.x(), p1.y())
+            line.setPen(line_pen)
+            line.setTransform(base)
+            self.scene.addItem(line)
+            self._area_overlay_items.append(line)
+            mid = QPointF((p0.x() + p1.x()) / 2.0, (p0.y() + p1.y()) / 2.0)
+            for pt in (p0, p1, mid):
+                hdl = QGraphicsEllipseItem(QRectF(pt.x() - hs / 2, pt.y() - hs / 2, hs, hs))
+                hdl.setPen(handle_pen)
+                hdl.setBrush(handle_brush)
+                hdl.setTransform(base)
+                self.scene.addItem(hdl)
+                self._area_overlay_items.append(hdl)
+            return
+
+        # circle / ellipse
+        sel = self._area_circle_sel(area)
+        angle = float(area.get("angle", 0.0))
+        c = sel.center()
+        box_t = QTransform()
+        box_t.translate(c.x(), c.y())
+        box_t.rotate(angle)
+        box_t.translate(-c.x(), -c.y())
+        combined = box_t * base
+        ell = QGraphicsEllipseItem(sel)
+        ell.setPen(line_pen)
+        ell.setTransform(combined)
+        self.scene.addItem(ell)
+        self._area_overlay_items.append(ell)
+        # Feather ring (inner edge of the falloff).
+        feather = float(area.get("feather", 0.25))
+        if feather > 0.01:
+            dx = sel.width() / 2.0 * feather
+            dy = sel.height() / 2.0 * feather
+            inner = QRectF(sel).adjusted(dx, dy, -dx, -dy)
+            if inner.width() > 1 and inner.height() > 1:
+                ring = QGraphicsEllipseItem(inner)
+                ring.setPen(QPen(QColor(255, 255, 255, 120),
+                                 max(1.0 / scale, 0.5), Qt.DotLine))
+                ring.setTransform(combined)
+                self.scene.addItem(ring)
+                self._area_overlay_items.append(ring)
+        hw, hh = sel.width() / 2.0, sel.height() / 2.0
+        rot_off = self.ROTATE_HANDLE_VIEW_PX / scale
+
+        def add_handle(item):
+            item.setPen(handle_pen)
+            item.setBrush(handle_brush)
+            item.setTransform(combined)
+            self.scene.addItem(item)
+            self._area_overlay_items.append(item)
+
+        for hx, hy in ((-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh),
+                       (0.0, -hh), (0.0, hh), (-hw, 0.0), (hw, 0.0)):
+            x, y = c.x() + hx, c.y() + hy
+            add_handle(QGraphicsRectItem(QRectF(x - hs / 2, y - hs / 2, hs, hs)))
+        stem = QGraphicsLineItem(c.x(), c.y() - hh, c.x(), c.y() - hh - rot_off)
+        stem.setPen(QPen(QColor(255, 255, 255, 220), max(1.5 / scale, 0.5)))
+        stem.setTransform(combined)
+        self.scene.addItem(stem)
+        self._area_overlay_items.append(stem)
+        add_handle(QGraphicsEllipseItem(
+            QRectF(c.x() - hs / 2, c.y() - hh - rot_off - hs / 2, hs, hs)))
+        add_handle(QGraphicsEllipseItem(QRectF(c.x() - hs / 2, c.y() - hs / 2, hs, hs)))
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._fit_view_to_content()
@@ -2513,6 +3054,9 @@ class HiResDetailWorker(QThread):
         self._cap = max_long_side
         # Snapshots taken on the GUI thread at request time:
         self._settings = dict(img_obj.adjustment_settings)
+        # Deep copy: each area nests settings + geometry dicts the GUI thread
+        # may mutate while this worker runs.
+        self._areas = copy.deepcopy(getattr(img_obj, "area_layers", []))
         self._contrast_base = img_obj.contrast_base
         self._temperature_base = img_obj.temperature_base
         self._brightness_base = img_obj.brightness_base
@@ -2538,7 +3082,8 @@ class HiResDetailWorker(QThread):
                 base, settings=self._settings,
                 contrast_base=self._contrast_base,
                 temperature_base=self._temperature_base,
-                brightness_base=self._brightness_base)
+                brightness_base=self._brightness_base,
+                areas_override=self._areas)
             if not self._converted:
                 # Mirror the preview pipeline: adjustments first, then the
                 # display-only auto-brightness stretch for raw negatives

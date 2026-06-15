@@ -2689,3 +2689,96 @@ def apply_curves(img16: np.ndarray, curves) -> np.ndarray:
                           composed * (65535.0 / 255.0)).astype(np.uint16)
         out[..., c] = lut16[img16[..., c]]
     return out
+
+
+# --- Area editing (local masked adjustment layers) -------------------------
+# Masks are rasterized from NORMALIZED geometry (fractions of width/height) so
+# the same area definition reproduces identically at the 1080px preview, the
+# hi-res zoom detail, and the full-res export — the same resolution-independent
+# contract apply_crop_to_image and the reference-norm replay already honor.
+
+def _smoothstep(a: np.ndarray) -> np.ndarray:
+    """Cubic ease (3a^2 - 2a^3) clamped to [0,1]."""
+    a = np.clip(a, 0.0, 1.0)
+    return a * a * (3.0 - 2.0 * a)
+
+
+def build_circle_mask(h, w, geom, angle_deg=0.0, feather=0.25) -> np.ndarray:
+    """Rotated, squishable ellipse -> float32 alpha[h,w] in [0,1].
+
+    geom: {cx, cy, rx, ry} as fractions of width/height (rx of width, ry of
+    height). angle_deg rotates the ellipse about its center (Qt clockwise
+    convention). feather is the fraction of the radius over which alpha ramps
+    from 1 (inside) to 0 (at the boundary). feather<=0 gives a hard edge.
+    """
+    cx = float(geom.get("cx", 0.5)) * w
+    cy = float(geom.get("cy", 0.5)) * h
+    rx = max(float(geom.get("rx", 0.3)) * w, 1e-3)
+    ry = max(float(geom.get("ry", 0.3)) * h, 1e-3)
+    t = np.deg2rad(float(angle_deg))
+    cs, sn = np.cos(t), np.sin(t)
+    ys, xs = np.mgrid[0:h, 0:w]
+    dx = xs.astype(np.float32) - cx
+    dy = ys.astype(np.float32) - cy
+    xr = cs * dx + sn * dy          # rotate into the ellipse-local frame
+    yr = -sn * dx + cs * dy
+    d = np.sqrt((xr / rx) ** 2 + (yr / ry) ** 2)   # 1.0 == ellipse boundary
+    f = max(float(feather), 1e-4)
+    return _smoothstep((1.0 - d) / f).astype(np.float32)
+
+
+def build_gradient_mask(h, w, geom, feather=0.25) -> np.ndarray:
+    """Linear gradient -> float32 alpha[h,w] in [0,1].
+
+    geom: {x0,y0,x1,y1} normalized endpoints. alpha is 0 at p0 (no effect),
+    1 at p1 (full effect), with a smooth ramp across the segment and constant
+    full/zero plateaus beyond the endpoints. The two handles define the ramp
+    extent, so feather is unused for gradients (accepted for API symmetry).
+    """
+    ax = float(geom.get("x0", 0.3)) * w
+    ay = float(geom.get("y0", 0.5)) * h
+    bx = float(geom.get("x1", 0.7)) * w
+    by = float(geom.get("y1", 0.5)) * h
+    vx, vy = bx - ax, by - ay
+    L2 = max(vx * vx + vy * vy, 1e-6)
+    ys, xs = np.mgrid[0:h, 0:w]
+    t = ((xs.astype(np.float32) - ax) * vx + (ys.astype(np.float32) - ay) * vy) / L2
+    return _smoothstep(t).astype(np.float32)
+
+
+def build_area_mask(h, w, area) -> np.ndarray:
+    """Dispatch on area['kind'] to the right mask builder."""
+    geom = area.get("geometry") or {}
+    feather = float(area.get("feather", 0.25))
+    if area.get("kind") == "gradient":
+        return build_gradient_mask(h, w, geom, feather)
+    return build_circle_mask(h, w, geom, float(area.get("angle", 0.0)), feather)
+
+
+def apply_area_layers(base_u16: np.ndarray, areas, layer_fn) -> np.ndarray:
+    """Composite enabled area layers onto a globally-adjusted base.
+
+    base_u16: the global adjustment result (uint16 RGB) at the CURRENT
+        resolution — the implicit "whole image" layer.
+    areas: list of area dicts (see spec/area-editing.md §4.1).
+    layer_fn: callable(base_u16, settings) -> uint16 array, the full per-pixel
+        adjustment pass for one area's own settings, computed against the SAME
+        base (so each area's delta is independent).
+
+    Additive blend: out = base + sum_i alpha_i * (layer_i - base), clipped.
+    Order-independent; overlapping areas accumulate. Returns base_u16 unchanged
+    when there are no enabled areas.
+    """
+    if not areas or not any(a.get("enabled") for a in areas):
+        return base_u16
+    h, w = base_u16.shape[:2]
+    base = base_u16.astype(np.float32)
+    acc = base.copy()
+    for a in areas:
+        if not a.get("enabled"):
+            continue
+        layer = np.asarray(layer_fn(base_u16, a.get("settings") or {}),
+                           dtype=np.float32)
+        m = build_area_mask(h, w, a)[..., None]
+        acc += m * (layer - base)
+    return np.clip(acc, 0, 65535).astype(np.uint16)
