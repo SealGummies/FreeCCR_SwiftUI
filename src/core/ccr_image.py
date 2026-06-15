@@ -119,7 +119,10 @@ class CCRImage:
         self.undo_stack: list = []  # Snapshots for Ctrl+Z, most recent last
         self.contrast_base: int = 0      # Non-destructive base contrast added internally; slider shows 0
         self.temperature_base: int = 0   # Non-destructive base temperature offset; slider shows 0
-        self.brightness_base: int = -8   # Non-destructive base brightness offset; slider shows 0
+        # Non-destructive base brightness offset (slider shows 0). The -8 is part
+        # of the film-NEGATIVE look; positives go straight to user adjustments
+        # from a neutral baseline (no darkening), so 0 there. See spec/positive-mode.md.
+        self.brightness_base: int = 0 if self._positive_mode_active() else -8
         self.histogram_image = None
         self.original_full_size: Optional[tuple[int, int]] = None  # (height, width) of the full-res source, set by read_image
 
@@ -179,7 +182,9 @@ class CCRImage:
         """
         self.contrast_base = 0      # Clear base offsets when reverting to original scan
         self.temperature_base = 0
-        self.brightness_base = -8   # Always applied; not tied to conversion state
+        # -8 is the negative-look baseline; positives reset to a neutral 0 so the
+        # decode goes straight to user adjustments (no darkening / shadow crush).
+        self.brightness_base = 0 if self._positive_mode_active() else -8
         self.conversion_inputs = None
         img = self.read_image(self.file_path, max_long_side=1080)
         if img is not None:

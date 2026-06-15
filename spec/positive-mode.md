@@ -108,6 +108,19 @@ display_img = adjusted if (self.converted or positive_mode) else auto_brightness
 Same change in the hi-res zoom worker (`HiResDetailWorker.run`) so zoomed detail
 matches the preview (capture `positive_mode` at request time for thread safety).
 
+### 4.2a Neutral look baseline (no negative-look offset on positives)
+Every CCRImage carries a non-destructive `brightness_base = -8` — part of the
+film-NEGATIVE look. Because it is non-zero, `apply_adjustments` runs
+`adjust_image` even with no user sliders, applying a gamma-1.3 darkening that
+crushes shadows. On a positive that is an unwanted "extra step" between decode
+and preview/output (it also rides into export). So positives use a **neutral
+baseline `brightness_base = 0`** (set in `CCRImage.__init__` and `reload_image`
+based on the mode; `contrast_base`/`temperature_base` are already 0). With the
+neutral baseline and no user sliders, `apply_adjustments` short-circuits to an
+identity, so a fresh positive is exactly: decode → (user adjustments) → output.
+`tint_balance_factor` is left computed from the decoded pixels (it only affects
+the Tint slider/WB-picker strength and never clips).
+
 ### 4.3 Export (`ccr_processor.ccr_export_positive`)
 A new function mirroring the **bwpoint export tail** but with **no
 normalization/inversion**:

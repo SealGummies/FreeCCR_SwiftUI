@@ -15,9 +15,26 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+import cv2  # noqa: E402
 import rawpy  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+# Full CCRImage construction builds QPixmaps, which needs a QApplication.
+_app = QApplication.instance() or QApplication(sys.argv[:1])
+
 from core.ccr_image import CCRImage  # noqa: E402
-from core.ccr_processor import ccr_export_positive  # noqa: E402
+from core.ccr_processor import adjust_image, ccr_export_positive  # noqa: E402
+
+
+def _scan_png(tmp_path, name="pos.png", w=96, h=64):
+    """A small 16-bit positive-ish image written to disk (non-RAW decode path)."""
+    yy, xx = np.mgrid[0:h, 0:w]
+    base = 8000 + 40000 * (xx / w) + 8000 * (yy / h)
+    img = np.clip(np.stack([base, base * 0.95, base * 0.9], axis=-1),
+                  500, 64000).astype(np.uint16)
+    path = str(tmp_path / name)
+    cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +242,35 @@ class TestBackendPositiveMode:
         backend.reprocess_all_for_positive_mode_change()
         # A normal image keeps whatever reload_image computed (no restore).
         assert plain.tint_balance_factor == pytest.approx(99.0)
+
+
+class TestBrightnessBaseline:
+    """Positives must go decode -> user adjustments -> output with NO negative
+    look baseline. The -8 brightness_base (a film-negative default) applies a
+    gamma-1.3 darkening that crushes shadows; positives must use a neutral 0."""
+
+    def test_negative_brightness_base_crushes_shadows_positive_is_identity(self):
+        shadow = np.full((4, 4, 3), 8000, dtype=np.uint16)
+        identity = adjust_image(shadow, brightness=0)
+        darkened = adjust_image(shadow, brightness=-8)
+        np.testing.assert_array_equal(identity, shadow)        # positive baseline: untouched
+        assert darkened.mean() < shadow.mean() * 0.85          # negative baseline: darkened
+
+    def test_fresh_positive_image_uses_neutral_brightness_base(self, tmp_path, backend):
+        path = _scan_png(tmp_path)
+        backend.positive_mode = True
+        assert CCRImage(path).brightness_base == 0
+        backend.positive_mode = False
+        assert CCRImage(path).brightness_base == -8            # negatives keep the look
+
+    def test_fresh_positive_preview_pipeline_is_identity(self, tmp_path, backend):
+        # With the neutral baseline and no user sliders, the preview pipeline is
+        # an identity on the decoded positive — no clipping/darkening step.
+        path = _scan_png(tmp_path)
+        backend.positive_mode = True
+        pos = CCRImage(path)
+        out = pos.apply_adjustments(pos.resized_raw)
+        np.testing.assert_array_equal(out, pos.resized_raw)
 
 
 if __name__ == "__main__":
