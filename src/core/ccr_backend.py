@@ -584,8 +584,16 @@ class CCRBackend:
             ci = img.conversion_inputs
             was_converted = img.converted
             cb, tb, bb = img.contrast_base, img.temperature_base, img.brightness_base
+            # Slices/duplicates deliberately INHERIT the parent's tint balance
+            # factor (their own region/converted pixels would give a different
+            # one). reload_image unconditionally recomputes it, so preserve the
+            # inherited value for those images.
+            inherited_tbf = bool(img.source_ops) or bool(getattr(img, "is_duplicate", False))
+            tbf = getattr(img, "tint_balance_factor", 1.0)
             try:
                 img.reload_image()                 # re-decode (ICC re-applied)
+                if inherited_tbf:
+                    img.tint_balance_factor = tbf
                 if was_converted and ci is not None:
                     _replay_conversion(img, ci)    # re-convert from the new scan
                 # Preserve the user's non-destructive look offsets across the

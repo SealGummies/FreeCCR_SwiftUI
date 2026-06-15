@@ -312,5 +312,33 @@ def test_backend_rejects_lut_profile_unchanged(tmp_path, monkeypatch):
         ccr_backend.input_icc_name = None
 
 
+def test_reprocess_preserves_inherited_tint_factor(tmp_path):
+    """Regression: a slice/duplicate inherits its parent's tint_balance_factor;
+    reprocessing after an input-ICC change must not let reload recompute it from
+    the image's own region. A plain image is free to re-adapt."""
+    _make_qapp()
+    from core.ccr_image import CCRImage
+    from core.ccr_backend import ccr_backend
+    p = str(tmp_path / "neg.png")
+    _write_negative_png(p)
+    saved_images = ccr_backend.images
+    cm.set_active_input_profile(None)
+    try:
+        plain = CCRImage(p)
+        dup = CCRImage(p)
+        dup.is_duplicate = True
+        SENT = 0.777
+        dup.tint_balance_factor = SENT             # inherited sentinel
+        plain_before = plain.tint_balance_factor
+        ccr_backend.images = [plain, dup]
+        cm.set_active_input_profile(cm.InputProfile.from_bytes(_adobe_like_icc()))
+        ccr_backend.reprocess_all_for_input_icc_change()
+        assert dup.tint_balance_factor == SENT     # inherited factor preserved
+        assert plain.tint_balance_factor != plain_before  # plain re-adapts to ICC
+    finally:
+        ccr_backend.images = saved_images
+        cm.set_active_input_profile(None)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
