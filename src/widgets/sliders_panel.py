@@ -722,6 +722,15 @@ class SlidersPanel(QWidget):
                 slider.blockSignals(False)
                 
 
+    def set_negative_controls_enabled(self, enabled: bool):
+        """Enable/disable the film-negative-only controls (the Film B/W Point
+        tools). Disabled in global Positive mode, where there is nothing to
+        convert. The toolbar's Convert/Un-convert/Auto Frame are gated
+        separately in ImagePreview."""
+        for btn in (self.white_point_btn, self.black_point_btn,
+                    self.convert_current_bwp_btn, self.convert_all_bwp_btn):
+            btn.setEnabled(enabled)
+
     def save_slider_values(self, image_id):
         pass
 

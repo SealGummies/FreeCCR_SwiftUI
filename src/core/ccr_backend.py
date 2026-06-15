@@ -2,7 +2,8 @@ from typing import List, Optional
 import cv2
 from core.ccr_image import CCRImage
 from core.ccr_processor import (ccr_normalize_with_reference, ccr_normalize_with_bwpoint,
-                                ccr_normalize_with_refparams, auto_fine_angle, auto_frame,
+                                ccr_normalize_with_refparams, ccr_export_positive,
+                                auto_fine_angle, auto_frame,
                                 auto_frame_v2)
 import os
 import glob
@@ -32,6 +33,11 @@ class CCRBackend:
     def _init(self):
         self.images: List[CCRImage] = []
         self.file_paths: List[str] = []
+        # Global Positive mode: when True, RAWs decode as normal sRGB positives
+        # and the negative pipeline (conversion / B-W point / reference frame) is
+        # bypassed — every image is editable/exportable directly. App-wide, like
+        # the input ICC profile; persisted by MainWindow. See spec/positive-mode.md.
+        self.positive_mode: bool = False
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Global input ICC profile (one app-wide setting; applied to every
@@ -605,6 +611,34 @@ class CCRBackend:
             if progress_callback:
                 progress_callback(i + 1, total)
 
+    def reprocess_all_for_positive_mode_change(self, progress_callback=None) -> None:
+        """Re-decode every loaded image after the global Positive-mode toggle.
+
+        Product decision (spec/positive-mode.md): KEEP adjustments, DROP
+        conversion. reload_image re-decodes through read_image (which now reads
+        the new global mode) and preserves adjustment_settings / crop / areas /
+        orientation; we explicitly drop the conversion so a re-decoded scan is
+        never left flagged converted. The reference_frame is kept so toggling
+        back to negative restores the user's frame."""
+        total = len(self.images)
+        for i, img in enumerate(self.images):
+            # Slices/duplicates INHERIT the parent's tint balance factor; their
+            # own region would derive a different one, and reload_image always
+            # recomputes it — so preserve the inherited value for those images.
+            inherited_tbf = bool(img.source_ops) or bool(getattr(img, "is_duplicate", False))
+            tbf = getattr(img, "tint_balance_factor", 1.0)
+            try:
+                img.converted = False
+                img.conversion_inputs = None
+                img.reload_image()                 # re-decode in the new global mode
+                if inherited_tbf:
+                    img.tint_balance_factor = tbf
+                img.update_thumbnail_and_preview()
+            except Exception as e:
+                print(f"Reprocess after positive-mode change failed for {img.file_path}: {e}")
+            if progress_callback:
+                progress_callback(i + 1, total)
+
     def update_thumbnail_by_index(self, idx: int):
         """
         Updates the thumbnail for the image at the given index.
@@ -699,6 +733,15 @@ class CCRBackend:
         if idx is not None and 0 <= idx < len(self.images):
             image_obj = self.images[idx]
             try:
+                if self.positive_mode:
+                    # Positive mode: export the adjusted positive directly — no
+                    # inversion, regardless of any leftover reference_frame.
+                    ccr_export_positive(image_obj, output_path=output_path,
+                                        water_mark=not self.software_activated,
+                                        jpg_out=jpg_output, jpg_quality=jpg_quality,
+                                        max_long_side=max_long_side,
+                                        output_colorspace=output_colorspace)
+                    return True
                 ci = getattr(image_obj, "conversion_inputs", None)
                 if ci is not None and ci.get("mode") == "ref_params":
                     # Sliced child of a reference-converted parent: replay the

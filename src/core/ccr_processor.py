@@ -1172,6 +1172,95 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     return rgb_result
 
 
+def ccr_export_positive(ccr_image, output_path=None, water_mark=True, jpg_out=False,
+                        jpg_quality=95, max_long_side=None, output_colorspace="srgb"):
+    """Positive-mode processing/export: NO negative inversion.
+
+    The image is already a normal positive (decoded in sRGB; see
+    spec/positive-mode.md), so this just applies the user adjustments, crop,
+    orientation, optional watermark and output colour space — mirroring the
+    bwpoint export tail without the normalization step.
+
+    output_path is None returns the adjusted in-memory array (parity with the
+    other normalize functions); otherwise the file is written and None returned.
+    """
+    total_start_time = time.time()
+    img = _load_export_source(ccr_image, output_path, max_long_side)
+    if img is None:
+        raise ValueError("CCRImage.resized_raw is None")
+
+    fine_angle = ccr_image.fine_rotation_angle / 100.0
+    h_flip = ccr_image.horizontal_mirrored
+    v_flip = ccr_image.vertical_mirrored
+
+    # In-app processing path: just the adjusted positive (preview/thumbnail use
+    # update_thumbnail_and_preview, which also applies adjustments — this mirrors
+    # the other normalize functions' output_path-is-None contract).
+    if output_path is None:
+        return ccr_image.apply_adjustments(img)
+
+    rgb_result = ccr_image.apply_adjustments(img)
+
+    # User crop (normalized rect in un-rotated/un-flipped space) — applied
+    # before flips/rotation so it matches the cropped preview orientation.
+    rgb_result = apply_crop_to_image(rgb_result, getattr(ccr_image, 'crop_rect', None),
+                                     getattr(ccr_image, 'crop_angle', 0.0))
+    # Flips
+    if h_flip and v_flip:
+        rgb_result = cv2.flip(rgb_result, -1)
+    elif h_flip:
+        rgb_result = cv2.flip(rgb_result, 1)
+    elif v_flip:
+        rgb_result = cv2.flip(rgb_result, 0)
+
+    # 90-degree rotation
+    angle = ccr_image.rotation_angle % 360
+    if angle == 90:
+        rgb_result = np.rot90(rgb_result, k=3)
+    elif angle == 180:
+        rgb_result = np.rot90(rgb_result, k=2)
+    elif angle == 270:
+        rgb_result = np.rot90(rgb_result, k=1)
+
+    # Watermark (positioned at bottom-right of image)
+    if water_mark:
+        rgb_result = np.ascontiguousarray(rgb_result)
+        h_out, w_out = rgb_result.shape[:2]
+        watermark_text = "FreeCCR Unpaid Demo"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = w_out / (30 * 32)
+        font_thickness = max(3, int(font_scale * 2))
+        text_size = cv2.getTextSize(watermark_text, font, font_scale, font_thickness)[0]
+        text_x = max(0, w_out - text_size[0] - 10)
+        text_y = max(text_size[1], h_out - text_size[1] - 10)
+        cv2.putText(rgb_result, watermark_text, (text_x, text_y),
+                    font, font_scale, (30000, 30000, 30000), font_thickness)
+
+    # Fine rotation at full resolution (canvas-expanding, like the other paths)
+    if fine_angle != 0:
+        h_r, w_r = rgb_result.shape[:2]
+        center_r = (w_r // 2, h_r // 2)
+        rot_mat = cv2.getRotationMatrix2D(center_r, -fine_angle, 1.0)
+        abs_cos = abs(rot_mat[0, 0])
+        abs_sin = abs(rot_mat[0, 1])
+        new_w = int(w_r * abs_cos + h_r * abs_sin)
+        new_h = int(h_r * abs_cos + w_r * abs_sin)
+        rot_mat[0, 2] += (new_w - w_r) / 2
+        rot_mat[1, 2] += (new_h - h_r) / 2
+        try:
+            rgb_result = cv2.warpAffine(rgb_result, rot_mat, (new_w, new_h),
+                                        flags=cv2.INTER_LINEAR,
+                                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        except Exception as e:
+            print(f"Warning: warpAffine failed: {e}")
+
+    write_export_image(ccr_image, rgb_result, output_path, jpg_out,
+                       jpg_quality, max_long_side, output_colorspace)
+    print(f"TOTAL positive export time: {time.time() - total_start_time:.3f}s")
+    gc.collect()
+    return None
+
+
 def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
                                  output_path=None, water_mark=True, jpg_out=False,
                                  jpg_quality=95, max_long_side=None,

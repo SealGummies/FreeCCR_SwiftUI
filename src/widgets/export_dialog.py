@@ -50,14 +50,23 @@ class ExportSettingsDialog(QDialog):
         self.plan: Optional[ExportPlan] = None
         self._current_idx = current_idx
         self._default_scope = default_scope
-        self._converted_indices = [idx for idx, img in enumerate(ccr_backend.images) if img.converted]
+        # In Positive mode every loaded image is exportable (no conversion step);
+        # otherwise only converted negatives are. (Variable names kept for churn,
+        # but they now mean "exportable".)
+        self._positive_mode = bool(getattr(ccr_backend, "positive_mode", False))
+
+        def _exportable(img):
+            return img.converted or self._positive_mode
+
+        self._converted_indices = [idx for idx, img in enumerate(ccr_backend.images)
+                                   if _exportable(img)]
         self._current_converted = (
             current_idx is not None
             and 0 <= current_idx < len(ccr_backend.images)
-            and ccr_backend.images[current_idx].converted
+            and _exportable(ccr_backend.images[current_idx])
         )
-        # Selected thumbnails that are converted — export only handles
-        # converted images, so non-converted selections are dropped here.
+        # Selected thumbnails that are exportable — non-exportable selections
+        # are dropped here.
         converted_set = set(self._converted_indices)
         self._selected_converted = [i for i in (selected_indices or []) if i in converted_set]
         self._bpp_cache = {}  # quality -> bytes per pixel sample
@@ -76,7 +85,8 @@ class ExportSettingsDialog(QDialog):
         # Scope
         scope_group = QGroupBox("Export scope")
         scope_layout = QVBoxLayout(scope_group)
-        self.scope_all_radio = QRadioButton(f"All converted images ({len(self._converted_indices)})")
+        all_label = "All images" if self._positive_mode else "All converted images"
+        self.scope_all_radio = QRadioButton(f"{all_label} ({len(self._converted_indices)})")
         self.scope_all_radio.setChecked(True)
         self.scope_current_radio = QRadioButton("Current image only")
         if not self._current_converted:
