@@ -3306,6 +3306,7 @@ class ExportItemsWorker(QThread):
                 jpg_output=self.plan.jpg_output,
                 jpg_quality=self.plan.jpg_quality,
                 max_long_side=self.plan.max_long_side,
+                output_colorspace=self.plan.output_colorspace,
                 progress_callback=progress_callback,
                 cancel_check=lambda: self._stop_requested,
             )

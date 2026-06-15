@@ -137,6 +137,14 @@ class MainWindow(QMainWindow):
         self.installEventFilter(self)
         self.create_menu()
 
+        # Restore a previously-chosen global input ICC profile (applied to every
+        # decode). Done before any images load so the first batch picks it up.
+        saved_icc = self._settings.value("import/input_icc_path", "", type=str)
+        if saved_icc and os.path.exists(saved_icc):
+            if ccr_backend.load_input_icc_from_storage(saved_icc) is None:
+                self._settings.remove("import/input_icc_path")
+            self._refresh_input_icc_menu()
+
         # Ctrl+Z (Cmd+Z on macOS): undo the last action on the current image;
         # repeated presses walk further back through the undo stack.
         self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
@@ -241,6 +249,15 @@ class MainWindow(QMainWindow):
         export_action.setShortcut("Ctrl+E")
         export_action.triggered.connect(self.image_preview.open_export_dialog)
 
+        # Input ICC profile: a single, global, persistent profile applied to
+        # every image at decode time, before conversion/adjustments.
+        file_menu.addSeparator()
+        self.input_icc_action = file_menu.addAction("Set Input ICC Profile…")
+        self.input_icc_action.triggered.connect(self.set_input_icc_profile)
+        self.clear_input_icc_action = file_menu.addAction("Clear Input ICC Profile")
+        self.clear_input_icc_action.triggered.connect(self.clear_input_icc_profile)
+        self._refresh_input_icc_menu()
+
         # Add Help menu with About, Licenses, Activation, and Help actions
         help_menu = menu_bar.addMenu("Help")
         about_action = help_menu.addAction("About")
@@ -251,6 +268,67 @@ class MainWindow(QMainWindow):
 
         help_action = help_menu.addAction("Help")
         help_action.triggered.connect(self.open_help_website)
+
+    # --- Input ICC profile (global, persistent) ---------------------------
+    def _refresh_input_icc_menu(self):
+        """Reflect the active input profile in the File-menu actions."""
+        name = getattr(ccr_backend, "input_icc_name", None)
+        if name:
+            self.input_icc_action.setText(f"Input ICC: {name}…")
+            self.clear_input_icc_action.setEnabled(True)
+        else:
+            self.input_icc_action.setText("Set Input ICC Profile…")
+            self.clear_input_icc_action.setEnabled(False)
+
+    def set_input_icc_profile(self):
+        from core.color_management import UnsupportedICCError
+        start_dir = self._settings.value("import/last_icc_dir", "", type=str)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Input ICC Profile", start_dir,
+            "ICC Profiles (*.icc *.icm);;All Files (*)")
+        if not path:
+            return
+        self._settings.setValue("import/last_icc_dir", os.path.dirname(path))
+        try:
+            name = ccr_backend.set_input_icc(path)
+        except UnsupportedICCError as e:
+            QMessageBox.warning(
+                self, "Unsupported ICC Profile",
+                f"This profile can't be used as an input profile:\n\n{e}\n\n"
+                "Only RGB matrix-shaper profiles are supported "
+                "(LUT-based, cLUT, or CMYK profiles are not).")
+            return
+        except Exception as e:
+            QMessageBox.warning(self, "Input ICC Profile Error",
+                                f"Could not load the ICC profile:\n\n{e}")
+            return
+        self._settings.setValue("import/input_icc_path", ccr_backend.input_icc_path)
+        self._refresh_input_icc_menu()
+        self._reprocess_after_input_icc_change()
+        self.sliders_panel.set_temporary_hint(
+            f"Input ICC profile set: {name}", duration=3000)
+
+    def clear_input_icc_profile(self):
+        ccr_backend.clear_input_icc()
+        self._settings.remove("import/input_icc_path")
+        self._refresh_input_icc_menu()
+        self._reprocess_after_input_icc_change()
+        self.sliders_panel.set_temporary_hint("Input ICC profile cleared.", duration=3000)
+
+    def _reprocess_after_input_icc_change(self):
+        """Re-decode + re-convert loaded images so the profile change shows
+        immediately, then refresh the UI."""
+        if not ccr_backend.images:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ccr_backend.reprocess_all_for_input_icc_change()
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.thumbnail_list.update_all_thumbnails()
+        if self.image_preview.current_idx is not None:
+            self.image_preview.update_preview(self.image_preview.current_idx)
+        ccr_backend.save_catalog()
 
     def show_activation_dialog(self):
         QMessageBox.information(

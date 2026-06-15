@@ -12,6 +12,7 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
                                 apply_area_layers, apply_crop_to_image)
+from core import color_management
 
 # Import optional libraries with fallbacks
 try:
@@ -240,6 +241,23 @@ class CCRImage:
             new_h = int(h * max_long_side / w)
         return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+    def _apply_input_icc(self, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Convert a freshly-decoded scan from the globally-assigned input ICC
+        profile into the working sRGB encoding, before any conversion or
+        adjustment. No-op when no input profile is set. Applied inside
+        read_image so preview, hi-res zoom, and export all inherit it
+        identically (resolution-independent point operation)."""
+        if arr is None:
+            return arr
+        profile = color_management.get_active_input_profile()
+        if profile is None:
+            return arr
+        try:
+            return profile.apply(arr)
+        except Exception as e:
+            logging.warning(f"Input ICC profile could not be applied: {e}")
+            return arr
+
     def read_image(self, file_path: str, preview = True, max_long_side: Optional[int] = None) -> Optional[np.ndarray]:
         """
         Read an image file. preview=True decodes RAW at half size.
@@ -346,7 +364,9 @@ class CCRImage:
                 
                 elapsed_time = time.time() - start_time
                 print(f"RAW processing completed in {elapsed_time:.3f} seconds")
-                return rgb
+                # Burn in the global input ICC (if any) on the decoded scan,
+                # before negative conversion / adjustments.
+                return self._apply_input_icc(rgb)
             except Exception as e:
                 logging.exception(f"Failed to read RAW image: {file_path}")
                 return None
@@ -432,7 +452,8 @@ class CCRImage:
             self.original_full_size = (img.shape[0], img.shape[1])
             if max_long_side:
                 img = self.resize_image_to_max_pixel(img, max_long_side)
-            return img
+            # Burn in the global input ICC (if any) before conversion/adjustments.
+            return self._apply_input_icc(img)
         
     def update_thumbnail_and_preview(self, thumbnail_size: int = 156, preview_size: int = 1080) -> None:
         """

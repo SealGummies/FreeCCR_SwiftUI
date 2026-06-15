@@ -28,6 +28,7 @@ class ExportPlan:
     jpg_output: bool = False
     jpg_quality: int = 92
     max_long_side: Optional[int] = None  # None = keep original size
+    output_colorspace: str = "srgb"  # "srgb" | "prophoto"
     open_folder: bool = False
     destination: str = ""
     skipped: int = 0  # files dropped by the "skip existing" policy
@@ -130,6 +131,20 @@ class ExportSettingsDialog(QDialog):
         self.format_combo.currentIndexChanged.connect(self._on_format_changed)
         form.addRow("Format:", self.format_combo)
 
+        # Output color space. sRGB is the current behaviour (now ICC-tagged);
+        # ProPhoto re-encodes the result into the wide-gamut space and embeds
+        # the matching ICC profile.
+        self.colorspace_combo = QComboBox()
+        self.colorspace_combo.addItem("sRGB", "srgb")
+        self.colorspace_combo.addItem("ProPhoto RGB (wide gamut)", "prophoto")
+        self.colorspace_combo.currentIndexChanged.connect(self._on_colorspace_changed)
+        form.addRow("Color space:", self.colorspace_combo)
+        self.colorspace_hint = QLabel(
+            "8-bit ProPhoto JPEG can band — prefer 16-bit TIFF for wide gamut.")
+        self.colorspace_hint.setStyleSheet("color: gray;")
+        self.colorspace_hint.setWordWrap(True)
+        form.addRow("", self.colorspace_hint)
+
         quality_layout = QHBoxLayout()
         self.quality_slider = QSlider(Qt.Horizontal)
         self.quality_slider.setRange(1, 100)
@@ -183,6 +198,7 @@ class ExportSettingsDialog(QDialog):
         self._estimate_timer.timeout.connect(self._update_estimate)
 
         self._update_quality_visibility()
+        self._update_colorspace_hint()
 
     # ---------- settings ----------
 
@@ -207,6 +223,9 @@ class ExportSettingsDialog(QDialog):
         fmt_index = self.format_combo.findData(s.value("export/format", "tiff", type=str))
         if fmt_index >= 0:
             self.format_combo.setCurrentIndex(fmt_index)
+        cs_index = self.colorspace_combo.findData(s.value("export/colorspace", "srgb", type=str))
+        if cs_index >= 0:
+            self.colorspace_combo.setCurrentIndex(cs_index)
         self.quality_slider.setValue(s.value("export/jpeg_quality", 92, type=int))
         resize_index = self.resize_combo.findData(s.value("export/resize", 0, type=int))
         if resize_index >= 0:
@@ -229,6 +248,7 @@ class ExportSettingsDialog(QDialog):
         s.setValue("export/scope", scope)
         s.setValue("export/filename_template", self.filename_edit.text())
         s.setValue("export/format", self.format_combo.currentData())
+        s.setValue("export/colorspace", self.colorspace_combo.currentData())
         s.setValue("export/jpeg_quality", self.quality_slider.value())
         s.setValue("export/resize", self.resize_combo.currentData())
         s.setValue("export/conflict", self.conflict_combo.currentData())
@@ -285,8 +305,18 @@ class ExportSettingsDialog(QDialog):
 
     def _on_format_changed(self):
         self._update_quality_visibility()
+        self._update_colorspace_hint()
         self._update_example()
         self._schedule_estimate()
+
+    def _on_colorspace_changed(self):
+        self._update_colorspace_hint()
+
+    def _update_colorspace_hint(self):
+        # The banding caution is only relevant for 8-bit ProPhoto JPEG.
+        is_prophoto = self.colorspace_combo.currentData() == "prophoto"
+        is_jpeg = self.format_combo.currentData() == "jpeg"
+        self.colorspace_hint.setVisible(is_prophoto and is_jpeg)
 
     def _on_quality_changed(self, value):
         self.quality_value_label.setText(str(value))
@@ -393,6 +423,7 @@ class ExportSettingsDialog(QDialog):
             jpg_output=self.format_combo.currentData() == "jpeg",
             jpg_quality=self.quality_slider.value(),
             max_long_side=self._selected_max_long_side(),
+            output_colorspace=self.colorspace_combo.currentData(),
             open_folder=self.open_folder_checkbox.isChecked(),
             destination=destination,
             skipped=skipped,
