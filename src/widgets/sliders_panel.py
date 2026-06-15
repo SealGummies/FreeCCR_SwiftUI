@@ -1085,6 +1085,14 @@ class SlidersPanel(QWidget):
         img = ccr_backend.get_image_by_index(self.current_idx) if self.current_idx is not None else None
         if img is not None:
             img.push_undo_state()
+            # Reset clears the crop too, but only when resetting the Whole Image
+            # layer — the crop is an image-global property, so resetting an
+            # individual area leaves it (and the crop) untouched. Folded into the
+            # single undo snapshot pushed above.
+            if img.active_area_id is None and (img.crop_rect is not None
+                                               or getattr(img, "crop_angle", 0.0)):
+                img.crop_rect = None
+                img.crop_angle = 0.0
         # Reset every slider to its default (0 for most, 10 for band_feather).
         for i, slider in enumerate(self.sliders):
             key = self.adjustment_keys[i] if i < len(self.adjustment_keys) else None
@@ -1238,10 +1246,11 @@ class SlidersPanel(QWidget):
                 img.crop_angle = crop_angle
             if profile_changes:
                 img.color_profile = src_profile
-            if adj_changes or profile_changes or curves_changes:
-                # Crop is display/export-level only — no reprocessing needed
-                # when nothing but the crop changed. Adjustments and the color
-                # profile both change pixels, so they do.
+            if adj_changes or profile_changes or curves_changes or crop_changes:
+                # Adjustments, curves, and the color profile all change pixels;
+                # a crop change moves the region the histogram is computed over
+                # (it samples only the cropped area). Any of these needs a
+                # reprocess so the cached preview/histogram stays in step.
                 try:
                     img.update_thumbnail_and_preview()
                 except Exception as e:

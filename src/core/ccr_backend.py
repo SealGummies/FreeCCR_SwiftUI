@@ -843,7 +843,11 @@ class CCRBackend:
                 dup.slice_parent = None
             if ((dup.contrast_base, dup.temperature_base, dup.brightness_base)
                     != (0, 0, -8) or img.adjustment_settings.get("tint")
+                    or dup.crop_rect is not None or dup.crop_angle
                     or any(a.get("enabled") for a in dup.area_layers)):
+                # crop_rect/crop_angle were assigned just above, after the
+                # constructor already built the histogram over the FULL image;
+                # the histogram is crop-aware now, so a crop needs a regen too.
                 dup.update_thumbnail_and_preview()
             self.images.insert(idx + 1, dup)
             created += 1

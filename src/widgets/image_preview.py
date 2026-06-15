@@ -1006,7 +1006,16 @@ class ImagePreview(QWidget):
             self.apply_transformations()
             histogram = ccr_backend.get_histogram_image_by_index(idx)
             self.parent().parent().sliders_panel.set_histogram(histogram)
-            
+
+            # A confirmed crop magnifies the kept region even at the fitted
+            # view, so — like zooming in — request crop-matched hi-res detail
+            # instead of leaving the upscaled preview crop looking soft. The
+            # zoom paths handle their own requests; this covers crop-at-fit
+            # (apply/clear crop, undo, switching to an already-cropped image).
+            # Debounced; the request self-validates against current state.
+            if self._zoom <= 1.0 + 1e-9 and self._zoomed_in_enough():
+                self._hires_timer.start(200)
+
         else:
             self.rotation_slider.setEnabled(False)
 
@@ -1394,9 +1403,40 @@ class ImagePreview(QWidget):
             return None
         return self._view_scale() * ratio
 
+    # A confirmed crop that keeps less than this fraction of a side (i.e. more
+    # than ~15% cropped off width or height) magnifies the kept region enough
+    # at the fitted view that the upscaled 1080px preview reads as soft —
+    # worth fetching crop-matched hi-res detail, just like zooming in.
+    CROP_HIRES_KEEP_MAX = 0.85
+
     def _zoomed_in_enough(self):
-        """True when preview pixels are magnified — i.e. detail would help."""
-        return self._zoom > 1.0 and self._view_scale() > 1.05
+        """True when preview pixels are magnified on screen — i.e. higher-res
+        detail would help. Magnification comes from zooming in, or from cropping
+        into the image (the kept region is scaled up to fill the view even at
+        the fitted zoom)."""
+        if self._view_scale() <= 1.05:
+            return False
+        return self._zoom > 1.0 or self._crop_wants_hires()
+
+    def _crop_wants_hires(self):
+        """At the fitted view a confirmed crop magnifies the kept region. Worth
+        a crop-matched hi-res fetch when the crop removes a meaningful slice
+        (>15% of a side) and the source carries more detail than the preview.
+        Crop/slice/area modes show the FULL image, so no crop magnification."""
+        if self.crop_mode or self.slice_mode or self.area_mode:
+            return False
+        img = (ccr_backend.get_image_by_index(self.current_idx)
+               if self.current_idx is not None else None)
+        if img is None or not getattr(img, "converted", False):
+            return False
+        crop = getattr(img, "crop_rect", None)
+        if crop is None:
+            return False
+        if min(crop[2] - crop[0], crop[3] - crop[1]) > self.CROP_HIRES_KEEP_MAX:
+            return False
+        # Only worthwhile if a higher-resolution decode actually exists.
+        ratio = self._preview_to_source_ratio()
+        return ratio is not None and ratio < 0.98
 
     def _update_hires_state(self):
         # Keep any rendered detail in memory until the image is switched
@@ -2408,6 +2448,10 @@ class ImagePreview(QWidget):
             else:
                 too_small = True
         self._exit_crop_mode()
+        if applied and img_obj is not None:
+            # The kept pixel region changed, so the histogram (computed over
+            # the cropped area) is stale — regenerate it before the redraw.
+            img_obj.update_thumbnail_and_preview()
         self.update_preview(self.current_idx)
         if cleared:
             hint = "Crop cleared. Ctrl+Z to undo."
@@ -2432,12 +2476,18 @@ class ImagePreview(QWidget):
     def clear_crop(self):
         """Right-click in crop mode: remove the crop entirely."""
         img_obj = ccr_backend.get_image_by_index(self.current_idx)
+        cleared = False
         if img_obj is not None and (img_obj.crop_rect is not None
                                     or getattr(img_obj, "crop_angle", 0.0)):
             img_obj.push_undo_state()
             img_obj.crop_rect = None
             img_obj.crop_angle = 0.0
+            cleared = True
         self._exit_crop_mode()
+        if cleared:
+            # Histogram is computed over the cropped region — regenerate it now
+            # that the whole image is kept again.
+            img_obj.update_thumbnail_and_preview()
         self.update_preview(self.current_idx)
 
     def _exit_crop_mode(self):
