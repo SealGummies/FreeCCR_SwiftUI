@@ -125,6 +125,15 @@ class TestCompositing:
         assert apply_area_layers(base, [_circle(settings={"add": 5}, **{"id": "x"})
                                         | {"enabled": False}], _add_layer(0)) is base
 
+    def test_enabled_but_empty_area_is_skipped(self):
+        # A freshly created area (enabled, no settings yet) must be a true no-op
+        # — returns the base unchanged without allocating a full-res mask/delta.
+        base = np.full((30, 30, 3), 12000, np.uint16)
+        area = {"kind": "circle", "enabled": True, "feather": 0.2, "angle": 0,
+                "geometry": {"cx": 0.5, "cy": 0.5, "rx": 0.3, "ry": 0.3},
+                "settings": {}}
+        assert apply_area_layers(base, [area], _add_layer(0)) is base
+
     def test_single_area_affects_only_mask(self):
         base = np.full((40, 40, 3), 10000, np.uint16)
         # a small centered circle, hard edge
