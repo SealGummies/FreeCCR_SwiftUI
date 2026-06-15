@@ -594,6 +594,40 @@ def safe_tifffile_imwrite(output_path: str, image: np.ndarray, **kwargs) -> bool
 
 
 
+def _load_export_source(ccr_image, output_path, max_long_side):
+    """Load the working image for an export pass.
+
+    For a DOWNSIZED export with no user crop, decode small and resize to the
+    export target up front, so the whole normalize + look + adjustments + warp
+    pipeline runs at the OUTPUT resolution instead of at full resolution
+    followed by a throwaway downscale at the very end. This is the single
+    biggest export-speed lever for non-full-size exports.
+
+    - RAW: decode at half size (preview=True) only when the half-size long edge
+      is still >= max_long_side, so we never under-deliver resolution; the
+      reader then resizes to max_long_side.
+    - Non-RAW: preview is ignored by the decoder, but passing max_long_side
+      resizes during read all the same.
+    - A user crop is excluded: it changes which region maps to max_long_side
+      (the late resize handles that), so cropped exports keep decoding full.
+    - Full-size exports (max_long_side is None) and the in-app processing path
+      (output_path is None) are unchanged.
+
+    Output dimensions are identical to the old path (the trailing
+    resize_image_to_max_pixel is kept as a no-op / fine-rotation-expansion
+    catch); only the resolution work happens at is reduced.
+    """
+    if output_path is None:
+        return ccr_image.resized_raw
+    crop = getattr(ccr_image, "crop_rect", None)
+    if max_long_side is not None and crop is None:
+        full = getattr(ccr_image, "original_full_size", None)
+        half_ok = full is not None and (max(full) // 2) >= int(max_long_side)
+        return ccr_image.read_image(ccr_image.file_path, preview=half_ok,
+                                    max_long_side=int(max_long_side))
+    return ccr_image.read_image(ccr_image.file_path, preview=False)
+
+
 def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_out=False,jpg_quality=95,max_long_side=None) -> np.ndarray:
     """
     Normalize and align the image using the CCR algorithm, using a reference rectangle
@@ -610,10 +644,7 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
     
     # Get the working image
     step_start = time.time()
-    if output_path is not None: # this is for output
-        img = ccr_image.read_image(ccr_image.file_path,preview=False)
-    else:  # this is for processing
-        img = ccr_image.resized_raw
+    img = _load_export_source(ccr_image, output_path, max_long_side)
     if img is None:
         raise ValueError("CCRImage.resized_raw is None")
     print(f"Image loading: {time.time() - step_start:.3f}s")
@@ -758,7 +789,9 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
     # Since we have inverted linear data, apply inverted gamma 1.5
     rgb_norm = rgb_inverted_full.astype(np.float32) / 65535.0
       # Apply inverted gamma 2.2 (use gamma = 2.2 for inverted image)
-    gamma_corrected = np.power(np.clip(rgb_norm, 0.0, 1.0), 1.0)
+    # gamma == 1.0 here, so np.power was a no-op — just clip (saves a full-res
+    # transcendental pass per export).
+    gamma_corrected = np.clip(rgb_norm, 0.0, 1.0)
     del rgb_norm
 
     # Convert to LAB-like processing for saturation
@@ -1002,10 +1035,7 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     total_start_time = time.time()
 
     # --- Load working image ---
-    if output_path is not None:
-        img = ccr_image.read_image(ccr_image.file_path, preview=False)
-    else:
-        img = ccr_image.resized_raw
+    img = _load_export_source(ccr_image, output_path, max_long_side)
     if img is None:
         raise ValueError("CCRImage: could not load image data for B/W point conversion")
 
@@ -1049,7 +1079,9 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
 
     # --- Saturation boost (identical to main pipeline) ---
     rgb_norm = rgb_inverted.astype(np.float32) / 65535.0
-    gamma_corrected = np.power(np.clip(rgb_norm, 0.0, 1.0), 1.0)
+    # gamma == 1.0 here, so np.power was a no-op — just clip (saves a full-res
+    # transcendental pass per export).
+    gamma_corrected = np.clip(rgb_norm, 0.0, 1.0)
     del rgb_norm
 
     luminance = np.dot(gamma_corrected[..., :3], [0.299, 0.587, 0.114])
@@ -1182,10 +1214,7 @@ def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
     applied at the end like the reference pipeline (display semantics).
     """
     total_start_time = time.time()
-    if output_path is not None:
-        img = ccr_image.read_image(ccr_image.file_path, preview=False)
-    else:
-        img = ccr_image.resized_raw
+    img = _load_export_source(ccr_image, output_path, max_long_side)
     if img is None:
         raise ValueError("CCRImage: could not load image data for ref-params conversion")
 
@@ -2689,3 +2718,100 @@ def apply_curves(img16: np.ndarray, curves) -> np.ndarray:
                           composed * (65535.0 / 255.0)).astype(np.uint16)
         out[..., c] = lut16[img16[..., c]]
     return out
+
+
+# --- Area editing (local masked adjustment layers) -------------------------
+# Masks are rasterized from NORMALIZED geometry (fractions of width/height) so
+# the same area definition reproduces identically at the 1080px preview, the
+# hi-res zoom detail, and the full-res export — the same resolution-independent
+# contract apply_crop_to_image and the reference-norm replay already honor.
+
+def _smoothstep(a: np.ndarray) -> np.ndarray:
+    """Cubic ease (3a^2 - 2a^3) clamped to [0,1]."""
+    a = np.clip(a, 0.0, 1.0)
+    return a * a * (3.0 - 2.0 * a)
+
+
+def build_circle_mask(h, w, geom, angle_deg=0.0, feather=0.25) -> np.ndarray:
+    """Rotated, squishable ellipse -> float32 alpha[h,w] in [0,1].
+
+    geom: {cx, cy, rx, ry} as fractions of width/height (rx of width, ry of
+    height). angle_deg rotates the ellipse about its center (Qt clockwise
+    convention). feather is the fraction of the radius over which alpha ramps
+    from 1 (inside) to 0 (at the boundary). feather<=0 gives a hard edge.
+    """
+    cx = float(geom.get("cx", 0.5)) * w
+    cy = float(geom.get("cy", 0.5)) * h
+    rx = max(float(geom.get("rx", 0.3)) * w, 1e-3)
+    ry = max(float(geom.get("ry", 0.3)) * h, 1e-3)
+    t = np.deg2rad(float(angle_deg))
+    cs, sn = np.cos(t), np.sin(t)
+    # arange broadcasting (not mgrid) keeps the big intermediates to one (h,w)
+    # float32 array — at full export resolution mgrid's two int64 grids would
+    # waste hundreds of MB per area.
+    ys = np.arange(h, dtype=np.float32)[:, None] - cy
+    xs = np.arange(w, dtype=np.float32)[None, :] - cx
+    xr = cs * xs + sn * ys          # rotate into the ellipse-local frame
+    yr = -sn * xs + cs * ys
+    d = np.sqrt((xr / rx) ** 2 + (yr / ry) ** 2)   # 1.0 == ellipse boundary
+    f = max(float(feather), 1e-4)
+    return _smoothstep((1.0 - d) / f).astype(np.float32)
+
+
+def build_gradient_mask(h, w, geom, feather=0.25) -> np.ndarray:
+    """Linear gradient -> float32 alpha[h,w] in [0,1].
+
+    geom: {x0,y0,x1,y1} normalized endpoints. alpha is 0 at p0 (no effect),
+    1 at p1 (full effect), with a smooth ramp across the segment and constant
+    full/zero plateaus beyond the endpoints. The two handles define the ramp
+    extent, so feather is unused for gradients (accepted for API symmetry).
+    """
+    ax = float(geom.get("x0", 0.3)) * w
+    ay = float(geom.get("y0", 0.5)) * h
+    bx = float(geom.get("x1", 0.7)) * w
+    by = float(geom.get("y1", 0.5)) * h
+    vx, vy = bx - ax, by - ay
+    L2 = max(vx * vx + vy * vy, 1e-6)
+    ys = np.arange(h, dtype=np.float32)[:, None] - ay
+    xs = np.arange(w, dtype=np.float32)[None, :] - ax
+    t = (xs * vx + ys * vy) / L2
+    return _smoothstep(t).astype(np.float32)
+
+
+def build_area_mask(h, w, area) -> np.ndarray:
+    """Dispatch on area['kind'] to the right mask builder."""
+    geom = area.get("geometry") or {}
+    feather = float(area.get("feather", 0.25))
+    if area.get("kind") == "gradient":
+        return build_gradient_mask(h, w, geom, feather)
+    return build_circle_mask(h, w, geom, float(area.get("angle", 0.0)), feather)
+
+
+def apply_area_layers(base_u16: np.ndarray, areas, layer_fn) -> np.ndarray:
+    """Composite enabled area layers onto a globally-adjusted base.
+
+    base_u16: the global adjustment result (uint16 RGB) at the CURRENT
+        resolution — the implicit "whole image" layer.
+    areas: list of area dicts (see spec/area-editing.md §4.1).
+    layer_fn: callable(base_u16, settings) -> uint16 array, the full per-pixel
+        adjustment pass for one area's own settings, computed against the SAME
+        base (so each area's delta is independent).
+
+    Additive blend: out = base + sum_i alpha_i * (layer_i - base), clipped.
+    Order-independent; overlapping areas accumulate. Returns base_u16 unchanged
+    when there are no enabled areas.
+    """
+    # Only areas that are enabled AND carry adjustments do anything — skip the
+    # rest before allocating any full-resolution mask/delta. (A freshly created
+    # area has empty settings until the user touches a slider.)
+    active = [a for a in areas if a.get("enabled") and a.get("settings")]
+    if not active:
+        return base_u16
+    h, w = base_u16.shape[:2]
+    base = base_u16.astype(np.float32)
+    acc = base.copy()
+    for a in active:
+        layer = np.asarray(layer_fn(base_u16, a["settings"]), dtype=np.float32)
+        m = build_area_mask(h, w, a)[..., None]
+        acc += m * (layer - base)
+    return np.clip(acc, 0, 65535).astype(np.uint16)

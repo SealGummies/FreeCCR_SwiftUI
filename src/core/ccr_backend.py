@@ -9,6 +9,7 @@ import glob
 import concurrent.futures
 import time
 import uuid
+import copy
 
 
 def _new_slice_group() -> str:
@@ -298,6 +299,127 @@ class CCRBackend:
         if idx is not None and 0 <= idx < len(self.images):
             image_obj = self.images[idx]
             image_obj.update_thumbnail_and_preview()
+
+    # --- Area editing (local masked adjustment layers) ---------------------
+    # The SlidersPanel edits whichever LAYER is active: the global
+    # (whole-image) adjustment_settings when active_area_id is None, else the
+    # selected area's own settings dict. These accessors route there so the
+    # panel needs no special-casing.
+
+    def _image_at(self, idx: int) -> Optional[CCRImage]:
+        if idx is not None and 0 <= idx < len(self.images):
+            return self.images[idx]
+        return None
+
+    def get_active_settings_by_index(self, idx: int) -> Optional[dict]:
+        """The adjustment_settings dict of the active layer (global or area)."""
+        img = self._image_at(idx)
+        return img.active_settings() if img is not None else None
+
+    def set_active_settings_by_index(self, idx: int, settings: dict,
+                                     reprocess: bool = True):
+        """Write settings to the active layer (global dict or the active
+        area's settings), then optionally reprocess."""
+        img = self._image_at(idx)
+        if img is None:
+            return
+        area = img.get_area(img.active_area_id)
+        if area is not None:
+            area["settings"] = settings
+        else:
+            img.adjustment_settings = settings
+        if reprocess:
+            img.update_thumbnail_and_preview()
+
+    def get_areas_by_index(self, idx: int) -> list:
+        img = self._image_at(idx)
+        return img.area_layers if img is not None else []
+
+    def get_active_area_id_by_index(self, idx: int) -> Optional[str]:
+        img = self._image_at(idx)
+        return img.active_area_id if img is not None else None
+
+    def set_active_area_by_index(self, idx: int, area_id: Optional[str]):
+        """Select the layer the panel edits: None = global (whole image),
+        else an area id. A stale id falls back to global."""
+        img = self._image_at(idx)
+        if img is None:
+            return
+        img.active_area_id = area_id if (area_id is None
+                                         or img.get_area(area_id)) else None
+
+    def _default_area(self, img: CCRImage, kind: str) -> dict:
+        """A new area centered on the image. The circle default is on-screen
+        circular (radius = 25% of the shorter side) by expressing rx/ry as
+        fractions of width/height respectively."""
+        h, w = (img.resized_raw.shape[:2]
+                if img.resized_raw is not None else (1, 1))
+        if kind == "gradient":
+            geom = {"x0": 0.30, "y0": 0.50, "x1": 0.70, "y1": 0.50}
+        else:
+            kind = "circle"
+            rpx = 0.25 * min(w, h)
+            geom = {"cx": 0.50, "cy": 0.50,
+                    "rx": rpx / max(w, 1), "ry": rpx / max(h, 1)}
+        return {
+            "id": uuid.uuid4().hex,
+            "kind": kind,
+            "enabled": True,
+            "feather": 0.25,
+            "angle": 0.0,
+            "geometry": geom,
+            "settings": {},
+        }
+
+    def add_area_by_index(self, idx: int, kind: str) -> Optional[str]:
+        """Append a new area, make it the active layer, and return its id."""
+        img = self._image_at(idx)
+        if img is None:
+            return None
+        area = self._default_area(img, kind)
+        img.area_layers.append(area)
+        img.active_area_id = area["id"]
+        img.update_thumbnail_and_preview()
+        return area["id"]
+
+    def remove_area_by_index(self, idx: int, area_id: str):
+        img = self._image_at(idx)
+        if img is None:
+            return
+        img.area_layers = [a for a in img.area_layers
+                           if a.get("id") != area_id]
+        if img.active_area_id == area_id:
+            img.active_area_id = None
+        img.update_thumbnail_and_preview()
+
+    def set_area_enabled_by_index(self, idx: int, area_id: str, enabled: bool):
+        img = self._image_at(idx)
+        if img is None:
+            return
+        area = img.get_area(area_id)
+        if area is not None:
+            area["enabled"] = bool(enabled)
+            img.update_thumbnail_and_preview()
+
+    def update_area_geometry_by_index(self, idx: int, area_id: str,
+                                      geometry=None, angle=None, feather=None,
+                                      reprocess: bool = True):
+        """Update an area's mask geometry/rotation/feather (used by the canvas
+        overlay drag and the feather slider)."""
+        img = self._image_at(idx)
+        if img is None:
+            return
+        area = img.get_area(area_id)
+        if area is None:
+            return
+        if geometry is not None:
+            area["geometry"] = dict(geometry)
+        if angle is not None:
+            area["angle"] = float(angle)
+        if feather is not None:
+            area["feather"] = float(feather)
+        if reprocess:
+            img.update_thumbnail_and_preview()
 
     def get_image_count(self) -> int:
         return len(self.images)
@@ -702,6 +824,10 @@ class CCRBackend:
             dup.brightness_base = img.brightness_base
             dup.tint_balance_factor = getattr(img, "tint_balance_factor", 1.0)
             dup._catalog_signature = getattr(img, "_catalog_signature", None)
+            # Clone area layers (deep — each nests settings + geometry) so the
+            # copy can diverge without aliasing the source. Areas are cloned on
+            # duplicate (whole-image copy), not transferred cross-image.
+            dup.area_layers = copy.deepcopy(img.area_layers)
             dup.is_duplicate = True
             # A duplicated slice becomes its OWN one-image round: a fresh
             # group means resetting the source's round never reaches into
@@ -716,7 +842,8 @@ class CCRBackend:
                 dup.slice_group = None
                 dup.slice_parent = None
             if ((dup.contrast_base, dup.temperature_base, dup.brightness_base)
-                    != (0, 0, -8) or img.adjustment_settings.get("tint")):
+                    != (0, 0, -8) or img.adjustment_settings.get("tint")
+                    or any(a.get("enabled") for a in dup.area_layers)):
                 dup.update_thumbnail_and_preview()
             self.images.insert(idx + 1, dup)
             created += 1

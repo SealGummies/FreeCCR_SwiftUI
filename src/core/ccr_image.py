@@ -1,6 +1,7 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import numpy as np
 import os
+import copy
 import rawpy
 import exifread
 import cv2
@@ -9,7 +10,8 @@ import time
 from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage, QPixmap if you use PySide
 #import lensfunpy  # Make sure lensfunpy is installed
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
-                                BAND_ADJUSTMENT_KEYS, apply_curves)
+                                BAND_ADJUSTMENT_KEYS, apply_curves,
+                                apply_area_layers)
 
 # Import optional libraries with fallbacks
 try:
@@ -47,6 +49,7 @@ class CCRImage:
         slice_group: Optional[str] = None,
         slice_parent: Optional[Dict[str, Any]] = None,
         color_profile: str = "color",
+        areas: Optional[List[Dict[str, Any]]] = None,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
@@ -102,6 +105,16 @@ class CCRImage:
         # clockwise on screen, Qt convention).
         self.crop_rect: Optional[tuple[float, float, float, float]] = None
         self.crop_angle: float = 0.0
+        # Area editing: local masked adjustment layers. Each area is a dict
+        # {id, kind ("circle"|"gradient"), enabled, feather, angle, geometry
+        # (normalized fractions), settings (a full adjustment_settings dict)}.
+        # The global adjustment_settings is the implicit "whole image" layer;
+        # areas composite additively on top of it (see spec/area-editing.md).
+        self.area_layers: List[Dict[str, Any]] = list(areas) if areas else []
+        # Which layer the adjustment panel currently edits: None = global
+        # (whole image); otherwise the id of an area in area_layers. Session
+        # state only — never persisted; always defaults to global on load.
+        self.active_area_id: Optional[str] = None
         self.undo_stack: list = []  # Snapshots for Ctrl+Z, most recent last
         self.contrast_base: int = 0      # Non-destructive base contrast added internally; slider shows 0
         self.temperature_base: int = 0   # Non-destructive base temperature offset; slider shows 0
@@ -515,7 +528,7 @@ class CCRImage:
 
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,
-                          color_profile=None) -> np.ndarray:
+                          color_profile=None, areas_override=None) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
         live state the GUI thread may be mutating concurrently."""
@@ -524,9 +537,12 @@ class CCRImage:
         tb = self.temperature_base if temperature_base is None else temperature_base
         bb = self.brightness_base if brightness_base is None else brightness_base
         profile = self.color_profile if color_profile is None else color_profile
-        if not s and cb == 0 and tb == 0 and bb == 0:
-            # No slider/base adjustments — but Black & White still has to map
-            # the image to a single luminance channel.
+        areas = (getattr(self, "area_layers", []) if areas_override is None
+                 else areas_override)
+        has_areas = bool(areas) and any(a.get("enabled") for a in areas)
+        if not s and cb == 0 and tb == 0 and bb == 0 and not has_areas:
+            # No slider/base/area adjustments — but Black & White still has to
+            # map the image to a single luminance channel.
             return self._to_grayscale(image) if profile == "bw" else image
         adjusted = adjust_image_opencl(image,
                      s.get('temperature', 0) + tb,
@@ -566,8 +582,55 @@ class CCRImage:
         curves = s.get('curves')
         if curves:
             adjusted = apply_curves(adjusted, curves)
+        # Area editing: composite each enabled local layer additively on top of
+        # the globally-adjusted ("whole image") result. Runs before the B&W
+        # collapse so per-area color adjustments apply in RGB, like curves.
+        if has_areas:
+            adjusted = apply_area_layers(adjusted, areas, self._adjust_for_area)
         if profile == "bw":
             adjusted = self._to_grayscale(adjusted)
+        return adjusted
+
+    def _adjust_for_area(self, base_u16: np.ndarray, settings: dict) -> np.ndarray:
+        """One area's full per-pixel adjustment layer, computed against the
+        globally-adjusted base. Reuses the exact slider + curve math, but with
+        ZEROED base offsets (contrast_base/temperature_base/brightness_base):
+        those are global-look offsets already baked into the base, so an area
+        must not re-apply them. Never touches negative inversion (whole-image)."""
+        s = settings or {}
+        if not s:
+            return base_u16
+        adjusted = adjust_image_opencl(base_u16,
+                     s.get('temperature', 0),
+                     s.get('tint', 0),
+                     s.get('exposure', 0),
+                     0.5 * s.get('brightness', 0),
+                     s.get('black_point', 0),
+                     s.get('white_point', 0),
+                     s.get('contrast', 0),
+                     s.get('saturation', 0),
+                     self.tint_balance_factor,
+                     highlights=s.get('highlights', 0),
+                     shadows=s.get('shadows', 0),
+                     ch_input_gain=s.get('ch_input_gain', 0),
+                     ch_master_shift=s.get('ch_master_shift', 0),
+                     ch_master_gain=s.get('ch_master_gain', 0),
+                     ch_r_shift=s.get('ch_r_shift', 0),
+                     ch_r_gain=s.get('ch_r_gain', 0),
+                     ch_r_blackpoint=s.get('ch_r_blackpoint', 0),
+                     ch_g_shift=s.get('ch_g_shift', 0),
+                     ch_g_gain=s.get('ch_g_gain', 0),
+                     ch_g_blackpoint=s.get('ch_g_blackpoint', 0),
+                     ch_b_shift=s.get('ch_b_shift', 0),
+                     ch_b_gain=s.get('ch_b_gain', 0),
+                     ch_b_blackpoint=s.get('ch_b_blackpoint', 0),
+                     sub_saturation=s.get('sub_saturation', 0),
+                     band_settings=(s if any(s.get(k, 0)
+                                             for k in BAND_ADJUSTMENT_KEYS)
+                                    else None))
+        curves = s.get('curves')
+        if curves:
+            adjusted = apply_curves(adjusted, curves)
         return adjusted
 
     def render_hires_base(self, max_long_side: Optional[int] = None,
@@ -639,6 +702,10 @@ class CCRImage:
             "fine_rotation_angle": self.fine_rotation_angle,
             "horizontal_mirrored": self.horizontal_mirrored,
             "vertical_mirrored": self.vertical_mirrored,
+            # Deep copy: each area nests a settings dict (with a curves
+            # sub-dict) and a geometry dict — a shallow copy would alias the
+            # live structure and a later edit would corrupt the snapshot.
+            "area_layers": copy.deepcopy(getattr(self, "area_layers", [])),
         }
 
     def push_undo_state(self) -> None:
@@ -666,7 +733,31 @@ class CCRImage:
         self.fine_rotation_angle = state["fine_rotation_angle"]
         self.horizontal_mirrored = state["horizontal_mirrored"]
         self.vertical_mirrored = state["vertical_mirrored"]
+        self.area_layers = copy.deepcopy(state.get("area_layers", []))
+        # The previously-active area may have been added back/removed by this
+        # undo; the panel re-resolves None -> global if the id is now stale.
+        active_id = getattr(self, "active_area_id", None)
+        if active_id is not None and not any(
+                a.get("id") == active_id for a in self.area_layers):
+            self.active_area_id = None
         return True
+
+    # --- Area editing helpers ----------------------------------------------
+    def get_area(self, area_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The area dict with this id, or None."""
+        if area_id is None:
+            return None
+        for a in self.area_layers:
+            if a.get("id") == area_id:
+                return a
+        return None
+
+    def active_settings(self) -> Dict[str, Any]:
+        """The adjustment_settings dict the panel currently edits: the global
+        (whole-image) dict when active_area_id is None, else the active area's
+        settings. Falls back to the global dict if the active id is stale."""
+        a = self.get_area(self.active_area_id)
+        return a["settings"] if a is not None else self.adjustment_settings
 
     def _auto_brightness_for_preview(self, image: np.ndarray) -> np.ndarray:
         """

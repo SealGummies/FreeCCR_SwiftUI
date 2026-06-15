@@ -218,6 +218,7 @@ class SlidersPanel(QWidget):
         self.slider_labels = []
         self.image_slider_map = {}
         self.current_image_id = None
+        self._layers_sig = None  # cheap signature to avoid needless rebuilds
         self.adjustment_keys = list(self.ADJUSTMENT_KEYS)
         self._sync_group_selection = None  # remembered while the app is open
         self.copied_adjustment = None  # Store copied adjustment settings
@@ -280,6 +281,50 @@ class SlidersPanel(QWidget):
         ]
 
         self.current_idx = None
+
+        # --- Layers (Area Editing) — top of the scroll area ---
+        # The implicit "Whole Image" layer plus one row per local area. Picking
+        # a row re-points every slider/curve below at that layer's settings.
+        # New areas are created from the top toolbar (circle/gradient) in
+        # ImagePreview; rows here select / enable-disable / delete them.
+        self.layers_container = QWidget()
+        layers_vbox = QVBoxLayout(self.layers_container)
+        layers_vbox.setContentsMargins(0, 0, 0, 0)
+        layers_vbox.setSpacing(2)
+        layers_title = QLabel("Layers")
+        layers_title.setStyleSheet("color: #888; font-size: 11px;")
+        layers_title.setAlignment(Qt.AlignCenter)
+        layers_vbox.addWidget(layers_title)
+        self._layers_list_vbox = QVBoxLayout()   # dynamic rows, rebuilt per image
+        self._layers_list_vbox.setSpacing(2)
+        layers_vbox.addLayout(self._layers_list_vbox)
+        # Per-area feather (shown only when a circle area is the active layer).
+        self.feather_row = QWidget()
+        feather_layout = QHBoxLayout(self.feather_row)
+        feather_layout.setContentsMargins(0, 0, 0, 0)
+        feather_label = QLabel("Feather")
+        feather_label.setMinimumWidth(70)
+        feather_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.feather_slider = ResettableSlider(Qt.Horizontal)
+        self.feather_slider.setMinimum(0)
+        self.feather_slider.setMaximum(100)
+        self.feather_slider.setValue(25)
+        self.feather_slider.setFixedHeight(30)
+        self.feather_value_label = QLabel("25")
+        self.feather_value_label.setMinimumWidth(40)
+        self.feather_slider.valueChanged.connect(self._on_feather_changed)
+        feather_layout.addWidget(feather_label)
+        feather_layout.addWidget(self.feather_slider)
+        feather_layout.addWidget(self.feather_value_label)
+        layers_vbox.addWidget(self.feather_row)
+        self.feather_row.setVisible(False)
+        self._layer_buttons = {}
+        scroll_layout.addWidget(self.layers_container)
+        layers_sep = QFrame()
+        layers_sep.setFrameShape(QFrame.HLine)
+        layers_sep.setFrameShadow(QFrame.Sunken)
+        layers_sep.setStyleSheet("margin-top: 4px; margin-bottom: 4px;")
+        scroll_layout.addWidget(layers_sep)
 
         # --- 10 existing sliders (sliders[0]–[9]) ---
         # --- Film B/W Point section — at the top, right below the histogram ---
@@ -663,6 +708,10 @@ class SlidersPanel(QWidget):
         self.crop_btn.setEnabled(enabled)
         self.color_profile_combo.setEnabled(enabled)
         self.curve_editor.setEnabled(enabled)
+        # Area editing presupposes a converted positive — gate the Layers list
+        # with the same flag as the sliders.
+        if hasattr(self, "layers_container"):
+            self.layers_container.setEnabled(enabled)
         if not enabled:
             self.curve_editor.set_curves(None)
         for slider in self.sliders:
@@ -675,6 +724,38 @@ class SlidersPanel(QWidget):
 
     def save_slider_values(self, image_id):
         pass
+
+    # --- Active-layer routing --------------------------------------------
+    # The panel edits whichever LAYER is active: the global (whole-image)
+    # adjustment_settings, or the selected area's own settings. These route
+    # reads/writes through the backend's layer-aware accessors so the rest of
+    # the panel needs no special-casing.
+    def _read_active_settings(self, idx) -> dict:
+        s = ccr_backend.get_active_settings_by_index(idx)
+        return s if s is not None else {}
+
+    def _store_active_settings(self, idx, adjustment):
+        """Light, no-reprocess store of the active layer's settings (heavy
+        reprocess is debounced separately)."""
+        ccr_backend.set_active_settings_by_index(idx, adjustment, reprocess=False)
+
+    def _load_active_layer(self, idx):
+        """Populate the sliders + curve editor from the active layer's
+        settings (global or area). Mirrors the populate logic set_current_idx
+        used to do inline, but sourced from the active layer."""
+        adjustment = self._read_active_settings(idx)
+        # Skip reloading curves while a curve drag is active: update_preview()
+        # re-enters here for the SAME image and reloading would clear the drag.
+        if not self.curve_editor.is_dragging():
+            self.curve_editor.set_curves(adjustment.get("curves") if adjustment else None)
+        for i, key in enumerate(self.adjustment_keys):
+            if i < len(self.sliders):
+                val = adjustment.get(key, self._default_for(key)) if adjustment \
+                    else self._default_for(key)
+                self.sliders[i].blockSignals(True)
+                self.sliders[i].setValue(val)
+                self.sliders[i].blockSignals(False)
+                self.slider_value_labels[i].setText(str(val))
 
     def set_current_idx(self, idx):
         # Clear any pending adjustments for the previous image
@@ -691,38 +772,190 @@ class SlidersPanel(QWidget):
         # Reflect this image's color profile (independent of the slider dict,
         # so it must be synced on both the empty and populated paths below).
         self._sync_color_profile_combo(idx)
-        adjustment = ccr_backend.get_adjustment_by_index(idx)
-        print(f"Setting current index: {idx}, adjustment: {adjustment}")
-        # Tone curves live inside the adjustment dict; load them into the editor
-        # regardless of whether any sliders are set. Skip while a curve drag is
-        # active: update_preview() re-enters set_current_idx for the SAME image,
-        # and reloading would clear the drag mid-gesture (the editor is already
-        # the source of truth during a drag).
-        if not self.curve_editor.is_dragging():
-            self.curve_editor.set_curves(adjustment.get("curves") if adjustment else None)
-        if adjustment is None or not adjustment:
-            # No adjustment yet: show each slider's default (0 for most,
-            # 10 for band_feather).
-            for i, slider in enumerate(self.sliders):
-                key = self.adjustment_keys[i] if i < len(self.adjustment_keys) else None
-                default = self._default_for(key)
-                slider.blockSignals(True)
-                slider.setValue(default)
-                slider.blockSignals(False)
-                self.slider_value_labels[i].setText(str(default))
-            return
-
-        # Missing keys fall back to the slider default so a partial dict can
-        # never leave a slider showing the previously selected image's value.
-        for i, key in enumerate(self.adjustment_keys):
-            if i < len(self.sliders):
-                val = adjustment.get(key, self._default_for(key))
-                self.sliders[i].blockSignals(True)
-                self.sliders[i].setValue(val)
-                self.sliders[i].blockSignals(False)
-                self.slider_value_labels[i].setText(str(val))
-        if idx is not None:
+        # Rebuild the Layers list only when its structure actually changed
+        # (image switch, area added/removed/toggled/selected) — set_current_idx
+        # is re-entered on every preview refresh (incl. each slider tick), and
+        # recreating the row widgets every time would flicker.
+        sig = self._layers_signature(idx)
+        if sig != self._layers_sig:
+            self._rebuild_layers_list(idx)
+        adjustment = self._read_active_settings(idx)
+        print(f"Setting current index: {idx}, active adjustment: {adjustment}")
+        self._load_active_layer(idx)
+        # Reprocess only when the active layer carries edits (mirrors the old
+        # populated-path behavior; a blank image is already rendered elsewhere).
+        if idx is not None and adjustment:
             ccr_backend.apply_adjustment_by_index(idx)
+
+    # --- Layers list (area editing) ---------------------------------------
+    def _ip(self):
+        """The ImagePreview, set by MainWindow; None outside the full app."""
+        return getattr(self, "image_preview", None)
+
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                # deleteLater (not immediate free): a rebuild can be triggered
+                # from inside a row widget's own signal (e.g. the enable
+                # checkbox's toggled), and freeing that widget synchronously
+                # would crash with a use-after-free. Detach now, delete later.
+                w.setParent(None)
+                w.deleteLater()
+            else:
+                sub = item.layout()
+                if sub is not None:
+                    SlidersPanel._clear_layout(sub)
+
+    def _layers_signature(self, idx):
+        """Cheap structural signature of the Layers list — changes only when a
+        rebuild is actually needed (image switch, area add/remove/toggle, or
+        active-layer change), NOT on every slider tick."""
+        img = ccr_backend.get_image_by_index(idx) if idx is not None else None
+        if img is None:
+            return None
+        # NOTE: 'enabled' is intentionally excluded — toggling a checkbox does
+        # not change the list STRUCTURE, so it must not trigger a rebuild (the
+        # rebuild would tear down the checkbox mid-signal). Only add/remove/
+        # reorder/active-change/image-switch should rebuild.
+        return (id(img), img.active_area_id,
+                tuple((a.get("id"), a.get("kind")) for a in img.area_layers))
+
+    def _rebuild_layers_list(self, idx):
+        """Rebuild the Layers rows (Whole Image + one per area) and sync the
+        feather control for the active layer."""
+        self._layers_sig = self._layers_signature(idx)
+        self._clear_layout(self._layers_list_vbox)
+        self._layer_buttons = {}
+        img = ccr_backend.get_image_by_index(idx) if idx is not None else None
+        if img is None:
+            self.feather_row.setVisible(False)
+            return
+        active = img.active_area_id
+        whole = QPushButton("Whole Image")
+        whole.setCheckable(True)
+        whole.setChecked(active is None)
+        whole.clicked.connect(lambda _=False: self._select_layer(None))
+        self._layers_list_vbox.addWidget(whole)
+        self._layer_buttons[None] = whole
+        counts = {}
+        for a in img.area_layers:
+            kind = a.get("kind", "circle")
+            counts[kind] = counts.get(kind, 0) + 1
+            glyph = "○" if kind == "circle" else "▤"
+            aid = a.get("id")
+            row = QHBoxLayout()
+            row.setSpacing(3)
+            chk = QCheckBox()
+            chk.setChecked(bool(a.get("enabled", True)))
+            chk.setToolTip("Enable / disable this area")
+            chk.toggled.connect(lambda on, _id=aid: self._on_area_enabled(_id, on))
+            sel = QPushButton(f"{glyph} {kind.capitalize()} {counts[kind]}")
+            sel.setCheckable(True)
+            sel.setChecked(active == aid)
+            sel.clicked.connect(lambda _=False, _id=aid: self._select_layer(_id))
+            rem = QPushButton("✕")
+            rem.setFixedWidth(24)
+            rem.setToolTip("Remove this area")
+            rem.clicked.connect(lambda _=False, _id=aid: self._on_remove_area(_id))
+            row.addWidget(chk)
+            row.addWidget(sel, 1)
+            row.addWidget(rem)
+            row_w = QWidget()
+            row_w.setLayout(row)
+            self._layers_list_vbox.addWidget(row_w)
+            self._layer_buttons[aid] = sel
+        # Feather control: only meaningful for a circle area (the gradient's
+        # softness is defined by its two endpoints).
+        act = img.get_area(active)
+        show_feather = act is not None and act.get("kind") == "circle"
+        self.feather_row.setVisible(show_feather)
+        if show_feather:
+            fv = int(round(float(act.get("feather", 0.25)) * 100))
+            self.feather_slider.blockSignals(True)
+            self.feather_slider.setValue(max(0, min(100, fv)))
+            self.feather_slider.blockSignals(False)
+            self.feather_value_label.setText(str(fv))
+
+    def refresh_layers(self, idx):
+        """Called by ImagePreview after an area is added/changed externally:
+        rebuild the rows and reload the (now-active) layer into the sliders."""
+        if idx != self.current_idx:
+            return
+        self._rebuild_layers_list(idx)
+        self._load_active_layer(idx)
+
+    def _select_layer(self, area_id):
+        """Make a layer (None = Whole Image, else an area id) the edit target."""
+        if self.current_idx is None:
+            return
+        self.end_undo_burst()
+        ccr_backend.set_active_area_by_index(self.current_idx, area_id)
+        self._rebuild_layers_list(self.current_idx)
+        self._load_active_layer(self.current_idx)
+        ip = self._ip()
+        if ip is not None and hasattr(ip, "on_active_layer_changed"):
+            ip.on_active_layer_changed(self.current_idx)
+
+    def _on_area_enabled(self, area_id, enabled):
+        if self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        self.end_undo_burst()
+        img.push_undo_state()
+        ccr_backend.set_area_enabled_by_index(self.current_idx, area_id, enabled)
+        ip = self._ip()
+        if ip is not None:
+            ip.update_preview(self.current_idx)
+        self._update_thumb()
+
+    def _on_remove_area(self, area_id):
+        if self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        self.end_undo_burst()
+        img.push_undo_state()
+        ccr_backend.remove_area_by_index(self.current_idx, area_id)
+        self._rebuild_layers_list(self.current_idx)
+        self._load_active_layer(self.current_idx)
+        ip = self._ip()
+        if ip is not None:
+            if hasattr(ip, "on_active_layer_changed"):
+                ip.on_active_layer_changed(self.current_idx)
+            ip.update_preview(self.current_idx)
+        self._update_thumb()
+
+    def _on_feather_changed(self, val):
+        self.feather_value_label.setText(str(val))
+        if self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None or img.active_area_id is None:
+            return
+        self._begin_undo_burst(img)
+        ccr_backend.update_area_geometry_by_index(
+            self.current_idx, img.active_area_id, feather=val / 100.0,
+            reprocess=False)
+        ip = self._ip()
+        if ip is not None:
+            ip.update_preview(self.current_idx)
+        # Debounce the heavy reprocess like a slider drag.
+        self._pending_adjustment = self._read_active_settings(self.current_idx)
+        self._pending_idx = self.current_idx
+        self._debounce_timer.stop()
+        self._debounce_timer.start(150)
+
+    def _update_thumb(self):
+        try:
+            self.parent().parent().thumbnail_list.update_thumbnail(self.current_idx)
+        except AttributeError:
+            pass
 
 
     def on_slider_changed(self):
@@ -739,8 +972,8 @@ class SlidersPanel(QWidget):
                 # Snapshot the pre-change state once per burst so a whole
                 # slider drag undoes as a single Ctrl+Z step.
                 self._begin_undo_burst(ccr_backend.images[self.current_idx])
-                ccr_backend.images[self.current_idx].adjustment_settings = adjustment
-            
+                self._store_active_settings(self.current_idx, adjustment)
+
             # Immediate preview update for visual feedback
             self.parent().parent().image_preview.update_preview(self.current_idx)
             
@@ -769,7 +1002,7 @@ class SlidersPanel(QWidget):
         self._attach_curves(adjustment)
         if 0 <= self.current_idx < len(ccr_backend.images):
             self._begin_undo_burst(ccr_backend.images[self.current_idx])
-            ccr_backend.images[self.current_idx].adjustment_settings = adjustment
+            self._store_active_settings(self.current_idx, adjustment)
         self.parent().parent().image_preview.update_preview(self.current_idx)
         self._pending_adjustment = adjustment
         self._pending_idx = self.current_idx
@@ -864,39 +1097,67 @@ class SlidersPanel(QWidget):
         # is the curve-only path). set_curves does not emit, so it won't start a
         # competing undo burst here.
         self.curve_editor.set_curves(None)
-        # Save adjustment to backend and update preview
+        # Save adjustment to the ACTIVE layer (global or selected area) and
+        # update the preview. Resetting an area zeroes that area's settings;
+        # resetting the Whole Image layer zeroes the global sliders (areas keep
+        # their own state and have their own delete control).
         if self.current_idx is not None:
             adjustment = {key: 0 for key in self.adjustment_keys}
-            ccr_backend.set_adjustment_by_index(self.current_idx, adjustment)
+            ccr_backend.set_active_settings_by_index(self.current_idx, adjustment,
+                                                     reprocess=True)
             self.parent().parent().image_preview.update_preview(self.current_idx)
 
     def on_compare_pressed(self):
-        # Temporarily show unadjusted image while holding the button
-        if self.current_idx is not None:
-            self._original_adjustment = ccr_backend.get_adjustment_by_index(self.current_idx)
-            # Set all adjustments to 0 but do not save to backend
-            for i, slider in enumerate(self.sliders):
-                slider.blockSignals(True)
-                slider.setValue(0)
-                slider.blockSignals(False)
-                self.slider_value_labels[i].setText("0")
-            # Update preview with temporary adjustment
-            ccr_backend.set_adjustment_by_index(self.current_idx, {key: 0 for key in self._original_adjustment or {}})
-            self.parent().parent().image_preview.update_preview(self.current_idx)
+        # Temporarily show the fully UNADJUSTED positive while the button is
+        # held: zero the global sliders AND suppress every area layer (without
+        # saving). Areas are DISABLED in place (not removed) so the area stays
+        # present — keeping area-edit mode and its overlay alive during compare.
+        # `_original_adjustment` doubles as the guard main_window checks to
+        # suppress Undo during a compare hold.
+        if self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        # Remember what to restore: the active layer's settings (to refill the
+        # sliders), the live global dict, and each area's enabled state.
+        self._original_adjustment = self._read_active_settings(self.current_idx)
+        self._compare_global = img.adjustment_settings
+        self._compare_area_enabled = [(a, a.get("enabled", True))
+                                      for a in img.area_layers]
+        img.adjustment_settings = {}
+        for a in img.area_layers:
+            a["enabled"] = False
+        for i, slider in enumerate(self.sliders):
+            slider.blockSignals(True)
+            slider.setValue(0)
+            slider.blockSignals(False)
+            self.slider_value_labels[i].setText("0")
+        img.update_thumbnail_and_preview()
+        self.parent().parent().image_preview.update_preview(self.current_idx)
 
     def on_compare_released(self):
-        # Restore previous adjustment and update preview
-        if self.current_idx is not None and hasattr(self, "_original_adjustment"):
-            adjustment = self._original_adjustment or {}
-            for i, key in enumerate(self.adjustment_keys):
-                val = adjustment.get(key, self._default_for(key))
-                self.sliders[i].blockSignals(True)
-                self.sliders[i].setValue(val)
-                self.sliders[i].blockSignals(False)
-                self.slider_value_labels[i].setText(str(val))
-            ccr_backend.set_adjustment_by_index(self.current_idx, adjustment)
-            self.parent().parent().image_preview.update_preview(self.current_idx)
-            del self._original_adjustment
+        # Restore the global dict + area enabled states and refill sliders.
+        if self.current_idx is None or not hasattr(self, "_original_adjustment"):
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is not None and hasattr(self, "_compare_global"):
+            img.adjustment_settings = self._compare_global
+            for a, enabled in self._compare_area_enabled:
+                a["enabled"] = enabled
+            img.update_thumbnail_and_preview()
+        adjustment = self._original_adjustment or {}
+        for i, key in enumerate(self.adjustment_keys):
+            val = adjustment.get(key, self._default_for(key))
+            self.sliders[i].blockSignals(True)
+            self.sliders[i].setValue(val)
+            self.sliders[i].blockSignals(False)
+            self.slider_value_labels[i].setText(str(val))
+        self.parent().parent().image_preview.update_preview(self.current_idx)
+        del self._original_adjustment
+        if hasattr(self, "_compare_global"):
+            del self._compare_global
+            del self._compare_area_enabled
 
     def on_sync_to_all_clicked(self):
         """
@@ -929,9 +1190,13 @@ class SlidersPanel(QWidget):
         sync_crop = bool(selection.get("crop"))
         sync_profile = bool(selection.get("profile"))
         sync_curves = bool(selection.get("curves"))
-        src_curves = self.curve_editor.get_curves()  # None when identity
-        current_adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
+        # Sync always copies the SOURCE image's GLOBAL (whole-image) layer, not
+        # the live sliders — those may currently reflect an active area, and
+        # areas are per-image (never synced). Read from the global dict.
         src = ccr_backend.get_image_by_index(self.current_idx)
+        src_global = dict(src.adjustment_settings) if src is not None else {}
+        src_curves = src_global.get("curves")  # None when identity/absent
+        current_adjustment = src_global
         crop_rect = src.crop_rect if src is not None else None
         crop_angle = getattr(src, "crop_angle", 0.0) if src is not None else 0.0
         src_profile = getattr(src, "color_profile", "color") if src is not None else "color"
@@ -1162,8 +1427,11 @@ class SlidersPanel(QWidget):
             # emit, so it won't re-trigger a save).
             self.curve_editor.set_curves(self.copied_adjustment.get("curves"))
 
-            # Save the adjustment to backend and update preview
-            ccr_backend.set_adjustment_by_index(self.current_idx, self.copied_adjustment)
+            # Save the adjustment to the ACTIVE layer and update preview. Copy
+            # the dict so the clipboard isn't aliased by the image's settings.
+            ccr_backend.set_active_settings_by_index(
+                self.current_idx, copy.deepcopy(self.copied_adjustment),
+                reprocess=True)
             self.parent().parent().image_preview.update_preview(self.current_idx)
             self.set_temporary_hint("Adjustments Pasted!", duration=2000)
             
