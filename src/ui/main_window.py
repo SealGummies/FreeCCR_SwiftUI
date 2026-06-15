@@ -352,6 +352,10 @@ class MainWindow(QMainWindow):
                 ccr_backend.reprocess_all_for_positive_mode_change()
             finally:
                 QApplication.restoreOverrideCursor()
+            # Every image was re-decoded, so the zoom hi-res cache (positive
+            # decode base + render) is stale — drop it so it can't be re-adjusted
+            # and shown over the freshly re-decoded scan.
+            self.image_preview._release_hires(refresh=False)
             self.thumbnail_list.update_all_thumbnails()
             if self.image_preview.current_idx is not None:
                 self.image_preview.update_preview(self.image_preview.current_idx)

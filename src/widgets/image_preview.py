@@ -1508,17 +1508,24 @@ class ImagePreview(QWidget):
         self.zoom_combo.blockSignals(False)
 
     def _hires_signature(self, img):
-        """Identity of the conversion baked into the preview, taken from the
-        snapshot captured at convert time — never from live editable state
+        """Identity of the DECODE+conversion baked into the preview, taken from
+        the snapshot captured at convert time — never from live editable state
         (reference frame redraws, global B/W point resampling, or fine
         rotation nudges change the NEXT conversion, not the displayed one).
-        Returns None when no color-matched replay is possible."""
+        Returns None when no color-matched replay is possible.
+
+        Positive mode is part of the identity: an un-converted image decodes to
+        COMPLETELY different pixels in positive (sRGB photo) vs negative (raw
+        green scan), so the two must never share a cached base/render — otherwise
+        toggling the mode reuses the stale base and re-adjusts the wrong pixels.
+        """
+        positive = ccr_backend.positive_mode
         if not img.converted:
-            return ("unconverted",)
+            return ("unconverted", positive)
         ci = getattr(img, "conversion_inputs", None)
         if ci is None:
             return None
-        return ("converted", tuple(sorted(ci.items())))
+        return ("converted", positive, tuple(sorted(ci.items())))
 
     def _current_adj_sig(self):
         """Identity of the adjustment state baked into the hi-res DISPLAY."""

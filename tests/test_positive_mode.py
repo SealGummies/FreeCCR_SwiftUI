@@ -274,5 +274,25 @@ class TestBrightnessBaseline:
         np.testing.assert_array_equal(out, pos.resized_raw)
 
 
+class TestHiResSignature:
+    """The zoom hi-res cache keys off _hires_signature, including base reuse. An
+    un-converted image decodes to completely different pixels in positive (sRGB
+    photo) vs negative (raw green scan) mode, so the signature MUST differ —
+    otherwise toggling the mode reuses the stale decode base and re-adjusts the
+    wrong pixels (the "green then dark non-green" hi-res glitch)."""
+
+    def test_unconverted_signature_encodes_decode_mode(self, backend):
+        from widgets.image_preview import ImagePreview
+        # _hires_signature uses only its img arg and the global flag — no self
+        # state — so a bare instance is enough (avoids the heavy Qt toolbar).
+        ip = ImagePreview.__new__(ImagePreview)
+        img = type("Img", (), {"converted": False, "conversion_inputs": None})()
+        backend.positive_mode = True
+        sig_positive = ip._hires_signature(img)
+        backend.positive_mode = False
+        sig_negative = ip._hires_signature(img)
+        assert sig_positive != sig_negative
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
