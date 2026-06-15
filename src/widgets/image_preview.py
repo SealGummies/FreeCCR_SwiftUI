@@ -178,7 +178,10 @@ class GraphicsImageView(QGraphicsView):
                 self.scene().removeItem(self._bw_rect_item)
                 self._bw_rect_item = None
             self.viewport().update()
-        elif event.button() == Qt.LeftButton and self.parent_widget.pixmap_item is not None:
+        elif (event.button() == Qt.LeftButton
+              and self.parent_widget.pixmap_item is not None
+              and not ccr_backend.positive_mode):
+            # Reference frames belong to the negative-conversion workflow only.
             self.drawing_reference = True
             self._drag_start = self.mapToScene(event.pos())
             self._drag_end = self._drag_start
@@ -603,9 +606,9 @@ class ImagePreview(QWidget):
         auto_icon = QIcon(resource_path("icons/auto.png"))
         if auto_icon.isNull():
             auto_icon = QIcon.fromTheme("view-refresh")
-        auto_frame_action = QAction(auto_icon, "Auto Frame", self)
-        auto_frame_action.triggered.connect(self.auto_frame)
-        self.toolbar.addAction(auto_frame_action)
+        self.auto_frame_action = QAction(auto_icon, "Auto Frame", self)
+        self.auto_frame_action.triggered.connect(self.auto_frame)
+        self.toolbar.addAction(self.auto_frame_action)
         add_spacer()
 
         rotate_left_icon = QIcon(resource_path("icons/rotate-left-icon-size_512.png"))
@@ -660,9 +663,9 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(self.add_gradient_action)
         add_spacer()
 
-        convert_action = QAction("Convert", self)
-        convert_action.triggered.connect(self.convert_ccr)
-        self.toolbar.addAction(convert_action)
+        self.convert_action = QAction("Convert", self)
+        self.convert_action.triggered.connect(self.convert_ccr)
+        self.toolbar.addAction(self.convert_action)
         add_spacer()
 
         self.unconvert_action = QAction("Un-convert", self)
@@ -890,7 +893,8 @@ class ImagePreview(QWidget):
         if self.area_mode and not self._area_rerender:
             active_gone = img_obj_now.get_area(
                 getattr(img_obj_now, "active_area_id", None)) is None
-            if not same_image or active_gone or not img_obj_now.converted:
+            editable = img_obj_now.converted or ccr_backend.positive_mode
+            if not same_image or active_gone or not editable:
                 self._exit_area_mode()
         if not same_image:
             # The fine-rotation burst belongs to the previous image; a switch
@@ -922,7 +926,7 @@ class ImagePreview(QWidget):
         if (preview_img is not None and not preview_img.isNull()
                 and crop is not None and not self.crop_mode and not self.slice_mode
                 and not self.area_mode
-                and ccr_backend.images[idx].converted):
+                and (ccr_backend.images[idx].converted or ccr_backend.positive_mode)):
             if crop_angle:
                 extracted = self._extract_rotated_crop(preview_img, crop, crop_angle)
                 if extracted is not None:
@@ -992,9 +996,9 @@ class ImagePreview(QWidget):
                         self.reference_rect_item.setPen(pen)
                         self.scene.addItem(self.reference_rect_item)
 
-            else:
-                # Show hint when no reference frame exists
-
+            elif not ccr_backend.positive_mode:
+                # Show hint when no reference frame exists (negative mode only —
+                # positive mode has no reference frame / conversion step).
                 self.parent().parent().sliders_panel.set_hint(
                     "<b>Hint:</b><br>Draw a frame around the image + some film base (orange/brown). "
                     "Avoid white backlight or black film holder areas. Left-drag to draw, right-click to remove."
@@ -1240,12 +1244,28 @@ class ImagePreview(QWidget):
 
     def _update_unconvert_action_state(self):
         self.current_converted = ccr_backend.get_converted_state_by_index(self.current_idx) if self.current_idx is not None else False
-        self.unconvert_action.setEnabled(self.current_converted)
-        self.export_action.setEnabled(any(img.converted for img in ccr_backend.images))
+        positive = ccr_backend.positive_mode
+        has_image = (self.current_idx is not None
+                     and 0 <= self.current_idx < len(ccr_backend.images))
+        # Negative-only toolbar actions are greyed in positive mode.
+        self.convert_action.setEnabled(not positive)
+        self.auto_frame_action.setEnabled(not positive)
+        self.unconvert_action.setEnabled(self.current_converted and not positive)
+        # Positive mode: every loaded image is exportable (no conversion needed).
+        self.export_action.setEnabled(
+            (positive and len(ccr_backend.images) > 0)
+            or any(img.converted for img in ccr_backend.images))
         parent = self.parent()
         if hasattr(parent.parent(), "sliders_panel"):
-            print("Setting sliders enabled based on current_converted:", self.current_converted)
-            parent.parent().sliders_panel.set_sliders_enabled(self.current_converted)
+            # Adjustments are available for a converted negative OR for any image
+            # in positive mode.
+            sliders_enabled = self.current_converted or (positive and has_image)
+            print("Setting sliders enabled:", sliders_enabled, "(positive:", positive, ")")
+            sliders_panel = parent.parent().sliders_panel
+            sliders_panel.set_sliders_enabled(sliders_enabled)
+            # Film B/W Point tools are negative-only.
+            if hasattr(sliders_panel, "set_negative_controls_enabled"):
+                sliders_panel.set_negative_controls_enabled(not positive)
         
 
     def set_bwpoint_mode(self, mode):
@@ -1427,7 +1447,8 @@ class ImagePreview(QWidget):
             return False
         img = (ccr_backend.get_image_by_index(self.current_idx)
                if self.current_idx is not None else None)
-        if img is None or not getattr(img, "converted", False):
+        if img is None or not (getattr(img, "converted", False)
+                               or ccr_backend.positive_mode):
             return False
         crop = getattr(img, "crop_rect", None)
         if crop is None:
@@ -1606,7 +1627,8 @@ class ImagePreview(QWidget):
         crop = getattr(img, "crop_rect", None)
         angle = getattr(img, "crop_angle", 0.0) or 0.0
         crop_active = (crop is not None and not self.crop_mode
-                       and not self.slice_mode and img.converted)
+                       and not self.slice_mode
+                       and (img.converted or ccr_backend.positive_mode))
         crop_sig = (crop, angle) if crop_active else None
         if cache.get("display_pm") is not None and cache.get("crop_sig") == crop_sig:
             return cache["display_pm"]
@@ -2535,7 +2557,7 @@ class ImagePreview(QWidget):
         img = ccr_backend.get_image_by_index(self.current_idx)
         if img is None:
             return
-        if not getattr(img, "converted", False):
+        if not (getattr(img, "converted", False) or ccr_backend.positive_mode):
             self._area_hint("Convert the image before adding a local area.")
             return
         aid = ccr_backend.add_area_by_index(self.current_idx, kind)
@@ -3025,7 +3047,8 @@ class ImagePreview(QWidget):
     def open_export_dialog(self, checked=False, default_scope=None):
         # `checked` absorbs the bool QAction.triggered emits; `default_scope`
         # is passed by callers (e.g. the thumbnail right-click "Export").
-        if not any(img.converted for img in ccr_backend.images):
+        if not (ccr_backend.positive_mode and ccr_backend.images) and \
+                not any(img.converted for img in ccr_backend.images):
             QMessageBox.information(self, "Nothing to Export",
                                     "Convert at least one image before exporting.")
             return
@@ -3155,6 +3178,9 @@ class HiResDetailWorker(QThread):
         self._temperature_base = img_obj.temperature_base
         self._brightness_base = img_obj.brightness_base
         self._converted = img_obj.converted
+        # Captured at request time (thread-safe): positive mode skips the
+        # negative display auto-brightness, like update_thumbnail_and_preview.
+        self._positive_mode = ccr_backend.positive_mode
         ci = getattr(img_obj, "conversion_inputs", None)
         self._conversion_inputs = dict(ci) if ci else None
 
@@ -3178,9 +3204,10 @@ class HiResDetailWorker(QThread):
                 temperature_base=self._temperature_base,
                 brightness_base=self._brightness_base,
                 areas_override=self._areas)
-            if not self._converted:
+            if not self._converted and not self._positive_mode:
                 # Mirror the preview pipeline: adjustments first, then the
                 # display-only auto-brightness stretch for raw negatives
+                # (skipped in positive mode — the decode is already exposed).
                 display = self._img._auto_brightness_for_preview(display)
             display8 = _np.ascontiguousarray(
                 _cv2.convertScaleAbs(display, alpha=255.0 / 65535.0))

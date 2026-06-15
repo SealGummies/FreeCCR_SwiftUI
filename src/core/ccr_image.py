@@ -258,6 +258,56 @@ class CCRImage:
             logging.warning(f"Input ICC profile could not be applied: {e}")
             return arr
 
+    @staticmethod
+    def _positive_mode_active() -> bool:
+        """Whether the app is in global Positive mode (RAWs decode as normal
+        sRGB positives, no negative conversion). Read lazily from the backend
+        singleton so decode/display stay in sync with a live toggle without a
+        per-image copy. See spec/positive-mode.md."""
+        try:
+            from core.ccr_backend import ccr_backend
+            return bool(ccr_backend.positive_mode)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _raw_color_postprocess_kwargs(positive: bool, preview: bool) -> dict:
+        """rawpy.postprocess kwargs for a (non-monochrome) RAW decode.
+
+        Negative (positive=False) is the original raw-sensor readout: raw color
+        space, linear gamma, no white balance, no auto-scale — the greenish,
+        dark scan the negative pipeline inverts. Positive (positive=True)
+        decodes a normal photo: sRGB color space + gamma, camera white balance,
+        AHD demosaic, and rawpy auto-brightness, so it no longer looks green.
+        Kept pure so the choice is unit-testable and the negative path is
+        provably unchanged."""
+        if positive:
+            return dict(
+                output_bps=16,
+                no_auto_bright=False,                              # auto-exposed
+                gamma=(2.222, 4.5),                               # sRGB-ish TRC
+                user_flip=0,
+                demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
+                half_size=preview,
+                use_camera_wb=True,                               # photographer's WB
+                use_auto_wb=False,
+                output_color=rawpy.ColorSpace.sRGB,
+                four_color_rgb=False,
+            )
+        return dict(
+            output_bps=16,
+            no_auto_bright=True,      # Consistent absolute sensor values across all frames
+            gamma=(1, 1),            # Linear gamma (no gamma correction)
+            user_flip=0,              # No rotation
+            demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,  # Simple linear demosaic
+            half_size=preview,        # Process at half resolution - much faster!
+            use_camera_wb=False,      # No camera white balance
+            use_auto_wb=False,        # No auto white balance
+            output_color=rawpy.ColorSpace.raw,  # Raw color space (no color correction)
+            no_auto_scale=True,       # No automatic scaling
+            four_color_rgb=False,     # Standard 3-color processing
+        )
+
     def read_image(self, file_path: str, preview = True, max_long_side: Optional[int] = None) -> Optional[np.ndarray]:
         """
         Read an image file. preview=True decodes RAW at half size.
@@ -273,7 +323,12 @@ class CCRImage:
         # Treat FFF files as TIFF files
         if ext == ".fff":
             ext = ".tiff"
-        
+
+        # Read the global Positive-mode flag once per call so every branch of
+        # this decode (RAW vs non-RAW, white-level, input ICC) uses one
+        # consistent value (spec/positive-mode.md §3 "read once").
+        positive_mode = self._positive_mode_active()
+
         if ext in [".cr3", ".cr2", ".nef", ".arw", ".dng", ".rw2", ".orf", ".raf", ".srw", ".pef", ".3fr"]:
             try:
                 print(f"Starting RAW processing for: {os.path.basename(file_path)}")
@@ -310,6 +365,10 @@ class CCRImage:
                         logging.warning(f"Error detecting monochrome sensor: {e}")
                         is_monochrome = False
 
+                    # Global Positive mode decodes color RAWs as normal sRGB
+                    # photos (monochrome sensors are left on their own path).
+                    positive_decode = positive_mode and not is_monochrome
+
                     if is_monochrome:
                         print(f"Detected monochrome sensor for: {os.path.basename(file_path)}")
                         # For monochrome sensors, use different processing
@@ -328,20 +387,10 @@ class CCRImage:
                         elif rgb.shape[2] == 1:
                             rgb = np.repeat(rgb, 3, axis=2)
                     else:
-                        # Pure/raw sensor readout with minimal processing (greenish result)
+                        # Positive mode: decode as a normal sRGB photo. Negative
+                        # mode: pure/raw sensor readout (greenish) for inversion.
                         rgb = raw.postprocess(
-                            output_bps=16,
-                            no_auto_bright=True,      # Consistent absolute sensor values across all frames
-                            gamma=(1, 1),            # Linear gamma (no gamma correction)
-                            user_flip=0,              # No rotation
-                            demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,  # Simple linear demosaic
-                            half_size=preview,        # Process at half resolution - much faster!
-                            use_camera_wb=False,      # No camera white balance
-                            use_auto_wb=False,        # No auto white balance
-                            output_color=rawpy.ColorSpace.raw,  # Raw color space (no color correction)
-                            no_auto_scale=True,       # No automatic scaling
-                            four_color_rgb=False,     # Standard 3-color processing
-                        )
+                            **self._raw_color_postprocess_kwargs(positive_decode, preview))
 
                     # Sliced images read only their region of the source.
                     # Single atomic assignment of the final size (see above).
@@ -355,7 +404,9 @@ class CCRImage:
 
                     # Scale native bit depth to full 16-bit range so images display at
                     # correct brightness (e.g. 14-bit data sits in [0,16383] without this).
-                    if white_level > 0 and white_level < 65535:
+                    # Skipped in positive mode: that decode is already auto-scaled and
+                    # full-range, so re-scaling would blow out the highlights.
+                    if not positive_decode and white_level > 0 and white_level < 65535:
                         print(f"Scaling RAW from {white_level}-ceiling to 16-bit (factor {65535.0/white_level:.4f})")
                         rgb = np.clip(
                             rgb.astype(np.float32) * (65535.0 / white_level),
@@ -365,8 +416,10 @@ class CCRImage:
                 elapsed_time = time.time() - start_time
                 print(f"RAW processing completed in {elapsed_time:.3f} seconds")
                 # Burn in the global input ICC (if any) on the decoded scan,
-                # before negative conversion / adjustments.
-                return self._apply_input_icc(rgb)
+                # before negative conversion / adjustments. Skipped in positive
+                # mode (the decode is already a ready sRGB positive — the input
+                # ICC is a negative-scanning tool).
+                return rgb if positive_decode else self._apply_input_icc(rgb)
             except Exception as e:
                 logging.exception(f"Failed to read RAW image: {file_path}")
                 return None
@@ -453,7 +506,8 @@ class CCRImage:
             if max_long_side:
                 img = self.resize_image_to_max_pixel(img, max_long_side)
             # Burn in the global input ICC (if any) before conversion/adjustments.
-            return self._apply_input_icc(img)
+            # Skipped in positive mode (treat the file as a ready sRGB positive).
+            return img if positive_mode else self._apply_input_icc(img)
         
     def update_thumbnail_and_preview(self, thumbnail_size: int = 156, preview_size: int = 1080) -> None:
         """
@@ -478,8 +532,12 @@ class CCRImage:
         # a copy and never touches resized_raw, so conversion, export, and B/W-point
         # sampling (which read resized_raw or the original file) are unaffected.
         # Once converted, the positive is properly exposed and the slider adjustments
-        # own the look, so the auto-brightness is skipped.
-        display_img = adjusted_img if self.converted else self._auto_brightness_for_preview(adjusted_img)
+        # own the look, so the auto-brightness is skipped. Positive mode decodes a
+        # correctly-exposed positive too, so it skips the negative auto-brightness
+        # as well (the adjustments own the look).
+        display_img = (adjusted_img
+                       if (self.converted or self._positive_mode_active())
+                       else self._auto_brightness_for_preview(adjusted_img))
 
         # Create thumbnail
         thumb_img = self.resize_image_to_max_pixel(display_img, thumbnail_size)
@@ -681,7 +739,12 @@ class CCRImage:
         if img is None:
             return None
         print(f"Hi-res decode: {time.time() - t0:.2f}s, shape {img.shape}")
-        if not self.converted:
+        # Decide replay from the (snapshotted) conversion_inputs, NOT the live
+        # self.converted flag: a positive-mode toggle can clear self.converted on
+        # the GUI thread mid-render, and this worker must reproduce exactly the
+        # conversion its snapshot describes. ci is None for un-converted scans
+        # (incl. positive mode) -> return the decoded image as-is.
+        if not ci:
             return img
 
         from core.ccr_processor import (compute_reference_norm_params,

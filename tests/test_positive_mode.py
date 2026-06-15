@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+Tests for global Positive mode (spec/positive-mode.md).
+
+Positive mode decodes RAWs as normal sRGB positives and bypasses the film
+negative pipeline: no conversion is needed, every image is editable/exportable
+directly, and the export applies adjustments WITHOUT inversion.
+"""
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+import rawpy  # noqa: E402
+from core.ccr_image import CCRImage  # noqa: E402
+from core.ccr_processor import ccr_export_positive  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# RAW decode kwargs (pure; the negative path must stay byte-for-byte unchanged)
+# --------------------------------------------------------------------------- #
+class TestRawPostprocessKwargs:
+    def test_positive_decodes_as_srgb_photo(self):
+        kw = CCRImage._raw_color_postprocess_kwargs(positive=True, preview=True)
+        assert kw["output_color"] == rawpy.ColorSpace.sRGB
+        assert kw["gamma"] == (2.222, 4.5)
+        assert kw["use_camera_wb"] is True
+        assert kw["no_auto_bright"] is False        # auto-exposed
+        assert kw["demosaic_algorithm"] == rawpy.DemosaicAlgorithm.AHD
+        # The positive decode is already full-range/auto-scaled — it must NOT
+        # ask rawpy to disable auto-scale (that's a negative-only flag).
+        assert "no_auto_scale" not in kw
+
+    def test_negative_is_the_original_raw_readout(self):
+        kw = CCRImage._raw_color_postprocess_kwargs(positive=False, preview=False)
+        # Regression guard: the greenish raw-sensor decode the inverter expects.
+        assert kw["output_color"] == rawpy.ColorSpace.raw
+        assert kw["gamma"] == (1, 1)
+        assert kw["no_auto_bright"] is True
+        assert kw["use_camera_wb"] is False
+        assert kw["use_auto_wb"] is False
+        assert kw["no_auto_scale"] is True
+
+    def test_preview_flag_threads_to_half_size(self):
+        assert CCRImage._raw_color_postprocess_kwargs(True, True)["half_size"] is True
+        assert CCRImage._raw_color_postprocess_kwargs(True, False)["half_size"] is False
+        assert CCRImage._raw_color_postprocess_kwargs(False, True)["half_size"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Positive export — no inversion
+# --------------------------------------------------------------------------- #
+def _stub_image(resized_raw, color_profile="color", adjustment_settings=None):
+    """A CCRImage shell (no file load) wired for apply_adjustments + export."""
+    img = CCRImage.__new__(CCRImage)
+    img.resized_raw = resized_raw
+    img.adjustment_settings = adjustment_settings or {}
+    img.color_profile = color_profile
+    img.contrast_base = 0
+    img.temperature_base = 0
+    img.brightness_base = 0
+    img.tint_balance_factor = 1.0
+    img.area_layers = []
+    img.fine_rotation_angle = 0
+    img.rotation_angle = 0
+    img.horizontal_mirrored = False
+    img.vertical_mirrored = False
+    img.crop_rect = None
+    img.crop_angle = 0.0
+    # Export re-reads the source via _load_export_source; for the stub (no file
+    # on disk) serve the in-memory pixels instead.
+    img.file_path = "stub.tiff"
+    img.original_full_size = resized_raw.shape[:2]
+    img.read_image = lambda *a, **k: img.resized_raw
+    return img
+
+
+def _asymmetric_image():
+    img = np.zeros((2, 3, 3), dtype=np.uint16)
+    img[0, 0] = (60000, 30000, 10000)
+    img[0, 1] = (10000, 50000, 20000)
+    img[0, 2] = (30000, 25000, 20000)
+    img[1, 0] = (1000, 2000, 3000)
+    img[1, 1] = (65000, 64000, 63000)
+    img[1, 2] = (200, 100, 50)
+    return img
+
+
+class TestPositiveExport:
+    def test_processing_path_returns_adjusted_not_inverted(self):
+        src = _asymmetric_image()
+        out = ccr_export_positive(_stub_image(src), output_path=None)
+        # Identity adjustments → the positive is returned unchanged.
+        np.testing.assert_array_equal(out, src)
+        # And it is emphatically NOT the negative inversion.
+        assert not np.array_equal(out, (65535 - src).astype(np.uint16))
+
+    def test_processing_path_honors_bw_profile(self):
+        src = _asymmetric_image()
+        out = ccr_export_positive(_stub_image(src, color_profile="bw"),
+                                  output_path=None)
+        # B&W collapses to a single luminance channel (R==G==B), still no invert.
+        assert np.array_equal(out[..., 0], out[..., 1])
+        assert np.array_equal(out[..., 1], out[..., 2])
+        assert out.max() < 65535  # not an inverted near-black image
+
+    def test_processing_path_applies_real_adjustment(self):
+        src = _asymmetric_image()
+        out = ccr_export_positive(
+            _stub_image(src, adjustment_settings={"exposure": 40}),
+            output_path=None)
+        assert not np.array_equal(out, src)  # exposure actually changed pixels
+
+    def test_writes_a_file(self, tmp_path):
+        src = _asymmetric_image()
+        dest = str(tmp_path / "out.tiff")
+        result = ccr_export_positive(_stub_image(src), output_path=dest,
+                                     water_mark=False)
+        assert result is None
+        assert os.path.exists(dest)
+
+
+# --------------------------------------------------------------------------- #
+# Backend: flag default, export routing, mode-toggle reprocess
+# --------------------------------------------------------------------------- #
+class _StubBackendImage:
+    def __init__(self, converted=False, adjustment_settings=None,
+                 source_ops=None, is_duplicate=False, tbf=1.0,
+                 conversion_inputs=None, reference_frame=None):
+        self.file_path = "stub.ARW"
+        self.converted = converted
+        self.conversion_inputs = conversion_inputs
+        self.adjustment_settings = adjustment_settings or {}
+        self.source_ops = source_ops or []
+        self.is_duplicate = is_duplicate
+        self.tint_balance_factor = tbf
+        self.reference_frame = reference_frame
+        self.reload_called = False
+        self.preview_refreshed = False
+
+    def reload_image(self):
+        self.reload_called = True
+        # Simulate read_image recomputing the tint factor from new pixels —
+        # the reprocess must restore the inherited value for slices/duplicates.
+        self.tint_balance_factor = 99.0
+
+    def update_thumbnail_and_preview(self):
+        self.preview_refreshed = True
+
+
+@pytest.fixture
+def backend():
+    from core.ccr_backend import ccr_backend
+    saved_images = ccr_backend.images
+    saved_positive = ccr_backend.positive_mode
+    saved_bp = ccr_backend.black_point_bgr
+    saved_wp = ccr_backend.white_point_bgr
+    yield ccr_backend
+    ccr_backend.images = saved_images
+    ccr_backend.positive_mode = saved_positive
+    ccr_backend.black_point_bgr = saved_bp
+    ccr_backend.white_point_bgr = saved_wp
+
+
+class TestBackendPositiveMode:
+    def test_default_is_false(self):
+        from core.ccr_backend import CCRBackend
+        # Bypass the singleton __new__ to check the _init default in isolation.
+        fresh = object.__new__(CCRBackend)
+        fresh._init()
+        assert fresh.positive_mode is False
+
+    def test_export_routes_to_positive(self, backend, monkeypatch):
+        calls = {}
+        monkeypatch.setattr("core.ccr_backend.ccr_export_positive",
+                            lambda *a, **k: calls.setdefault("positive", k))
+        monkeypatch.setattr("core.ccr_backend.ccr_normalize_with_reference",
+                            lambda *a, **k: calls.setdefault("reference", k))
+        backend.images = [_StubBackendImage(reference_frame=(0, 0, 10, 10))]
+        backend.positive_mode = True
+        assert backend.export_image_by_index(0, "out.tiff") is True
+        assert "positive" in calls and "reference" not in calls
+
+    def test_export_routes_to_negative_when_off(self, backend, monkeypatch):
+        calls = {}
+        monkeypatch.setattr("core.ccr_backend.ccr_export_positive",
+                            lambda *a, **k: calls.setdefault("positive", k))
+        monkeypatch.setattr("core.ccr_backend.ccr_normalize_with_reference",
+                            lambda *a, **k: calls.setdefault("reference", k))
+        backend.images = [_StubBackendImage(reference_frame=(0, 0, 10, 10))]
+        backend.positive_mode = False
+        backend.black_point_bgr = None
+        backend.white_point_bgr = None
+        assert backend.export_image_by_index(0, "out.tiff") is True
+        assert "reference" in calls and "positive" not in calls
+
+    def test_reprocess_drops_conversion_keeps_adjustments(self, backend):
+        img = _StubBackendImage(converted=True,
+                                adjustment_settings={"exposure": 20},
+                                conversion_inputs={"mode": "ref"})
+        backend.images = [img]
+        backend.positive_mode = True
+        backend.reprocess_all_for_positive_mode_change()
+        assert img.reload_called
+        assert img.converted is False
+        assert img.conversion_inputs is None
+        assert img.adjustment_settings == {"exposure": 20}  # kept
+
+    def test_reprocess_preserves_inherited_tint_factor_for_slices(self, backend):
+        slice_img = _StubBackendImage(source_ops=[(0, (0, 0, 1, 1))], tbf=1.234)
+        backend.images = [slice_img]
+        backend.positive_mode = True
+        backend.reprocess_all_for_positive_mode_change()
+        # reload_image set it to 99.0; the inherited value must be restored.
+        assert slice_img.tint_balance_factor == pytest.approx(1.234)
+
+    def test_reprocess_recomputes_tint_factor_for_normal_images(self, backend):
+        plain = _StubBackendImage(tbf=1.0)  # no source_ops, not a duplicate
+        backend.images = [plain]
+        backend.positive_mode = True
+        backend.reprocess_all_for_positive_mode_change()
+        # A normal image keeps whatever reload_image computed (no restore).
+        assert plain.tint_balance_factor == pytest.approx(99.0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

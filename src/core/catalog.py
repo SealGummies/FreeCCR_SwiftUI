@@ -372,8 +372,17 @@ def _restore_image(file_path: str, state: dict):
     img.tint_balance_factor = state.get("tint_balance_factor",
                                         getattr(img, "tint_balance_factor", 1.0))
 
+    # Positive mode never replays a stored negative conversion onto the
+    # (positive-decoded) scan — the image loads as an editable positive with its
+    # stored adjustments. See spec/positive-mode.md.
+    positive = False
+    try:
+        from core.ccr_backend import ccr_backend
+        positive = bool(ccr_backend.positive_mode)
+    except Exception:
+        positive = False
     ci = _ci_from_json(state.get("conversion_inputs"))
-    if state.get("converted") and ci is not None:
+    if state.get("converted") and ci is not None and not positive:
         _replay_conversion(img, ci)
 
     # Bases AFTER the replay (the bw pipeline writes its own defaults)

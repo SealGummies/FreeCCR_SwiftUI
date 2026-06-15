@@ -134,6 +134,15 @@ class MainWindow(QMainWindow):
         # Persisted UI preferences (last-open location etc.)
         self._settings = QSettings("FreeCCR", "FreeCCR")
 
+        # Restore the global Positive-mode toggle BEFORE any image loads so the
+        # first batch decodes in the right mode (see spec/positive-mode.md).
+        positive_mode = self._settings.value("import/positive_mode", False, type=bool)
+        ccr_backend.positive_mode = positive_mode
+        self.thumbnail_list.set_positive_checkbox(positive_mode)
+        # Reflect the restored mode in the toolbar/slider gating right away
+        # (no images yet, but the negative-only actions should already grey out).
+        self.image_preview._update_unconvert_action_state()
+
         self.installEventFilter(self)
         self.create_menu()
 
@@ -329,6 +338,35 @@ class MainWindow(QMainWindow):
         if self.image_preview.current_idx is not None:
             self.image_preview.update_preview(self.image_preview.current_idx)
         ccr_backend.save_catalog()
+
+    # --- Positive mode (global, persistent) -------------------------------
+    def on_positive_mode_toggled(self, checked: bool):
+        """Flip the global Positive-mode flag, persist it, and re-decode all
+        loaded images in the new mode (keep adjustments, drop conversion).
+        Mirrors the input-ICC reprocess. See spec/positive-mode.md."""
+        ccr_backend.positive_mode = bool(checked)
+        self._settings.setValue("import/positive_mode", bool(checked))
+        if ccr_backend.images:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                ccr_backend.reprocess_all_for_positive_mode_change()
+            finally:
+                QApplication.restoreOverrideCursor()
+            self.thumbnail_list.update_all_thumbnails()
+            if self.image_preview.current_idx is not None:
+                self.image_preview.update_preview(self.image_preview.current_idx)
+            else:
+                # No selection: still refresh the toolbar/slider gating.
+                self.image_preview._update_unconvert_action_state()
+            ccr_backend.save_catalog()
+        else:
+            # No images yet — just refresh the gating so the toolbar reflects
+            # the new mode immediately.
+            self.image_preview._update_unconvert_action_state()
+        self.sliders_panel.set_temporary_hint(
+            "Positive mode on — adjust any image directly."
+            if checked else "Positive mode off — film-negative tools restored.",
+            duration=4000)
 
     def show_activation_dialog(self):
         QMessageBox.information(
