@@ -50,6 +50,26 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: win_installer/FreeCCR_Install_*.exe
+          # Install instructions shown on every release page.
+          # KEEP IN SYNC with the macOS job's upload step below.
+          body: |
+            ## Install
+
+            ### Windows
+            Download the installer (`FreeCCR_Install_*.exe`) from the **Assets** below and run it.
+
+            ### macOS (Apple Silicon)
+            Download `FreeCCR_macOS_*.zip` from the **Assets**, unzip it, and move `FreeCCR.app` into your **Applications** folder.
+
+            ⚠️ **macOS may say the app is "damaged and can't be opened" — it isn't.** FreeCCR isn't notarized by Apple, so Gatekeeper blocks unsigned downloads on first launch. Clear the quarantine flag once by running this in **Terminal**:
+
+            ```
+            xattr -r -d com.apple.quarantine /Applications/FreeCCR.app
+            ```
+
+            Then open the app normally.
+
+            *Alternative:* right-click the app → **Open** → **Open**. On macOS Sequoia (15), if no "Open" button appears, use the Terminal command above, or go to **System Settings → Privacy & Security → Open Anyway**.
 
   build-macos:
     runs-on: macos-latest  # ARM64 (Apple Silicon)
@@ -121,3 +141,23 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: FreeCCR_macOS_*.zip
+          # Install instructions shown on every release page.
+          # KEEP IN SYNC with the Windows job's upload step above.
+          body: |
+            ## Install
+
+            ### Windows
+            Download the installer (`FreeCCR_Install_*.exe`) from the **Assets** below and run it.
+
+            ### macOS (Apple Silicon)
+            Download `FreeCCR_macOS_*.zip` from the **Assets**, unzip it, and move `FreeCCR.app` into your **Applications** folder.
+
+            ⚠️ **macOS may say the app is "damaged and can't be opened" — it isn't.** FreeCCR isn't notarized by Apple, so Gatekeeper blocks unsigned downloads on first launch. Clear the quarantine flag once by running this in **Terminal**:
+
+            ```
+            xattr -r -d com.apple.quarantine /Applications/FreeCCR.app
+            ```
+
+            Then open the app normally.
+
+            *Alternative:* right-click the app → **Open** → **Open**. On macOS Sequoia (15), if no "Open" button appears, use the Terminal command above, or go to **System Settings → Privacy & Security → Open Anyway**.
