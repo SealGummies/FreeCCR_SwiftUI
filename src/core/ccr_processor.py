@@ -1059,47 +1059,53 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     del norm
     gc.collect()
 
-    # --- Saturation boost (identical to main pipeline) ---
-    rgb_norm = rgb_inverted.astype(np.float32) / 65535.0
-    # gamma == 1.0 here, so np.power was a no-op — just clip (saves a full-res
-    # transcendental pass per export).
-    gamma_corrected = np.clip(rgb_norm, 0.0, 1.0)
-    del rgb_norm
-
-    luminance = np.dot(gamma_corrected[..., :3], [0.299, 0.587, 0.114])
-    luminance_expanded = np.expand_dims(luminance, axis=-1)
-    saturation_curve = np.power(luminance, 0.8)
-    del luminance
-    base_saturation = 1.15
-    min_saturation = 1.00
-    dynamic_saturation = min_saturation + (base_saturation - min_saturation) * saturation_curve
-    del saturation_curve
-    dynamic_saturation = np.expand_dims(dynamic_saturation, axis=-1)
-    gamma_corrected = luminance_expanded + dynamic_saturation * (gamma_corrected - luminance_expanded)
-    del luminance_expanded, dynamic_saturation
-    gamma_corrected = np.clip(gamma_corrected, 0.0, 1.0)
-
-    # --- Shadow warmth correction (identical to main pipeline) ---
-    shadow_corrected = gamma_corrected
-    shadow_luminance = np.dot(shadow_corrected[..., :3], [0.299, 0.587, 0.114])
-    warmth_curve = np.exp(-shadow_luminance * 4.0)
-    warmth_strength = 0.35 * warmth_curve
-    del warmth_curve
-    green_curve = np.exp(-shadow_luminance * 3.5)
-    del shadow_luminance
-    green_strength = 0.15 * green_curve
-    del green_curve
-    shadow_corrected[..., 0] *= (1.0 + warmth_strength * 0.8)
-    shadow_corrected[..., 1] *= (1.0 + green_strength)
-    shadow_corrected[..., 2] *= (1.0 - warmth_strength)
-    del warmth_strength, green_strength
-
-    rgb_result = np.clip(shadow_corrected * 65535.0, 0, 65535).astype(np.uint16)
-    del shadow_corrected, gamma_corrected, rgb_inverted
+    # --- Post-invert "look" DISABLED (saturation boost + shadow warmth) ---
+    # Commented out to produce a neutral linear inversion: no luminance-weighted
+    # saturation curve, no shadow warmth/green shift. rgb_result is the raw
+    # inverted image. Re-enable by uncommenting the block below.
+    rgb_result = rgb_inverted
+    # # --- Saturation boost (identical to main pipeline) ---
+    # rgb_norm = rgb_inverted.astype(np.float32) / 65535.0
+    # # gamma == 1.0 here, so np.power was a no-op — just clip (saves a full-res
+    # # transcendental pass per export).
+    # gamma_corrected = np.clip(rgb_norm, 0.0, 1.0)
+    # del rgb_norm
+    #
+    # luminance = np.dot(gamma_corrected[..., :3], [0.299, 0.587, 0.114])
+    # luminance_expanded = np.expand_dims(luminance, axis=-1)
+    # saturation_curve = np.power(luminance, 0.8)
+    # del luminance
+    # base_saturation = 1.15
+    # min_saturation = 1.00
+    # dynamic_saturation = min_saturation + (base_saturation - min_saturation) * saturation_curve
+    # del saturation_curve
+    # dynamic_saturation = np.expand_dims(dynamic_saturation, axis=-1)
+    # gamma_corrected = luminance_expanded + dynamic_saturation * (gamma_corrected - luminance_expanded)
+    # del luminance_expanded, dynamic_saturation
+    # gamma_corrected = np.clip(gamma_corrected, 0.0, 1.0)
+    #
+    # # --- Shadow warmth correction (identical to main pipeline) ---
+    # shadow_corrected = gamma_corrected
+    # shadow_luminance = np.dot(shadow_corrected[..., :3], [0.299, 0.587, 0.114])
+    # warmth_curve = np.exp(-shadow_luminance * 4.0)
+    # warmth_strength = 0.35 * warmth_curve
+    # del warmth_curve
+    # green_curve = np.exp(-shadow_luminance * 3.5)
+    # del shadow_luminance
+    # green_strength = 0.15 * green_curve
+    # del green_curve
+    # shadow_corrected[..., 0] *= (1.0 + warmth_strength * 0.8)
+    # shadow_corrected[..., 1] *= (1.0 + green_strength)
+    # shadow_corrected[..., 2] *= (1.0 - warmth_strength)
+    # del warmth_strength, green_strength
+    #
+    # rgb_result = np.clip(shadow_corrected * 65535.0, 0, 65535).astype(np.uint16)
+    # del shadow_corrected, gamma_corrected, rgb_inverted
     gc.collect()
 
     # Non-destructive base offsets applied through the adjustment pipeline (UI shows 0).
-    ccr_image.contrast_base = 40
+    # contrast_base set to 0 to disable the baked-in contrast S-curve (was 40).
+    ccr_image.contrast_base = 0
     ccr_image.temperature_base = 0
 
     # --- User adjustments (export only) ---
@@ -1550,7 +1556,10 @@ def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bg
         np.multiply(norm[..., c], 65535.0, out=norm[..., c])
         np.clip(norm[..., c], 0, 65535, out=norm[..., c])
     inverted = (65535.0 - norm).clip(0, 65535).astype(np.uint16)
-    return apply_postinvert_look(inverted)
+    # apply_postinvert_look DISABLED — return the neutral linear inversion so the
+    # zoom/hi-res replay matches the look-less preview/export path.
+    return inverted
+    # return apply_postinvert_look(inverted)
 
 
 def auto_fine_angle(img16: np.ndarray, debug: bool = False) -> float:
