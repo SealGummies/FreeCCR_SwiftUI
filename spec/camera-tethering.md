@@ -456,6 +456,25 @@ An adversarial review of the implementation surfaced these fixes, now in code:
 - **`append_image_item` returns bool** + logs on an invalid index; a skipped add
   (rebuild in flight) self-heals on the next full `load_thumbnails`.
 
+### 9.5 Follow-up fixes (post-merge feedback)
+- **Banner theme.** The status strip now matches FreeCCR's default light theme:
+  a soft amber active-session bar (`#fff3cd`), a red recording dot, and a
+  white-on-red **Stop** button (was a dark `#2b2b2b` strip with an
+  invisible-on-dark default button).
+- **Immediate B/W status.** Sampling a Black/White point now refreshes the
+  banner note at once (`MainWindow.refresh_tether_banner`, called from
+  `persist_bwpoint`), so the "captures import unconverted" warning clears the
+  moment both points are set — no waiting for the next capture/poll.
+- **Inherited look on capture.** Each new capture inherits the editable look —
+  `adjustment_settings`, coarse/fine rotation, flips, crop, color profile, and
+  area layers — of the image active when it arrived (`_tether_template` /
+  `_apply_tether_template`, snapshotted in `_on_capture` before the new image is
+  selected). A rotate/brightness/etc. set on one frame thus auto-applies to the
+  next imported frame, which a fixed copy-stand rig wants. The template chains
+  forward (each capture becomes the source for the next) and is a deep,
+  isolated copy. Skipped when the active image's look is all-default (no wasted
+  re-render).
+
 ### 9.3 Out-of-scope confirmations (unchanged from §2)
 Direct USB camera control / live view / remote shutter, 30 fps video, in-app
 camera settings, retroactive re-conversion on B/W-point change, and a

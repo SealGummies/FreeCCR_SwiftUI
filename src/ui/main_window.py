@@ -11,6 +11,7 @@ from core.tether_watcher import (TetherWatchWorker, FolderScanner, is_supported,
                                  encode_bwpoint, decode_bwpoint)
 import ctypes
 from version import VERSION  # Make sure version.py is in your src folder
+import copy
 import html
 import os
 import sys
@@ -703,11 +704,22 @@ class MainWindow(QMainWindow):
             self._dispatch_to_worker(os.path.join(self._tether_folder, name))
 
     def _on_capture(self, img):
+        # Inherit the editable "look" (adjustments, orientation, crop) of the
+        # image active just before this capture, so a rotate/brightness/etc. set
+        # on one frame auto-applies to the next imported frame — a fixed
+        # copy-stand rig wants identical treatment per frame. Snapshot BEFORE
+        # appending the new image (current_idx still points at the prior one).
+        template = self._tether_template()
         # Always keep the capture — even one that arrives just after Stop (the
         # worker had already decoded it). Dropping it would lose a real photo.
         ccr_backend.images.append(img)
         ccr_backend.file_paths.append(img.file_path)
         idx = len(ccr_backend.images) - 1
+        if template is not None:
+            self._apply_tether_template(img, template)
+            # Re-bake preview/thumbnail so inherited adjustments are reflected
+            # (rotation/flips/crop are applied by update_preview on selection).
+            img.update_thumbnail_and_preview()
         self.thumbnail_list.append_image_item(idx, select=True)
         name = getattr(img, "display_name", None) or os.path.basename(img.file_path)
         if self._tether_active:
@@ -720,6 +732,55 @@ class MainWindow(QMainWindow):
             # Late arrival after Stop: persist immediately (the debounced timer
             # is gone) so the photo isn't lost on close.
             ccr_backend.save_catalog()
+
+    def _tether_template(self):
+        """Snapshot the editable look of the currently displayed image so the
+        next capture can inherit it. Returns None when there is no current image
+        or its look is entirely default (so no wasted re-render)."""
+        idx = self.image_preview.current_idx
+        if idx is None:
+            return None
+        src = ccr_backend.get_image_by_index(idx)
+        if src is None:
+            return None
+        adj = getattr(src, "adjustment_settings", None) or {}
+        areas = getattr(src, "area_layers", None) or []
+        rot = getattr(src, "rotation_angle", 0)
+        fine = getattr(src, "fine_rotation_angle", 0)
+        hflip = getattr(src, "horizontal_mirrored", False)
+        vflip = getattr(src, "vertical_mirrored", False)
+        crop = getattr(src, "crop_rect", None)
+        crop_angle = getattr(src, "crop_angle", 0.0) or 0.0
+        profile = getattr(src, "color_profile", "color")
+        if not (adj or areas or rot or fine or hflip or vflip
+                or crop is not None or crop_angle or profile != "color"):
+            return None
+        return {
+            "adjustment_settings": copy.deepcopy(adj),
+            "area_layers": copy.deepcopy(areas),
+            "rotation_angle": rot,
+            "fine_rotation_angle": fine,
+            "horizontal_mirrored": hflip,
+            "vertical_mirrored": vflip,
+            "crop_rect": crop,
+            "crop_angle": crop_angle,
+            "color_profile": profile,
+        }
+
+    @staticmethod
+    def _apply_tether_template(img, t):
+        """Apply an inherited look template to a freshly captured image. The
+        template already holds isolated deep copies, so direct assignment is
+        safe (each capture builds its own template)."""
+        img.adjustment_settings = t["adjustment_settings"]
+        img.area_layers = t["area_layers"]
+        img.rotation_angle = t["rotation_angle"]
+        img.fine_rotation_angle = t["fine_rotation_angle"]
+        img.horizontal_mirrored = t["horizontal_mirrored"]
+        img.vertical_mirrored = t["vertical_mirrored"]
+        img.crop_rect = t["crop_rect"]
+        img.crop_angle = t["crop_angle"]
+        img.color_profile = t["color_profile"]
 
     def _on_capture_error(self, path, msg):
         self.sliders_panel.set_temporary_hint(
@@ -767,13 +828,23 @@ class MainWindow(QMainWindow):
             self._tether_worker = None
 
     def persist_bwpoint(self):
-        """Write the current global B/W point to QSettings (spec §4.1)."""
+        """Write the current global B/W point to QSettings (spec §4.1) and, if a
+        tethering session is live, refresh the banner so its note reflects the
+        new B/W state immediately (e.g. drops the 'unconverted' warning)."""
         bp = encode_bwpoint(ccr_backend.black_point_bgr)
         wp = encode_bwpoint(ccr_backend.white_point_bgr)
         if bp is not None:
             self._settings.setValue("convert/black_point_bgr", bp)
         if wp is not None:
             self._settings.setValue("convert/white_point_bgr", wp)
+        self.refresh_tether_banner()
+
+    def refresh_tether_banner(self):
+        """Re-render the banner note from current state (B/W point / Positive
+        mode). No-op when not tethering or the folder is unavailable."""
+        if self._tether_active and not self._tether_unavailable:
+            self.image_preview.show_tether_banner(
+                self._tether_folder_label(), self._tether_count, self._tether_note())
 
     def _restore_bwpoint(self):
         """Restore a persisted global B/W point into the backend at startup."""

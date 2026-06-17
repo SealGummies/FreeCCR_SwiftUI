@@ -203,3 +203,56 @@ def test_worker_positive_mode_skips_conversion(tmp_path):
         ccr_backend.positive_mode = False
         ccr_backend.black_point_bgr = None
         ccr_backend.white_point_bgr = None
+
+
+# --- capture inherits adjustments from the active image (bug fix #3) --------
+def test_capture_inherits_adjustments(tmp_path):
+    from ui.main_window import MainWindow
+    from core.ccr_image import CCRImage
+    ccr_backend.images.clear()
+    ccr_backend.file_paths.clear()
+    ccr_backend.black_point_bgr = None
+    ccr_backend.white_point_bgr = None
+    ccr_backend.positive_mode = False
+
+    w = MainWindow()
+    a_path = tmp_path / "a.png"
+    cv2.imwrite(str(a_path), (np.random.RandomState(11).rand(80, 100, 3) * 255).astype(np.uint8))
+    a = CCRImage(str(a_path))
+    a.adjustment_settings = {"brightness": 25, "contrast": 10}
+    a.rotation_angle = 90
+    ccr_backend.images.append(a)
+    ccr_backend.file_paths.append(a.file_path)
+    w.thumbnail_list.append_image_item(0, select=True)   # A becomes current
+    assert w.image_preview.current_idx == 0
+
+    w._tether_active = True
+    w._tether_folder = str(tmp_path)
+    b_path = tmp_path / "b.png"
+    cv2.imwrite(str(b_path), (np.random.RandomState(12).rand(80, 100, 3) * 255).astype(np.uint8))
+    b = CCRImage(str(b_path))
+    w._on_capture(b)
+
+    assert b.adjustment_settings == {"brightness": 25, "contrast": 10}
+    assert b.adjustment_settings is not a.adjustment_settings   # isolated copy
+    assert b.rotation_angle == 90
+    w.stop_tethering()
+
+
+def test_capture_no_template_when_active_image_is_default(tmp_path):
+    from ui.main_window import MainWindow
+    from core.ccr_image import CCRImage
+    ccr_backend.images.clear()
+    ccr_backend.file_paths.clear()
+    ccr_backend.black_point_bgr = None
+    ccr_backend.white_point_bgr = None
+    ccr_backend.positive_mode = False
+
+    w = MainWindow()
+    a_path = tmp_path / "a.png"
+    cv2.imwrite(str(a_path), (np.random.RandomState(13).rand(60, 60, 3) * 255).astype(np.uint8))
+    a = CCRImage(str(a_path))   # untouched look
+    ccr_backend.images.append(a)
+    ccr_backend.file_paths.append(a.file_path)
+    w.thumbnail_list.append_image_item(0, select=True)
+    assert w._tether_template() is None   # nothing worth inheriting
