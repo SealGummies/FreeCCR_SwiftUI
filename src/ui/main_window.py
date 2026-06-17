@@ -652,6 +652,12 @@ class MainWindow(QMainWindow):
         # genuinely-new capture triggers the B/W-point prompt.
         self._tether_import_existing = {os.path.normpath(p) for p in import_paths}
         self._tether_scanner = FolderScanner(initial_names=existing)
+        # Each session starts fresh: clear the global B/W point so the user
+        # re-samples it from THIS roll's film lead (the first frame). Different
+        # rolls/stocks have different base colour + density, so a previous
+        # roll's point must not carry over.
+        ccr_backend.black_point_bgr = None
+        ccr_backend.white_point_bgr = None
 
         # Long-lived worker on its own event-loop QThread (spec §9.1.7); work is
         # delivered by QMetaObject.invokeMethod (queued) so it runs off-GUI.
@@ -869,24 +875,18 @@ class MainWindow(QMainWindow):
         on that frame."""
         if not self._tether_active:
             return
-        has_point = (ccr_backend.black_point_bgr is not None
-                     and ccr_backend.white_point_bgr is not None)
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Information)
         box.setWindowTitle("Set B/W Point for This Roll")
-        text = ("This first frame should be a shot of the <b>film lead</b> — "
-                "showing both the clear film base and a fully-exposed (dense) "
-                "area.<br><br>Set the roll's B/W point from it so the rest of the "
-                "roll converts to positive automatically:<br>"
-                "• <b>Black Point</b> — draw over the clear film base<br>"
-                "• <b>White Point</b> — draw over the dense / exposed area")
-        if has_point:
-            text += ("<br><br>A B/W point from earlier is already set — re-sample "
-                     "it for this roll, or keep the existing one.")
-        box.setText(text)
+        box.setText(
+            "This first frame should be a shot of the <b>film lead</b> — showing "
+            "both the clear film base and a fully-exposed (dense) area.<br><br>"
+            "Set this roll's B/W point from it so the rest of the roll converts "
+            "to positive automatically:<br>"
+            "• <b>Black Point</b> — draw over the clear film base<br>"
+            "• <b>White Point</b> — draw over the dense / exposed area")
         set_btn = box.addButton("Set Black Point", QMessageBox.AcceptRole)
-        box.addButton("Keep Existing" if has_point else "Skip",
-                      QMessageBox.RejectRole)
+        box.addButton("Skip", QMessageBox.RejectRole)
         box.setDefaultButton(set_btn)
         box.exec()
         if box.clickedButton() is not set_btn:

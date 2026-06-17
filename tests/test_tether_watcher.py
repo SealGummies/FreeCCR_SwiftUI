@@ -295,3 +295,30 @@ def test_bw_prompt_fires_once_on_first_new_capture(tmp_path):
     assert w._tether_prompted is True
 
     w.stop_tethering()
+
+
+def test_session_start_clears_bwpoint(tmp_path, monkeypatch):
+    """Entering a tethering session clears any prior B/W point so the user must
+    re-sample from this roll's lead; the banner reflects the uncalibrated state."""
+    from ui.main_window import MainWindow
+    from PySide6.QtWidgets import QFileDialog
+    ccr_backend.images.clear()
+    ccr_backend.file_paths.clear()
+    ccr_backend.positive_mode = False
+    # A stale point from a "previous roll".
+    ccr_backend.black_point_bgr = (60000.0, 60000.0, 60000.0)
+    ccr_backend.white_point_bgr = (5000.0, 5000.0, 5000.0)
+
+    w = MainWindow()
+    roll = tmp_path / "roll"          # empty → no "import existing?" prompt
+    roll.mkdir()
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        lambda *a, **k: str(roll))
+    w.enter_tethering()
+    try:
+        assert w._tether_active is True
+        assert ccr_backend.black_point_bgr is None
+        assert ccr_backend.white_point_bgr is None
+        assert "No B/W point" in w.tether_banner._note.text()
+    finally:
+        w.stop_tethering()

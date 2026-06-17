@@ -475,24 +475,31 @@ An adversarial review of the implementation surfaced these fixes, now in code:
   isolated copy. Skipped when the active image's look is all-default (no wasted
   re-render).
 
-### 9.6 Per-session B/W-point prompt (film-lead workflow)
-After the **first genuinely-new capture** of each tethering session, FreeCCR
-prompts the user to set the roll's B/W point from it — the intended workflow is
-that the first shot is the **film lead** (clear base + a fully-exposed/dense
-area), which calibrates the whole roll. Details:
-- Fires once per session (`_tether_prompted`, reset in `enter_tethering`).
-- Files imported via the "import existing?" prompt at session start are excluded
-  (`_tether_import_existing`); only a frame detected by the poll counts as the
+### 9.6 Per-session B/W-point reset + prompt (film-lead workflow)
+Every tethering session **clears the global B/W point** on entry and re-samples
+it from the roll's own **film lead** — different rolls/stocks have different base
+colour and density, so a previous roll's point must not carry over. This
+supersedes the original "persist + reuse" choice **for tethering**; the persisted
+point (QSettings) still benefits the normal, non-tethering convert workflow and
+is restored at startup, but `enter_tethering` resets the in-memory point to
+`None` so each session starts uncalibrated.
+
+- `enter_tethering` sets `ccr_backend.black_point_bgr/white_point_bgr = None`.
+  Captures import **unconverted** until the user samples (the banner note says
+  so).
+- After the **first genuinely-new capture** of the session (the film lead),
+  FreeCCR prompts once (`_tether_prompted`, reset per session) to set the roll's
+  B/W point from it. Files imported via the "import existing?" prompt are
+  excluded (`_tether_import_existing`); only a poll-detected frame counts as the
   lead.
-- The dialog explains the Black (clear base) / White (dense area) sampling; if a
-  B/W point is already set it offers "Keep Existing" vs re-sampling for this roll.
-- Choosing "Set Black Point" re-selects the lead frame (in case a later capture
-  stole the selection while the dialog was open) and enters Black-point sampling;
-  the existing sample flow then guides the user to the White point. Once both are
-  set, `persist_bwpoint` → `refresh_tether_banner` clears the note and subsequent
-  captures auto-convert.
-- The modal is opened via `QTimer.singleShot(0, …)` so it never blocks the
-  capture slot (and never hangs a headless test, which doesn't spin the loop).
+- The dialog always offers **Set Black Point** / **Skip** (no "Keep Existing" —
+  the point was just cleared). Choosing Set Black Point re-selects the lead frame
+  (in case a later capture stole the selection while the dialog was open) and
+  enters Black-point sampling; the existing flow then guides the user to the
+  White point. Once both are set, `persist_bwpoint` → `refresh_tether_banner`
+  clears the note and subsequent captures auto-convert.
+- The modal opens via `QTimer.singleShot(0, …)` so it never blocks the capture
+  slot (and never hangs a headless test, which doesn't spin the loop).
 
 ### 9.3 Out-of-scope confirmations (unchanged from §2)
 Direct USB camera control / live view / remote shutter, 30 fps video, in-app
