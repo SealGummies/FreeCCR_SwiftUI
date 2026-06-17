@@ -1341,6 +1341,11 @@ class SlidersPanel(QWidget):
         other = "Black Point" if mode == "white" else "White Point"
         bp_set = ccr_backend.black_point_bgr is not None
         wp_set = ccr_backend.white_point_bgr is not None
+        # Persist the global B/W point so tethering (and the next session) can
+        # reuse it. See spec/camera-tethering.md §4.1.
+        mw = self.parent().parent()
+        if hasattr(mw, "persist_bwpoint"):
+            mw.persist_bwpoint()
         if bp_set and wp_set:
             self.set_temporary_hint(
                 f"{label} sampled! Both points set — click <b>Convert All (B/W Point)</b>.", duration=5000)
