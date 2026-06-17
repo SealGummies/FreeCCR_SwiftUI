@@ -145,6 +145,9 @@ class MainWindow(QMainWindow):
         self._tether_folder = None
         self._tether_count = 0
         self._tether_unavailable = False
+        self._tether_prompted = False          # B/W-point prompt shown this session?
+        self._tether_import_existing = set()   # paths imported at start (no prompt)
+        self._tether_lead_img = None           # the first new capture (film lead)
         self.tether_banner = TetherBanner()
         self.tether_banner.stopRequested.connect(self.stop_tethering)
         self.image_preview.set_tether_banner(self.tether_banner)
@@ -643,6 +646,11 @@ class MainWindow(QMainWindow):
         self._tether_folder = folder
         self._tether_count = 0
         self._tether_unavailable = False
+        self._tether_prompted = False
+        self._tether_lead_img = None
+        # Files imported at session start are not the "film lead" — only a
+        # genuinely-new capture triggers the B/W-point prompt.
+        self._tether_import_existing = {os.path.normpath(p) for p in import_paths}
         self._tether_scanner = FolderScanner(initial_names=existing)
 
         # Long-lived worker on its own event-loop QThread (spec §9.1.7); work is
@@ -728,6 +736,15 @@ class MainWindow(QMainWindow):
                 self._tether_folder_label(), self._tether_count, self._tether_note())
             self.sliders_panel.set_temporary_hint(f"Captured {name}", duration=2500)
             self._schedule_tether_save()
+            # Once per session, after the first genuinely-new capture (the film
+            # lead), prompt the user to set the roll's B/W point from it.
+            if (not self._tether_prompted
+                    and os.path.normpath(img.file_path) not in self._tether_import_existing):
+                self._tether_prompted = True
+                self._tether_lead_img = img
+                # Defer so the modal opens cleanly after this slot returns (and
+                # never blocks/hangs a headless test, which won't spin the loop).
+                QTimer.singleShot(0, self._prompt_bwpoint_for_session)
         else:
             # Late arrival after Stop: persist immediately (the debounced timer
             # is gone) so the photo isn't lost on close.
@@ -845,6 +862,45 @@ class MainWindow(QMainWindow):
         if self._tether_active and not self._tether_unavailable:
             self.image_preview.show_tether_banner(
                 self._tether_folder_label(), self._tether_count, self._tether_note())
+
+    def _prompt_bwpoint_for_session(self):
+        """After the first capture of a session (the film lead), guide the user
+        to set the roll's B/W point from it, then kick off Black-point sampling
+        on that frame."""
+        if not self._tether_active:
+            return
+        has_point = (ccr_backend.black_point_bgr is not None
+                     and ccr_backend.white_point_bgr is not None)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("Set B/W Point for This Roll")
+        text = ("This first frame should be a shot of the <b>film lead</b> — "
+                "showing both the clear film base and a fully-exposed (dense) "
+                "area.<br><br>Set the roll's B/W point from it so the rest of the "
+                "roll converts to positive automatically:<br>"
+                "• <b>Black Point</b> — draw over the clear film base<br>"
+                "• <b>White Point</b> — draw over the dense / exposed area")
+        if has_point:
+            text += ("<br><br>A B/W point from earlier is already set — re-sample "
+                     "it for this roll, or keep the existing one.")
+        box.setText(text)
+        set_btn = box.addButton("Set Black Point", QMessageBox.AcceptRole)
+        box.addButton("Keep Existing" if has_point else "Skip",
+                      QMessageBox.RejectRole)
+        box.setDefaultButton(set_btn)
+        box.exec()
+        if box.clickedButton() is not set_btn:
+            return
+        # Make sure sampling targets the lead frame even if a later capture stole
+        # the selection while the dialog was open.
+        lead = self._tether_lead_img
+        if lead is not None and lead in ccr_backend.images:
+            self.thumbnail_list.thumbnail_list.setCurrentRow(
+                ccr_backend.images.index(lead))
+        self.image_preview.set_bwpoint_mode("black")
+        self.sliders_panel.set_temporary_hint(
+            "<b>Black Point:</b> draw a rectangle over the clear film base, then "
+            "set the White Point on the dense / exposed area.", duration=9000)
 
     def _restore_bwpoint(self):
         """Restore a persisted global B/W point into the backend at startup."""

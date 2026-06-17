@@ -256,3 +256,42 @@ def test_capture_no_template_when_active_image_is_default(tmp_path):
     ccr_backend.file_paths.append(a.file_path)
     w.thumbnail_list.append_image_item(0, select=True)
     assert w._tether_template() is None   # nothing worth inheriting
+
+
+def test_bw_prompt_fires_once_on_first_new_capture(tmp_path):
+    """The B/W-point prompt is flagged after the first genuinely-new capture,
+    not for files imported at session start, and only once per session."""
+    from ui.main_window import MainWindow
+    from core.ccr_image import CCRImage
+    ccr_backend.images.clear()
+    ccr_backend.file_paths.clear()
+    ccr_backend.black_point_bgr = None
+    ccr_backend.white_point_bgr = None
+    ccr_backend.positive_mode = False
+
+    w = MainWindow()
+    w._prompt_bwpoint_for_session = lambda: None   # neutralize the modal
+    w._tether_active = True
+    w._tether_folder = str(tmp_path)
+    w._tether_prompted = False
+
+    def _png(name, seed):
+        p = tmp_path / name
+        cv2.imwrite(str(p), (np.random.RandomState(seed).rand(50, 50, 3) * 255).astype(np.uint8))
+        return CCRImage(str(p))
+
+    # A file imported at session start must NOT trigger the prompt.
+    existing = _png("existing.png", 1)
+    w._tether_import_existing = {os.path.normpath(existing.file_path)}
+    w._on_capture(existing)
+    assert w._tether_prompted is False
+
+    # The first genuinely-new capture flags the prompt.
+    w._on_capture(_png("new1.png", 2))
+    assert w._tether_prompted is True
+
+    # A second new capture does not re-flag (single prompt per session).
+    w._on_capture(_png("new2.png", 3))
+    assert w._tether_prompted is True
+
+    w.stop_tethering()
