@@ -727,6 +727,11 @@ class ImagePreview(QWidget):
 
         self.setLayout(self.layout)
 
+        # Tethering status strip (watch-folder mode). Inserted into THIS widget's
+        # own layout so ImagePreview's parent() chain to MainWindow is unchanged
+        # (see spec/camera-tethering.md §9.1.5). None until MainWindow installs it.
+        self._tether_banner = None
+
         # State
         self.current_pixmap = None
         self.current_idx = None
@@ -867,6 +872,25 @@ class ImagePreview(QWidget):
         elif self.area_mode:
             # Esc leaves area editing: deselect back to the Whole Image layer.
             self._select_whole_image_layer()
+
+    # --- Tethering banner (watch-folder mode) ----------------------------
+    def set_tether_banner(self, banner):
+        """Install the watch-folder status strip at the top of this widget's
+        own layout (above the toolbar). Reparents the banner into ImagePreview;
+        ImagePreview's own parent is untouched."""
+        self._tether_banner = banner
+        self.layout.insertWidget(0, banner)
+        banner.setVisible(False)
+
+    def show_tether_banner(self, folder, count, note=""):
+        if self._tether_banner is None:
+            return
+        self._tether_banner.set_status(folder, count, note)
+        self._tether_banner.setVisible(True)
+
+    def hide_tether_banner(self):
+        if self._tether_banner is not None:
+            self._tether_banner.setVisible(False)
 
     def update_preview(self, idx):
         ''' Update the UI image based on the backend, using the index from the thumbnail list. '''

@@ -1,12 +1,17 @@
 from PySide6.QtWidgets import QApplication, QMainWindow, QHBoxLayout, QWidget, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel, QLineEdit
 from PySide6.QtGui import QIcon, QShortcut, QKeySequence
-from PySide6.QtCore import Qt, QEvent, QThread, Signal, QObject, QSettings, QTimer
+from PySide6.QtCore import (Qt, QEvent, QThread, Signal, QObject, QSettings,
+                            QTimer, QMetaObject, Q_ARG)
 from widgets.thumbnail_list import ThumbnailList
 from widgets.image_preview import ImagePreview
 from widgets.sliders_panel import SlidersPanel
+from widgets.tether_banner import TetherBanner
 from core.ccr_backend import ccr_backend
+from core.tether_watcher import (TetherWatchWorker, FolderScanner, is_supported,
+                                 encode_bwpoint, decode_bwpoint)
 import ctypes
 from version import VERSION  # Make sure version.py is in your src folder
+import copy
 import html
 import os
 import sys
@@ -127,6 +132,26 @@ class MainWindow(QMainWindow):
         self.sliders_panel.set_sliders_enabled(False)
         self.sliders_panel.image_preview = self.image_preview
 
+        # Tethering (watch-folder capture) state + status banner. The banner is
+        # installed INTO image_preview's own layout (not wrapped around it) so
+        # ImagePreview's parent().parent() chains stay valid — see
+        # spec/camera-tethering.md §9.1.5.
+        self._tether_active = False
+        self._tether_thread = None
+        self._tether_worker = None
+        self._tether_timer = None
+        self._tether_save_timer = None
+        self._tether_scanner = None
+        self._tether_folder = None
+        self._tether_count = 0
+        self._tether_unavailable = False
+        self._tether_prompted = False          # B/W-point prompt shown this session?
+        self._tether_import_existing = set()   # paths imported at start (no prompt)
+        self._tether_lead_img = None           # the first new capture (film lead)
+        self.tether_banner = TetherBanner()
+        self.tether_banner.stopRequested.connect(self.stop_tethering)
+        self.image_preview.set_tether_banner(self.tether_banner)
+
         self.layout.addWidget(self.thumbnail_list, 0)
         self.layout.addWidget(self.image_preview, 3)
         self.layout.addWidget(self.sliders_panel, 0)
@@ -142,6 +167,10 @@ class MainWindow(QMainWindow):
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
+
+        # Restore a persisted global B/W point (set in a prior session) so
+        # tethering can auto-convert captures right away. Before any image loads.
+        self._restore_bwpoint()
 
         self.installEventFilter(self)
         self.create_menu()
@@ -202,6 +231,10 @@ class MainWindow(QMainWindow):
             QMessageBox.No
         )
         if reply == QMessageBox.Yes:
+            # Stop any active tethering session (poller + worker thread) cleanly
+            # before persisting, so no capture is mid-write into a locked catalog.
+            if self._tether_active:
+                self.stop_tethering()
             # Persist the edit catalog so reopening these files restores
             # their conversion/slices/crop/adjustments.
             ccr_backend.save_catalog()
@@ -252,6 +285,9 @@ class MainWindow(QMainWindow):
 
         open_folder_action = file_menu.addAction("Open Folder")
         open_folder_action.triggered.connect(self.open_folder)
+
+        self.tether_action = file_menu.addAction("Tethering…")
+        self.tether_action.triggered.connect(self.toggle_tethering)
 
         file_menu.addSeparator()
         export_action = file_menu.addAction("Export…")
@@ -539,6 +575,343 @@ class MainWindow(QMainWindow):
             self._loader_thread.finished.connect(self._cleanup_loader)
             self._loader_worker.finished.connect(self.thumbnail_list.load_thumbnails)
             self._loader_thread.start()
+
+    # --- Tethering (watch-folder capture) ---------------------------------
+    def toggle_tethering(self):
+        if self._tether_active:
+            self.stop_tethering()
+        else:
+            self.enter_tethering()
+
+    def _tether_folder_label(self):
+        if not self._tether_folder:
+            return ""
+        return (os.path.basename(self._tether_folder.rstrip("/\\"))
+                or self._tether_folder)
+
+    def _tether_note(self):
+        """Banner sub-text reflecting how captures will be handled."""
+        if ccr_backend.positive_mode:
+            return "Positive mode — captures import as positives."
+        if ccr_backend.black_point_bgr is None or ccr_backend.white_point_bgr is None:
+            return ("No B/W point set — captures import unconverted. "
+                    "Set Black & White points to auto-convert.")
+        return ""
+
+    def enter_tethering(self):
+        if self._tether_active:
+            return
+        # The batch is about to grow — persist current edits first (like the
+        # open flows) so nothing is lost if the session is interrupted.
+        ccr_backend.save_catalog()
+        start_dir = self._settings.value("files/last_tether_dir", "", type=str)
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Folder to Watch for Captures", start_dir)
+        if not folder:
+            return
+        normalized = normalize_unicode_path(folder)
+        if not validate_unicode_path(normalized):
+            QMessageBox.warning(
+                self, "Unicode Path Warning",
+                f"The selected folder path contains characters that may cause "
+                f"issues:\n\n{folder}\n\nPlease choose a folder with a simpler "
+                f"path name.")
+            return
+        self._settings.setValue("files/last_tether_dir", folder)
+        folder = os.path.normpath(normalized)
+
+        # Snapshot the folder's current supported files. They are seeded into the
+        # scanner (so the poller never re-imports them); optionally import them now.
+        try:
+            existing = [e.name for e in os.scandir(folder)
+                        if e.is_file() and is_supported(e.name)]
+        except OSError as e:
+            QMessageBox.warning(self, "Tethering Error",
+                                f"Could not read the folder:\n\n{e}")
+            return
+        import_paths = []
+        if existing:
+            resp = QMessageBox.question(
+                self, "Import Existing Files?",
+                f"This folder already contains {len(existing)} supported "
+                f"image(s).\n\nImport them too?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if resp == QMessageBox.Yes:
+                import_paths = [os.path.join(folder, n) for n in existing]
+                try:
+                    import_paths.sort(key=os.path.getmtime)  # oldest first
+                except OSError:
+                    pass
+
+        self._tether_folder = folder
+        self._tether_count = 0
+        self._tether_unavailable = False
+        self._tether_prompted = False
+        self._tether_lead_img = None
+        # Files imported at session start are not the "film lead" — only a
+        # genuinely-new capture triggers the B/W-point prompt.
+        self._tether_import_existing = {os.path.normpath(p) for p in import_paths}
+        self._tether_scanner = FolderScanner(initial_names=existing)
+        # Each session starts fresh: clear the global B/W point so the user
+        # re-samples it from THIS roll's film lead (the first frame). Different
+        # rolls/stocks have different base colour + density, so a previous
+        # roll's point must not carry over.
+        ccr_backend.black_point_bgr = None
+        ccr_backend.white_point_bgr = None
+
+        # Long-lived worker on its own event-loop QThread (spec §9.1.7); work is
+        # delivered by QMetaObject.invokeMethod (queued) so it runs off-GUI.
+        self._tether_thread = QThread()
+        self._tether_worker = TetherWatchWorker()
+        self._tether_worker.moveToThread(self._tether_thread)
+        self._tether_worker.captured.connect(self._on_capture)
+        self._tether_worker.captureError.connect(self._on_capture_error)
+        self._tether_thread.start()
+
+        self._tether_active = True
+        self.tether_action.setText("Stop Tethering")
+        self.image_preview.show_tether_banner(
+            self._tether_folder_label(), self._tether_count, self._tether_note())
+
+        self._tether_timer = QTimer(self)
+        self._tether_timer.setInterval(1000)
+        self._tether_timer.timeout.connect(self._poll_tether_folder)
+        self._tether_timer.start()
+
+        for p in import_paths:
+            self._dispatch_to_worker(p)
+
+        self.sliders_panel.set_temporary_hint(
+            f"Tethering — watching “{self._tether_folder_label()}”. "
+            f"Captures appear here automatically.", duration=5000)
+
+    def _dispatch_to_worker(self, path):
+        if self._tether_worker is None:
+            return
+        QMetaObject.invokeMethod(self._tether_worker, "process",
+                                 Qt.QueuedConnection, Q_ARG(str, path))
+
+    def _poll_tether_folder(self):
+        if not self._tether_active or not self._tether_folder:
+            return
+        entries = []
+        try:
+            for e in os.scandir(self._tether_folder):
+                try:
+                    if e.is_file():
+                        entries.append((e.name, e.stat().st_size))
+                except OSError:
+                    continue
+        except OSError:
+            if not self._tether_unavailable:
+                self._tether_unavailable = True
+                self.image_preview.show_tether_banner(
+                    self._tether_folder_label(), self._tether_count,
+                    "folder unavailable — reconnect to resume")
+            return
+        if self._tether_unavailable:
+            # Folder is back — clear the stale "unavailable" note.
+            self._tether_unavailable = False
+            self.image_preview.show_tether_banner(
+                self._tether_folder_label(), self._tether_count, self._tether_note())
+        for name in self._tether_scanner.feed(entries):
+            self._dispatch_to_worker(os.path.join(self._tether_folder, name))
+
+    def _on_capture(self, img):
+        # Inherit the editable "look" (adjustments, orientation, crop) of the
+        # image active just before this capture, so a rotate/brightness/etc. set
+        # on one frame auto-applies to the next imported frame — a fixed
+        # copy-stand rig wants identical treatment per frame. Snapshot BEFORE
+        # appending the new image (current_idx still points at the prior one).
+        template = self._tether_template()
+        # Always keep the capture — even one that arrives just after Stop (the
+        # worker had already decoded it). Dropping it would lose a real photo.
+        ccr_backend.images.append(img)
+        ccr_backend.file_paths.append(img.file_path)
+        idx = len(ccr_backend.images) - 1
+        if template is not None:
+            self._apply_tether_template(img, template)
+            # Re-bake preview/thumbnail so inherited adjustments are reflected
+            # (rotation/flips/crop are applied by update_preview on selection).
+            img.update_thumbnail_and_preview()
+        self.thumbnail_list.append_image_item(idx, select=True)
+        name = getattr(img, "display_name", None) or os.path.basename(img.file_path)
+        if self._tether_active:
+            self._tether_count += 1
+            self.image_preview.show_tether_banner(
+                self._tether_folder_label(), self._tether_count, self._tether_note())
+            self.sliders_panel.set_temporary_hint(f"Captured {name}", duration=2500)
+            self._schedule_tether_save()
+            # Once per session, after the first genuinely-new capture (the film
+            # lead), prompt the user to set the roll's B/W point from it.
+            if (not self._tether_prompted
+                    and os.path.normpath(img.file_path) not in self._tether_import_existing):
+                self._tether_prompted = True
+                self._tether_lead_img = img
+                # Defer so the modal opens cleanly after this slot returns (and
+                # never blocks/hangs a headless test, which won't spin the loop).
+                QTimer.singleShot(0, self._prompt_bwpoint_for_session)
+        else:
+            # Late arrival after Stop: persist immediately (the debounced timer
+            # is gone) so the photo isn't lost on close.
+            ccr_backend.save_catalog()
+
+    def _tether_template(self):
+        """Snapshot the editable look of the currently displayed image so the
+        next capture can inherit it. Returns None when there is no current image
+        or its look is entirely default (so no wasted re-render)."""
+        idx = self.image_preview.current_idx
+        if idx is None:
+            return None
+        src = ccr_backend.get_image_by_index(idx)
+        if src is None:
+            return None
+        adj = getattr(src, "adjustment_settings", None) or {}
+        areas = getattr(src, "area_layers", None) or []
+        rot = getattr(src, "rotation_angle", 0)
+        fine = getattr(src, "fine_rotation_angle", 0)
+        hflip = getattr(src, "horizontal_mirrored", False)
+        vflip = getattr(src, "vertical_mirrored", False)
+        crop = getattr(src, "crop_rect", None)
+        crop_angle = getattr(src, "crop_angle", 0.0) or 0.0
+        profile = getattr(src, "color_profile", "color")
+        if not (adj or areas or rot or fine or hflip or vflip
+                or crop is not None or crop_angle or profile != "color"):
+            return None
+        return {
+            "adjustment_settings": copy.deepcopy(adj),
+            "area_layers": copy.deepcopy(areas),
+            "rotation_angle": rot,
+            "fine_rotation_angle": fine,
+            "horizontal_mirrored": hflip,
+            "vertical_mirrored": vflip,
+            "crop_rect": crop,
+            "crop_angle": crop_angle,
+            "color_profile": profile,
+        }
+
+    @staticmethod
+    def _apply_tether_template(img, t):
+        """Apply an inherited look template to a freshly captured image. The
+        template already holds isolated deep copies, so direct assignment is
+        safe (each capture builds its own template)."""
+        img.adjustment_settings = t["adjustment_settings"]
+        img.area_layers = t["area_layers"]
+        img.rotation_angle = t["rotation_angle"]
+        img.fine_rotation_angle = t["fine_rotation_angle"]
+        img.horizontal_mirrored = t["horizontal_mirrored"]
+        img.vertical_mirrored = t["vertical_mirrored"]
+        img.crop_rect = t["crop_rect"]
+        img.crop_angle = t["crop_angle"]
+        img.color_profile = t["color_profile"]
+
+    def _on_capture_error(self, path, msg):
+        self.sliders_panel.set_temporary_hint(
+            f"Skipped {os.path.basename(path)}: {msg}", duration=4000)
+
+    def _schedule_tether_save(self):
+        """Coalesce catalog saves during capture bursts (spec §9.1.6)."""
+        if self._tether_save_timer is None:
+            self._tether_save_timer = QTimer(self)
+            self._tether_save_timer.setSingleShot(True)
+            self._tether_save_timer.timeout.connect(ccr_backend.save_catalog)
+        self._tether_save_timer.start(3000)
+
+    def stop_tethering(self):
+        if not self._tether_active:
+            return
+        self._tether_active = False
+        if self._tether_timer is not None:
+            self._tether_timer.stop()
+            self._tether_timer = None
+        if self._tether_save_timer is not None:
+            self._tether_save_timer.stop()
+            self._tether_save_timer = None
+        self._stop_tether_worker()
+        self.image_preview.hide_tether_banner()
+        self.tether_action.setText("Tethering…")
+        ccr_backend.save_catalog()
+        self.sliders_panel.set_temporary_hint("Tethering stopped.", duration=3000)
+
+    def _stop_tether_worker(self):
+        """Cancel + join the worker thread (mirrors _stop_loader_if_running)."""
+        if getattr(self, "_tether_thread", None) is not None:
+            try:
+                if self._tether_worker is not None:
+                    self._tether_worker.cancel()
+                if self._tether_thread.isRunning():
+                    self._tether_thread.quit()
+                    self._tether_thread.wait(3000)
+            except RuntimeError:
+                pass
+            # Just drop the Python refs (mirrors _stop_loader_if_running). The
+            # thread's event loop has exited, so a deleteLater() here would never
+            # be processed; GC of the wrapper releases the C++ object.
+            self._tether_thread = None
+            self._tether_worker = None
+
+    def persist_bwpoint(self):
+        """Write the current global B/W point to QSettings (spec §4.1) and, if a
+        tethering session is live, refresh the banner so its note reflects the
+        new B/W state immediately (e.g. drops the 'unconverted' warning)."""
+        bp = encode_bwpoint(ccr_backend.black_point_bgr)
+        wp = encode_bwpoint(ccr_backend.white_point_bgr)
+        if bp is not None:
+            self._settings.setValue("convert/black_point_bgr", bp)
+        if wp is not None:
+            self._settings.setValue("convert/white_point_bgr", wp)
+        self.refresh_tether_banner()
+
+    def refresh_tether_banner(self):
+        """Re-render the banner note from current state (B/W point / Positive
+        mode). No-op when not tethering or the folder is unavailable."""
+        if self._tether_active and not self._tether_unavailable:
+            self.image_preview.show_tether_banner(
+                self._tether_folder_label(), self._tether_count, self._tether_note())
+
+    def _prompt_bwpoint_for_session(self):
+        """After the first capture of a session (the film lead), guide the user
+        to set the roll's B/W point from it, then kick off Black-point sampling
+        on that frame."""
+        if not self._tether_active:
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("Set B/W Point for This Roll")
+        box.setText(
+            "This first frame should be a shot of the <b>film lead</b> — showing "
+            "both the clear film base and a fully-exposed (dense) area.<br><br>"
+            "Set this roll's B/W point from it so the rest of the roll converts "
+            "to positive automatically:<br>"
+            "• <b>Black Point</b> — draw over the clear film base<br>"
+            "• <b>White Point</b> — draw over the dense / exposed area")
+        set_btn = box.addButton("Set Black Point", QMessageBox.AcceptRole)
+        box.addButton("Skip", QMessageBox.RejectRole)
+        box.setDefaultButton(set_btn)
+        box.exec()
+        if box.clickedButton() is not set_btn:
+            return
+        # Make sure sampling targets the lead frame even if a later capture stole
+        # the selection while the dialog was open.
+        lead = self._tether_lead_img
+        if lead is not None and lead in ccr_backend.images:
+            self.thumbnail_list.thumbnail_list.setCurrentRow(
+                ccr_backend.images.index(lead))
+        self.image_preview.set_bwpoint_mode("black")
+        self.sliders_panel.set_temporary_hint(
+            "<b>Black Point:</b> draw a rectangle over the clear film base, then "
+            "set the White Point on the dense / exposed area.", duration=9000)
+
+    def _restore_bwpoint(self):
+        """Restore a persisted global B/W point into the backend at startup."""
+        bp = decode_bwpoint(
+            self._settings.value("convert/black_point_bgr", "", type=str))
+        wp = decode_bwpoint(
+            self._settings.value("convert/white_point_bgr", "", type=str))
+        if bp is not None:
+            ccr_backend.set_black_point(bp)
+        if wp is not None:
+            ccr_backend.set_white_point(wp)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Up, Qt.Key_Down):

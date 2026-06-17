@@ -104,6 +104,11 @@ class ThumbnailList(QWidget):
 
         self.thumbnail_list = QListWidget()
         self.thumbnail_list.setViewMode(QListWidget.IconMode)
+        # Set the icon size up front so incrementally-appended items (e.g.
+        # tether captures added via append_image_item, before any full
+        # load_thumbnails rebuild has run) show at full size, not Qt's tiny
+        # default. load_thumbnails also sets this, harmlessly.
+        self.thumbnail_list.setIconSize(QSize(156, 156))
         self.thumbnail_list.setSpacing(10)
         self.thumbnail_list.setDragDropMode(QListWidget.NoDragDrop)
         self.thumbnail_list.setResizeMode(QListWidget.Adjust)
@@ -220,6 +225,34 @@ class ThumbnailList(QWidget):
     def update_all_thumbnails(self):
         for idx in range(ccr_backend.get_image_count()):
             self.update_thumbnail(idx)
+
+    def append_image_item(self, idx, select=True):
+        """Append a single thumbnail item for a newly added backend image
+        (e.g. a tether capture) without rebuilding the whole list. When select
+        is True, selecting the item drives update_preview/set_current_idx via
+        on_current_item_changed (so the capture shows big on the canvas).
+        Returns True if the item was appended; False if skipped (a rebuild is
+        in flight, or the index is no longer valid — the next full rebuild will
+        include the image either way)."""
+        if getattr(self, "_rebuilding", False):
+            return False
+        img_obj = ccr_backend.get_image_by_index(idx)
+        if img_obj is None:
+            logging.warning(f"append_image_item: no backend image at index {idx}")
+            return False
+        filename = (getattr(img_obj, "display_name", None)
+                    or os.path.basename(img_obj.file_path))
+        item = QListWidgetItem(filename)
+        thumbnail = ccr_backend.get_thumbnail_by_index(idx)
+        if thumbnail is not None:
+            item.setIcon(QIcon(self.apply_frontend_transformations(thumbnail, idx)))
+        item.setData(Qt.UserRole, idx)
+        self.thumbnail_list.addItem(item)
+        self.count_label.setText(
+            f"Total: {ccr_backend.get_image_count()} image(s)")
+        if select:
+            self.thumbnail_list.setCurrentRow(self.thumbnail_list.count() - 1)
+        return True
         
     def on_thumbnail_clicked(self, item):
         idx = item.data(Qt.UserRole)
