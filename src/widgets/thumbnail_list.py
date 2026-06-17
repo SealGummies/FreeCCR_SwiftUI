@@ -104,6 +104,11 @@ class ThumbnailList(QWidget):
 
         self.thumbnail_list = QListWidget()
         self.thumbnail_list.setViewMode(QListWidget.IconMode)
+        # Set the icon size up front so incrementally-appended items (e.g.
+        # tether captures added via append_image_item, before any full
+        # load_thumbnails rebuild has run) show at full size, not Qt's tiny
+        # default. load_thumbnails also sets this, harmlessly.
+        self.thumbnail_list.setIconSize(QSize(156, 156))
         self.thumbnail_list.setSpacing(10)
         self.thumbnail_list.setDragDropMode(QListWidget.NoDragDrop)
         self.thumbnail_list.setResizeMode(QListWidget.Adjust)
