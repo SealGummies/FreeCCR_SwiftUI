@@ -439,3 +439,48 @@ Manual:
    are not lost when the active profile changes.
 6. **Both IT8.7/1 and IT8.7/2 accepted** (identical layout); chart type shown for
    confirmation only.
+
+## 11. Refinement (v2) — CxF references, mirroring, non-classic grids
+
+Driven by a real user target (LaserSoft **ISO 12641-2 "advanced"** transmissive
+film target, 864 patches, batch reference in **CxF**).
+
+### 11.1 CxF reference files (`parse_cxf_reference`)
+- `parse_reference(path)` dispatches by content: XML / `.cxf` → CxF, else CGATS.
+- CxF3 (ISO 17972) is XML. The parser is **namespace-tolerant** (default *or*
+  `cc:` namespace — strip to local names) and **spelling-tolerant**: LaserSoft
+  uses British `Colour*` (e.g. `ColourValues`, `ColourCIELab`, `ColourIEXYZ`,
+  `ColourSpecification`); X-Rite uses American `Color*`. Values are matched by
+  **child structure** (`L/A/B` ⇒ Lab, `X/Y/Z` ⇒ XYZ), not by tag name, so the
+  spelling variance is irrelevant.
+- Each value's `Colo[u]rSpecification` IDREF resolves against
+  `ColorSpecificationCollection`; the D50/2° value is preferred. XYZ are Y≈100.
+- Patch id = `Object/@Name`. `ObjectType` substrate/colorant/trick/measurements
+  are skipped.
+
+### 11.2 Mirrored capture
+A back-lit film target shot through its base is left-right **mirrored**. The
+locator gains a **"Mirrored capture"** checkbox that `np.fliplr`s the working
+image (display + sampling); patch geometry then maps normally. Distinct from
+**Flip 180°** (rotation), which a mirror cannot be corrected by.
+
+### 11.3 Non-classic (plain-grid) targets — block mode
+Targets that aren't the classic 12×22-colour-block-plus-GS-strip layout (e.g.
+the ISO 12641-2 advanced grid, a regular 12×72 with grays as in-grid rows) use
+**block mode**: a regular `rows × cols` grid the user delimits by the **top-left
+and bottom-right patch ids** of the block in frame (e.g. `A49`/`L72` for one
+photographed panel). `parse_block` derives the row letters + column numbers;
+`block_sample_points` lays the grid on the 4-corner quad. The dialog selects
+block vs classic by whether the reference has a `GS0` patch.
+
+### 11.4 ID-agnostic, auto-neutral fit
+`fit_camera_matrix` no longer assumes the classic id set or a `GS0` white patch.
+It fits over whatever ids are sampled-and-in-reference, and `_pick_wb_id`
+auto-selects the **lightest low-chroma (near-neutral) patch** from the reference
+— working for the classic GS strip *and* in-grid grays. Sampling-window size
+scales to the grid density (`ncols`/`nrows`).
+
+### 11.5 Validated on real data
+The full path (CxF parse → un-mirror → 12×24 block A49–L72 → auto-neutral fit)
+on the user's LaserSoft shot yields **avg ΔE2000 ≈ 1.8** (232 of 288 patches;
+dark patches clipped at the low end were rejected).

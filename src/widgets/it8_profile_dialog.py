@@ -8,6 +8,7 @@ Core math lives in core.it8_profile; this module is UI only.
 See spec/it8-camera-profile.md.
 """
 import os
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -58,22 +59,60 @@ class IT8PatchLocator(QWidget):
         self.setMinimumSize(520, 360)
         self.setMouseTracking(True)
         self._qimg: Optional[QImage] = None
+        self._base = None                 # decoded array as given
+        self._work = None                 # working array (mirrored if requested)
+        self._mirror = False
         self._iw = self._ih = 0
         self._quad = []                   # 4 (x,y) array-space corners TL,TR,BR,BL
         self._gray_offset = 0.0
+        self._mode = "classic"            # "classic" (12x22 + GS strip) | "block"
+        self._rows = []                   # block mode: row letters
+        self._cols = []                   # block mode: column numbers
         self._drag = -1                   # index of handle being dragged, or -1
         self._scale = 1.0
         self._ox = self._oy = 0.0
 
     def set_image(self, arr_u16: np.ndarray):
-        self._qimg = _gamma_stretch_to_qimage(arr_u16)
-        self._ih, self._iw = arr_u16.shape[:2]
-        # Default colour-block quad inset from the image edges.
+        self._base = arr_u16
+        self._rebuild_work()
+
+    def _rebuild_work(self):
+        if self._base is None:
+            return
+        self._work = (np.ascontiguousarray(np.fliplr(self._base))
+                      if self._mirror else self._base)
+        self._qimg = _gamma_stretch_to_qimage(self._work)
+        self._ih, self._iw = self._work.shape[:2]
+        # Default block quad inset from the image edges (re-derived on reload).
         ix, iy = self._iw, self._ih
-        self._quad = [(0.10 * ix, 0.10 * iy), (0.90 * ix, 0.10 * iy),
-                      (0.90 * ix, 0.82 * iy), (0.10 * ix, 0.82 * iy)]
+        self._quad = [(0.12 * ix, 0.16 * iy), (0.88 * ix, 0.16 * iy),
+                      (0.88 * ix, 0.78 * iy), (0.12 * ix, 0.78 * iy)]
         self.update()
         self.changed.emit()
+
+    # --- configuration ---
+    def set_mirror(self, on: bool):
+        if bool(on) != self._mirror:
+            self._mirror = bool(on)
+            self._rebuild_work()
+
+    def set_layout_classic(self):
+        self._mode = "classic"
+        self.update(); self.changed.emit()
+
+    def set_layout_block(self, rows, cols):
+        self._mode = "block"
+        self._rows, self._cols = list(rows), list(cols)
+        self.update(); self.changed.emit()
+
+    def image_array(self):
+        return self._work
+
+    def grid_dims(self):
+        """(ncols, nrows) for sampling-window sizing."""
+        if self._mode == "block":
+            return max(1, len(self._cols)), max(1, len(self._rows))
+        return 22, 12
 
     # --- geometry accessors ---
     def quad(self):
@@ -96,6 +135,10 @@ class IT8PatchLocator(QWidget):
     def points(self):
         if not self._quad:
             return {}
+        if self._mode == "block":
+            if not self._rows or not self._cols:
+                return {}
+            return it8.block_sample_points(self._quad, self._rows, self._cols)
         return it8.grid_sample_points(self._quad, self._gray_offset)
 
     # --- coordinate mapping (array <-> widget) ---
@@ -205,6 +248,7 @@ class IT8ProfileDialog(QDialog):
         self._ref: Optional[it8.IT8Reference] = None
         self._fit: Optional[it8.CameraFit] = None
         self._locator_arr = None           # array currently loaded in the locator
+        self._mode = "classic"             # "classic" (GS strip) | "block" (plain grid)
         self.saved_path: Optional[str] = None
         self.apply_now = False
 
@@ -274,8 +318,9 @@ class IT8ProfileDialog(QDialog):
         lay.addWidget(QLabel("<b>Step 2 — Batch reference file</b>"))
         guide = QLabel(
             "Load the reference data file that matches your chart's printed "
-            "<b>batch/serial number</b>. Each IT8 chart batch is measured "
-            "separately — the wrong file gives wrong colour.<br>"
+            "<b>batch/serial number</b>. Each chart batch is measured "
+            "separately — the wrong file gives wrong colour. Both <b>CGATS</b> "
+            "(.it8/.txt) and <b>CxF</b> (.cxf) reference files are accepted.<br>"
             f"Wolf Faust provides free per-batch files: <a href='{_REF_URL}'>"
             f"{_REF_URL}</a>")
         guide.setWordWrap(True)
@@ -296,23 +341,36 @@ class IT8ProfileDialog(QDialog):
     def _build_locate_page(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.addWidget(QLabel(
+        self.locate_hint = QLabel(
             "<b>Step 3 — Locate the patches</b> — drag the four green corners "
-            "onto the outer corners of the 12×22 colour grid. Yellow dots are "
-            "colour patches, blue dots the grayscale strip."))
+            "onto the outer corners of the patch grid. Dots mark where each "
+            "patch is sampled; nudge the corners until every dot sits inside "
+            "its patch.")
+        self.locate_hint.setWordWrap(True)
+        lay.addWidget(self.locate_hint)
         self.locator = IT8PatchLocator()
         self.locator.changed.connect(self._update_locate_status)
         lay.addWidget(self.locator, 1)
+
+        # Row 1: orientation controls.
         ctl = QHBoxLayout()
         flip = QPushButton("Flip 180°")
         flip.clicked.connect(self.locator.flip)
         ctl.addWidget(flip)
-        ctl.addWidget(QLabel("Gray strip:"))
+        self.mirror_check = QCheckBox("Mirrored capture")
+        self.mirror_check.setToolTip(
+            "Tick if the shot is left-right mirrored (e.g. a back-lit film "
+            "target shot through its base). The image is flipped horizontally.")
+        self.mirror_check.toggled.connect(self._on_mirror_toggled)
+        ctl.addWidget(self.mirror_check)
+        # Gray-strip nudge (classic IT8 only).
+        self.gray_label = QLabel("Gray strip:")
+        ctl.addWidget(self.gray_label)
         self.gray_slider = QSlider(Qt.Horizontal)
         self.gray_slider.setMinimum(-100)
         self.gray_slider.setMaximum(100)
         self.gray_slider.setValue(0)
-        self.gray_slider.setFixedWidth(160)
+        self.gray_slider.setFixedWidth(140)
         self.gray_slider.valueChanged.connect(
             lambda v: self.locator.set_gray_offset(v / 1000.0))
         ctl.addWidget(self.gray_slider)
@@ -320,7 +378,38 @@ class IT8ProfileDialog(QDialog):
         self.locate_status = QLabel("")
         ctl.addWidget(self.locate_status)
         lay.addLayout(ctl)
+
+        # Row 2: block patch-id range (non-classic grids only).
+        self.block_row = QWidget()
+        brow = QHBoxLayout(self.block_row)
+        brow.setContentsMargins(0, 0, 0, 0)
+        brow.addWidget(QLabel("Top-left patch:"))
+        self.tl_edit = QLineEdit()
+        self.tl_edit.setFixedWidth(70)
+        self.tl_edit.editingFinished.connect(self._apply_block_ids)
+        brow.addWidget(self.tl_edit)
+        brow.addWidget(QLabel("Bottom-right patch:"))
+        self.br_edit = QLineEdit()
+        self.br_edit.setFixedWidth(70)
+        self.br_edit.editingFinished.connect(self._apply_block_ids)
+        brow.addWidget(self.br_edit)
+        brow.addWidget(QLabel("(read the corner patch labels off the chart)"))
+        brow.addStretch(1)
+        lay.addWidget(self.block_row)
+        self.block_row.setVisible(False)
         return w
+
+    def _on_mirror_toggled(self, on):
+        self.locator.set_mirror(bool(on))
+
+    def _apply_block_ids(self):
+        if self._mode != "block":
+            return
+        try:
+            rows, cols = it8.parse_block(self.tl_edit.text(), self.br_edit.text())
+        except ValueError:
+            return
+        self.locator.set_layout_block(rows, cols)
 
     def _build_build_page(self):
         w = QWidget()
@@ -425,12 +514,13 @@ class IT8ProfileDialog(QDialog):
         start = self._settings.value("files/last_it8_ref_dir", "", type=str)
         path, _ = QFileDialog.getOpenFileName(
             self, "Select IT8 reference file", start,
-            "IT8 reference (*.it8 *.txt *.cie);;All Files (*)")
+            "Reference files (*.it8 *.txt *.cie *.cxf);;CxF (*.cxf);;"
+            "CGATS (*.it8 *.txt *.cie);;All Files (*)")
         if not path:
             return
         self._settings.setValue("files/last_it8_ref_dir", os.path.dirname(path))
         try:
-            ref = it8.parse_it8_reference(path)
+            ref = it8.parse_reference(path)
         except it8.IT8ReferenceError as e:
             QMessageBox.warning(self, "Reference File", str(e))
             return
@@ -439,32 +529,53 @@ class IT8ProfileDialog(QDialog):
                                 f"Could not read the reference file:\n\n{e}")
             return
         self._ref = ref
-        n = len(ref.matched_ids)
+        # Classic IT8 has a GS0..GS23 strip; anything else is a plain grid that
+        # the user delimits with corner patch ids (block mode).
+        self._mode = "classic" if "GS0" in ref.patches else "block"
+        n = len(ref.matched_ids if self._mode == "classic" else ref.patches)
+        extent = self._ref_extent()
+        extent_txt = (f"<br>Patch ids: <b>{extent[0]}</b> … <b>{extent[1]}</b>"
+                      if self._mode == "block" and extent else "")
         self.ref_label.setText(
             f"Loaded: <b>{os.path.basename(path)}</b><br>"
             f"Chart type: {ref.chart_type or 'unknown'}<br>"
             f"Batch / serial: <b>{ref.batch or 'unknown'}</b> — confirm this "
             f"matches the number printed on your chart.<br>"
-            f"Patches recognised: {n}")
+            f"Patches recognised: {n}{extent_txt}")
         self._update_nav()
+
+    def _ref_extent(self):
+        """(top-left, bottom-right) patch ids spanning the reference's letter+
+        number grid, e.g. ('A1','L72'). None if no such ids."""
+        rows, cols = set(), set()
+        for sid in self._ref.patches:
+            m = re.match(r'^([A-Za-z])(\d+)$', sid)
+            if m:
+                rows.add(m.group(1).upper())
+                cols.add(int(m.group(2)))
+        if not rows or not cols:
+            return None
+        return (f"{min(rows)}{min(cols)}", f"{max(rows)}{max(cols)}")
 
     # ------------------------------------------------------------------ #
     # Page 3 — locate
     # ------------------------------------------------------------------ #
     def _update_locate_status(self):
-        if self._target_img is None or self._ref is None:
+        img = self.locator.image_array()
+        if img is None or self._ref is None:
             return
         pts = self.locator.points()
-        samples = it8.sample_patches(self._target_img, pts, self.locator.quad())
-        valid = sum(1 for sid in self._ref.matched_ids
-                    if sid in samples and samples[sid].valid)
-        total = len(self._ref.matched_ids)
+        nc, nr = self.locator.grid_dims()
+        samples = it8.sample_patches(img, pts, self.locator.quad(),
+                                     ncols=nc, nrows=nr)
+        in_ref = [sid for sid in samples if sid in self._ref.patches]
+        valid = sum(1 for sid in in_ref if samples[sid].valid)
         warn = ""
         if ("GS0" in samples and "GS23" in samples
                 and samples["GS0"].valid and samples["GS23"].valid):
             if samples["GS0"].rgb.mean() < samples["GS23"].rgb.mean():
                 warn = "  ⚠ GS0 darker than GS23 — try Flip 180°"
-        self.locate_status.setText(f"Valid patches: {valid}/{total}{warn}")
+        self.locate_status.setText(f"Valid patches: {valid}/{len(in_ref)}{warn}")
 
     # ------------------------------------------------------------------ #
     # Page 4 — build
@@ -474,7 +585,9 @@ class IT8ProfileDialog(QDialog):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             pts = self.locator.points()
-            samples = it8.sample_patches(self._target_img, pts, self.locator.quad())
+            nc, nr = self.locator.grid_dims()
+            samples = it8.sample_patches(self.locator.image_array(), pts,
+                                         self.locator.quad(), ncols=nc, nrows=nr)
             fit = it8.fit_camera_matrix(samples, self._ref)
         except it8.IT8ReferenceError as e:
             fit, err = None, str(e)
@@ -587,15 +700,46 @@ class IT8ProfileDialog(QDialog):
             return
 
         self.stack.setCurrentIndex(i + 1)
-        # On entering the locate page, (re)load the decoded target into the
-        # locator whenever the underlying array changed (a re-decode produces a
-        # new array object — identity check catches a new same-size target too).
+        # On entering the locate page, configure the layout for the reference
+        # type and (re)load the decoded target into the locator whenever the
+        # underlying array changed (a re-decode makes a new array object).
         if self.stack.currentIndex() == self.PAGE_LOCATE:
+            self._configure_locate_page()
             if self._target_img is not self._locator_arr:
                 self.locator.set_image(self._target_img)
                 self._locator_arr = self._target_img
             self._update_locate_status()
         self._update_nav()
+
+    def _configure_locate_page(self):
+        """Show classic (GS-strip) vs block (plain grid) controls per the
+        reference, and seed the block patch-id range from its extent."""
+        block = self._mode == "block"
+        self.block_row.setVisible(block)
+        self.gray_label.setVisible(not block)
+        self.gray_slider.setVisible(not block)
+        if block:
+            self.locate_hint.setText(
+                "<b>Step 3 — Locate the patches</b> — drag the four green "
+                "corners onto the outer corners of the patch grid you "
+                "photographed. Set the top-left / bottom-right patch ids below "
+                "to match the block in frame, then nudge the corners until every "
+                "dot sits inside its patch.")
+            extent = self._ref_extent()
+            if extent and not self.tl_edit.text():
+                self.tl_edit.setText(extent[0])
+                self.br_edit.setText(extent[1])
+            try:
+                rows, cols = it8.parse_block(self.tl_edit.text(), self.br_edit.text())
+                self.locator.set_layout_block(rows, cols)
+            except ValueError:
+                pass
+        else:
+            self.locate_hint.setText(
+                "<b>Step 3 — Locate the patches</b> — drag the four green "
+                "corners onto the outer corners of the 12×22 colour grid. "
+                "Yellow dots are colour patches, blue dots the grayscale strip.")
+            self.locator.set_layout_classic()
 
     def _update_nav(self):
         i = self.stack.currentIndex()

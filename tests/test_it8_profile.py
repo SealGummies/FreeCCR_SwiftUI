@@ -170,6 +170,141 @@ def test_partial_record_does_not_crash():
 
 
 # --------------------------------------------------------------------------- #
+# CxF reference parsing.
+# --------------------------------------------------------------------------- #
+
+def _make_cxf(rows, *, prefix="", british=True):
+    """Build a minimal CxF3 file. prefix '' = default namespace, 'cc:' =
+    prefixed. british=True uses LaserSoft spelling (Colour*/ColourIEXYZ)."""
+    def t(name):
+        return f"{prefix}{name}"
+    XYZ = "ColourIEXYZ" if british else "ColorCIEXYZ"
+    LAB = "ColourCIELab" if british else "ColorCIELab"
+    CV = "ColourValues" if british else "ColorValues"
+    SREF = "ColourSpecification" if british else "ColorSpecification"
+    SCOL = "ColourSpecificationCollection" if british else "ColorSpecificationCollection"
+    SPEC = "ColourSpecification" if british else "ColorSpecification"
+    nsdecl = (f'xmlns:{prefix[:-1]}="http://colorexchangeformat.com/CxF3-core"'
+              if prefix else 'xmlns="http://colorexchangeformat.com/CxF3-core"')
+    objs = []
+    for name, (X, Y, Z), (L, A, B) in rows:
+        objs.append(
+            f'<{t("Object")} ObjectType="Target" Name="{name}" Id="{name}">'
+            f'<{t(CV)}>'
+            f'<{t(XYZ)} {SREF}="CS1"><{t("X")}>{X}</{t("X")}>'
+            f'<{t("Y")}>{Y}</{t("Y")}><{t("Z")}>{Z}</{t("Z")}></{t(XYZ)}>'
+            f'<{t(LAB)} {SREF}="CS1"><{t("L")}>{L}</{t("L")}>'
+            f'<{t("A")}>{A}</{t("A")}><{t("B")}>{B}</{t("B")}></{t(LAB)}>'
+            f'</{t(CV)}></{t("Object")}>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<{t("CxF")} {nsdecl}>'
+        f'<{t("FileInformation")}>'
+        f'<{t("Creator")}>LaserSoft Imaging AG</{t("Creator")}>'
+        f'<{t("Tag")} Name="28178_TargetType" Value="ISO 12641-2 Candidate"/>'
+        f'<{t("Tag")} Name="Serial" Value="E210616"/>'
+        f'</{t("FileInformation")}>'
+        f'<{t("Resources")}><{t("ObjectCollection")}>{"".join(objs)}'
+        f'</{t("ObjectCollection")}>'
+        f'<{t(SCOL)}><{t(SPEC)} Id="CS1"><{t("TristimulusSpec")}>'
+        f'<{t("Illuminant")}>D50</{t("Illuminant")}>'
+        f'<{t("Observer")}>2_Degree</{t("Observer")}>'
+        f'</{t("TristimulusSpec")}></{t(SPEC)}></{t(SCOL)}>'
+        f'</{t("Resources")}></{t("CxF")}>')
+
+
+def test_parse_cxf_british_default_ns(tmp_path):
+    # Matches the user's LaserSoft file: default namespace + British spelling.
+    rows = [("A1", (2.819, 2.434, 1.559), (17.62, 9.14, 4.69)),
+            ("L72", (5.627, 12.305, 1.759), (41.6, -38.0, 35.0))]
+    p = tmp_path / "E210616.cxf"
+    p.write_text(_make_cxf(rows, prefix="", british=True), encoding="utf-8")
+    ref = it8.parse_reference(str(p))
+    assert ref.batch == "E210616"
+    assert "ISO 12641-2" in ref.chart_type
+    assert len(ref.patches) == 2
+    np.testing.assert_allclose(ref.xyz("A1"), [2.819, 2.434, 1.559])
+    np.testing.assert_allclose(ref.lab("L72"), [41.6, -38.0, 35.0])
+
+
+def test_parse_cxf_prefixed_american(tmp_path):
+    # X-Rite style: cc: prefix + American spelling. Tolerated by local-name match.
+    rows = [("R1", (9.243, 9.910, 5.366), (37.99, 13.56, 14.06))]
+    p = tmp_path / "x.cxf"
+    p.write_text(_make_cxf(rows, prefix="cc:", british=False), encoding="utf-8")
+    ref = it8.parse_reference(str(p))
+    assert len(ref.patches) == 1
+    np.testing.assert_allclose(ref.xyz("R1"), [9.243, 9.910, 5.366])
+
+
+def test_parse_reference_dispatch(tmp_path):
+    cxf = tmp_path / "ref.cxf"
+    cxf.write_text(_make_cxf([("A1", (2, 2, 1), (17, 9, 4))]), encoding="utf-8")
+    assert it8.parse_reference(str(cxf)).originator == "LaserSoft Imaging AG"
+    # CGATS text still routes to the CGATS parser.
+    fields = ["SAMPLE_ID", "XYZ_X", "XYZ_Y", "XYZ_Z"]
+    txt = _make_cgats(fields, [("A1", {"XYZ_X": 2, "XYZ_Y": 2, "XYZ_Z": 1})])
+    cg = _write(tmp_path, "ref.txt", txt)
+    assert "A1" in it8.parse_reference(cg).patches
+
+
+def test_parse_cxf_errors(tmp_path):
+    p = tmp_path / "bad.cxf"
+    p.write_text("<NotCxF><x/></NotCxF>", encoding="utf-8")
+    with pytest.raises(it8.IT8ReferenceError):
+        it8.parse_reference(str(p))
+
+
+# --------------------------------------------------------------------------- #
+# Generic block geometry + fit (non-classic targets, e.g. ISO 12641-2).
+# --------------------------------------------------------------------------- #
+
+def test_parse_block():
+    rows, cols = it8.parse_block("A49", "L72")
+    assert rows == list("ABCDEFGHIJKL")
+    assert cols == list(range(49, 73))
+    # order-insensitive
+    assert it8.parse_block("L72", "A49") == (rows, cols)
+
+
+def test_block_sample_points_unit_quad():
+    quad = [(0, 0), (240, 0), (240, 120), (0, 120)]   # TL,TR,BR,BL
+    rows, cols = it8.parse_block("A49", "L72")          # 12 rows x 24 cols
+    pts = it8.block_sample_points(quad, rows, cols)
+    assert len(pts) == 288
+    # A49 (row0,col0) centre = (0.5/24*240, 0.5/12*120) = (5,5).
+    np.testing.assert_allclose(pts["A49"], (5.0, 5.0), atol=1e-6)
+    # L72 (row11,col23) centre = (23.5/24*240, 11.5/12*120) = (235,115).
+    np.testing.assert_allclose(pts["L72"], (235.0, 115.0), atol=1e-6)
+
+
+def test_fit_block_generic_autoneutral():
+    # A 12x24 block with in-grid neutrals (no GS strip): auto-neutral WB must
+    # find a gray and the fit recover the generator.
+    M0 = np.array([[0.46, 0.31, 0.17],
+                   [0.23, 0.70, 0.07],
+                   [0.02, 0.12, 0.93]])
+    rng = np.random.default_rng(11)
+    patches = {}
+    rows, cols = it8.parse_block("A49", "L72")
+    for ri, r in enumerate(rows):
+        for c in cols:
+            if r in "GHIJ":                 # neutral rows (D50 chromaticity)
+                Y = rng.uniform(3, 88)
+                patches[f"{r}{c}"] = (Y / 100.0) * D50 * 100.0
+            else:
+                Y = rng.uniform(5, 85)
+                patches[f"{r}{c}"] = np.array([Y * rng.uniform(0.7, 1.3), Y,
+                                               Y * rng.uniform(0.4, 1.2)])
+    samples = _consistent_samples(M0, patches)
+    ref = _ref_from_patches(patches)
+    fit = it8.fit_camera_matrix(samples, ref)
+    assert fit.wb_id[0] in "GHIJ"           # auto-picked an in-grid neutral
+    np.testing.assert_allclose(fit.matrix, M0, atol=1e-6)
+    assert fit.avg_de < 1e-3
+
+
+# --------------------------------------------------------------------------- #
 # Geometry.
 # --------------------------------------------------------------------------- #
 

@@ -16,6 +16,9 @@ matrix-shaper profile (and FreeCCR's InputProfile apply path) can represent.
 """
 from __future__ import annotations
 
+import os
+import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -260,6 +263,135 @@ def parse_it8_reference(path: str) -> IT8Reference:
 
 
 # --------------------------------------------------------------------------- #
+# 1b. CxF (Color Exchange Format) reference files — XML, ISO 17972.
+# --------------------------------------------------------------------------- #
+
+def _strip_ns(root) -> None:
+    """Rewrite every tag/attribute to its local name (drop the namespace).
+    CxF producers vary between a default and a 'cc:' namespace; some (LaserSoft)
+    also use British spelling (Colour*). Local-name matching tolerates all."""
+    for el in root.iter():
+        el.tag = el.tag.rpartition('}')[2]
+        if el.attrib:
+            el.attrib = {k.rpartition('}')[2]: v for k, v in el.attrib.items()}
+
+
+def _cxf_spec_ref(el) -> Optional[str]:
+    """The Colo[u]rSpecification IDREF attribute of a colour-value element."""
+    for k, v in el.attrib.items():
+        if k.endswith("Specification"):
+            return v
+    return None
+
+
+def _cxf_triplet(obj, children: Tuple[str, str, str], specs: dict):
+    """Among an Object's descendants, find the element that has exactly the
+    given direct child tags (e.g. L/A/B or X/Y/Z) — matched by child structure,
+    so ColorCIELab vs ColourCIELab vs ColourIEXYZ spelling doesn't matter — and
+    return its 3 floats, preferring a value under a D50/2° ColorSpecification."""
+    best, best_score = None, -1
+    for el in obj.iter():
+        vals = []
+        for ct in children:
+            sub = el.find(ct)
+            if sub is None or sub.text is None:
+                vals = None
+                break
+            try:
+                vals.append(float(sub.text.strip()))
+            except ValueError:
+                vals = None
+                break
+        if not vals or len(vals) != 3:
+            continue
+        ill, obs = specs.get(_cxf_spec_ref(el), ("", ""))
+        score = (2 if ill.upper() == "D50" else 0) + (1 if obs.startswith("2") else 0)
+        if score > best_score:
+            best, best_score = vals, score
+    return best
+
+
+_CXF_SKIP_TYPES = {"substrate", "colorant", "trick", "measurements", "device"}
+
+
+def parse_cxf_reference(path: str) -> IT8Reference:
+    """Parse a CxF3 (ISO 17972) reference file. Namespace- and spelling-tolerant
+    (default or cc: namespace; American 'Color' or British 'Colour'). Reads each
+    patch's D50/2° CIEXYZ (and/or CIELab). Raises IT8ReferenceError on a file
+    that isn't parseable CxF or has no usable patches."""
+    try:
+        with open(path, "rb") as f:
+            root = ET.fromstring(f.read())     # bytes → honours XML encoding/BOM
+    except ET.ParseError as e:
+        raise IT8ReferenceError(f"Not a valid CxF/XML file: {e}")
+    _strip_ns(root)
+    if not root.tag.endswith("CxF"):
+        raise IT8ReferenceError("XML root is not <CxF> — not a CxF colour file.")
+
+    ref = IT8Reference()
+    fi = root.find("FileInformation")
+    if fi is not None:
+        for tag in fi.findall("Tag"):
+            nm = (tag.get("Name") or "").lower()
+            if nm == "serial":
+                ref.batch = tag.get("Value") or ""
+            elif nm.endswith("targettype"):
+                ref.chart_type = tag.get("Value") or ""
+        ref.descriptor = fi.findtext("Description") or ""
+        ref.originator = fi.findtext("Creator") or ""
+
+    # spec Id -> (illuminant, observer), for D50/2° selection.
+    specs: Dict[str, Tuple[str, str]] = {}
+    for cs in root.iter():
+        if cs.tag.endswith("Specification") and cs.get("Id") is not None:
+            ill = obs = ""
+            for sub in cs.iter():
+                if sub.tag == "Illuminant" and sub.text:
+                    ill = sub.text.strip()
+                elif sub.tag == "Observer" and sub.text:
+                    obs = sub.text.strip()
+            specs[cs.get("Id")] = (ill, obs)
+
+    for obj in root.iter("Object"):
+        otype = (obj.get("ObjectType") or "").lower()
+        if otype in _CXF_SKIP_TYPES:
+            continue
+        name = obj.get("Name") or obj.get("Id")
+        if not name:
+            continue
+        rec: Dict[str, float] = {}
+        xyz = _cxf_triplet(obj, ("X", "Y", "Z"), specs)
+        if xyz is not None:
+            rec["XYZ_X"], rec["XYZ_Y"], rec["XYZ_Z"] = xyz
+        lab = _cxf_triplet(obj, ("L", "A", "B"), specs)
+        if lab is not None:
+            rec["LAB_L"], rec["LAB_A"], rec["LAB_B"] = lab
+        if rec:
+            ref.patches[_normalize_sample_id(name)] = rec
+
+    ref.fields = ["SAMPLE_ID", "XYZ_X", "XYZ_Y", "XYZ_Z", "LAB_L", "LAB_A", "LAB_B"]
+    if not ref.patches:
+        raise IT8ReferenceError(
+            "No usable patches found in the CxF file (no D50 CIEXYZ/CIELab "
+            "values were parsed).")
+    return ref
+
+
+def parse_reference(path: str) -> IT8Reference:
+    """Parse an IT8 reference file, dispatching by content: CxF (XML) vs CGATS
+    (text). This is the entry point the UI should call."""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256).lstrip()
+    except OSError as e:
+        raise IT8ReferenceError(f"Could not read the reference file:\n{e}")
+    if ext == ".cxf" or head[:1] == b"<":
+        return parse_cxf_reference(path)
+    return parse_it8_reference(path)
+
+
+# --------------------------------------------------------------------------- #
 # 2. Target decode (raw-linear device RGB, no input ICC).
 # --------------------------------------------------------------------------- #
 
@@ -341,6 +473,36 @@ def grid_sample_points(quad, gray_offset: float = DEFAULT_GRAY_OFFSET
     return {i: (float(x), float(y)) for i, (x, y) in zip(ALL_IDS, pts)}
 
 
+def parse_block(tl_id: str, br_id: str):
+    """Row letters + column numbers for a rectangular patch block from its
+    top-left and bottom-right ids, e.g. ('A49','L72') -> (['A'..'L'],[49..72]).
+    Used for non-classic targets (e.g. the ISO 12641-2 advanced grid) that are a
+    plain rows×cols grid with no separate gray strip."""
+    def split(s):
+        m = re.match(r'^\s*([A-Za-z])(\d+)\s*$', s or "")
+        if not m:
+            raise ValueError(f"Patch id must be a letter + number (e.g. A49), got {s!r}")
+        return m.group(1).upper(), int(m.group(2))
+    (r0, c0), (r1, c1) = split(tl_id), split(br_id)
+    rows = [chr(x) for x in range(min(ord(r0), ord(r1)), max(ord(r0), ord(r1)) + 1)]
+    cols = list(range(min(c0, c1), max(c0, c1) + 1))
+    return rows, cols
+
+
+def block_sample_points(quad, rows, cols) -> Dict[str, Tuple[float, float]]:
+    """Sample centres (array coords) for a regular len(rows)×len(cols) grid laid
+    on the 4-corner quad (TL,TR,BR,BL). IDs are '<row><col>' (e.g. 'A49')."""
+    H = _homography(np.asarray(quad, dtype=np.float64))
+    nr, nc = len(rows), len(cols)
+    uv, ids = [], []
+    for ri, r in enumerate(rows):
+        for ci, c in enumerate(cols):
+            uv.append(((ci + 0.5) / nc, (ri + 0.5) / nr))
+            ids.append(f"{r}{c}")
+    pts = _apply_h(H, np.asarray(uv, dtype=np.float64))
+    return {i: (float(x), float(y)) for i, (x, y) in zip(ids, pts)}
+
+
 # --------------------------------------------------------------------------- #
 # 4. Patch sampling (robust central window, clip rejection).
 # --------------------------------------------------------------------------- #
@@ -352,26 +514,29 @@ class PatchSample:
     n_pix: int
 
 
-def _quad_cell_halfsize(quad: np.ndarray, frac: float) -> Tuple[float, float]:
-    """Half-window (px) for sampling, derived from the colour block's mean cell
-    size so the window scales with the chart's size in the frame."""
+def _quad_cell_halfsize(quad: np.ndarray, frac: float,
+                        ncols: int = 22, nrows: int = 12) -> Tuple[float, float]:
+    """Half-window (px) for sampling, derived from the block's mean cell size so
+    the window scales with the chart's size in the frame and its grid density."""
     q = np.asarray(quad, dtype=np.float64)
     top = np.linalg.norm(q[1] - q[0]); bot = np.linalg.norm(q[2] - q[3])
     left = np.linalg.norm(q[3] - q[0]); right = np.linalg.norm(q[2] - q[1])
-    cell_w = 0.5 * (top + bot) / 22.0
-    cell_h = 0.5 * (left + right) / 12.0
+    cell_w = 0.5 * (top + bot) / max(1, ncols)
+    cell_h = 0.5 * (left + right) / max(1, nrows)
     return max(1.0, 0.5 * frac * cell_w), max(1.0, 0.5 * frac * cell_h)
 
 
 def sample_patches(img_u16: np.ndarray, points: Dict[str, Tuple[float, float]],
                    quad, frac: float = 0.5, clip_lo: float = 0.005,
-                   clip_hi: float = 0.995) -> Dict[str, PatchSample]:
+                   clip_hi: float = 0.995, ncols: int = 22,
+                   nrows: int = 12) -> Dict[str, PatchSample]:
     """Sample each patch's device RGB from a central window via a per-channel
-    trimmed mean; flag patches with >2% clipped pixels or out of frame."""
+    trimmed mean; flag patches with >2% clipped pixels or out of frame. ncols/
+    nrows set the grid density so the sampling window scales to the cell size."""
     h, w = img_u16.shape[:2]
     full = 65535.0
     lo, hi = clip_lo * full, clip_hi * full
-    half_w, half_h = _quad_cell_halfsize(quad, frac)
+    half_w, half_h = _quad_cell_halfsize(quad, frac, ncols, nrows)
     out: Dict[str, PatchSample] = {}
     for sid, (cx, cy) in points.items():
         x0 = int(round(cx - half_w)); x1 = int(round(cx + half_w)) + 1
@@ -494,18 +659,27 @@ class CameraFit:
     wb_id: str
 
 
+_NEUTRAL_CHROMA = 6.0   # max CIELab chroma for a patch to count as "neutral"
+
+
 def _pick_wb_id(samples: Dict[str, PatchSample], ref: IT8Reference,
-                preferred: str) -> Optional[str]:
-    """The lightest valid neutral to white-balance on: preferred (GS0) if valid,
-    else the highest-L valid GS patch, else the highest-Y valid patch."""
-    if preferred in samples and samples[preferred].valid and ref.lab(preferred) is not None:
+                preferred: Optional[str] = None) -> Optional[str]:
+    """The lightest valid neutral to white-balance on: `preferred` if given and
+    valid, else the lightest valid near-neutral patch (low Lab chroma, highest
+    L*) — works for any target (classic GS strip or in-grid grays), else the
+    highest-Y valid patch."""
+    if (preferred and preferred in samples and samples[preferred].valid
+            and ref.lab(preferred) is not None):
         return preferred
     best, best_L = None, -1.0
-    for k in GRAY_IDS:
-        if k in samples and samples[k].valid:
-            lab = ref.lab(k)
-            if lab is not None and lab[0] > best_L:
-                best, best_L = k, lab[0]
+    for sid, ps in samples.items():
+        if not ps.valid:
+            continue
+        lab = ref.lab(sid)
+        if lab is None:
+            continue
+        if float(np.hypot(lab[1], lab[2])) < _NEUTRAL_CHROMA and lab[0] > best_L:
+            best, best_L = sid, lab[0]
     if best is not None:
         return best
     best, best_Y = None, -1.0
@@ -517,19 +691,24 @@ def _pick_wb_id(samples: Dict[str, PatchSample], ref: IT8Reference,
 
 
 def fit_camera_matrix(samples: Dict[str, PatchSample], ref: IT8Reference, *,
-                      weight: str = "none", wb_id: str = "GS0") -> CameraFit:
+                      ids: Optional[List[str]] = None, weight: str = "none",
+                      wb_id: Optional[str] = None) -> CameraFit:
     """Fit the 3x3 camera matrix from sampled device RGB + reference XYZ.
 
+    ids: patch ids to use (default: every sampled id present in the reference).
     weight: 'none' (plain XYZ least squares, the documented baseline) or '1/Y'
-    (down-weight bright patches). See spec §5.4."""
+    (down-weight bright patches). wb_id: force the white-balance patch (default:
+    auto-pick the lightest neutral). See spec §5.4."""
     chosen_wb = _pick_wb_id(samples, ref, wb_id)
     if chosen_wb is None:
         raise IT8ReferenceError("No valid neutral patch to white-balance on — "
                                 "check the chart placement and exposure.")
 
+    iter_ids = ids if ids is not None else [s for s in samples
+                                            if ref.xyz(s) is not None]
     used, dropped = [], []
     d_list, x_list = [], []
-    for sid in ALL_IDS:
+    for sid in iter_ids:
         ps = samples.get(sid)
         xyz = ref.xyz(sid)
         if ps is None or xyz is None:
