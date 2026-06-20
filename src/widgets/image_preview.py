@@ -1545,6 +1545,12 @@ class ImagePreview(QWidget):
         detail would help. Magnification comes from zooming in, or from cropping
         into the image (the kept region is scaled up to fill the view even at
         the fitted zoom)."""
+        # Dust mode always wants the sharpest pixels for precise spotting, so
+        # load hi-res detail even at the fitted view (and on zoom-in). The
+        # display path already shows the full, un-fine-rotated image in dust
+        # mode, so the hi-res lines up with the normalized dust spots.
+        if self.dust_mode:
+            return True
         if self._view_scale() <= 1.05:
             return False
         return self._zoom > 1.0 or self._crop_wants_hires()
@@ -1665,11 +1671,6 @@ class ImagePreview(QWidget):
     HIRES_MAX_LONG_SIDE = 4500   # bounds non-RAW decodes (RAW half-size passes through)
 
     def _maybe_request_hires(self):
-        # Dust mode renders preview pixels only: the hi-res replay can bake fine
-        # rotation / conversion specifics that would misalign the normalized dust
-        # spots, so zoom there stays on the (upscaled) preview.
-        if self.dust_mode:
-            return
         if not self._zoomed_in_enough() or self.current_idx is None:
             return
         img = ccr_backend.get_image_by_index(self.current_idx)

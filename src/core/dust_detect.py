@@ -28,8 +28,11 @@ MODEL_SHA256 = "61e4a93d4e94b4fc6212e2e9b785fa12b5cbc9654724b02aaf8b212075bb729f
 # --- Detection tuning -------------------------------------------------------
 DETECT_SHORT = 512      # short side the detector runs at
 DETECT_MULTIPLE = 16    # both dims rounded to a multiple of this (U-Net req.)
-MAX_BLOB = 600          # connected-component pixel cap at ~2k px (resolution-normalized)
-SPOT_PAD = 2.0          # px added to each detected spot's radius (inpaint margin)
+MAX_BLOB = 400          # connected-component pixel cap at ~2k px (resolution-normalized);
+                        # drops large detections (film border / real image content)
+MAX_ASPECT = 3.0        # drop elongated detections (thin LINES are usually real
+                        # structure — a bike frame, the horizon — not dust)
+SPOT_PAD = 1.5          # px added to each detected spot's radius (inpaint margin)
 
 _session = None          # cached ort.InferenceSession
 _session_path = None     # model path the cached session was built from
@@ -200,14 +203,23 @@ def prob_to_spots(prob: np.ndarray, sensitivity: float, kind: str = "auto") -> l
     for i in range(1, n):  # 0 is background
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area > max_blob:
-            continue
+            continue  # too big — film border / real image content, not dust
         cw = int(stats[i, cv2.CC_STAT_WIDTH])
         ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        # Drop elongated detections. Real dust is compact; the scratch detector
+        # also fires on legitimate thin LINES (a bike frame, the horizon, a path
+        # edge), and circle-inpainting those smears real detail. Leave linear
+        # defects to the manual brush (a stroke). See spec/dust-removal.md §5.4.
+        if max(cw, ch) / max(1, min(cw, ch)) > MAX_ASPECT:
+            continue
         cx, cy = centroids[i]
-        r = (0.5 * max(cw, ch) + SPOT_PAD) / w
+        # Area-EQUIVALENT radius (+ small margin), NOT the bounding-box extent:
+        # a tight circle matches the speck so the inpaint stays invisible
+        # instead of leaving a big smudge over the surrounding pixels.
+        r_px = float(np.sqrt(area / np.pi)) + SPOT_PAD
         spots.append({
             "kind": kind,
             "pts": [[float(cx) / w, float(cy) / h]],
-            "r": float(r),
+            "r": float(r_px / w),
         })
     return spots

@@ -147,6 +147,28 @@ class TestProbToSpots:
     def test_blank_prob_yields_nothing(self):
         assert dust_detect.prob_to_spots(np.zeros((40, 40), np.float32), 100) == []
 
+    def test_drops_elongated_keeps_compact(self):
+        # A thin line is real image structure (bike frame / horizon), not dust:
+        # the aspect filter drops it while keeping a compact speck. Guards the
+        # AI-artifact fix (see spec/dust-removal.md §5.3/§5.4).
+        prob = np.zeros((100, 100), np.float32)
+        prob[50, 10:22] = 0.9       # 1x12 thin line (area 12, aspect 12) -> dropped
+        prob[80:83, 80:83] = 0.9    # 3x3 compact speck (area 9)          -> kept
+        spots = dust_detect.prob_to_spots(prob, 60)
+        assert len(spots) == 1
+        x, y = spots[0]["pts"][0]
+        assert x > 0.5 and y > 0.5  # the compact speck, not the line
+
+    def test_radius_is_area_equivalent_not_extent(self):
+        # A 6x6 compact blob -> radius ~ sqrt(36/pi) ~ 3.4 px (+pad), NOT the
+        # 0.5*extent=3 of the old bounding-box sizing blown up by elongation.
+        prob = np.zeros((200, 200), np.float32)
+        prob[100:106, 100:106] = 0.9
+        spots = dust_detect.prob_to_spots(prob, 60)
+        assert len(spots) == 1
+        r_px = spots[0]["r"] * 200
+        assert 3.0 < r_px < 7.0     # tight circle, no big smudge
+
 
 # --- Availability / graceful degradation ------------------------------------
 class TestAvailability:

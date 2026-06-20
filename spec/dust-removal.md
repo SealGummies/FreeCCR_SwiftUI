@@ -114,10 +114,13 @@ reference to `MainWindow` and `ImagePreview` passed at construction (it does
     `push_undo_state()` once for the stroke, re-render the image (inpaint
     applied), and refresh thumbnail + preview. The dust is now visibly gone.
   - **Ctrl + mouse wheel**: resize the brush (kept in sync with the slider).
-  - **Mouse wheel** (no modifier): zoom in/out for precise spotting (preview
-    pixels; hi-res replay is suppressed in dust mode — §5.5). **Middle-button
-    drag**: pan the zoomed view. (Both match the normal viewer; only the brush
-    moves to Ctrl + wheel.)
+  - **Mouse wheel** (no modifier): zoom in/out for precise spotting.
+    **Middle-button drag**: pan the zoomed view. (Both match the normal viewer;
+    only the brush moves to Ctrl + wheel.)
+  - **Hi-res detail loads on entry** (and refines on zoom) so dust is visible at
+    full sharpness. The hi-res render reproduces `resized_raw`'s orientation and
+    goes through `apply_adjustments` (so it shows the dust-removed result); the
+    dust-mode display stays full / un-fine-rotated, so spots stay aligned.
   - A **brush-circle cursor** tracks the pointer; its on-screen radius is
     `r_norm * W * view_scale` display pixels (§5.5).
 - Coordinate mapping reuses the existing inverse-`base_transform` +
@@ -309,12 +312,19 @@ panel that imports it) load even when `onnxruntime` is absent.
 - **`prob_to_spots(prob, prob_h, prob_w, sensitivity, max_dim) -> list[spot]`**:
   - `thr = 0.85 - 0.60 * (sensitivity/100)` (0 → very selective … 100 →
     aggressive), matching openenlarge.
-  - Binarize at `thr`; via `cv2.connectedComponentsWithStats`, drop components
-    whose pixel area exceeds a resolution-normalized `max_blob` (only small
-    dust/hairs removed, not real detail); dilate 1 px.
-  - Each surviving component → one `auto` spot: centroid `(cx/prob_w, cy/prob_h)`;
-    radius `r = (0.5*max(comp_w, comp_h) + pad) / prob_w` (covers the speck plus a
-    small margin for the inpaint to key off).
+  - Binarize at `thr`; via `cv2.connectedComponentsWithStats`:
+    - drop components whose pixel area exceeds a resolution-normalized
+      `max_blob` (film border / real image content, not dust);
+    - **drop elongated components** (aspect ratio > `MAX_ASPECT`): the detector
+      also fires on legitimate thin LINES (a bike frame, the horizon, a path
+      edge); circle-inpainting those smears real detail, so linear defects are
+      left to the manual brush (§5.4). This is the main guard against AI
+      artifacts on clean scans.
+  - Each surviving (compact) component → one `auto` spot: centroid
+    `(cx/prob_w, cy/prob_h)`; **area-equivalent** radius
+    `r = (sqrt(area/π) + pad) / prob_w` — a tight circle matching the speck, so
+    the inpaint stays invisible rather than leaving a smudge (the old
+    bounding-extent radius over-covered and was the artifact source).
   - `prob_to_spots` is **pure / model-free** (operates on a numpy prob map) so it
     is unit-testable without ONNX.
 - All ONNX use is guarded; any import/inference error surfaces as

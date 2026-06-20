@@ -151,8 +151,8 @@ class DustRemovalPanel(QWidget):
         self.sensitivity_slider = QSlider(Qt.Horizontal)
         self.sensitivity_slider.setMinimum(0)
         self.sensitivity_slider.setMaximum(100)
-        self.sensitivity_slider.setValue(50)
-        self.sensitivity_value = QLabel("50")
+        self.sensitivity_slider.setValue(35)  # conservative default — fewer false positives
+        self.sensitivity_value = QLabel("35")
         self.sensitivity_value.setMinimumWidth(40)
         self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
         sens_row.addWidget(self.sensitivity_label)
