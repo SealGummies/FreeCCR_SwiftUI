@@ -35,6 +35,47 @@ class _DetectWorker(QObject):
             self.failed.emit(str(e))
 
 
+class _DetectAllWorker(QObject):
+    """Runs AI detection on EVERY target image off the GUI thread. Detection is
+    per-image (each scan has its own dust), at the current sensitivity. Emits a
+    (img, spots) pair per image so the GUI thread applies them; reads only stable
+    per-image state (resized_raw + manual spots) off-thread."""
+    detected = Signal(object, object)   # img, spots
+    progress = Signal(int, int)         # done, total
+    done = Signal(int)                  # processed count
+    failed = Signal(str)
+
+    def __init__(self, targets, sensitivity):
+        super().__init__()
+        self._targets = targets
+        self._sensitivity = sensitivity
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            from widgets.image_preview import ImagePreview
+            total = len(self._targets)
+            processed = 0
+            for img in self._targets:
+                if self._cancel:
+                    break
+                source = ImagePreview.dust_detect_source_for(img)
+                if source is None:
+                    self.progress.emit(processed, total)
+                    continue
+                prob, luma = dust_detect.detect(source)
+                spots = dust_detect.prob_to_spots(prob, luma, self._sensitivity)
+                self.detected.emit(img, spots)
+                processed += 1
+                self.progress.emit(processed, total)
+            self.done.emit(processed)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
 class _DownloadWorker(QObject):
     progress = Signal(int, int)   # done_bytes, total_bytes
     done = Signal()
@@ -64,10 +105,13 @@ class DustRemovalPanel(QWidget):
         self.image_preview = image_preview
         self._downloading = False
         self._detecting = False
+        self._detecting_all = False
         self._download_thread = None
         self._download_worker = None
         self._detect_thread = None
         self._detect_worker = None
+        self._detect_all_thread = None
+        self._detect_all_worker = None
         # Cached detector outputs (probability map + luma) for the current
         # image so the Sensitivity slider re-thresholds without re-running the net.
         self._prob = None
@@ -166,6 +210,14 @@ class DustRemovalPanel(QWidget):
         self.detect_btn.clicked.connect(self._on_detect)
         layout.addWidget(self.detect_btn)
 
+        self.detect_all_btn = QPushButton("Detect && Remove — All Images")
+        self.detect_all_btn.setToolTip(
+            "Run AI dust detection on every converted image — each scan is "
+            "detected on its own (not by copying spots), at the current "
+            "sensitivity.")
+        self.detect_all_btn.clicked.connect(self._on_detect_all)
+        layout.addWidget(self.detect_all_btn)
+
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #888; font-size: 11px;")
@@ -253,7 +305,7 @@ class DustRemovalPanel(QWidget):
                 else "No dust found at this sensitivity.")
 
     def _on_detect(self):
-        if self._detecting or self._downloading:
+        if self._detecting or self._detecting_all or self._downloading:
             return
         source = self.image_preview.dust_detect_source()
         if source is None:
@@ -309,6 +361,84 @@ class DustRemovalPanel(QWidget):
     def _clear_detect_thread(self):
         self._detect_thread = None
         self._detect_worker = None
+
+    # --- AI: detect on ALL images ----------------------------------------
+    def _on_detect_all(self):
+        if self._detecting or self._detecting_all or self._downloading:
+            return
+        from core.ccr_backend import ccr_backend
+        targets = [im for im in ccr_backend.images
+                   if (getattr(im, "converted", False) or ccr_backend.positive_mode)
+                   and getattr(im, "resized_raw", None) is not None]
+        if not targets:
+            self.status_label.setText("No converted images to detect on.")
+            return
+        self._detecting_all = True
+        self.detect_btn.setEnabled(False)
+        self.detect_all_btn.setEnabled(False)
+        self.detect_all_btn.setText("Detecting all…")
+        self.status_label.setText(f"AI dust detection on {len(targets)} images…")
+        try:
+            self._detect_all_thread = QThread()
+            self._detect_all_worker = _DetectAllWorker(
+                targets, float(self.sensitivity_slider.value()))
+            self._detect_all_worker.moveToThread(self._detect_all_thread)
+            self._detect_all_thread.started.connect(self._detect_all_worker.run)
+            self._detect_all_worker.detected.connect(self._on_detect_all_one)
+            self._detect_all_worker.progress.connect(self._on_detect_all_progress)
+            self._detect_all_worker.done.connect(self._on_detect_all_done)
+            self._detect_all_worker.failed.connect(self._on_detect_all_failed)
+            self._detect_all_worker.done.connect(self._detect_all_thread.quit)
+            self._detect_all_worker.failed.connect(self._detect_all_thread.quit)
+            self._detect_all_worker.done.connect(self._detect_all_worker.deleteLater)
+            self._detect_all_worker.failed.connect(self._detect_all_worker.deleteLater)
+            self._detect_all_thread.finished.connect(self._clear_detect_all_thread)
+            self._detect_all_thread.start()
+        except Exception as e:  # noqa: BLE001 — never leave the flag/buttons stuck
+            self._detect_all_thread = None
+            self._detect_all_worker = None
+            self._finish_detect_all()
+            self.status_label.setText(f"Could not start batch detection: {e}")
+
+    def _finish_detect_all(self):
+        self._detecting_all = False
+        self.detect_btn.setEnabled(True)
+        self.detect_all_btn.setEnabled(True)
+        self.detect_all_btn.setText("Detect && Remove — All Images")
+
+    def _on_detect_all_one(self, img, spots):
+        # Runs on the GUI thread (queued from the worker). Discard if the user
+        # left dust mode while the batch was running (Done/Esc cancels it, but a
+        # signal may already be queued); apply_auto_spots_to_image also ignores
+        # an image no longer loaded.
+        if not self.image_preview.dust_mode:
+            return
+        self.image_preview.apply_auto_spots_to_image(img, spots)
+        if img is self._prob_image_ref:
+            self._prob = None
+            self._luma = None
+            self._prob_image_ref = None
+
+    def _on_detect_all_progress(self, done, total):
+        self.status_label.setText(f"AI dust detection… {done}/{total}")
+
+    def _on_detect_all_done(self, count):
+        self._finish_detect_all()
+        self.status_label.setText(
+            f"AI dust removal applied to {count} image{'s' if count != 1 else ''}.")
+        try:
+            from core.ccr_backend import ccr_backend
+            ccr_backend.save_catalog()
+        except Exception:
+            pass
+
+    def _on_detect_all_failed(self, msg):
+        self._finish_detect_all()
+        self.status_label.setText(f"Batch AI detection failed: {msg}")
+
+    def _clear_detect_all_thread(self):
+        self._detect_all_thread = None
+        self._detect_all_worker = None
 
     def _on_download(self):
         if self._downloading:
@@ -367,6 +497,7 @@ class DustRemovalPanel(QWidget):
         self.sensitivity_slider.setVisible(present)
         self.sensitivity_value.setVisible(present)
         self.detect_btn.setVisible(present)
+        self.detect_all_btn.setVisible(present)
 
     def _current_image(self):
         from core.ccr_backend import ccr_backend
@@ -374,27 +505,30 @@ class DustRemovalPanel(QWidget):
         return ccr_backend.get_image_by_index(idx) if idx is not None else None
 
     def cancel_jobs(self):
-        """Cancel an in-flight model download when leaving dust mode (Done/Esc).
-        The download worker honours cancel(); the (short) ONNX detection has no
-        interrupt, but its result is already discarded if the image changed."""
-        wkr = self._download_worker
-        if wkr is not None:
-            try:
-                wkr.cancel()
-            except Exception:
-                pass
+        """Cancel in-flight model download / batch detection when leaving dust
+        mode (Done/Esc). Those workers honour cancel(); the single short ONNX
+        detection has no interrupt, but its result is discarded if the image
+        changed."""
+        for wkr in (self._download_worker, self._detect_all_worker):
+            if wkr is not None:
+                try:
+                    wkr.cancel()
+                except Exception:
+                    pass
 
     def shutdown(self):
         """Stop any in-flight download/detection thread (called on app close).
         Mirrors MainWindow._stop_loader_if_running: cancel, quit, wait, then
         drop the refs so isRunning() is never called on a freed C++ object."""
-        if self._download_worker is not None:
-            try:
-                self._download_worker.cancel()
-            except Exception:
-                pass
+        for wkr in (self._download_worker, self._detect_all_worker):
+            if wkr is not None:
+                try:
+                    wkr.cancel()
+                except Exception:
+                    pass
         for attr_thr, attr_wkr in (("_download_thread", "_download_worker"),
-                                   ("_detect_thread", "_detect_worker")):
+                                   ("_detect_thread", "_detect_worker"),
+                                   ("_detect_all_thread", "_detect_all_worker")):
             thr = getattr(self, attr_thr, None)
             if thr is not None:
                 try:

@@ -323,6 +323,20 @@ class TestPanelWiring:
         panel.cancel_jobs()
         panel.shutdown()   # must not raise with no threads running
 
+    def test_detect_all_no_targets_is_safe(self):
+        from widgets.dust_panel import DustRemovalPanel, _DetectAllWorker  # noqa: F401
+        from core.ccr_backend import ccr_backend
+        saved = ccr_backend.images
+        ccr_backend.images = []
+        try:
+            panel = DustRemovalPanel(_StubMain(), _StubPreview())
+            assert hasattr(panel, "detect_all_btn")
+            panel._on_detect_all()                 # no convertible images
+            assert panel._detecting_all is False    # no batch started
+            assert panel._detect_all_thread is None
+        finally:
+            ccr_backend.images = saved
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

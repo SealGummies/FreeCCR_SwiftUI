@@ -94,8 +94,13 @@ in the catalog, and undoable.
    - When the model is **absent**: an explanatory line + **Download AI model
      (~150 MB)** button; while downloading, a progress bar; on failure, an error
      line + retry.
-   - When the model is **present**: a **Sensitivity** slider (0–100) and a
-     **Detect & Remove** button (busy/spinner state while running).
+   - When the model is **present**: a **Sensitivity** slider (0–100), a
+     **Detect & Remove** button (current image), and a **Detect & Remove — All
+     Images** button. The latter runs detection **per image** (each scan has its
+     own dust) at the current sensitivity, off the GUI thread with progress, and
+     replaces each image's `auto` spots (manual spots kept). Detection always
+     heals only the **manual** spots first, never the `auto` spots it is about
+     to replace, so re-running never loses prior coverage.
    - When `onnxruntime` is **not importable**: a disabled state with
      "AI detection unavailable in this build."
 5. Spacer.

@@ -2333,24 +2333,52 @@ class ImagePreview(QWidget):
         self._commit_dust_change(img)
         return True
 
-    def dust_detect_source(self):
-        """The working positive (with existing spots already healed) the AI
-        detector should run on, or None."""
-        img = ccr_backend.get_image_by_index(self.current_idx)
-        if img is None or img.resized_raw is None:
+    @staticmethod
+    def dust_detect_source_for(img):
+        """The working positive the AI detector should run on for `img`, or None.
+        Only the MANUAL (brush) spots are healed first — the 'auto' spots are
+        about to be replaced, so healing them would hide the very dust we want to
+        re-detect (making a second Detect lose the first one's coverage)."""
+        raw = getattr(img, "resized_raw", None)
+        if img is None or raw is None:
             return None
-        return apply_dust_removal(img.resized_raw, img.dust_spots)
+        brush = [s for s in getattr(img, "dust_spots", []) if s.get("kind") == "brush"]
+        return apply_dust_removal(raw, brush)
+
+    def dust_detect_source(self):
+        """Detection source for the current image (see dust_detect_source_for)."""
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        return self.dust_detect_source_for(img) if img is not None else None
 
     def apply_detected_spots(self, new_auto_spots) -> int:
         """Replace the AI-detected ('auto') spots with a fresh set; manual
         ('brush') spots are kept. Returns the new auto-spot count."""
         img = ccr_backend.get_image_by_index(self.current_idx)
-        if img is None:
+        return self.apply_auto_spots_to_image(img, new_auto_spots)
+
+    def apply_auto_spots_to_image(self, img, new_auto_spots) -> int:
+        """Replace the AI 'auto' spots on a SPECIFIC image (used by both the
+        single Detect and the batch 'detect on all'). Manual spots are kept.
+        Re-bakes that image's thumbnail/preview; refreshes the canvas only when
+        it is the current image. Returns the new auto-spot count."""
+        # Ignore an image no longer loaded — a stale batch result for an image
+        # the user removed or replaced (new Open) must not mutate an orphan.
+        if img is None or img not in ccr_backend.images:
             return 0
         img.push_undo_state()
         img.dust_spots = [s for s in img.dust_spots if s.get("kind") != "auto"]
         img.dust_spots.extend(new_auto_spots or [])
-        self._commit_dust_change(img)
+        cur = (ccr_backend.get_image_by_index(self.current_idx)
+               if self.current_idx is not None else None)
+        if img is cur:
+            self._commit_dust_change(img)
+        else:
+            img.update_thumbnail_and_preview()
+            try:
+                idx = ccr_backend.images.index(img)
+                self.window().thumbnail_list.update_thumbnail(idx)
+            except (ValueError, AttributeError):
+                pass
         return len(new_auto_spots or [])
 
     def _commit_dust_change(self, img):
