@@ -1739,7 +1739,12 @@ class ImagePreview(QWidget):
             self._hires["display_pm"] = None
             self._hires["crop_sig"] = None
             if self._hires.get("adj_sig") != self._current_adj_sig():
-                self._hires["full_pm"] = None
+                # In dust mode, KEEP the last sharp render on screen until the
+                # re-render lands, so a paint stroke doesn't flash the blurry
+                # preview in between (the new render — with the spot inpainted —
+                # swaps in a moment later). Outside dust mode, drop it as before.
+                if not self.dust_mode:
+                    self._hires["full_pm"] = None
                 self._hires["adj_sig"] = None
         if self._zoomed_in_enough():
             self._hires_timer.start(350)
@@ -2352,6 +2357,10 @@ class ImagePreview(QWidget):
         """Re-bake the preview/thumbnail after a dust edit and refresh the UI."""
         img.update_thumbnail_and_preview()
         self.update_preview(self.current_idx)
+        # Kick the hi-res re-render right away (instead of the debounce) so the
+        # inpainted spot resolves promptly; the in-flight guard dedups it. The
+        # previous sharp render stays on screen until this lands (no blur flash).
+        self._maybe_request_hires()
         try:
             self.window().thumbnail_list.update_thumbnail(self.current_idx)
         except Exception:
