@@ -121,13 +121,20 @@ class TestApplyAdjustmentsIntegration:
 
 
 # --- dust_detect.prob_to_spots (model-free) ---------------------------------
+def _bright_luma(prob):
+    """Luma where high-prob regions read bright (white film dust) on a dark
+    surround, so detections pass the bright-speck gate."""
+    return np.clip(prob, 0.0, 1.0).astype(np.float32)
+
+
 class TestProbToSpots:
     def test_threshold_direction(self):
         prob = np.zeros((100, 100), np.float32)
         prob[10:13, 10:13] = 0.5            # a small mid-confidence blob
+        luma = _bright_luma(prob)
         # sensitivity 0 -> thr 0.85 -> nothing; 100 -> thr 0.25 -> detected.
-        assert dust_detect.prob_to_spots(prob, 0) == []
-        spots = dust_detect.prob_to_spots(prob, 100)
+        assert dust_detect.prob_to_spots(prob, luma, 0) == []
+        spots = dust_detect.prob_to_spots(prob, luma, 100)
         assert len(spots) == 1
         assert spots[0]["kind"] == "auto"
         x, y = spots[0]["pts"][0]
@@ -135,17 +142,18 @@ class TestProbToSpots:
         assert spots[0]["r"] > 0
 
     def test_size_gate_drops_large_blobs(self):
-        # max_blob = 600 * max(h,w) / 2000 = 30 px for a 100x100 map.
+        # max_blob = MAX_BLOB(400) * max(h,w) / 2000 = 20 px for a 100x100 map.
         prob = np.zeros((100, 100), np.float32)
         prob[10:13, 10:13] = 0.9            # 9 px  -> kept
         prob[50:62, 50:62] = 0.9            # 144 px -> dropped
-        spots = dust_detect.prob_to_spots(prob, 50)
+        spots = dust_detect.prob_to_spots(prob, _bright_luma(prob), 50)
         assert len(spots) == 1
         x, y = spots[0]["pts"][0]
         assert x < 0.3 and y < 0.3          # the small blob, not the big one
 
     def test_blank_prob_yields_nothing(self):
-        assert dust_detect.prob_to_spots(np.zeros((40, 40), np.float32), 100) == []
+        z = np.zeros((40, 40), np.float32)
+        assert dust_detect.prob_to_spots(z, z, 100) == []
 
     def test_drops_elongated_keeps_compact(self):
         # A thin line is real image structure (bike frame / horizon), not dust:
@@ -154,7 +162,7 @@ class TestProbToSpots:
         prob = np.zeros((100, 100), np.float32)
         prob[50, 10:22] = 0.9       # 1x12 thin line (area 12, aspect 12) -> dropped
         prob[80:83, 80:83] = 0.9    # 3x3 compact speck (area 9)          -> kept
-        spots = dust_detect.prob_to_spots(prob, 60)
+        spots = dust_detect.prob_to_spots(prob, _bright_luma(prob), 60)
         assert len(spots) == 1
         x, y = spots[0]["pts"][0]
         assert x > 0.5 and y > 0.5  # the compact speck, not the line
@@ -164,10 +172,25 @@ class TestProbToSpots:
         # 0.5*extent=3 of the old bounding-box sizing blown up by elongation.
         prob = np.zeros((200, 200), np.float32)
         prob[100:106, 100:106] = 0.9
-        spots = dust_detect.prob_to_spots(prob, 60)
+        spots = dust_detect.prob_to_spots(prob, _bright_luma(prob), 60)
         assert len(spots) == 1
         r_px = spots[0]["r"] * 200
         assert 3.0 < r_px < 7.0     # tight circle, no big smudge
+
+    def test_bright_gate_drops_dark_blob(self):
+        # Film dust inverts to WHITE specks. A compact, right-sized blob that is
+        # DARKER than its surround (e.g. a face on bright sky) is NOT dust and
+        # must be rejected — this is what removed a person's head before.
+        # 200x200 so the 6x6 blob clears the size gate (max_blob ~ 40 here) and
+        # the brightness gate is what actually decides.
+        prob = np.zeros((200, 200), np.float32)
+        prob[40:46, 40:46] = 0.9                 # detector fires on a 6x6 region
+        dark = np.full((200, 200), 0.8, np.float32)
+        dark[40:46, 40:46] = 0.2                 # dark blob, bright surround
+        assert dust_detect.prob_to_spots(prob, dark, 60) == []
+        bright = np.full((200, 200), 0.2, np.float32)
+        bright[40:46, 40:46] = 0.9               # bright blob (real dust)
+        assert len(dust_detect.prob_to_spots(prob, bright, 60)) == 1
 
 
 # --- Availability / graceful degradation ------------------------------------

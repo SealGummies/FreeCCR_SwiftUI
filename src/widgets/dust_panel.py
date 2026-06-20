@@ -20,7 +20,7 @@ from core import dust_detect
 
 
 class _DetectWorker(QObject):
-    done = Signal(object)   # probability map (np.ndarray)
+    done = Signal(object)   # (prob, luma) numpy arrays
     failed = Signal(str)
 
     def __init__(self, source):
@@ -29,8 +29,8 @@ class _DetectWorker(QObject):
 
     def run(self):
         try:
-            prob = dust_detect.detect(self.source)
-            self.done.emit(prob)
+            prob, luma = dust_detect.detect(self.source)
+            self.done.emit((prob, luma))
         except Exception as e:  # noqa: BLE001 — surfaced to the user
             self.failed.emit(str(e))
 
@@ -68,9 +68,10 @@ class DustRemovalPanel(QWidget):
         self._download_worker = None
         self._detect_thread = None
         self._detect_worker = None
-        # Cached detector probability map for the current image so the
-        # Sensitivity slider re-thresholds without re-running the net.
+        # Cached detector outputs (probability map + luma) for the current
+        # image so the Sensitivity slider re-thresholds without re-running the net.
         self._prob = None
+        self._luma = None
         self._prob_image_ref = None
         # The image a running detection was started on — results are discarded
         # if the user switches images before it finishes.
@@ -205,6 +206,7 @@ class DustRemovalPanel(QWidget):
         img = self._current_image()
         if img is not self._prob_image_ref:
             self._prob = None
+            self._luma = None
             self._prob_image_ref = None
         # Push the current brush size to the canvas so they agree on entry.
         self.image_preview.set_dust_brush_size(self.brush_slider.value() / 1000.0)
@@ -244,7 +246,7 @@ class DustRemovalPanel(QWidget):
         self.sensitivity_value.setText(str(value))
         # Cheap re-threshold of the cached prob map (no net re-run).
         if self._prob is not None and self._current_image() is self._prob_image_ref:
-            spots = dust_detect.prob_to_spots(self._prob, float(value))
+            spots = dust_detect.prob_to_spots(self._prob, self._luma, float(value))
             n = self.image_preview.apply_detected_spots(spots)
             self.status_label.setText(
                 f"Removed {n} spot{'s' if n != 1 else ''}." if n
@@ -275,7 +277,7 @@ class DustRemovalPanel(QWidget):
         self._detect_thread.finished.connect(self._clear_detect_thread)
         self._detect_thread.start()
 
-    def _on_detect_done(self, prob):
+    def _on_detect_done(self, result):
         # Discard results if the user navigated to a different image (or out of
         # dust mode) while detection was running — the prob map is for the old
         # image and must not be applied to the current one.
@@ -283,10 +285,12 @@ class DustRemovalPanel(QWidget):
                 or not self.image_preview.dust_mode):
             self._finish_detect()
             return
+        prob, luma = result
         self._prob = prob
+        self._luma = luma
         self._prob_image_ref = self._current_image()
         spots = dust_detect.prob_to_spots(
-            prob, float(self.sensitivity_slider.value()))
+            prob, luma, float(self.sensitivity_slider.value()))
         n = self.image_preview.apply_detected_spots(spots)
         self.status_label.setText(
             f"Removed {n} spot{'s' if n != 1 else ''}." if n

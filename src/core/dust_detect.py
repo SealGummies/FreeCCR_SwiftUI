@@ -33,6 +33,12 @@ MAX_BLOB = 400          # connected-component pixel cap at ~2k px (resolution-no
 MAX_ASPECT = 3.0        # drop elongated detections (thin LINES are usually real
                         # structure — a bike frame, the horizon — not dust)
 SPOT_PAD = 1.5          # px added to each detected spot's radius (inpaint margin)
+# Film dust inverts to BRIGHT/white specks, so a real dust blob is brighter than
+# its surroundings. Require at least this luma lift (0..1) over the surrounding
+# ring; this rejects normal-toned content the detector wrongly fires on (a face,
+# a dark feature) — those are not bright specks.
+BRIGHT_MARGIN = 0.06
+BRIGHT_RING = 3         # px ring around a blob used as the "surround" reference
 
 _session = None          # cached ort.InferenceSession
 _session_path = None     # model path the cached session was built from
@@ -153,11 +159,12 @@ def _detect_size(h: int, w: int) -> tuple:
     return dh, dw
 
 
-def detect(positive_rgb16: np.ndarray) -> np.ndarray:
-    """Run the detector on a 16-bit RGB positive and return a float32
-    probability map (values 0..1) at detection resolution. Raises if the model
-    or onnxruntime is unavailable. Cache this per image — re-thresholding for a
-    Sensitivity change uses `prob_to_spots`, no net re-run."""
+def detect(positive_rgb16: np.ndarray) -> tuple:
+    """Run the detector on a 16-bit RGB positive. Returns
+    `(prob, luma)` — both float32 at detection resolution: the probability map
+    (0..1) and the grayscale luma (0..1, used for the bright-speck gate in
+    prob_to_spots). Raises if the model or onnxruntime is unavailable. Cache the
+    pair per image — a Sensitivity change re-runs only prob_to_spots, not the net."""
     sess = _get_session()
     h, w = positive_rgb16.shape[:2]
     dh, dw = _detect_size(h, w)
@@ -178,17 +185,23 @@ def detect(positive_rgb16: np.ndarray) -> np.ndarray:
     prob = 1.0 / (1.0 + np.exp(-arr))
     if prob.shape != (dh, dw):
         prob = cv2.resize(prob, (dw, dh), interpolation=cv2.INTER_LINEAR)
-    return prob.astype(np.float32)
+    return prob.astype(np.float32), luma.astype(np.float32)
 
 
-def prob_to_spots(prob: np.ndarray, sensitivity: float, kind: str = "auto") -> list:
-    """Threshold + size-gate a probability map into normalized dust spots.
+def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
+                  kind: str = "auto") -> list:
+    """Threshold + filter a probability map into normalized dust spots.
 
-    Pure / model-free (operates on a numpy prob map), so it is unit-testable
-    without ONNX. Threshold follows openenlarge: thr = 0.85 - 0.60*(s/100), so
-    higher sensitivity removes more. Components larger than a resolution-
-    normalized cap are dropped (real image detail, not dust). Each surviving
-    component becomes one circular spot (centroid + extent-derived radius).
+    Pure / model-free (operates on numpy arrays), so it is unit-testable without
+    ONNX. `luma` is the detection-resolution grayscale (0..1) used for the
+    bright-speck gate. Threshold follows openenlarge: thr = 0.85 - 0.60*(s/100),
+    so higher sensitivity removes more. A surviving component must be:
+      - small enough (not film border / real content),
+      - compact (elongated lines are structure/scratches → manual brush),
+      - BRIGHTER than its surroundings (film dust inverts to white specks; this
+        rejects normal-toned content the detector wrongly fires on — e.g. a
+        face). See spec/dust-removal.md §5.3.
+    Each survivor becomes one circular spot (centroid + area-equivalent radius).
     """
     h, w = prob.shape[:2]
     s = max(0.0, min(100.0, float(sensitivity)))
@@ -196,7 +209,7 @@ def prob_to_spots(prob: np.ndarray, sensitivity: float, kind: str = "auto") -> l
     binary = (prob >= thr).astype(np.uint8)
     if not binary.any():
         return []
-    n, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(
         binary, connectivity=8)
     max_blob = MAX_BLOB * max(h, w) / 2000.0
     spots = []
@@ -204,6 +217,8 @@ def prob_to_spots(prob: np.ndarray, sensitivity: float, kind: str = "auto") -> l
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area > max_blob:
             continue  # too big — film border / real image content, not dust
+        left = int(stats[i, cv2.CC_STAT_LEFT])
+        top = int(stats[i, cv2.CC_STAT_TOP])
         cw = int(stats[i, cv2.CC_STAT_WIDTH])
         ch = int(stats[i, cv2.CC_STAT_HEIGHT])
         # Drop elongated detections. Real dust is compact; the scratch detector
@@ -212,6 +227,20 @@ def prob_to_spots(prob: np.ndarray, sensitivity: float, kind: str = "auto") -> l
         # defects to the manual brush (a stroke). See spec/dust-removal.md §5.4.
         if max(cw, ch) / max(1, min(cw, ch)) > MAX_ASPECT:
             continue
+        # Bright-speck gate: compare the blob's luma to a surrounding ring. Film
+        # dust is brighter (white) than its surroundings after inversion; a face
+        # or other real feature is not, so it is rejected.
+        x0 = max(0, left - BRIGHT_RING)
+        y0 = max(0, top - BRIGHT_RING)
+        x1 = min(w, left + cw + BRIGHT_RING)
+        y1 = min(h, top + ch + BRIGHT_RING)
+        win_comp = labels[y0:y1, x0:x1] == i
+        win_luma = luma[y0:y1, x0:x1]
+        comp_luma = float(win_luma[win_comp].mean())
+        surround = win_luma[~win_comp]
+        surround_luma = float(surround.mean()) if surround.size else comp_luma
+        if comp_luma - surround_luma < BRIGHT_MARGIN:
+            continue  # not a bright speck → not film dust
         cx, cy = centroids[i]
         # Area-EQUIVALENT radius (+ small margin), NOT the bounding-box extent:
         # a tight circle matches the speck so the inpaint stays invisible

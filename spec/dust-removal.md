@@ -318,8 +318,14 @@ panel that imports it) load even when `onnxruntime` is absent.
     - **drop elongated components** (aspect ratio > `MAX_ASPECT`): the detector
       also fires on legitimate thin LINES (a bike frame, the horizon, a path
       edge); circle-inpainting those smears real detail, so linear defects are
-      left to the manual brush (§5.4). This is the main guard against AI
-      artifacts on clean scans.
+      left to the manual brush (§5.4).
+    - **bright-speck gate**: film dust inverts to **white** specks, so a real
+      dust blob is brighter than its surroundings. Require the blob's mean luma
+      to exceed a surrounding ring by `BRIGHT_MARGIN`; this rejects normal-toned
+      content the detector wrongly fires on (a face, a dark feature — which is
+      how the AI once removed a person's head). `detect` therefore returns
+      `(prob, luma)` so `prob_to_spots` has the detection-resolution grayscale.
+      This and the aspect filter are the main guards against AI false positives.
   - Each surviving (compact) component → one `auto` spot: centroid
     `(cx/prob_w, cy/prob_h)`; **area-equivalent** radius
     `r = (sqrt(area/π) + pad) / prob_w` — a tight circle matching the speck, so
