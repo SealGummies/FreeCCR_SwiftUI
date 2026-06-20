@@ -172,7 +172,14 @@ class DustRemovalPanel(QWidget):
 
         layout.addStretch(1)
 
-        self.done_btn = QPushButton("Done")
+        self.done_btn = QPushButton("✓  Done")
+        self.done_btn.setMinimumHeight(42)
+        self.done_btn.setToolTip("Close dust removal and return to the adjustment sliders.")
+        self.done_btn.setStyleSheet(
+            "QPushButton { background:#2d7d46; color:white; font-weight:bold; "
+            "font-size:13px; border:none; border-radius:5px; padding:8px; }"
+            "QPushButton:hover { background:#359152; }"
+            "QPushButton:pressed { background:#256b3b; }")
         self.done_btn.clicked.connect(self._on_done)
         layout.addWidget(self.done_btn)
 
@@ -344,6 +351,10 @@ class DustRemovalPanel(QWidget):
         present = avail and dust_detect.is_model_present()
         need_dl = avail and not present and not self._downloading
 
+        if not avail:
+            self.ai_unavailable_label.setText(
+                dust_detect.availability_reason()
+                or "AI detection unavailable in this build.")
         self.ai_unavailable_label.setVisible(not avail)
         self.download_label.setVisible(need_dl)
         self.download_btn.setVisible(need_dl)

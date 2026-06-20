@@ -138,7 +138,8 @@ class GraphicsImageView(QGraphicsView):
             interaction_active = (self.drawing_reference or self._space_pan
                                   or self._bw_drag_start is not None
                                   or self.parent_widget.crop_mode
-                                  or self.parent_widget.dust_mode
+                                  or (self.parent_widget.dust_mode
+                                      and self.parent_widget._dust_painting)
                                   or self.parent_widget._area_drag is not None
                                   or self.parent_widget._slice_drag is not None)
             if not interaction_active:
@@ -511,8 +512,9 @@ class GraphicsImageView(QGraphicsView):
         if delta == 0 or self.parent_widget.pixmap_item is None:
             event.ignore()
             return
-        if self.parent_widget.dust_mode:
-            # Wheel resizes the brush in dust mode (no zoom).
+        if self.parent_widget.dust_mode and (event.modifiers() & Qt.ControlModifier):
+            # Ctrl+wheel resizes the brush in dust mode; a plain wheel zooms
+            # (handled below), so the user can zoom in for precise spotting.
             self.parent_widget.adjust_dust_brush(
                 1 if delta > 0 else -1,
                 anchor_scene=self.mapToScene(event.position().toPoint()))
@@ -1663,6 +1665,11 @@ class ImagePreview(QWidget):
     HIRES_MAX_LONG_SIDE = 4500   # bounds non-RAW decodes (RAW half-size passes through)
 
     def _maybe_request_hires(self):
+        # Dust mode renders preview pixels only: the hi-res replay can bake fine
+        # rotation / conversion specifics that would misalign the normalized dust
+        # spots, so zoom there stays on the (upscaled) preview.
+        if self.dust_mode:
+            return
         if not self._zoomed_in_enough() or self.current_idx is None:
             return
         img = ccr_backend.get_image_by_index(self.current_idx)

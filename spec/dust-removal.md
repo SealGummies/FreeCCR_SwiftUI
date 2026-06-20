@@ -113,7 +113,11 @@ reference to `MainWindow` and `ImagePreview` passed at construction (it does
   - **Left-release**: commit the stroke as one `brush` spot (§4),
     `push_undo_state()` once for the stroke, re-render the image (inpaint
     applied), and refresh thumbnail + preview. The dust is now visibly gone.
-  - **Mouse wheel**: adjust brush size (kept in sync with the slider).
+  - **Ctrl + mouse wheel**: resize the brush (kept in sync with the slider).
+  - **Mouse wheel** (no modifier): zoom in/out for precise spotting (preview
+    pixels; hi-res replay is suppressed in dust mode — §5.5). **Middle-button
+    drag**: pan the zoomed view. (Both match the normal viewer; only the brush
+    moves to Ctrl + wheel.)
   - A **brush-circle cursor** tracks the pointer; its on-screen radius is
     `r_norm * W * view_scale` display pixels (§5.5).
 - Coordinate mapping reuses the existing inverse-`base_transform` +

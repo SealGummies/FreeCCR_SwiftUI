@@ -57,6 +57,18 @@ def is_available() -> bool:
         return False
 
 
+def availability_reason() -> str:
+    """Human-readable reason the AI detector can't run, or '' when available.
+    Surfaced in the panel so the user knows exactly what to do."""
+    try:
+        import onnxruntime  # noqa: F401
+        return ""
+    except Exception as e:
+        return ("AI detection needs the 'onnxruntime' package, which isn't "
+                f"importable ({type(e).__name__}). Run "
+                "`pip install -r requirements.txt`, then restart FreeCCR.")
+
+
 def is_model_present() -> bool:
     """True when the detector model file exists locally and is non-empty."""
     try:

@@ -1,5 +1,17 @@
 import sys
 import os
+
+# Pre-load onnxruntime (if installed) BEFORE Qt. On Windows, onnxruntime's
+# native DLLs fail their init routine when loaded AFTER Qt ("DLL initialization
+# routine failed"), which would silently disable AI dust detection in this Qt
+# app. Importing it first lets its DLLs load cleanly; Qt then loads fine on top.
+# Guarded so the app still runs when onnxruntime isn't installed (manual dust
+# removal is unaffected). See spec/dust-removal.md §8.
+try:
+    import onnxruntime  # noqa: F401
+except Exception:
+    pass
+
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
 
