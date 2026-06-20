@@ -150,6 +150,7 @@ def serialize_image(img) -> dict:
         "conversion_inputs": _ci_to_json(img.conversion_inputs),
         "adjustment_settings": dict(img.adjustment_settings),
         "areas": _areas_to_json(getattr(img, "area_layers", None)),
+        "dust_spots": copy.deepcopy(getattr(img, "dust_spots", None) or []),
         "color_profile": getattr(img, "color_profile", "color"),
         "crop_rect": list(img.crop_rect) if img.crop_rect else None,
         "crop_angle": float(img.crop_angle or 0.0),
@@ -170,6 +171,7 @@ def _is_pristine(state: dict) -> bool:
     return (not state["converted"] and not state["source_ops"]
             and not state["adjustment_settings"]
             and not state.get("areas")
+            and not state.get("dust_spots")
             and state.get("color_profile", "color") == "color"
             and state["crop_rect"] is None
             and state["rotation_angle"] == 0 and state["fine_rotation_angle"] == 0
@@ -363,6 +365,7 @@ def _restore_image(file_path: str, state: dict):
         areas=_areas_from_json(state.get("areas")),
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
+    img.dust_spots = copy.deepcopy(state.get("dust_spots") or [])
     img.color_profile = state.get("color_profile", "color")
     ref = state.get("reference_frame")
     img.reference_frame = tuple(ref) if ref else None

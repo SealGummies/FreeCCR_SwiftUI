@@ -11,7 +11,8 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 #import lensfunpy  # Make sure lensfunpy is installed
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
-                                apply_area_layers, apply_crop_to_image)
+                                apply_area_layers, apply_crop_to_image,
+                                apply_dust_removal)
 from core import color_management
 
 # Import optional libraries with fallbacks
@@ -112,6 +113,12 @@ class CCRImage:
         # The global adjustment_settings is the implicit "whole image" layer;
         # areas composite additively on top of it (see spec/area-editing.md).
         self.area_layers: List[Dict[str, Any]] = list(areas) if areas else []
+        # Dust removal: non-destructive spot inpainting. Each spot is
+        # {kind ("brush"|"auto"), pts ([[x,y],...] normalized over W/H),
+        # r (radius as a fraction of WIDTH)}. Rasterized + inpainted at render
+        # time (resolution-independent). [] = no dust removal. See
+        # spec/dust-removal.md.
+        self.dust_spots: List[Dict[str, Any]] = []
         # Which layer the adjustment panel currently edits: None = global
         # (whole image); otherwise the id of an area in area_layers. Session
         # state only — never persisted; always defaults to global on load.
@@ -621,12 +628,26 @@ class CCRImage:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
+    def _apply_dust_removal(self, image: np.ndarray) -> np.ndarray:
+        """Inpaint stored dust spots out of the working image (no-op when there
+        are none). Spots are normalized, so this scales to whatever resolution
+        is being processed — preview, hi-res zoom, or full-res export. See
+        spec/dust-removal.md."""
+        spots = getattr(self, "dust_spots", None)
+        if not spots:
+            return image
+        return apply_dust_removal(image, spots)
+
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,
                           color_profile=None, areas_override=None) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
         live state the GUI thread may be mutating concurrently."""
+        # Dust removal runs FIRST so the inpainted positive flows through the
+        # rest of the adjustment stage (and so a dust-only image is still
+        # cleaned even when the early-return guard below would otherwise skip).
+        image = self._apply_dust_removal(image)
         s = self.adjustment_settings if settings is None else settings
         cb = self.contrast_base if contrast_base is None else contrast_base
         tb = self.temperature_base if temperature_base is None else temperature_base
@@ -806,6 +827,9 @@ class CCRImage:
             # sub-dict) and a geometry dict — a shallow copy would alias the
             # live structure and a later edit would corrupt the snapshot.
             "area_layers": copy.deepcopy(getattr(self, "area_layers", [])),
+            # Deep copy: each spot nests a point list, so a shallow copy would
+            # alias live state and a later edit would corrupt the snapshot.
+            "dust_spots": copy.deepcopy(getattr(self, "dust_spots", [])),
         }
 
     def push_undo_state(self) -> None:
@@ -834,6 +858,7 @@ class CCRImage:
         self.horizontal_mirrored = state["horizontal_mirrored"]
         self.vertical_mirrored = state["vertical_mirrored"]
         self.area_layers = copy.deepcopy(state.get("area_layers", []))
+        self.dust_spots = copy.deepcopy(state.get("dust_spots", []))
         # The previously-active area may have been added back/removed by this
         # undo; the panel re-resolves None -> global if the id is now stale.
         active_id = getattr(self, "active_area_id", None)
