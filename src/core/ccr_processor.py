@@ -2815,6 +2815,77 @@ def apply_curves(img16: np.ndarray, curves) -> np.ndarray:
     return out
 
 
+# --- Dust removal (spot inpainting) ----------------------------------------
+# Dust edits are stored as NORMALIZED spots (fractions of width/height) on the
+# image, so the same definition reproduces at the 1080px preview, the hi-res
+# zoom detail and the full-res export — the resolution-independent contract the
+# area masks and reference-norm replay already honor. See spec/dust-removal.md.
+
+def rasterize_dust_mask(spots, h: int, w: int) -> np.ndarray:
+    """Rasterize dust spots into a uint8 {0,255} mask of shape (h, w).
+
+    spots: list of {"kind", "pts": [[x,y],...], "r"} where x,y are normalized
+    over width/height and r is a fraction of WIDTH. Each spot is the union of
+    equal-radius circular dabs along its polyline (consecutive points joined by
+    a thick line so a fast drag leaves no gap). r is width-based in both axes,
+    so a spot rasterizes to a true pixel circle at any resolution.
+    """
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if not spots or w <= 0 or h <= 0:
+        return mask
+    for spot in spots:
+        pts = spot.get("pts") or []
+        r_px = max(1, int(round(float(spot.get("r", 0.0)) * w)))
+        prev = None
+        for p in pts:
+            try:
+                x = int(round(float(p[0]) * w))
+                y = int(round(float(p[1]) * h))
+            except (TypeError, ValueError, IndexError):
+                continue
+            cv2.circle(mask, (x, y), r_px, 255, -1)
+            if prev is not None:
+                cv2.line(mask, prev, (x, y), 255, thickness=2 * r_px)
+            prev = (x, y)
+    return mask
+
+
+def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.ndarray:
+    """Inpaint the dust spots out of a 16-bit RGB image, non-destructively.
+
+    Only the masked pixels are replaced (the rest of the frame keeps full
+    16-bit precision); the fill is computed by cv2.inpaint (Telea) in 8-bit and
+    composited back through a feathered alpha so the patch blends seamlessly.
+    Returns a NEW uint16 array; img16 is never mutated. No-op (returns img16
+    unchanged) when there are no spots or the rasterized mask is empty.
+    """
+    if not spots:
+        return img16
+    h, w = img16.shape[:2]
+    mask = rasterize_dust_mask(spots, h, w)
+    if not mask.any():
+        return img16
+
+    # Inpaint in 8-bit BGR (what cv2.inpaint supports).
+    bgr8 = cv2.cvtColor(cv2.convertScaleAbs(img16, alpha=255.0 / 65535.0),
+                        cv2.COLOR_RGB2BGR)
+    filled8 = cv2.inpaint(bgr8, mask, inpaint_radius, cv2.INPAINT_TELEA)
+    filled16 = cv2.cvtColor(filled8, cv2.COLOR_BGR2RGB).astype(np.uint16) * 257
+
+    # Feathered alpha: dilate a touch to bury the speck's antialiased edge,
+    # then box-blur to a soft 0..1 ramp so the fill has no visible seam. Inside
+    # the dilate+blur halo (a few px around the mask) pixels blend toward the
+    # fill; OUTSIDE the halo alpha is exactly 0, so those pixels are kept
+    # bit-for-bit. The halo is the intended seamless-blend region.
+    k = np.ones((3, 3), np.uint8)
+    a = cv2.dilate(mask, k, iterations=1)
+    a = (cv2.blur(a, (5, 5)).astype(np.float32) / 255.0)[..., None]
+
+    out = (img16.astype(np.float32) * (1.0 - a)
+           + filled16.astype(np.float32) * a)
+    return np.clip(out, 0, 65535).astype(np.uint16)
+
+
 # --- Area editing (local masked adjustment layers) -------------------------
 # Masks are rasterized from NORMALIZED geometry (fractions of width/height) so
 # the same area definition reproduces identically at the 1080px preview, the

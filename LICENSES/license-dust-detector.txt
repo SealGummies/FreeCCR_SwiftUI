@@ -1,0 +1,21 @@
+Dust Removal — AI detector model
+=================================
+
+FreeCCR's optional "AI Dust Detection" downloads a neural dust/scratch
+detector model (detector.onnx) on first use. The model and its weights are not
+bundled with FreeCCR; they are fetched from the openenlarge project's published
+release asset and cached locally in the user's app-data folder.
+
+Model: BOPBTL ("Bringing Old Photos Back to Life") scratch detector, U-Net.
+Distributed via: openenlarge (https://github.com/MohaElder/openenlarge),
+release "autodust-assets-v1".
+Upstream lineage: leonelhs/zeroscratches → Microsoft "Bringing Old Photos Back
+to Life" (microsoft/Bringing-Old-Photos-Back-to-Life), MIT License.
+
+Inference is performed with onnxruntime (MIT License). The actual dust removal
+(inpainting) uses OpenCV's cv2.inpaint (see license-opencv.txt).
+
+This file records attribution. Confirm and, if required, reproduce the full
+upstream MIT license text here before distributing a build that advertises the
+AI feature. The manual (brush) dust removal path uses no third-party model and
+works fully offline.

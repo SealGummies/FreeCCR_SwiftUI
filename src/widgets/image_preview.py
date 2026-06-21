@@ -9,6 +9,7 @@ from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QP
                            QImage)
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
+from core.ccr_processor import apply_dust_removal
 from widgets.export_dialog import ExportSettingsDialog
 import math
 import copy
@@ -137,6 +138,8 @@ class GraphicsImageView(QGraphicsView):
             interaction_active = (self.drawing_reference or self._space_pan
                                   or self._bw_drag_start is not None
                                   or self.parent_widget.crop_mode
+                                  or (self.parent_widget.dust_mode
+                                      and self.parent_widget._dust_painting)
                                   or self.parent_widget._area_drag is not None
                                   or self.parent_widget._slice_drag is not None)
             if not interaction_active:
@@ -148,6 +151,10 @@ class GraphicsImageView(QGraphicsView):
         if self._space_pan:
             # Space+drag pans the view (ScrollHandDrag handles the motion)
             return super().mousePressEvent(event)
+        if self.parent_widget.dust_mode and self.parent_widget.pixmap_item is not None:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.dust_press(self.mapToScene(event.pos()))
+            return
         if self.parent_widget.crop_mode and self.parent_widget.pixmap_item is not None:
             if event.button() == Qt.LeftButton:
                 self.parent_widget.begin_crop_drag(self.mapToScene(event.pos()))
@@ -217,6 +224,9 @@ class GraphicsImageView(QGraphicsView):
             return
         if self._space_pan:
             return super().mouseMoveEvent(event)
+        if self.parent_widget.dust_mode:
+            self.parent_widget.dust_move(self.mapToScene(event.pos()))
+            return
         if self.parent_widget.crop_mode:
             scene_pos = self.mapToScene(event.pos())
             if self.parent_widget._crop_drag is not None:
@@ -333,6 +343,10 @@ class GraphicsImageView(QGraphicsView):
             return
         if self._space_pan:
             return super().mouseReleaseEvent(event)
+        if self.parent_widget.dust_mode:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.dust_release()
+            return
         if self.parent_widget.crop_mode:
             if event.button() == Qt.LeftButton:
                 self.parent_widget.end_crop_drag(self.mapToScene(event.pos()))
@@ -498,6 +512,14 @@ class GraphicsImageView(QGraphicsView):
         if delta == 0 or self.parent_widget.pixmap_item is None:
             event.ignore()
             return
+        if self.parent_widget.dust_mode and (event.modifiers() & Qt.ControlModifier):
+            # Ctrl+wheel resizes the brush in dust mode; a plain wheel zooms
+            # (handled below), so the user can zoom in for precise spotting.
+            self.parent_widget.adjust_dust_brush(
+                1 if delta > 0 else -1,
+                anchor_scene=self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
         # Take keyboard focus so space-pan is immediately available after a
         # zoom (ClickFocus alone would leave space going to other widgets)
         self.setFocus()
@@ -509,6 +531,8 @@ class GraphicsImageView(QGraphicsView):
     def _restore_mode_cursor(self):
         pw = self.parent_widget
         if pw is not None and pw.crop_mode:
+            self.setCursor(Qt.CrossCursor)
+        elif pw is not None and pw.dust_mode:
             self.setCursor(Qt.CrossCursor)
         elif self.wb_pick_mode:
             self.setCursor(_eyedropper_cursor())
@@ -663,6 +687,21 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(self.add_gradient_action)
         add_spacer()
 
+        # Dust removal: opens the Dust Removal panel (covers the sliders) and a
+        # paint/AI-detect mode on the canvas. Checkable so it reflects mode
+        # state. Grouped with the area-editing tools (a separator before it).
+        self.toolbar.addSeparator()
+        add_spacer()
+        self.dust_action = QAction("🧹 Dust Removal", self)
+        self.dust_action.setCheckable(True)
+        self.dust_action.setToolTip(
+            "Spot out dust, hair and small scratches. Opens the Dust Removal "
+            "panel: paint over dust with the brush, or use AI auto-detect.")
+        self.dust_action.triggered.connect(
+            lambda checked: self.window().toggle_dust_removal(checked))
+        self.toolbar.addAction(self.dust_action)
+        add_spacer()
+
         self.convert_action = QAction("Convert", self)
         self.convert_action.triggered.connect(self.convert_ccr)
         self.toolbar.addAction(self.convert_action)
@@ -786,6 +825,19 @@ class ImagePreview(QWidget):
         self._slice_drag = None          # line dict being dragged, or None
         self._slice_worker = None
 
+        # Dust removal mode. Like crop, dust mode shows the FULL un-cropped
+        # image with coarse rotation/flip only (no fine rotation) so canvas
+        # pixels map 1:1 to resized_raw. Spots are stored on the image; the
+        # brush only draws a live overlay + commits on release. See
+        # spec/dust-removal.md.
+        self.dust_mode = False
+        self._dust_painting = False
+        self._dust_pts = []              # current stroke, normalized [[x,y],...]
+        self._dust_brush_r = 0.012       # brush radius, fraction of image width
+        self._dust_stroke_item = None    # live red stroke overlay (in-progress)
+        self._dust_cursor_item = None    # brush-circle cursor following the pointer
+        self.dust_panel = None           # set by MainWindow (brush-slider sync)
+
         # Coalesce a fine-rotation drag into a single undo step
         self._fine_rot_burst_active = False
         self._fine_rot_burst_timer = QTimer(self)
@@ -831,6 +883,15 @@ class ImagePreview(QWidget):
         """Empty the canvas after the last image is removed: drop all
         references to the deleted image (incl. the hi-res cache memory) and
         reset the view state."""
+        if self.dust_mode:
+            # No image left to edit — drop dust mode and restore the sliders.
+            self.dust_mode = False
+            self._dust_painting = False
+            self._dust_pts = []
+            self._clear_dust_items()
+            mw = self.window()
+            if hasattr(mw, "_show_sliders_panel"):
+                mw._show_sliders_panel()
         if self.crop_mode:
             self._exit_crop_mode()
         if self.slice_mode:
@@ -872,6 +933,9 @@ class ImagePreview(QWidget):
         elif self.area_mode:
             # Esc leaves area editing: deselect back to the Whole Image layer.
             self._select_whole_image_layer()
+        elif self.dust_mode:
+            # Esc leaves dust mode (MainWindow restores the sliders panel).
+            self.window().toggle_dust_removal(False)
 
     # --- Tethering banner (watch-folder mode) ----------------------------
     def set_tether_banner(self, banner):
@@ -920,6 +984,19 @@ class ImagePreview(QWidget):
             editable = img_obj_now.converted or ccr_backend.positive_mode
             if not same_image or active_gone or not editable:
                 self._exit_area_mode()
+        # Dust mode leaves on an image switch (like crop/area), so a half-drawn
+        # stroke can't commit to the wrong image and the panel can't drift out
+        # of sync. Torn down WITHOUT a recursive update_preview — we're already
+        # rendering the new image; MainWindow restores the sliders panel.
+        if self.dust_mode and not same_image:
+            self.dust_mode = False
+            self._dust_painting = False
+            self._dust_pts = []
+            self._clear_dust_items()
+            self.view.setCursor(Qt.ArrowCursor)
+            mw = self.window()
+            if hasattr(mw, "_show_sliders_panel"):
+                mw._show_sliders_panel()
         if not same_image:
             # The fine-rotation burst belongs to the previous image; a switch
             # must end it so the next image's first drag gets its own snapshot.
@@ -949,7 +1026,7 @@ class ImagePreview(QWidget):
         crop_angle = getattr(ccr_backend.images[idx], "crop_angle", 0.0) or 0.0
         if (preview_img is not None and not preview_img.isNull()
                 and crop is not None and not self.crop_mode and not self.slice_mode
-                and not self.area_mode
+                and not self.area_mode and not self.dust_mode
                 and (ccr_backend.images[idx].converted or ccr_backend.positive_mode)):
             if crop_angle:
                 extracted = self._extract_rotated_crop(preview_img, crop, crop_angle)
@@ -990,13 +1067,20 @@ class ImagePreview(QWidget):
         self._area_overlay_items = []
         self._slice_ghost_item = None
         self._slice_dim_item = None
+        # scene.clear() above already deleted these — drop the stale refs so a
+        # later removeItem() can't touch freed C++ objects.
+        self._dust_stroke_item = None
+        self._dust_cursor_item = None
         for _slice_line in self._slice_lines:
             _slice_line["item"] = None
 
         self.parent().parent().sliders_panel.set_current_idx(idx)
 
         if preview_img and not preview_img.isNull():
-            self.rotation_slider.setEnabled(True)
+            # Fine rotation is suppressed in dust mode (the canvas shows the
+            # un-fine-rotated image), so disable its slider to match — otherwise
+            # it would show a value the display ignores and could mutate state.
+            self.rotation_slider.setEnabled(not self.dust_mode)
             self.pixmap_item = QGraphicsPixmapItem(preview_img)
             self.scene.addItem(self.pixmap_item)
 
@@ -1143,7 +1227,7 @@ class ImagePreview(QWidget):
         # (Slice mode keeps the fine rotation displayed: cuts are placed on
         # the rotated frame and the rotation is baked into the slices.)
         img_transform = QTransform(base_transform)
-        if self.current_fine_rotation and not self.crop_mode:
+        if self.current_fine_rotation and not self.crop_mode and not self.dust_mode:
             img_transform.translate(cx, cy)
             img_transform.rotate(self.current_fine_rotation / 100.0)
             img_transform.translate(-cx, -cy)
@@ -1290,6 +1374,9 @@ class ImagePreview(QWidget):
             # Film B/W Point tools are negative-only.
             if hasattr(sliders_panel, "set_negative_controls_enabled"):
                 sliders_panel.set_negative_controls_enabled(not positive)
+            # Dust removal follows the same gate as the adjustment sliders.
+            if hasattr(self, "dust_action"):
+                self.dust_action.setEnabled(sliders_enabled)
         
 
     def set_bwpoint_mode(self, mode):
@@ -1458,6 +1545,12 @@ class ImagePreview(QWidget):
         detail would help. Magnification comes from zooming in, or from cropping
         into the image (the kept region is scaled up to fill the view even at
         the fitted zoom)."""
+        # Dust mode always wants the sharpest pixels for precise spotting, so
+        # load hi-res detail even at the fitted view (and on zoom-in). The
+        # display path already shows the full, un-fine-rotated image in dust
+        # mode, so the hi-res lines up with the normalized dust spots.
+        if self.dust_mode:
+            return True
         if self._view_scale() <= 1.05:
             return False
         return self._zoom > 1.0 or self._crop_wants_hires()
@@ -1562,10 +1655,18 @@ class ImagePreview(QWidget):
              tuple(sorted((a.get("geometry") or {}).items())),
              tuple(sorted((a.get("settings") or {}).items())))
             for a in getattr(img, "area_layers", []))
+        # Dust spots are inpainted inside apply_adjustments, so a change to them
+        # must invalidate the cached hi-res display (see spec/dust-removal.md §4.4).
+        dust_sig = tuple(
+            (s.get("kind"),
+             tuple((round(float(p[0]) * 10000), round(float(p[1]) * 10000))
+                   for p in (s.get("pts") or [])),
+             round(float(s.get("r", 0)) * 10000))
+            for s in getattr(img, "dust_spots", []))
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "color_profile", "color"),
-                areas_sig)
+                areas_sig, dust_sig)
 
     HIRES_MAX_LONG_SIDE = 4500   # bounds non-RAW decodes (RAW half-size passes through)
 
@@ -1638,7 +1739,12 @@ class ImagePreview(QWidget):
             self._hires["display_pm"] = None
             self._hires["crop_sig"] = None
             if self._hires.get("adj_sig") != self._current_adj_sig():
-                self._hires["full_pm"] = None
+                # In dust mode, KEEP the last sharp render on screen until the
+                # re-render lands, so a paint stroke doesn't flash the blurry
+                # preview in between (the new render — with the spot inpainted —
+                # swaps in a moment later). Outside dust mode, drop it as before.
+                if not self.dust_mode:
+                    self._hires["full_pm"] = None
                 self._hires["adj_sig"] = None
         if self._zoomed_in_enough():
             self._hires_timer.start(350)
@@ -2089,6 +2195,264 @@ class ImagePreview(QWidget):
             t.rotate(self.current_rotation)
         t.translate(-cx, -cy)
         return t if t.isInvertible() else None
+
+    # --- Dust removal mode -------------------------------------------------
+    # Paint over dust to inpaint it (cv2.inpaint), or AI-detect it. Edits are
+    # stored as normalized spots on the image and replayed in the render
+    # pipeline at every resolution. See spec/dust-removal.md.
+    def enter_dust_mode(self) -> bool:
+        """Show the full un-cropped image (coarse rotation/flip only, no fine
+        rotation) so canvas pixels map 1:1 to resized_raw, ready for painting."""
+        if self.current_idx is None:
+            return False
+        img_obj = ccr_backend.get_image_by_index(self.current_idx)
+        if (img_obj is None or self.current_pixmap is None
+                or self.current_pixmap.isNull()):
+            return False
+        if self.crop_mode:
+            self._exit_crop_mode()
+        if self.slice_mode:
+            self._exit_slice_mode()
+        if self.area_mode:
+            self._exit_area_mode()
+        self.view.bwpoint_mode = None
+        self.view.wb_pick_mode = False
+        self.dust_mode = True
+        self._dust_painting = False
+        self._dust_pts = []
+        self._zoom = 1.0
+        self._release_hires(refresh=False)
+        # dust_mode is already True, so update_preview shows the full un-cropped
+        # image (its crop-display branch checks `not self.dust_mode`).
+        self.update_preview(self.current_idx)
+        self._sync_zoom_combo()
+        self.view.setCursor(Qt.CrossCursor)
+        return True
+
+    def exit_dust_mode(self):
+        """Tear down the brush overlay and restore the normal (cropped,
+        fine-rotated) preview. Stored dust edits remain on the image."""
+        if not self.dust_mode:
+            return
+        self.dust_mode = False
+        self._dust_painting = False
+        self._dust_pts = []
+        self._clear_dust_items()
+        self.view.setCursor(Qt.ArrowCursor)
+        if self.current_idx is not None:
+            self.update_preview(self.current_idx)
+            self._sync_zoom_combo()
+
+    def set_dust_panel(self, panel):
+        """MainWindow wires the DustRemovalPanel here so wheel-resize can keep
+        the panel's brush slider in sync."""
+        self.dust_panel = panel
+
+    def set_dust_brush_size(self, r_norm: float):
+        self._dust_brush_r = max(0.002, min(0.2, float(r_norm)))
+
+    def adjust_dust_brush(self, step: int, anchor_scene=None):
+        """Wheel-resize the brush (exponential); keep the panel slider + the
+        on-canvas brush ring in sync."""
+        factor = 1.15 if step > 0 else (1.0 / 1.15)
+        self._dust_brush_r = max(0.002, min(0.2, self._dust_brush_r * factor))
+        if getattr(self, "dust_panel", None) is not None:
+            self.dust_panel.sync_brush_size(self._dust_brush_r)
+        self._update_dust_cursor(anchor_scene)
+
+    def _dust_scene_to_norm(self, scene_pos):
+        """Scene point -> normalized (x over width, y over height) in the
+        displayed (= resized_raw, un-cropped, un-fine-rotated) pixmap."""
+        t = self._base_transform()
+        if t is None or self.current_pixmap is None:
+            return None
+        inv, ok = t.inverted()
+        if not ok:
+            return None
+        local = inv.map(scene_pos)
+        w = self.current_pixmap.width()
+        h = self.current_pixmap.height()
+        if w <= 0 or h <= 0:
+            return None
+        return [local.x() / w, local.y() / h]
+
+    def dust_press(self, scene_pos):
+        if not self.dust_mode:
+            return
+        n = self._dust_scene_to_norm(scene_pos)
+        if n is None:
+            return
+        self._dust_painting = True
+        self._dust_pts = [n]
+        self._draw_dust_stroke()
+        self._update_dust_cursor(scene_pos)
+
+    def dust_move(self, scene_pos):
+        if not self.dust_mode:
+            return
+        self._update_dust_cursor(scene_pos)
+        if not self._dust_painting:
+            return
+        n = self._dust_scene_to_norm(scene_pos)
+        if n is None:
+            return
+        self._dust_pts.append(n)
+        self._draw_dust_stroke()
+
+    def dust_release(self):
+        if not self.dust_mode or not self._dust_painting:
+            return
+        self._dust_painting = False
+        pts = self._dust_pts
+        self._dust_pts = []
+        if not pts:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        img.push_undo_state()
+        img.dust_spots.append(
+            {"kind": "brush", "pts": pts, "r": float(self._dust_brush_r)})
+        self._commit_dust_change(img)
+
+    def dust_undo_last(self) -> bool:
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None or not img.dust_spots:
+            return False
+        img.push_undo_state()
+        img.dust_spots.pop()
+        self._commit_dust_change(img)
+        return True
+
+    def dust_clear_all(self) -> bool:
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None or not img.dust_spots:
+            return False
+        img.push_undo_state()
+        img.dust_spots = []
+        self._commit_dust_change(img)
+        return True
+
+    @staticmethod
+    def dust_detect_source_for(img):
+        """The working positive the AI detector should run on for `img`, or None.
+        Only the MANUAL (brush) spots are healed first — the 'auto' spots are
+        about to be replaced, so healing them would hide the very dust we want to
+        re-detect (making a second Detect lose the first one's coverage)."""
+        raw = getattr(img, "resized_raw", None)
+        if img is None or raw is None:
+            return None
+        brush = [s for s in getattr(img, "dust_spots", []) if s.get("kind") == "brush"]
+        return apply_dust_removal(raw, brush)
+
+    def dust_detect_source(self):
+        """Detection source for the current image (see dust_detect_source_for)."""
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        return self.dust_detect_source_for(img) if img is not None else None
+
+    def apply_detected_spots(self, new_auto_spots) -> int:
+        """Replace the AI-detected ('auto') spots with a fresh set; manual
+        ('brush') spots are kept. Returns the new auto-spot count."""
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        return self.apply_auto_spots_to_image(img, new_auto_spots)
+
+    def apply_auto_spots_to_image(self, img, new_auto_spots) -> int:
+        """Replace the AI 'auto' spots on a SPECIFIC image (used by both the
+        single Detect and the batch 'detect on all'). Manual spots are kept.
+        Re-bakes that image's thumbnail/preview; refreshes the canvas only when
+        it is the current image. Returns the new auto-spot count."""
+        # Ignore an image no longer loaded — a stale batch result for an image
+        # the user removed or replaced (new Open) must not mutate an orphan.
+        if img is None or img not in ccr_backend.images:
+            return 0
+        img.push_undo_state()
+        img.dust_spots = [s for s in img.dust_spots if s.get("kind") != "auto"]
+        img.dust_spots.extend(new_auto_spots or [])
+        cur = (ccr_backend.get_image_by_index(self.current_idx)
+               if self.current_idx is not None else None)
+        if img is cur:
+            self._commit_dust_change(img)
+        else:
+            img.update_thumbnail_and_preview()
+            try:
+                idx = ccr_backend.images.index(img)
+                self.window().thumbnail_list.update_thumbnail(idx)
+            except (ValueError, AttributeError):
+                pass
+        return len(new_auto_spots or [])
+
+    def _commit_dust_change(self, img):
+        """Re-bake the preview/thumbnail after a dust edit and refresh the UI."""
+        img.update_thumbnail_and_preview()
+        self.update_preview(self.current_idx)
+        # Kick the hi-res re-render right away (instead of the debounce) so the
+        # inpainted spot resolves promptly; the in-flight guard dedups it. The
+        # previous sharp render stays on screen until this lands (no blur flash).
+        self._maybe_request_hires()
+        try:
+            self.window().thumbnail_list.update_thumbnail(self.current_idx)
+        except Exception:
+            pass
+
+    def _clear_dust_items(self):
+        for attr in ("_dust_stroke_item", "_dust_cursor_item"):
+            item = getattr(self, attr, None)
+            if item is not None:
+                try:
+                    self.scene.removeItem(item)
+                except (RuntimeError, ValueError):
+                    pass
+                setattr(self, attr, None)
+
+    def _draw_dust_stroke(self):
+        """Draw/refresh the live red overlay for the in-progress stroke."""
+        if self._dust_stroke_item is not None:
+            try:
+                self.scene.removeItem(self._dust_stroke_item)
+            except (RuntimeError, ValueError):
+                pass
+            self._dust_stroke_item = None
+        if not self._dust_pts or self.current_pixmap is None:
+            return
+        t = self._base_transform()
+        if t is None:
+            return
+        w = self.current_pixmap.width()
+        h = self.current_pixmap.height()
+        path = QPainterPath()
+        first = t.map(QPointF(self._dust_pts[0][0] * w, self._dust_pts[0][1] * h))
+        path.moveTo(first)
+        for p in self._dust_pts[1:]:
+            path.lineTo(t.map(QPointF(p[0] * w, p[1] * h)))
+        if len(self._dust_pts) == 1:
+            path.lineTo(first)  # a single dab
+        item = QGraphicsPathItem(path)
+        pen = QPen(QColor(255, 40, 40, 150), 2.0 * self._dust_brush_r * w,
+                   Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        item.setPen(pen)
+        self.scene.addItem(item)
+        self._dust_stroke_item = item
+
+    def _update_dust_cursor(self, scene_pos):
+        """Move the brush-circle cursor ring to the pointer (sized by brush)."""
+        if self._dust_cursor_item is not None:
+            try:
+                self.scene.removeItem(self._dust_cursor_item)
+            except (RuntimeError, ValueError):
+                pass
+            self._dust_cursor_item = None
+        if (scene_pos is None or self.current_pixmap is None
+                or not self.dust_mode or self.pixmap_item is None):
+            return
+        r = self._dust_brush_r * self.current_pixmap.width()
+        item = QGraphicsEllipseItem(scene_pos.x() - r, scene_pos.y() - r,
+                                    2 * r, 2 * r)
+        pen = QPen(QColor(255, 255, 255, 220), 1)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(QBrush(Qt.NoBrush))
+        self.scene.addItem(item)
+        self._dust_cursor_item = item
 
     def enter_crop_mode(self) -> bool:
         """Show the full image with the current crop (if any) as the starting

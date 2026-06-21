@@ -8,3 +8,4 @@ keyring
 requests
 nuitka
 pyopencl
+onnxruntime

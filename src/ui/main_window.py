@@ -5,6 +5,7 @@ from PySide6.QtCore import (Qt, QEvent, QThread, Signal, QObject, QSettings,
 from widgets.thumbnail_list import ThumbnailList
 from widgets.image_preview import ImagePreview
 from widgets.sliders_panel import SlidersPanel
+from widgets.dust_panel import DustRemovalPanel
 from widgets.tether_banner import TetherBanner
 from core.ccr_backend import ccr_backend
 from core.tether_watcher import (TetherWatchWorker, FolderScanner, is_supported,
@@ -132,6 +133,15 @@ class MainWindow(QMainWindow):
         self.sliders_panel.set_sliders_enabled(False)
         self.sliders_panel.image_preview = self.image_preview
 
+        # Dust Removal panel — covers the sliders panel while in dust mode. Kept
+        # as a SIBLING of sliders_panel (not a QStackedWidget wrapping it) so
+        # SlidersPanel's parent().parent() chain to MainWindow stays valid.
+        # See spec/dust-removal.md.
+        self.dust_panel = DustRemovalPanel(self, self.image_preview)
+        self.dust_panel.setFixedWidth(300)
+        self.dust_panel.setVisible(False)
+        self.image_preview.set_dust_panel(self.dust_panel)
+
         # Tethering (watch-folder capture) state + status banner. The banner is
         # installed INTO image_preview's own layout (not wrapped around it) so
         # ImagePreview's parent().parent() chains stay valid — see
@@ -155,6 +165,7 @@ class MainWindow(QMainWindow):
         self.layout.addWidget(self.thumbnail_list, 0)
         self.layout.addWidget(self.image_preview, 3)
         self.layout.addWidget(self.sliders_panel, 0)
+        self.layout.addWidget(self.dust_panel, 0)
 
         # Persisted UI preferences (last-open location etc.)
         self._settings = QSettings("FreeCCR", "FreeCCR")
@@ -235,6 +246,10 @@ class MainWindow(QMainWindow):
             # before persisting, so no capture is mid-write into a locked catalog.
             if self._tether_active:
                 self.stop_tethering()
+            # Stop any in-flight dust model download / detection thread so a
+            # running QThread can't abort the process at teardown.
+            if hasattr(self, "dust_panel"):
+                self.dust_panel.shutdown()
             # Persist the edit catalog so reopening these files restores
             # their conversion/slices/crop/adjustments.
             ccr_backend.save_catalog()
@@ -244,6 +259,40 @@ class MainWindow(QMainWindow):
 
     def on_image_selected(self, file_path):
         pass
+
+    # --- Dust removal (panel cover + canvas mode) -------------------------
+    def toggle_dust_removal(self, on=None):
+        """Show/hide the Dust Removal panel (covering the sliders) and
+        enter/exit the canvas dust mode. `on=None` flips the current state."""
+        if on is None:
+            on = not self.image_preview.dust_mode
+        if on:
+            if self.image_preview.current_idx is None:
+                self._sync_dust_action(False)
+                return
+            if not self.image_preview.enter_dust_mode():
+                self._sync_dust_action(False)
+                return
+            self.sliders_panel.setVisible(False)
+            self.dust_panel.bind_image()
+            self.dust_panel.setVisible(True)
+            self._sync_dust_action(True)
+        else:
+            self.dust_panel.cancel_jobs()
+            self.image_preview.exit_dust_mode()
+            self._show_sliders_panel()
+
+    def _show_sliders_panel(self):
+        self.dust_panel.setVisible(False)
+        self.sliders_panel.setVisible(True)
+        self._sync_dust_action(False)
+
+    def _sync_dust_action(self, checked: bool):
+        action = getattr(self.image_preview, "dust_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(checked)
+            action.blockSignals(False)
 
     def undo_last_action(self):
         """Restore the current image's previous state (adjustments, crop,
