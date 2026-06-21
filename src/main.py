@@ -12,10 +12,35 @@ import os
 # Guarded so the app still runs when onnxruntime is absent (manual dust removal
 # is unaffected, and the AI panel reports the reason).
 try:
-    _ort_capi = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
-                             "onnxruntime", "capi")
-    if os.path.isdir(_ort_capi):
-        os.add_dll_directory(_ort_capi)
+    import ctypes
+    _bases = []
+    for _b in (getattr(sys, "executable", ""), (sys.argv[0] if sys.argv else "")):
+        try:
+            _b = os.path.dirname(os.path.abspath(_b))
+        except Exception:
+            continue
+        if _b and _b not in _bases:
+            _bases.append(_b)
+    for _b in _bases:
+        _ort_capi = os.path.join(_b, "onnxruntime", "capi")
+        if not os.path.isdir(_ort_capi):
+            continue
+        try:
+            os.add_dll_directory(_ort_capi)
+        except Exception:
+            pass
+        # add_dll_directory alone is NOT enough in the Nuitka build: it loads the
+        # .pyd without searching capi/ for its onnxruntime.dll dependency. Load
+        # the native runtime explicitly (by full path) so the .pyd finds it
+        # already in-process. (ctypes-proven; see spec/dust-removal.md §8.)
+        for _dll in ("onnxruntime.dll", "onnxruntime_providers_shared.dll"):
+            _dp = os.path.join(_ort_capi, _dll)
+            if os.path.exists(_dp):
+                try:
+                    ctypes.WinDLL(_dp)
+                except Exception:
+                    pass
+        break
 except Exception:
     pass
 try:

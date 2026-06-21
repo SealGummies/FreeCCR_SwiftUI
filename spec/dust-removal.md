@@ -421,18 +421,33 @@ pytest-style. Two groups:
 
 ## 8. Build / packaging
 
-- `onnxruntime` is added to `requirements.txt` so running from source
-  (`python src/main.py`, the primary dev path) has AI working out of the box.
-- The lazy in-function import means a Nuitka **standalone** build that does *not*
-  bundle `onnxruntime` still runs — the AI section simply reports unavailable and
-  manual dust works. Two valid build options (validate empirically, tracked as a
-  build TODO, not blocking this feature):
-  1. **Bundle**: add `--include-package=onnxruntime` and the provider DLL/data
-     dirs to `build_exe.bat` / Makefile.
-  2. **Exclude**: `--nofollow-import-to=onnxruntime` to ship AI-disabled (manual
-     only), keeping the build small and green.
-- The ~150 MB model is **never** bundled; it downloads on demand to the app data
-  dir, like a user asset.
+`onnxruntime` is in `requirements.txt`, so from source (`python src/main.py`) AI
+works out of the box. Making it work in the **Nuitka standalone exe** took four
+fixes (all empirically verified by a startup diagnostic that logs onnxruntime
+readiness, and `--windows-console-mode=attach` so it's visible):
+
+1. **Compiler = MSVC, not mingw** (`--msvc=latest`). mingw gcc 14.2 / clang 19
+   both crashed (ICE / codegen) compiling FreeCCR's huge generated C files
+   (`ccr_processor`, `__helpers`); MSVC compiles them. `--jobs=6` bounds parallel
+   compile memory (24 cores otherwise launch 24 compilers and crash on the huge
+   units).
+2. **Bundle onnxruntime**: `--include-package=onnxruntime
+   --include-package-data=onnxruntime` (pulls the modules, the `.pyd`, and the
+   native `capi/*.dll`).
+3. **Refresh the MSVC runtime** (the key one): Nuitka bundles the VC toolset's
+   redist runtime (`msvcp140*.dll` / `vcruntime140*.dll`), which is OLDER
+   (14.29/14.32) than onnxruntime needs (14.44+). Loaded against the stale
+   runtime the `.pyd` fails its init ("DLL initialization routine failed") and AI
+   is silently disabled. `build_exe.bat` overwrites those DLLs in `main.dist`
+   with the system's current ones post-build.
+4. **`main.py` startup**: before any Qt import (load-order matters on Windows),
+   add `<exe>/onnxruntime/capi` to the DLL search path and pre-load
+   `onnxruntime.dll` so the bundled `.pyd` resolves it. Guarded / no-op from
+   source.
+
+The lazy in-function import still means a build *without* onnxruntime runs fine
+(AI reports the reason, manual dust unaffected). The ~150 MB detector model is
+**never** bundled; it downloads on demand to the app-data dir.
 
 ## 9. Refinement notes — resolved decisions
 
