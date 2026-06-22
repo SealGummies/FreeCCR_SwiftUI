@@ -195,12 +195,14 @@ class ExportSettingsDialog(QDialog):
         button_layout = QHBoxLayout()
         button_layout.addStretch(1)
         self.export_button = QPushButton("Export")
-        self.export_button.setDefault(True)
         self.export_button.clicked.connect(self._on_export_clicked)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(self.export_button)
+        # Export is the deliberate commit → primary + dialog default; Cancel recedes.
+        theme.style_button(self.export_button, "primary", default=True)
+        theme.style_button(cancel_button, "secondary")
         button_layout.addWidget(cancel_button)
+        button_layout.addWidget(self.export_button)
         layout.addLayout(button_layout)
 
         # Debounced size estimation

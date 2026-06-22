@@ -13,7 +13,8 @@ unavailable/needs-download state and the manual brush is unaffected.
 See spec/dust-removal.md.
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                                QPushButton, QSlider, QFrame, QProgressBar)
+                                QPushButton, QSlider, QFrame, QProgressBar,
+                                QMessageBox)
 from PySide6.QtCore import Qt, QObject, QThread, Signal
 
 from core import dust_detect
@@ -163,7 +164,9 @@ class DustRemovalPanel(QWidget):
         self.undo_btn.clicked.connect(self._on_undo_last)
         self.clear_btn = QPushButton("Clear all")
         self.clear_btn.clicked.connect(self._on_clear_all)
+        theme.style_button(self.clear_btn, "danger")  # removes all spots
         manual_btns.addWidget(self.undo_btn)
+        manual_btns.addSpacing(8)
         manual_btns.addWidget(self.clear_btn)
         layout.addLayout(manual_btns)
 
@@ -229,11 +232,8 @@ class DustRemovalPanel(QWidget):
         self.done_btn = QPushButton("✓  Done")
         self.done_btn.setMinimumHeight(42)
         self.done_btn.setToolTip("Close dust removal and return to the adjustment sliders.")
-        self.done_btn.setStyleSheet(
-            f"QPushButton {{ background:{theme.SUCCESS}; color:white; font-weight:bold; "
-            f"font-size:13px; border:none; border-radius:5px; padding:8px; }}"
-            f"QPushButton:hover {{ background:{theme.SUCCESS_HOVER}; }}"
-            f"QPushButton:pressed {{ background:{theme.SUCCESS_PRESSED}; }}")
+        # The panel's commit action → neutral primary (no success-green chrome).
+        theme.style_button(self.done_btn, "primary")
         self.done_btn.clicked.connect(self._on_done)
         layout.addWidget(self.done_btn)
 
@@ -285,6 +285,17 @@ class DustRemovalPanel(QWidget):
             self.status_label.setText("Nothing to undo.")
 
     def _on_clear_all(self):
+        from core.ccr_backend import ccr_backend
+        img = ccr_backend.get_image_by_index(self.image_preview.current_idx)
+        n = len(getattr(img, "dust_spots", []) or []) if img is not None else 0
+        if n == 0:
+            self.status_label.setText("No dust spots to clear.")
+            return
+        if QMessageBox.question(
+                self, "Clear All Dust Spots",
+                f"Remove all {n} dust spot{'s' if n != 1 else ''} from this image?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
         if self.image_preview.dust_clear_all():
             self._prob = None  # spots gone; a re-detect should start fresh
             self.status_label.setText("Cleared all dust spots.")
@@ -373,6 +384,13 @@ class DustRemovalPanel(QWidget):
                    and getattr(im, "resized_raw", None) is not None]
         if not targets:
             self.status_label.setText("No converted images to detect on.")
+            return
+        n = len(targets)
+        if QMessageBox.question(
+                self, "Detect on All Images",
+                f"Run AI dust detection on all {n} image{'s' if n != 1 else ''}? "
+                "This may take a while.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         self._detecting_all = True
         self.detect_btn.setEnabled(False)

@@ -315,6 +315,70 @@ def load_tinted_icon(abs_path: str, color: str = ICON,
     return icon
 
 
+_BTN_ROLE_QSS = {
+    # Primary = the weighty commit on a surface. NEUTRAL elevation (no hue) so it
+    # leads without adding colour to a colour-critical UI.
+    "primary": (
+        "QPushButton { background-color: %(s_active)s; color: %(text)s;"
+        " border: 1px solid %(border_strong)s; border-radius: %(r)dpx;"
+        " padding: 5px 12px; font-weight: bold; }"
+        " QPushButton:hover { background-color: %(p_hover)s; }"
+        " QPushButton:pressed { background-color: %(border)s; }"
+        " QPushButton:disabled { background-color: %(surface)s; color: %(disabled)s;"
+        " border-color: %(border)s; }"
+    ),
+    # Danger = irreversible data loss. The only saturated colour in normal UI;
+    # restrained at rest (red text + border), fills red on hover.
+    "danger": (
+        "QPushButton { background-color: %(surface)s; color: %(danger)s;"
+        " border: 1px solid %(danger)s; border-radius: %(r)dpx; padding: 4px 12px; }"
+        " QPushButton:hover { background-color: %(danger)s; color: #ffffff; }"
+        " QPushButton:pressed { background-color: %(danger_pressed)s; color: #ffffff; }"
+        " QPushButton:disabled { background-color: %(surface)s; color: %(disabled)s;"
+        " border-color: %(border)s; }"
+    ),
+    # Glyph-only danger (e.g. a ✕ remove): no rest emphasis, red glyph, fills on hover.
+    "danger_glyph": (
+        "QPushButton { background-color: transparent; color: %(danger)s;"
+        " border: 1px solid %(border)s; border-radius: %(r)dpx; padding: 4px 8px; }"
+        " QPushButton:hover { background-color: %(danger)s; color: #ffffff;"
+        " border-color: %(danger)s; }"
+        " QPushButton:pressed { background-color: %(danger_pressed)s; color: #ffffff; }"
+        " QPushButton:disabled { color: %(disabled)s; border-color: %(border)s; }"
+    ),
+}
+
+
+def style_button(btn, role, *, default=False, glyph_only=False) -> None:
+    """Give a QPushButton a semantic role so colour carries meaning, not decoration:
+
+    - ``"primary"`` — the surface's weighty commit (neutral elevation, bold):
+      Convert Current, Sync, Export, Done.
+    - ``"danger"``  — irreversible data loss (red): Reset, Reset Curve, Clear all.
+      Pass ``glyph_only=True`` for a glyph button like a ✕ remove.
+    - ``"secondary"`` / ``None`` — the default neutral button (clears any role).
+
+    ``default=True`` also makes it the dialog's default button (focus ring). Plain
+    QPushButtons honour their own stylesheet over the global rule, so the role
+    reliably takes effect.
+    """
+    role = (role or "").lower()
+    vals = {
+        "r": RADIUS_SM, "surface": SURFACE, "s_active": SURFACE_ACTIVE,
+        "p_hover": "#505050", "border": BORDER, "border_strong": BORDER_STRONG,
+        "text": TEXT, "disabled": TEXT_DISABLED,
+        "danger": DANGER, "danger_pressed": DANGER_PRESSED,
+    }
+    if role == "primary":
+        btn.setStyleSheet(_BTN_ROLE_QSS["primary"] % vals)
+    elif role == "danger":
+        btn.setStyleSheet(_BTN_ROLE_QSS["danger_glyph" if glyph_only else "danger"] % vals)
+    else:
+        btn.setStyleSheet("")
+    if default:
+        btn.setDefault(True)
+
+
 def apply_theme(app, settings=None) -> None:
     """Install the global dark theme on the QApplication.
 

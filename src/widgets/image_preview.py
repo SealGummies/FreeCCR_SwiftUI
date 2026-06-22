@@ -705,6 +705,13 @@ class ImagePreview(QWidget):
         self.unconvert_action = QAction("Un-convert", self)
         self.unconvert_action.triggered.connect(self.unconvert_ccr)
         self.toolbar.addAction(self.unconvert_action)
+        # Destructive revert → red text when enabled, muted when disabled.
+        _unconv_btn = self.toolbar.widgetForAction(self.unconvert_action)
+        if _unconv_btn is not None:
+            _unconv_btn.setStyleSheet(
+                f"QToolButton {{ color: {theme.DANGER}; }}"
+                f"QToolButton:hover {{ color: {theme.DANGER_HOVER}; }}"
+                f"QToolButton:disabled {{ color: {theme.TEXT_DISABLED}; }}")
         add_spacer()
 
         self.export_action = QAction("Export…", self)

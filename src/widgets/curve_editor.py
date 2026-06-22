@@ -378,6 +378,7 @@ class CurveEditor(QWidget):
 
         self.reset_button = QPushButton("Reset Curve")
         self.reset_button.clicked.connect(self.canvas.reset)
+        theme.style_button(self.reset_button, "danger")  # discards the curve
         layout.addWidget(self.reset_button)
 
         self._channel_buttons["rgb"].setChecked(True)

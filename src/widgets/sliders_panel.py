@@ -52,23 +52,36 @@ class SyncSettingsDialog(QDialog):
             layout.addWidget(checkbox)
             self._checkboxes[gid] = checkbox
 
+        # Selection helpers — pushed to opposite ends with checkbox glyphs so they
+        # no longer read as one identical pair.
         select_row = QHBoxLayout()
-        select_all_btn = QPushButton("Select All")
-        deselect_all_btn = QPushButton("Deselect All")
+        select_all_btn = QPushButton("☑  Select All")
+        deselect_all_btn = QPushButton("☐  Deselect All")
+        theme.style_button(select_all_btn, "secondary")
+        theme.style_button(deselect_all_btn, "secondary")
         select_all_btn.clicked.connect(lambda: self._set_all(True))
         deselect_all_btn.clicked.connect(lambda: self._set_all(False))
         select_row.addWidget(select_all_btn)
+        select_row.addStretch(1)
         select_row.addWidget(deselect_all_btn)
         layout.addLayout(select_row)
 
+        # Separator: "choose what to sync" (above) vs "commit" (below).
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color: {theme.BORDER}; margin-top: 8px; margin-bottom: 4px;")
+        layout.addWidget(sep)
+
         button_row = QHBoxLayout()
         sync_btn = QPushButton("Sync")
-        sync_btn.setDefault(True)
         cancel_btn = QPushButton("Cancel")
+        theme.style_button(sync_btn, "primary", default=True)
+        theme.style_button(cancel_btn, "secondary")
         sync_btn.clicked.connect(self.accept)
         cancel_btn.clicked.connect(self.reject)
-        button_row.addWidget(sync_btn)
+        button_row.addStretch(1)
         button_row.addWidget(cancel_btn)
+        button_row.addWidget(sync_btn)
         layout.addLayout(button_row)
 
     def _set_all(self, checked: bool):
@@ -392,9 +405,11 @@ class SlidersPanel(QWidget):
         self.clear_white_point_btn.setFixedWidth(28)
         self.clear_white_point_btn.setToolTip(
             "Clear the white point — use the calibrated default slope instead")
+        theme.style_button(self.clear_white_point_btn, "danger", glyph_only=True)
         self.black_point_btn = QPushButton("Set Black Point")
         bwp_row.addWidget(self.black_point_btn)
         bwp_row.addWidget(self.white_point_btn)
+        bwp_row.addSpacing(4)
         bwp_row.addWidget(self.clear_white_point_btn)
         scroll_layout.addLayout(bwp_row)
         # Shows which slope source the next conversion will use.
@@ -403,6 +418,9 @@ class SlidersPanel(QWidget):
         scroll_layout.addWidget(self.bwp_mode_label)
         self.convert_current_bwp_btn = QPushButton("Convert Current")
         self.convert_all_bwp_btn = QPushButton("Convert All")
+        # Convert Current is the section's primary (core single-image action);
+        # Convert All stays neutral and gets a count confirmation instead.
+        theme.style_button(self.convert_current_bwp_btn, "primary")
         convert_row = QHBoxLayout()
         convert_row.addWidget(self.convert_current_bwp_btn)
         convert_row.addWidget(self.convert_all_bwp_btn)
@@ -481,7 +499,10 @@ class SlidersPanel(QWidget):
         buttons_layout = QHBoxLayout()
         self.reset_button = QPushButton("Reset")
         self.compare_button = QPushButton("Compare")
+        # Reset discards all adjustments → danger. Gap so it isn't one block with Compare.
+        theme.style_button(self.reset_button, "danger")
         buttons_layout.addWidget(self.reset_button)
+        buttons_layout.addSpacing(8)
         buttons_layout.addWidget(self.compare_button)
         scroll_layout.addLayout(buttons_layout)
 
@@ -1499,6 +1520,15 @@ class SlidersPanel(QWidget):
             QMessageBox.warning(self, "Black Point Missing",
                 "Please set a Black Point (film base) before converting. A White "
                 "Point is optional — without it the calibrated default slope is used.")
+            return
+        n = len(ccr_backend.images)
+        if n == 0:
+            return
+        if QMessageBox.question(
+                self, "Convert All Images",
+                f"Convert all {n} image{'s' if n != 1 else ''} with the current "
+                "black/white point? Any existing conversions will be replaced.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         dialog = BWPointConvertDialog(self)
         worker = BWPointConvertWorker()
