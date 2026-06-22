@@ -6,6 +6,7 @@ import logging
 import numpy as np
 from io import BytesIO
 from core.ccr_backend import ccr_backend  # <-- Add this import
+from ui import theme
 
 class LoadingDialog(QDialog):
     def __init__(self, parent=None, cancel_callback=None):
@@ -25,9 +26,11 @@ class LoadingDialog(QDialog):
         # Add Cancel button
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setFixedWidth(100)
+        self.cancel_button.setFixedHeight(theme.CONTROL_H)
         self.cancel_button.clicked.connect(self.on_cancel)
         self.cancel_callback = cancel_callback
         btn_layout = QVBoxLayout()
+        btn_layout.setSpacing(theme.GAP_ROW)
         btn_layout.addWidget(self.cancel_button, alignment=Qt.AlignCenter)
         layout.addLayout(btn_layout)
 
@@ -88,6 +91,7 @@ class ThumbnailList(QWidget):
 
     def init_ui(self):
         self.layout = QVBoxLayout()
+        theme.apply_panel_spacing(self.layout)
 
         # Positive mode toggle — sits above the thumbnails. When checked, RAWs
         # decode as normal sRGB positives and the film-negative tools are

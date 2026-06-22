@@ -41,8 +41,9 @@ class SyncSettingsDialog(QDialog):
     def __init__(self, parent=None, selection=None):
         super().__init__(parent)
         self.setWindowTitle("Sync to All")
-        self.setMinimumWidth(280)
+        self.setMinimumWidth(theme.DIALOG_W_SM)
         layout = QVBoxLayout(self)
+        theme.apply_panel_spacing(layout)
         layout.addWidget(QLabel("Sync these settings to all images:"))
 
         self._checkboxes = {}
@@ -54,7 +55,7 @@ class SyncSettingsDialog(QDialog):
 
         # Selection helpers — pushed to opposite ends with checkbox glyphs so they
         # no longer read as one identical pair.
-        select_row = QHBoxLayout()
+        select_row = theme.apply_button_row(QHBoxLayout())
         select_all_btn = QPushButton("☑  Select All")
         deselect_all_btn = QPushButton("☐  Deselect All")
         theme.style_button(select_all_btn, "secondary")
@@ -67,12 +68,9 @@ class SyncSettingsDialog(QDialog):
         layout.addLayout(select_row)
 
         # Separator: "choose what to sync" (above) vs "commit" (below).
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet(f"color: {theme.BORDER}; margin-top: 8px; margin-bottom: 4px;")
-        layout.addWidget(sep)
+        layout.addWidget(theme.section_separator())
 
-        button_row = QHBoxLayout()
+        button_row = theme.apply_button_row(QHBoxLayout())
         sync_btn = QPushButton("Sync")
         cancel_btn = QPushButton("Cancel")
         theme.style_button(sync_btn, "primary", default=True)
@@ -100,8 +98,8 @@ class CollapsibleSection(QWidget):
         self._toggle_btn.setChecked(False)
         self._toggle_btn.setStyleSheet(
             "QPushButton { text-align: left; padding: 4px 6px; "
-            f"background: {theme.SURFACE}; border: none; border-radius: 4px; "
-            f"color: {theme.TEXT}; font-size: 11px; }}"
+            f"background: {theme.SURFACE}; border: none; border-radius: {theme.RADIUS_SM}px; "
+            f"color: {theme.TEXT}; font-size: 11px; font-weight: bold; }}"
             f"QPushButton:checked {{ background: {theme.SURFACE_ACTIVE}; }}"
         )
         self._toggle_btn.clicked.connect(self._on_toggle)
@@ -109,13 +107,13 @@ class CollapsibleSection(QWidget):
         self._content = QWidget()
         self._content_layout = QVBoxLayout()
         self._content_layout.setContentsMargins(0, 0, 0, 0)
-        self._content_layout.setSpacing(2)
+        self._content_layout.setSpacing(theme.GAP_ROW)
         self._content.setLayout(self._content_layout)
         self._content.setVisible(False)
 
         outer = QVBoxLayout()
-        outer.setContentsMargins(0, 4, 0, 0)
-        outer.setSpacing(2)
+        outer.setContentsMargins(0, theme.GAP_SECTION, 0, 0)
+        outer.setSpacing(theme.GAP_ROW)
         outer.addWidget(self._toggle_btn)
         outer.addWidget(self._content)
         self.setLayout(outer)
@@ -310,7 +308,7 @@ class SlidersPanel(QWidget):
         # Outer layout: histogram (fixed) + scroll area (stretchy) + hint (fixed)
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(theme.GAP_ROW)
 
         # --- Histogram — fixed at top, outside scroll area ---
         self.histogram_label = QLabel()
@@ -327,8 +325,7 @@ class SlidersPanel(QWidget):
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout()
         scroll_layout.setAlignment(Qt.AlignTop)
-        scroll_layout.setContentsMargins(4, 4, 4, 4)
-        scroll_layout.setSpacing(2)
+        theme.apply_panel_spacing(scroll_layout)
         scroll_content.setLayout(scroll_layout)
 
         scroll_area = QScrollArea()
@@ -356,8 +353,8 @@ class SlidersPanel(QWidget):
         layers_vbox.setContentsMargins(0, 0, 0, 0)
         layers_vbox.setSpacing(2)
         layers_title = QLabel("Layers")
-        layers_title.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
-        layers_title.setAlignment(Qt.AlignCenter)
+        layers_title.setStyleSheet(theme.section_header_qss())
+        layers_title.setAlignment(Qt.AlignLeft)
         layers_vbox.addWidget(layers_title)
         self._layers_list_vbox = QVBoxLayout()   # dynamic rows, rebuilt per image
         self._layers_list_vbox.setSpacing(2)
@@ -366,16 +363,17 @@ class SlidersPanel(QWidget):
         self.feather_row = QWidget()
         feather_layout = QHBoxLayout(self.feather_row)
         feather_layout.setContentsMargins(0, 0, 0, 0)
+        feather_layout.setSpacing(theme.GAP_TIGHT)
         feather_label = QLabel("Feather")
-        feather_label.setMinimumWidth(70)
+        feather_label.setFixedWidth(theme.LABEL_COL_W)
         feather_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.feather_slider = ResettableSlider(Qt.Horizontal)
         self.feather_slider.setMinimum(0)
         self.feather_slider.setMaximum(100)
         self.feather_slider.setValue(25)
-        self.feather_slider.setFixedHeight(30)
+        self.feather_slider.setFixedHeight(theme.CONTROL_H)
         self.feather_value_label = QLabel("25")
-        self.feather_value_label.setMinimumWidth(40)
+        self.feather_value_label.setFixedWidth(theme.VALUE_COL_W)
         self.feather_slider.valueChanged.connect(self._on_feather_changed)
         feather_layout.addWidget(feather_label)
         feather_layout.addWidget(self.feather_slider)
@@ -384,32 +382,30 @@ class SlidersPanel(QWidget):
         self.feather_row.setVisible(False)
         self._layer_buttons = {}
         scroll_layout.addWidget(self.layers_container)
-        layers_sep = QFrame()
-        layers_sep.setFrameShape(QFrame.HLine)
-        layers_sep.setFrameShadow(QFrame.Sunken)
-        layers_sep.setStyleSheet("margin-top: 4px; margin-bottom: 4px;")
-        scroll_layout.addWidget(layers_sep)
+        scroll_layout.addWidget(theme.section_separator())
 
         # --- 10 existing sliders (sliders[0]–[9]) ---
         # --- Film B/W Point section — at the top, right below the histogram ---
         bwp_label = QLabel("Film B/W Point")
-        bwp_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px; margin-bottom: 2px;")
-        bwp_label.setAlignment(Qt.AlignCenter)
+        bwp_label.setStyleSheet(theme.section_header_qss())
+        bwp_label.setAlignment(Qt.AlignLeft)
         scroll_layout.addWidget(bwp_label)
 
-        bwp_row = QHBoxLayout()
+        bwp_row = theme.apply_button_row(QHBoxLayout())
         self.white_point_btn = QPushButton("Set White Point")
         # Small "clear" button: drops the white point so conversion uses the
         # calibrated default slope (black point only).
         self.clear_white_point_btn = QPushButton("✕")
-        self.clear_white_point_btn.setFixedWidth(28)
+        self.clear_white_point_btn.setFixedWidth(theme.GLYPH_W)
+        self.clear_white_point_btn.setFixedHeight(theme.CONTROL_H)
         self.clear_white_point_btn.setToolTip(
             "Clear the white point — use the calibrated default slope instead")
         theme.style_button(self.clear_white_point_btn, "danger", glyph_only=True)
         self.black_point_btn = QPushButton("Set Black Point")
+        self.black_point_btn.setFixedHeight(theme.CONTROL_H)
+        self.white_point_btn.setFixedHeight(theme.CONTROL_H)
         bwp_row.addWidget(self.black_point_btn)
         bwp_row.addWidget(self.white_point_btn)
-        bwp_row.addSpacing(4)
         bwp_row.addWidget(self.clear_white_point_btn)
         scroll_layout.addLayout(bwp_row)
         # Shows which slope source the next conversion will use.
@@ -421,22 +417,19 @@ class SlidersPanel(QWidget):
         # Convert Current is the section's primary (core single-image action);
         # Convert All stays neutral and gets a count confirmation instead.
         theme.style_button(self.convert_current_bwp_btn, "primary")
-        convert_row = QHBoxLayout()
+        self.convert_current_bwp_btn.setFixedHeight(theme.CONTROL_H)
+        self.convert_all_bwp_btn.setFixedHeight(theme.CONTROL_H)
+        convert_row = theme.apply_button_row(QHBoxLayout())
         convert_row.addWidget(self.convert_current_bwp_btn)
         convert_row.addWidget(self.convert_all_bwp_btn)
         scroll_layout.addLayout(convert_row)
 
         # Separator between B/W Point tools and the adjustment sliders
-        separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
-        separator.setFrameShadow(QFrame.Sunken)
-        separator.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
-        scroll_layout.addWidget(separator)
+        scroll_layout.addWidget(theme.section_separator())
 
         # Auto white balance: pick a neutral point with an eyedropper.
         # Enabled only for converted images (same gating as the sliders).
         self.wb_picker_btn = QPushButton("Auto WB Picker")
-        self.wb_picker_btn.setFixedWidth(140)
         self.wb_picker_btn.setToolTip(
             "Click, then pick a neutral gray/white point on the image "
             "to auto-set Temperature and Tint.")
@@ -456,11 +449,13 @@ class SlidersPanel(QWidget):
             "left/right edge for a horizontal cut; click to place a line, "
             "drag to adjust, right-click to delete, Enter to slice, "
             "Esc to cancel.")
-        wb_crop_row = QHBoxLayout()
-        wb_crop_row.addWidget(self.wb_picker_btn)
-        wb_crop_row.addWidget(self.crop_btn)
-        wb_crop_row.addWidget(self.slice_btn)
-        wb_crop_row.addStretch()
+        self.wb_picker_btn.setFixedHeight(theme.CONTROL_H)
+        self.crop_btn.setFixedHeight(theme.CONTROL_H)
+        self.slice_btn.setFixedHeight(theme.CONTROL_H)
+        wb_crop_row = theme.apply_button_row(QHBoxLayout())
+        wb_crop_row.addWidget(self.wb_picker_btn, 1)
+        wb_crop_row.addWidget(self.crop_btn, 1)
+        wb_crop_row.addWidget(self.slice_btn, 1)
         scroll_layout.addLayout(wb_crop_row)
 
         # Color Profile dropdown — sits right above Temperature. "Color" keeps
@@ -496,18 +491,20 @@ class SlidersPanel(QWidget):
         scroll_layout.addLayout(self.sub_saturation_slider_layout)
 
         # --- Reset / Compare / Sync buttons ---
-        buttons_layout = QHBoxLayout()
+        buttons_layout = theme.apply_button_row(QHBoxLayout())
         self.reset_button = QPushButton("Reset")
         self.compare_button = QPushButton("Compare")
         # Reset discards all adjustments → danger. Gap so it isn't one block with Compare.
         theme.style_button(self.reset_button, "danger")
+        self.reset_button.setFixedHeight(theme.CONTROL_H)
+        self.compare_button.setFixedHeight(theme.CONTROL_H)
         buttons_layout.addWidget(self.reset_button)
-        buttons_layout.addSpacing(8)
         buttons_layout.addWidget(self.compare_button)
         scroll_layout.addLayout(buttons_layout)
 
         sync_layout = QHBoxLayout()
         self.sync_to_all_button = QPushButton("Sync to All")
+        self.sync_to_all_button.setFixedHeight(theme.CONTROL_H)
         sync_layout.addWidget(self.sync_to_all_button)
         scroll_layout.addLayout(sync_layout)
 
@@ -520,11 +517,7 @@ class SlidersPanel(QWidget):
         # content layout, so create_slider() append order is independent of where
         # the section sits in scroll_layout.
         def _section_separator():
-            sep = QFrame()
-            sep.setFrameShape(QFrame.HLine)
-            sep.setFrameShadow(QFrame.Sunken)
-            sep.setStyleSheet("margin-top: 8px; margin-bottom: 4px;")
-            return sep
+            return theme.section_separator()
 
         scroll_layout.addWidget(_section_separator())
         self.curves_section = CollapsibleSection("Curves")
@@ -585,7 +578,7 @@ class SlidersPanel(QWidget):
         self._band_buttons = {}
         self._band_pages = {}
         band_btn_row = QHBoxLayout()
-        band_btn_row.setSpacing(4)
+        band_btn_row.setSpacing(theme.GAP_BTN)
         for color in COLOR_BANDS:
             btn = QPushButton()
             btn.setCheckable(True)
@@ -699,16 +692,16 @@ class SlidersPanel(QWidget):
         slider.setValue(default_value)
         slider.setOrientation(Qt.Horizontal)
         slider.setTickInterval(10)
-        slider.setFixedHeight(30)
+        slider.setFixedHeight(theme.CONTROL_H)
 
         label = QLabel(label_text)
-        label.setMinimumWidth(70)
+        label.setFixedWidth(theme.LABEL_COL_W)
         label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        label.setFixedHeight(30)
+        label.setFixedHeight(theme.CONTROL_H)
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         value_label = QLabel(str(slider.value()))
-        value_label.setMinimumWidth(40)
+        value_label.setFixedWidth(theme.VALUE_COL_W)
         value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         # Directly call on_slider_changed without debounce
@@ -719,6 +712,8 @@ class SlidersPanel(QWidget):
         slider.valueChanged.connect(handle_slider_change)
 
         slider_layout = QHBoxLayout()
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+        slider_layout.setSpacing(theme.GAP_TIGHT)
         slider_layout.addWidget(label, alignment=Qt.AlignVCenter)
         slider_layout.addWidget(slider, alignment=Qt.AlignVCenter)
         slider_layout.addWidget(value_label, alignment=Qt.AlignVCenter)
@@ -732,17 +727,18 @@ class SlidersPanel(QWidget):
         """Build the 'Color Profile' label + dropdown row (Color / Black &
         White). Laid out like a slider row so it lines up with Temperature."""
         label = QLabel("Color Profile")
-        label.setMinimumWidth(70)
+        label.setFixedWidth(theme.LABEL_COL_W)
         label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        label.setFixedHeight(30)
+        label.setFixedHeight(theme.CONTROL_H)
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.color_profile_combo = QComboBox()
         self.color_profile_combo.addItems(["Color", "Black & White"])
-        self.color_profile_combo.setFixedHeight(28)
+        self.color_profile_combo.setFixedHeight(theme.CONTROL_H)
         self.color_profile_combo.currentIndexChanged.connect(self.on_color_profile_changed)
 
         row = QHBoxLayout()
+        row.setSpacing(theme.GAP_TIGHT)
         row.addWidget(label, alignment=Qt.AlignVCenter)
         row.addWidget(self.color_profile_combo, alignment=Qt.AlignVCenter)
         return row
@@ -945,7 +941,7 @@ class SlidersPanel(QWidget):
             glyph = "○" if kind == "circle" else "▤"
             aid = a.get("id")
             row = QHBoxLayout()
-            row.setSpacing(3)
+            row.setSpacing(theme.GAP_BTN)
             chk = QCheckBox()
             chk.setChecked(bool(a.get("enabled", True)))
             chk.setToolTip("Enable / disable this area")
@@ -955,7 +951,7 @@ class SlidersPanel(QWidget):
             sel.setChecked(active == aid)
             sel.clicked.connect(lambda _=False, _id=aid: self._select_layer(_id))
             rem = QPushButton("✕")
-            rem.setFixedWidth(24)
+            rem.setFixedWidth(theme.GLYPH_W)
             rem.setToolTip("Remove this area")
             rem.clicked.connect(lambda _=False, _id=aid: self._on_remove_area(_id))
             row.addWidget(chk)
@@ -1665,7 +1661,7 @@ class BWPointConvertDialog(QDialog):
         self.setModal(True)
         self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
         self.setWindowModality(Qt.ApplicationModal)
-        self.setMinimumWidth(260)
+        self.setMinimumWidth(theme.DIALOG_W_SM)
 
         self.label = QLabel("Applying B/W point conversion", self)
         self.label.setAlignment(Qt.AlignCenter)
@@ -1677,6 +1673,7 @@ class BWPointConvertDialog(QDialog):
         self.stop_button.clicked.connect(self._on_stop)
 
         layout = QVBoxLayout()
+        theme.apply_panel_spacing(layout)
         layout.addWidget(self.label)
         layout.addWidget(self.progress_label)
         layout.addWidget(self.stop_button)

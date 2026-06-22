@@ -70,6 +70,24 @@ SPACE_XS, SPACE_SM, SPACE_MD, SPACE_LG, SPACE_XL = 2, 4, 6, 8, 12
 RADIUS_SM, RADIUS_MD, RADIUS_LG = 3, 5, 8
 FS_CAPTION, FS_BODY, FS_CONTROL, FS_HEADING = 11, 12, 13, 14
 
+# 3.7b Layout rhythm — the spacing "design language". Use these intent-named gaps
+# in Python layout code (setSpacing / setContentsMargins / addSpacing) so spacing
+# is consistent, never an ad-hoc literal.
+GAP_TIGHT = SPACE_XS      # 2  — within one control row (label | control | value)
+GAP_ROW = SPACE_SM        # 4  — between rows inside a group (intra-group rhythm)
+GAP_BTN = SPACE_LG        # 8  — between sibling buttons in a button row (canonical)
+GAP_PANEL = SPACE_LG      # 8  — panel/dialog content margin; inter-column gutter
+GAP_SECTION = SPACE_XL    # 12 — between functional groups (usually with a separator)
+
+# Standard control geometry (one scale instead of a 22/24/28/30/42 zoo).
+CONTROL_H = 28            # sliders, combos, labels, normal & secondary buttons, tabs
+CONTROL_H_LG = 36         # weighty primary commits (Done, Export)
+GLYPH_W = 28             # square glyph buttons (✕ remove / clear) — one width
+LABEL_COL_W = 90          # right-aligned label gutter — fits the longest label ("Subtracted Sat")
+VALUE_COL_W = 40          # left-aligned value gutter in a 3-column row
+DIALOG_W_SM = 280         # progress / simple dialogs
+DIALOG_W_MD = 440         # forms (export, update, sync)
+
 
 class Paint:
     """3.8 UI-chrome paint constants (non-QSS; follow the dark theme)."""
@@ -377,6 +395,37 @@ def style_button(btn, role, *, default=False, glyph_only=False) -> None:
         btn.setStyleSheet("")
     if default:
         btn.setDefault(True)
+
+
+def apply_panel_spacing(layout, *, margin=GAP_PANEL, spacing=GAP_ROW):
+    """Conform a panel/dialog layout to the standard rhythm in one call."""
+    layout.setContentsMargins(margin, margin, margin, margin)
+    layout.setSpacing(spacing)
+    return layout
+
+
+def apply_button_row(layout, *, spacing=GAP_BTN):
+    """Conform a horizontal button row: canonical button gap, no extra margins."""
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(spacing)
+    return layout
+
+
+def section_separator():
+    """The one canonical horizontal rule between functional regions."""
+    from PySide6.QtWidgets import QFrame
+    sep = QFrame()
+    sep.setFrameShape(QFrame.HLine)
+    sep.setFrameShadow(QFrame.Sunken)
+    sep.setStyleSheet(
+        f"color: {BORDER}; margin-top: {SPACE_LG}px; margin-bottom: {SPACE_SM}px;")
+    return sep
+
+
+def section_header_qss():
+    """QSS for a group-anchor section header (bold caption, full-strength text)."""
+    return (f"color: {TEXT}; font-size: {FS_CAPTION}px; font-weight: bold; "
+            f"letter-spacing: 0.5px; margin-bottom: {SPACE_XS}px;")
 
 
 def apply_theme(app, settings=None) -> None:

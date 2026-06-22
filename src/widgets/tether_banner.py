@@ -24,8 +24,8 @@ class TetherBanner(QWidget):
             f"#TetherBanner {{ background-color: {theme.WARN_BG}; "
             f"border-bottom: 1px solid {theme.WARN_BORDER}; }}")
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 5, 12, 5)
-        layout.setSpacing(8)
+        layout.setContentsMargins(theme.SPACE_XL, theme.GAP_ROW, theme.SPACE_XL, theme.GAP_ROW)
+        layout.setSpacing(theme.GAP_BTN)
 
         self._dot = QLabel("●")  # ●
         self._dot.setStyleSheet(
@@ -37,10 +37,10 @@ class TetherBanner(QWidget):
         self._note.setStyleSheet(
             f"color: {theme.WARN_TEXT_MUTED}; background: transparent;")
         self._stop = QPushButton("Stop")
-        self._stop.setFixedHeight(24)
+        self._stop.setFixedHeight(theme.CONTROL_H)
         self._stop.setStyleSheet(
             f"QPushButton {{ background-color: {theme.DANGER}; color: white; border: none; "
-            f"border-radius: 4px; padding: 2px 14px; }}"
+            f"border-radius: {theme.RADIUS_SM}px; padding: 2px 14px; }}"
             f"QPushButton:hover {{ background-color: {theme.DANGER_HOVER}; }}"
             f"QPushButton:pressed {{ background-color: {theme.DANGER_PRESSED}; }}")
         self._stop.clicked.connect(self.stopRequested)

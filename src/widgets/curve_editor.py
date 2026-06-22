@@ -352,22 +352,22 @@ class CurveEditor(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(theme.GAP_ROW)
 
         # Channel selector buttons (mutually exclusive, checkable)
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(4)
+        btn_row.setSpacing(theme.GAP_BTN)
         self._channel_buttons = {}
         for ch, label in self._CHANNEL_LABELS:
             btn = QPushButton(label)
             btn.setCheckable(True)
-            btn.setFixedHeight(22)
+            btn.setFixedHeight(theme.CONTROL_H)
             btn.setStyleSheet(
                 f"QPushButton {{ background: {theme.SURFACE}; border: 1px solid {theme.BORDER}; "
-                f"border-radius: 3px; color: {self._BTN_TINT[ch]}; font-size: 11px; }}"
+                f"border-radius: {theme.RADIUS_SM}px; color: {self._BTN_TINT[ch]}; font-size: 11px; }}"
                 f"QPushButton:checked {{ background: {theme.SURFACE_ACTIVE}; border: 2px solid {theme.ACCENT}; }}")
             btn.clicked.connect(lambda _=False, c=ch: self._on_channel(c))
-            btn_row.addWidget(btn)
+            btn_row.addWidget(btn, 1)
             self._channel_buttons[ch] = btn
         layout.addLayout(btn_row)
 
@@ -379,6 +379,7 @@ class CurveEditor(QWidget):
         self.reset_button = QPushButton("Reset Curve")
         self.reset_button.clicked.connect(self.canvas.reset)
         theme.style_button(self.reset_button, "danger")  # discards the curve
+        self.reset_button.setFixedHeight(theme.CONTROL_H)
         layout.addWidget(self.reset_button)
 
         self._channel_buttons["rgb"].setChecked(True)

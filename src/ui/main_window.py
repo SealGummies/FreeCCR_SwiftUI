@@ -24,6 +24,7 @@ import webbrowser
 from utils.unicode_path_utils import normalize_unicode_path, validate_unicode_path
 from utils.update_check import (fetch_latest_release, parse_version,
                                 should_offer_update, REPO_URL)
+from ui import theme
 
 class UpdateCheckWorker(QObject):
     """Fetches the latest GitHub release off the GUI thread.
@@ -59,10 +60,9 @@ class UpdateAvailableDialog(QDialog):
     def __init__(self, parent, release, current_version):
         super().__init__(parent)
         self.setWindowTitle("Update Available")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(theme.DIALOG_W_MD)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(18)
+        theme.apply_panel_spacing(layout, margin=theme.SPACE_XL, spacing=theme.GAP_SECTION)
         message = QLabel(
             f"A new version of FreeCCR is available: "
             f"<b>{html.escape(release['tag'])}</b><br>"
@@ -70,13 +70,13 @@ class UpdateAvailableDialog(QDialog):
         message.setWordWrap(True)
         layout.addWidget(message)
         buttons = QHBoxLayout()
-        buttons.setSpacing(10)
+        buttons.setSpacing(theme.GAP_BTN)
         update_btn = QPushButton("Update")
         update_btn.setDefault(True)
         remind_btn = QPushButton("Remind Me Later")
         skip_btn = QPushButton("Skip This Version")
         for btn in (update_btn, remind_btn, skip_btn):
-            btn.setMinimumHeight(30)
+            btn.setMinimumHeight(theme.CONTROL_H)
         update_btn.clicked.connect(lambda: self.done(self.UPDATE))
         remind_btn.clicked.connect(lambda: self.done(self.REMIND))
         skip_btn.clicked.connect(lambda: self.done(self.SKIP))
@@ -121,6 +121,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.central_widget)
 
         self.layout = QHBoxLayout(self.central_widget)
+        self.layout.setSpacing(theme.GAP_PANEL)
+        self.layout.setContentsMargins(0, 0, 0, 0)
 
         self.thumbnail_list = ThumbnailList(self.on_image_selected)
         self.thumbnail_list.setFixedWidth(216)
@@ -478,7 +480,9 @@ class MainWindow(QMainWindow):
     def show_licenses_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Third-Party Licenses")
+        dialog.setMinimumWidth(theme.DIALOG_W_MD)
         layout = QVBoxLayout(dialog)
+        theme.apply_panel_spacing(layout)
 
         text_edit = QTextEdit(dialog)
         text_edit.setReadOnly(True)
@@ -981,8 +985,9 @@ class ActivationDialog(QDialog):
     def __init__(self, parent=None, allow_deactivate=False):
         super().__init__(parent)
         self.setWindowTitle("Activate FreeCCR")
-        self.setMinimumWidth(350)
+        self.setMinimumWidth(theme.DIALOG_W_MD)
         layout = QVBoxLayout(self)
+        theme.apply_panel_spacing(layout)
         self.allow_deactivate = allow_deactivate
 
         layout.addWidget(QLabel("Please activate your software to continue."))

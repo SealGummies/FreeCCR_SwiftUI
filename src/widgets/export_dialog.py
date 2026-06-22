@@ -46,7 +46,7 @@ class ExportSettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Export")
         self.setModal(True)
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(theme.DIALOG_W_MD)
         theme.apply_windows_dark_titlebar(self)  # dark native title bar (Win10/11)
 
         self.plan: Optional[ExportPlan] = None
@@ -83,6 +83,7 @@ class ExportSettingsDialog(QDialog):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
+        theme.apply_panel_spacing(layout, margin=theme.SPACE_XL, spacing=theme.GAP_SECTION)
 
         # Scope
         scope_group = QGroupBox("Export scope")
@@ -110,6 +111,7 @@ class ExportSettingsDialog(QDialog):
 
         # Destination
         dest_layout = QHBoxLayout()
+        dest_layout.setSpacing(theme.GAP_BTN)
         dest_layout.addWidget(QLabel("Destination:"))
         self.dest_edit = QLineEdit()
         self.dest_edit.textChanged.connect(self._on_dest_changed)
@@ -137,6 +139,8 @@ class ExportSettingsDialog(QDialog):
 
         # Format / quality / estimate / resize / conflicts
         form = QFormLayout()
+        form.setHorizontalSpacing(theme.GAP_BTN)
+        form.setVerticalSpacing(theme.GAP_ROW)
         self.format_combo = QComboBox()
         self.format_combo.addItem("TIFF 16-bit (lossless)", "tiff")
         self.format_combo.addItem("JPEG", "jpeg")
@@ -158,11 +162,12 @@ class ExportSettingsDialog(QDialog):
         form.addRow("", self.colorspace_hint)
 
         quality_layout = QHBoxLayout()
+        quality_layout.setSpacing(theme.GAP_BTN)
         self.quality_slider = QSlider(Qt.Horizontal)
         self.quality_slider.setRange(1, 100)
         self.quality_slider.setValue(92)
         self.quality_value_label = QLabel("92")
-        self.quality_value_label.setMinimumWidth(28)
+        self.quality_value_label.setMinimumWidth(theme.VALUE_COL_W)
         quality_layout.addWidget(self.quality_slider, 1)
         quality_layout.addWidget(self.quality_value_label)
         self.quality_slider.valueChanged.connect(self._on_quality_changed)
@@ -192,11 +197,15 @@ class ExportSettingsDialog(QDialog):
         layout.addWidget(self.open_folder_checkbox)
 
         # Buttons
+        layout.addWidget(theme.section_separator())
         button_layout = QHBoxLayout()
+        button_layout.setSpacing(theme.GAP_BTN)
         button_layout.addStretch(1)
         self.export_button = QPushButton("Export")
+        self.export_button.setFixedHeight(theme.CONTROL_H_LG)
         self.export_button.clicked.connect(self._on_export_clicked)
         cancel_button = QPushButton("Cancel")
+        cancel_button.setFixedHeight(theme.CONTROL_H)
         cancel_button.clicked.connect(self.reject)
         # Export is the deliberate commit → primary + dialog default; Cancel recedes.
         theme.style_button(self.export_button, "primary", default=True)
