@@ -10,8 +10,9 @@ See ``spec/visual-redesign.md`` for the design rationale and token table.
 
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, QEvent
 from PySide6.QtGui import QColor, QPalette, QIcon, QPixmap, QPainter
+from PySide6.QtWidgets import QWidget
 
 # --------------------------------------------------------------------------- #
 # 3.1 Surfaces (neutral grays — zero hue)
@@ -350,3 +351,42 @@ def apply_windows_dark_titlebar(widget) -> bool:
         return True
     except Exception:
         return False
+
+
+class _DarkTitleBarFilter(QObject):
+    """App-level filter that darkens each top-level window's title bar on show.
+
+    Covers dialogs created on demand (message boxes, the export / loading / about
+    dialogs) without touching every call site. Windows-only; inert elsewhere.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._seen = set()
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.Type.Show
+                and isinstance(obj, QWidget) and obj.isWindow()):
+            key = id(obj)
+            if key not in self._seen:
+                self._seen.add(key)
+                apply_windows_dark_titlebar(obj)
+        return False
+
+
+_dark_titlebar_filter = None
+
+
+def install_dark_titlebar_filter(app) -> None:
+    """Install an app-wide filter so every top-level window (dialogs, message
+    boxes) gets a dark native title bar when shown.
+
+    No-op off Windows or if already installed. Call once after ``apply_theme()``
+    from the app entry point (kept out of ``apply_theme`` so the test suite,
+    which themes a shared QApplication, isn't given a persistent filter).
+    """
+    global _dark_titlebar_filter
+    if sys.platform != "win32" or _dark_titlebar_filter is not None:
+        return
+    _dark_titlebar_filter = _DarkTitleBarFilter(app)
+    app.installEventFilter(_dark_titlebar_filter)
