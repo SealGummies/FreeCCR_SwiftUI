@@ -57,7 +57,7 @@ def main():
     from ui.main_window import MainWindow
 
     app = QApplication(sys.argv)
-    from ui.theme import apply_theme
+    from ui.theme import apply_theme, apply_windows_dark_titlebar
     apply_theme(app)  # neutral dark theme (Fusion + palette + global QSS)
     _icon_path = os.path.join(os.path.dirname(__file__), 'icons', 'freeccr_logo.png')
     app.setWindowIcon(QIcon(_icon_path))
@@ -65,6 +65,7 @@ def main():
     window = MainWindow()
     print("MainWindow created, setting up UI...")
 
+    apply_windows_dark_titlebar(window)  # dark native title bar (Win10/11)
     window.show()
     sys.exit(app.exec())
 

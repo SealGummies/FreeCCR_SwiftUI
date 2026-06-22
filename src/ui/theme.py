@@ -8,6 +8,8 @@ image color). Installed once at app start via ``apply_theme(app)`` (see
 See ``spec/visual-redesign.md`` for the design rationale and token table.
 """
 
+import sys
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette, QIcon, QPixmap, QPainter
 
@@ -319,3 +321,32 @@ def apply_theme(app, settings=None) -> None:
     app.setStyle("Fusion")
     app.setPalette(build_palette())
     app.setStyleSheet(global_qss())
+
+
+def apply_windows_dark_titlebar(widget) -> bool:
+    """Make a top-level window's native title bar dark on Windows 10/11.
+
+    Qt's palette/QSS don't reach the OS-drawn title bar (the non-client area), so
+    it stays light against the dark theme. This sets the DWM immersive-dark-mode
+    attribute on the window's HWND. Apply it to each top-level window (main window,
+    custom dialogs) before showing it. No-op off Windows or if unsupported.
+    Returns True if the attribute call was made.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        # winId() forces creation of the native window handle.
+        hwnd = int(widget.winId())
+        if not hwnd:
+            return False
+        value = ctypes.c_int(1)
+        size = ctypes.sizeof(value)
+        # DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (Win10 20H1+/Win11); 19 on older builds.
+        dwm = ctypes.windll.dwmapi
+        if dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), size) != 0:
+            dwm.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(value), size)
+        return True
+    except Exception:
+        return False

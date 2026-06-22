@@ -47,6 +47,7 @@ class ExportSettingsDialog(QDialog):
         self.setWindowTitle("Export")
         self.setModal(True)
         self.setMinimumWidth(440)
+        theme.apply_windows_dark_titlebar(self)  # dark native title bar (Win10/11)
 
         self.plan: Optional[ExportPlan] = None
         self._current_idx = current_idx
