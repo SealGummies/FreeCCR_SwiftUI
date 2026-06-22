@@ -642,9 +642,9 @@ class MainWindow(QMainWindow):
         """Banner sub-text reflecting how captures will be handled."""
         if ccr_backend.positive_mode:
             return "Positive mode — captures import as positives."
-        if ccr_backend.black_point_bgr is None or ccr_backend.white_point_bgr is None:
-            return ("No B/W point set — captures import unconverted. "
-                    "Set Black & White points to auto-convert.")
+        if ccr_backend.black_point_bgr is None:
+            return ("No black point set — captures import unconverted. "
+                    "Set the Black Point (film base) to auto-convert.")
         return ""
 
     def enter_tethering(self):
@@ -904,11 +904,16 @@ class MainWindow(QMainWindow):
         tethering session is live, refresh the banner so its note reflects the
         new B/W state immediately (e.g. drops the 'unconverted' warning)."""
         bp = encode_bwpoint(ccr_backend.black_point_bgr)
-        wp = encode_bwpoint(ccr_backend.white_point_bgr)
         if bp is not None:
             self._settings.setValue("convert/black_point_bgr", bp)
-        if wp is not None:
-            self._settings.setValue("convert/white_point_bgr", wp)
+        # A cleared white point must be removed, else it would be restored next
+        # session and override the default-slope choice.
+        if ccr_backend.white_point_bgr is None:
+            self._settings.remove("convert/white_point_bgr")
+        else:
+            wp = encode_bwpoint(ccr_backend.white_point_bgr)
+            if wp is not None:
+                self._settings.setValue("convert/white_point_bgr", wp)
         self.refresh_tether_banner()
 
     def refresh_tether_banner(self):

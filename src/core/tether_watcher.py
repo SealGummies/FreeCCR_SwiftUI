@@ -186,7 +186,8 @@ class TetherWatchWorker(QObject):
             black = ccr_backend.black_point_bgr
             white = ccr_backend.white_point_bgr
             positive = ccr_backend.positive_mode
-            convert = (not positive and black is not None and white is not None)
+            # white may be None → default-slope conversion (black point only).
+            convert = (not positive and black is not None)
             for img in imgs:
                 if self._cancelled:
                     return
@@ -210,7 +211,7 @@ class TetherWatchWorker(QObject):
             img.converted = True
             img.conversion_inputs = {
                 "mode": "bw",
-                "bw": (tuple(black), tuple(white)),
+                "bw": (tuple(black), tuple(white) if white is not None else None),
                 "fine_rot": img.fine_rotation_angle,
             }
             img.update_thumbnail_and_preview()

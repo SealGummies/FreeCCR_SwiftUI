@@ -1,0 +1,56 @@
+PyOpenCL cl directory: C:\Users\kevincat\AppData\Local\Programs\Python\Python311\Lib\site-packages\pyopencl\cl
+Nuitka-Options: Used command line options:
+Nuitka-Options:   --msvc=latest --jobs=6 --standalone --assume-yes-for-downloads --include-package=numpy --include-package=utils --enable-plugin=pyside6 --include-data-dir=src/icons=icons --include-data-dir=LICENSES=LICENSES --windows-icon-from-ico=src/icons/freeccr_logo.ico --windows-console-mode=attach --include-package=pyopencl --include-data-dir=C:\Users\kevincat\AppData\Local\Programs\Python\Python311\Lib\site-packages\pyopencl\cl=pyopencl/cl --include-package=onnxruntime --include-package-data=onnxruntime --nofollow-import-to=doctest --nofollow-import-to=IPython --nofollow-import-to=PIL.PdfParser --nofollow-import-to=PIL.PdfImagePlugin --output-filename=freeccr.exe src/main.py
+Nuitka: Starting Python compilation with:
+Nuitka:   Version '2.7.6' on Python 3.11 (flavor 'CPython Official') commercial grade 'not installed'.
+Nuitka-Plugins:WARNING: anti-bloat: Undesirable import of 'unittest' in 'onnxruntime.backend.backend' (at '~\AppData\Local\Programs\Python\Python311\Lib\site-packages\onnxruntime\backend\backend.py:10') encountered. It may slow down compilation.
+Nuitka-Plugins:WARNING:     Complex topic! More information can be found at https://nuitka.net/info/unwanted-module.html
+Nuitka-Plugins:WARNING: anti-bloat: Undesirable import of 'pytest' in 'numpy.typing.tests.test_typing' (at '~\AppData\Local\Programs\Python\Python311\Lib\site-packages\numpy\typing\tests\test_typing.py:11') encountered. It may slow down compilation.
+Nuitka-Plugins:WARNING:     Complex topic! More information can be found at https://nuitka.net/info/unwanted-module.html
+Nuitka-Plugins:matplotlib: Using configuration file or default backend 'qtagg'.
+Nuitka: Completed Python level compilation and optimization.
+Nuitka: Generating source code for C backend compiler.
+Nuitka: Running data composer tool for optimal constant value handling.
+Nuitka: Running C compilation via Scons.
+Nuitka-Scons: MSVC version resolved to 14.3.
+Nuitka-Scons: Backend C compiler: cl (cl 14.3).
+Nuitka-Scons: Backend C linking with 1362 files (no progress information available for this stage).
+Nuitka-Scons: Compiled 1362 C files using clcache with 0 cache hits and 1362 cache misses.
+Nuitka-Postprocessing: Adding 1 icon(s) from icon file 'src/icons/freeccr_logo.ico'.
+Nuitka-Plugins:pyside6: Including Qt plugins 'iconengines,imageformats,platforms,styles,tls' below 'PySide6\qt-plugins'.
+Nuitka-Plugins:dll-files: Found 1 file DLLs from cv2 installation.
+Nuitka-Plugins:dll-files: Found 2 files DLLs from onnxruntime installation.
+Nuitka-Plugins:dll-files: Found 4 files DLLs from shiboken6 installation.
+Nuitka-Options: Included data file 'icons\auto.png' due to specified data dir 'src/icons' on command line.
+Nuitka-Options: Included data file 'icons\freeccr_logo.icns' due to specified data dir 'src/icons' on command line.
+Nuitka-Options: Included data file 'icons\freeccr_logo.ico' due to specified data dir 'src/icons' on command line.
+Nuitka-Options: Included data file 'icons\freeccr_logo.png' due to specified data dir 'src/icons' on command line.
+Nuitka-Options: Included data file 'icons\freeccr_text_logo.png' due to specified data dir 'src/icons' on command line.
+Nuitka-Options: Included data file 'icons\horizontal-mirror-icon.png' due to specified data dir 'src/icons' on command line.
+Nuitka-Options: Included data file 'icons\rotate-left-icon-size_512.png' due to specified data dir 'src/icons' on command line.
+Nuitka-Options: Included data file 'icons\rotate-right-icon-size_512.png' due to specified data dir 'src/icons' on command line.
+Nuitka-Options: Included data file 'icons\vertical-mirror-icon.png' due to specified data dir 'src/icons' on command line.
+Nuitka-Options: Included data file 'LICENSES\license-FreeCCR.txt' due to specified data dir 'LICENSES' on command line.
+Nuitka-Options: Included data file 'LICENSES\license-LibRaw.txt' due to specified data dir 'LICENSES' on command line.
+Nuitka-Options: Included data file 'LICENSES\license-dust-detector.txt' due to specified data dir 'LICENSES' on command line.
+Nuitka-Options: Included data file 'LICENSES\license-exifread.txt' due to specified data dir 'LICENSES' on command line.
+Nuitka-Options: Included data file 'LICENSES\license-numpy.txt' due to specified data dir 'LICENSES' on command line.
+Nuitka-Options: Included data file 'LICENSES\license-opencv.txt' due to specified data dir 'LICENSES' on command line.
+Nuitka-Options: Included data file 'LICENSES\license-pyside6.txt' due to specified data dir 'LICENSES' on command line.
+Nuitka-Options: Included data file 'LICENSES\license-rawpy.txt' due to specified data dir 'LICENSES' on command line.
+Nuitka-Options: Included data file 'LICENSES\license-tifffile.txt' due to specified data dir 'LICENSES' on command line.
+Nuitka-Options: Included 11 data files due to specified data dir 'C:\Users\kevincat\AppData\Local\Programs\Python\Python311\Lib\site-packages\pyopencl\cl' on command line.
+Nuitka-Options: Included data file 'onnxruntime\LICENSE' due to package 'onnxruntime' package data.
+Nuitka-Options: Included data file 'onnxruntime\Privacy.md' due to package 'onnxruntime' package data.
+Nuitka-Options: Included data file 'onnxruntime\ThirdPartyNotices.txt' due to package 'onnxruntime' package data.
+Nuitka-Options: Included data file 'onnxruntime\datasets\logreg_iris.onnx' due to package 'onnxruntime' package data.
+Nuitka-Options: Included data file 'onnxruntime\datasets\mul_1.onnx' due to package 'onnxruntime' package data.
+Nuitka-Options: Included data file 'onnxruntime\datasets\sigmoid.onnx' due to package 'onnxruntime' package data.
+Nuitka-Options: Included data file 'onnxruntime\tools\mobile_helpers\coreml_supported_mlprogram_ops.md' due to package 'onnxruntime' package data.
+Nuitka-Options: Included data file 'onnxruntime\tools\mobile_helpers\coreml_supported_neuralnetwork_ops.md' due to package 'onnxruntime' package data.
+Nuitka-Options: Included data file 'onnxruntime\tools\mobile_helpers\nnapi_supported_ops.md' due to package 'onnxruntime' package data.
+Nuitka-Plugins:data-files: Included data file 'certifi\cacert.pem' due to package data for 'certifi'.
+Nuitka-Plugins:matplotlib: Included 183 data files due to package data for 'matplotlib.
+Nuitka-Plugins:matplotlib: Included data file 'matplotlib\mpl-data\matplotlibrc' due to updated matplotlib config file with backend to use.
+Nuitka: Keeping build directory 'main.build'.
+Nuitka: Successfully created 'H:\Projects\FreeCCR\main.dist\freeccr.exe'.

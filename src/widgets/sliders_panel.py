@@ -335,10 +335,21 @@ class SlidersPanel(QWidget):
 
         bwp_row = QHBoxLayout()
         self.white_point_btn = QPushButton("Set White Point")
+        # Small "clear" button: drops the white point so conversion uses the
+        # calibrated default slope (black point only).
+        self.clear_white_point_btn = QPushButton("✕")
+        self.clear_white_point_btn.setFixedWidth(28)
+        self.clear_white_point_btn.setToolTip(
+            "Clear the white point — use the calibrated default slope instead")
         self.black_point_btn = QPushButton("Set Black Point")
-        bwp_row.addWidget(self.white_point_btn)
         bwp_row.addWidget(self.black_point_btn)
+        bwp_row.addWidget(self.white_point_btn)
+        bwp_row.addWidget(self.clear_white_point_btn)
         scroll_layout.addLayout(bwp_row)
+        # Shows which slope source the next conversion will use.
+        self.bwp_mode_label = QLabel("")
+        self.bwp_mode_label.setStyleSheet("color: #888; font-size: 11px;")
+        scroll_layout.addWidget(self.bwp_mode_label)
         self.convert_current_bwp_btn = QPushButton("Convert Current (B/W Point)")
         scroll_layout.addWidget(self.convert_current_bwp_btn)
         self.convert_all_bwp_btn = QPushButton("Convert All (B/W Point)")
@@ -561,6 +572,7 @@ class SlidersPanel(QWidget):
         self.crop_btn.clicked.connect(self._on_crop_clicked)
         self.slice_btn.clicked.connect(self._on_slice_clicked)
         self.white_point_btn.clicked.connect(self._on_set_white_point)
+        self.clear_white_point_btn.clicked.connect(self._on_clear_white_point)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
         self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
         self.convert_all_bwp_btn.clicked.connect(self._on_convert_all_bwpoint)
@@ -1336,9 +1348,38 @@ class SlidersPanel(QWidget):
             self.set_temporary_hint(
                 "<b>Black Point:</b> Draw a rect over the transparent/clear film base.", duration=6000)
 
+    def _on_clear_white_point(self):
+        """Clear the sampled white point so conversion uses the calibrated
+        default slope (black point only)."""
+        ccr_backend.clear_white_point()
+        mw = self.parent().parent()
+        if hasattr(mw, "persist_bwpoint"):
+            mw.persist_bwpoint()
+        self._update_bwp_mode_label()
+        if ccr_backend.black_point_bgr is None:
+            self.set_temporary_hint(
+                "White point cleared. Set a <b>Black Point</b> (film base), then "
+                "Convert to use the <b>default slope</b>.", duration=6000)
+        else:
+            self.set_temporary_hint(
+                "White point cleared — conversion will use the calibrated "
+                "<b>default slope</b>. Click <b>Convert</b> to apply.", duration=6000)
+
+    def _update_bwp_mode_label(self):
+        """Reflect which slope source the next B/W-point conversion will use."""
+        if not hasattr(self, "bwp_mode_label"):
+            return
+        bp_set = ccr_backend.black_point_bgr is not None
+        wp_set = ccr_backend.white_point_bgr is not None
+        if not bp_set:
+            self.bwp_mode_label.setText("")
+        elif wp_set:
+            self.bwp_mode_label.setText("Slope source: white point (two-point)")
+        else:
+            self.bwp_mode_label.setText("Slope source: default slope (black point only)")
+
     def on_bwpoint_sampled(self, mode):
         label = "White Point" if mode == "white" else "Black Point"
-        other = "Black Point" if mode == "white" else "White Point"
         bp_set = ccr_backend.black_point_bgr is not None
         wp_set = ccr_backend.white_point_bgr is not None
         # Persist the global B/W point so tethering (and the next session) can
@@ -1346,17 +1387,24 @@ class SlidersPanel(QWidget):
         mw = self.parent().parent()
         if hasattr(mw, "persist_bwpoint"):
             mw.persist_bwpoint()
+        self._update_bwp_mode_label()
         if bp_set and wp_set:
             self.set_temporary_hint(
                 f"{label} sampled! Both points set — click <b>Convert All (B/W Point)</b>.", duration=5000)
+        elif bp_set:
+            # Black point alone is enough — default slope fills in for the white.
+            self.set_temporary_hint(
+                "Black Point sampled! Click <b>Convert</b> to use the default slope, "
+                "or set a <b>White Point</b> for a custom slope.", duration=6000)
         else:
             self.set_temporary_hint(
-                f"{label} sampled! Now set the <b>{other}</b>.", duration=5000)
+                "White Point sampled! Now set the <b>Black Point</b> (film base).", duration=5000)
 
     def _on_convert_current_bwpoint(self):
-        if ccr_backend.black_point_bgr is None or ccr_backend.white_point_bgr is None:
-            QMessageBox.warning(self, "B/W Point Missing",
-                "Please set both Black Point and White Point before converting.")
+        if ccr_backend.black_point_bgr is None:
+            QMessageBox.warning(self, "Black Point Missing",
+                "Please set a Black Point (film base) before converting. A White "
+                "Point is optional — without it the calibrated default slope is used.")
             return
         if self.current_idx is None:
             return
@@ -1367,15 +1415,17 @@ class SlidersPanel(QWidget):
             if img.converted:
                 img.reload_image()
             from core.ccr_processor import ccr_normalize_with_bwpoint
+            white = ccr_backend.white_point_bgr  # may be None → default slope
             processed = ccr_normalize_with_bwpoint(
-                img, ccr_backend.black_point_bgr, ccr_backend.white_point_bgr
+                img, ccr_backend.black_point_bgr, white
             )
             if processed is not None:
                 img.resized_raw = processed
             img.converted = True
             img.conversion_inputs = {
                 "mode": "bw",
-                "bw": (tuple(ccr_backend.black_point_bgr), tuple(ccr_backend.white_point_bgr)),
+                "bw": (tuple(ccr_backend.black_point_bgr),
+                       tuple(white) if white is not None else None),
                 "fine_rot": img.fine_rotation_angle,
             }
             img.update_thumbnail_and_preview()
@@ -1389,9 +1439,10 @@ class SlidersPanel(QWidget):
             QMessageBox.critical(self, "Conversion Error", str(e))
 
     def _on_convert_all_bwpoint(self):
-        if ccr_backend.black_point_bgr is None or ccr_backend.white_point_bgr is None:
-            QMessageBox.warning(self, "B/W Point Missing",
-                "Please set both Black Point and White Point before converting.")
+        if ccr_backend.black_point_bgr is None:
+            QMessageBox.warning(self, "Black Point Missing",
+                "Please set a Black Point (film base) before converting. A White "
+                "Point is optional — without it the calibrated default slope is used.")
             return
         dialog = BWPointConvertDialog(self)
         worker = BWPointConvertWorker()

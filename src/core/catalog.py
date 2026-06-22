@@ -71,7 +71,8 @@ def _ci_to_json(ci):
     if out.get("ref") is not None:
         out["ref"] = list(out["ref"])
     if out.get("bw") is not None:
-        out["bw"] = [list(out["bw"][0]), list(out["bw"][1])]
+        black, white = out["bw"]
+        out["bw"] = [list(black), (list(white) if white is not None else None)]
     for key in ("p_lo", "p_hi", "od"):
         if out.get(key) is not None:
             out[key] = list(out[key])
@@ -85,7 +86,8 @@ def _ci_from_json(ci):
     if out.get("ref") is not None:
         out["ref"] = tuple(out["ref"])
     if out.get("bw") is not None:
-        out["bw"] = (tuple(out["bw"][0]), tuple(out["bw"][1]))
+        black, white = out["bw"]
+        out["bw"] = (tuple(black), (tuple(white) if white is not None else None))
     for key in ("p_lo", "p_hi", "od"):
         if out.get(key) is not None:
             out[key] = tuple(out[key])
@@ -161,6 +163,7 @@ def serialize_image(img) -> dict:
         "contrast_base": int(img.contrast_base),
         "temperature_base": int(img.temperature_base),
         "brightness_base": int(img.brightness_base),
+        "exposure_base": float(getattr(img, "exposure_base", 0.0)),
         "tint_balance_factor": float(getattr(img, "tint_balance_factor", 1.0)),
         "reference_frame": list(img.reference_frame) if img.reference_frame else None,
     }
@@ -392,6 +395,7 @@ def _restore_image(file_path: str, state: dict):
     img.contrast_base = state.get("contrast_base", img.contrast_base)
     img.temperature_base = state.get("temperature_base", img.temperature_base)
     img.brightness_base = state.get("brightness_base", img.brightness_base)
+    img.exposure_base = state.get("exposure_base", getattr(img, "exposure_base", 0.0))
     img.update_thumbnail_and_preview()
     return img
 
