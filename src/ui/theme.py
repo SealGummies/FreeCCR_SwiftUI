@@ -41,6 +41,9 @@ SELECTION_TEXT = "#ffffff"
 CH_R = "#d06666"
 CH_G = "#66aa66"
 CH_B = "#6688d0"
+# Slider track gradients (groove) — map the axis to its colour meaning.
+TEMP_GRADIENT = ("#3d7fd1", "#e6c34d")   # Temperature: cool blue (low) -> warm amber (high)
+TINT_GRADIENT = ("#5cb85c", "#c264c2")   # Tint: green (low) -> magenta (high)
 SUCCESS = "#3a8f5a"
 SUCCESS_HOVER = "#46a368"
 SUCCESS_PRESSED = "#2f7449"

@@ -2,8 +2,9 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayou
                                 QSizePolicy, QStyleOptionSlider, QFrame, QStyle,
                                 QPushButton, QDialog, QMessageBox, QScrollArea,
                                 QCheckBox, QComboBox)
-from PySide6.QtCore import Qt, QTimer, QThread, Signal
-from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QRectF
+from PySide6.QtGui import (QPixmap, QKeySequence, QShortcut, QPainter, QColor,
+                           QLinearGradient, QPen)
 from core.ccr_backend import ccr_backend
 from core.ccr_processor import COLOR_BANDS, BAND_PARAMS, BAND_ADJUSTMENT_KEYS
 from widgets.curve_editor import CurveEditor
@@ -178,6 +179,55 @@ class ResettableSlider(QSlider):
         elif delta < 0:
             self.setValue(self.value() - 1)
         event.accept()
+
+
+class GradientSlider(ResettableSlider):
+    """A horizontal slider whose groove is a left->right colour gradient
+    (Temperature blue->amber, Tint green->magenta) so the axis reads at a glance.
+
+    The groove + knob are painted directly rather than via QSS: a global
+    ``QSlider`` stylesheet rule, matching this widget through subclassing, would
+    otherwise outrank any per-widget / #id groove rule (a Qt cascade quirk), so
+    QSS gradients never take here. Custom painting sidesteps that entirely.
+    """
+
+    GROOVE_H = 6
+    KNOB_D = 14
+
+    def __init__(self, stops, orientation=Qt.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self._lo = QColor(stops[0])
+        self._hi = QColor(stops[1])
+
+    def paintEvent(self, event):
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+        handle = self.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Gradient groove bar, vertically centred.
+        gy = self.height() / 2 - self.GROOVE_H / 2
+        bar = QRectF(groove.x(), gy, groove.width(), self.GROOVE_H)
+        grad = QLinearGradient(bar.left(), 0.0, bar.right(), 0.0)
+        grad.setColorAt(0.0, self._lo)
+        grad.setColorAt(1.0, self._hi)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(grad)
+        painter.drawRoundedRect(bar, 3, 3)
+
+        # Light, outlined knob at the handle position.
+        knob = QRectF(0, 0, self.KNOB_D, self.KNOB_D)
+        knob.moveCenter(QRectF(handle).center())
+        painter.setBrush(QColor(theme.Paint.CURVE_NODE))
+        painter.setPen(QPen(QColor(theme.Paint.CURVE_NODE_OUTLINE), 1))
+        painter.drawEllipse(knob)
+        painter.end()
+
 
 class SlidersPanel(QWidget):
     # Order must match the create_slider() call order exactly — the two
@@ -398,8 +448,10 @@ class SlidersPanel(QWidget):
         # luminance channel (preview and export). Per-image, like the sliders.
         self.color_profile_row = self._create_color_profile_row()
 
-        self.temperature_slider_layout = self.create_slider("Temperature")
-        self.tint_slider_layout = self.create_slider("Tint")
+        self.temperature_slider_layout = self.create_slider(
+            "Temperature", gradient=theme.TEMP_GRADIENT)
+        self.tint_slider_layout = self.create_slider(
+            "Tint", gradient=theme.TINT_GRADIENT)
         self.exposure_slider_layout = self.create_slider("Gain")
         self.brightness_slider_layout = self.create_slider("Brightness")
         self.highlights_slider_layout = self.create_slider("Highlights")
@@ -612,8 +664,13 @@ class SlidersPanel(QWidget):
             self.histogram_label.setText("")
 
     def create_slider(self, label_text, min_value=-100, max_value=100,
-                      default_value=0):
-        slider = ResettableSlider(Qt.Horizontal)
+                      default_value=0, gradient=None):
+        # `gradient` (a (left, right) colour pair) gives a custom-painted
+        # gradient groove — e.g. Temperature blue->amber, Tint green->magenta.
+        if gradient is not None:
+            slider = GradientSlider(gradient, Qt.Horizontal)
+        else:
+            slider = ResettableSlider(Qt.Horizontal)
         slider.setMinimum(min_value)
         slider.setMaximum(max_value)
         slider.setValue(default_value)
