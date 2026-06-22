@@ -15,7 +15,7 @@ import copy
 SYNC_GROUPS = [
     ("profile", "Color Profile (Color / B&W)", ()),
     ("wb", "White Balance / Tint", ("temperature", "tint")),
-    ("tone", "Tone (exposure, brightness, contrast, ...)",
+    ("tone", "Tone (gain, brightness, contrast, ...)",
      ("exposure", "brightness", "highlights", "white_point",
       "shadows", "black_point", "contrast")),
     ("sat", "Saturation", ("saturation", "sub_saturation")),
@@ -275,7 +275,7 @@ class SlidersPanel(QWidget):
         layout.addWidget(scroll_area, 1)  # stretch=1: fills remaining height
 
         self.slider_labels = [
-            "Temperature", "Tint", "Exposure", "Brightness",
+            "Temperature", "Tint", "Gain", "Brightness",
             "Highlights", "White Point", "Shadows", "Black Point", "Contrast", "Saturation",
             "Subtracted Sat"
         ]
@@ -399,7 +399,7 @@ class SlidersPanel(QWidget):
 
         self.temperature_slider_layout = self.create_slider("Temperature")
         self.tint_slider_layout = self.create_slider("Tint")
-        self.exposure_slider_layout = self.create_slider("Exposure")
+        self.exposure_slider_layout = self.create_slider("Gain")
         self.brightness_slider_layout = self.create_slider("Brightness")
         self.highlights_slider_layout = self.create_slider("Highlights")
         self.white_point_slider_layout = self.create_slider("White Point")

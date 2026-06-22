@@ -304,7 +304,7 @@ class CCRImage:
                 # the brightest pixels saturate, CLIPPING highlights to white.
                 # rawpy's auto-scale (no_auto_scale left at its default, off) still
                 # maps the sensor white level to full range — a proper, non-clipping
-                # exposure that preserves highlight headroom (raise Exposure to taste).
+                # exposure that preserves highlight headroom (raise Gain to taste).
                 no_auto_bright=True,
                 gamma=(2.222, 4.5),                               # sRGB-ish TRC
                 user_flip=0,
