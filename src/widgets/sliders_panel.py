@@ -401,10 +401,12 @@ class SlidersPanel(QWidget):
         self.bwp_mode_label = QLabel("")
         self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         scroll_layout.addWidget(self.bwp_mode_label)
-        self.convert_current_bwp_btn = QPushButton("Convert Current (B/W Point)")
-        scroll_layout.addWidget(self.convert_current_bwp_btn)
-        self.convert_all_bwp_btn = QPushButton("Convert All (B/W Point)")
-        scroll_layout.addWidget(self.convert_all_bwp_btn)
+        self.convert_current_bwp_btn = QPushButton("Convert Current")
+        self.convert_all_bwp_btn = QPushButton("Convert All")
+        convert_row = QHBoxLayout()
+        convert_row.addWidget(self.convert_current_bwp_btn)
+        convert_row.addWidget(self.convert_all_bwp_btn)
+        scroll_layout.addLayout(convert_row)
 
         # Separator between B/W Point tools and the adjustment sliders
         separator = QFrame()
@@ -1444,7 +1446,7 @@ class SlidersPanel(QWidget):
         self._update_bwp_mode_label()
         if bp_set and wp_set:
             self.set_temporary_hint(
-                f"{label} sampled! Both points set — click <b>Convert All (B/W Point)</b>.", duration=5000)
+                f"{label} sampled! Both points set — click <b>Convert All</b>.", duration=5000)
         elif bp_set:
             # Black point alone is enough — default slope fills in for the white.
             self.set_temporary_hint(
