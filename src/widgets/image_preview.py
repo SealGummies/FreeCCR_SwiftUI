@@ -1665,6 +1665,7 @@ class ImagePreview(QWidget):
             for s in getattr(img, "dust_spots", []))
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
+                getattr(img, "exposure_base", 0.0),
                 getattr(img, "color_profile", "color"),
                 areas_sig, dust_sig)
 
@@ -3572,6 +3573,7 @@ class HiResDetailWorker(QThread):
         self._contrast_base = img_obj.contrast_base
         self._temperature_base = img_obj.temperature_base
         self._brightness_base = img_obj.brightness_base
+        self._exposure_base = getattr(img_obj, "exposure_base", 0.0)
         self._converted = img_obj.converted
         # Captured at request time (thread-safe): positive mode skips the
         # negative display auto-brightness, like update_thumbnail_and_preview.
@@ -3598,6 +3600,7 @@ class HiResDetailWorker(QThread):
                 contrast_base=self._contrast_base,
                 temperature_base=self._temperature_base,
                 brightness_base=self._brightness_base,
+                exposure_base=self._exposure_base,
                 areas_override=self._areas)
             if not self._converted and not self._positive_mode:
                 # Mirror the preview pipeline: adjustments first, then the

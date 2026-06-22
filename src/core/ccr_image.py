@@ -130,6 +130,9 @@ class CCRImage:
         # of the film-NEGATIVE look; positives go straight to user adjustments
         # from a neutral baseline (no darkening), so 0 there. See spec/positive-mode.md.
         self.brightness_base: int = 0 if self._positive_mode_active() else -8
+        # Non-destructive auto-exposure (default-slope mode), in ch_input_gain
+        # units → applied as a uniform gain. See spec/auto-exposure-default-slope.md.
+        self.exposure_base: float = 0.0
         self.histogram_image = None
         self.original_full_size: Optional[tuple[int, int]] = None  # (height, width) of the full-res source, set by read_image
 
@@ -192,6 +195,7 @@ class CCRImage:
         # -8 is the negative-look baseline; positives reset to a neutral 0 so the
         # decode goes straight to user adjustments (no darkening / shadow crush).
         self.brightness_base = 0 if self._positive_mode_active() else -8
+        self.exposure_base = 0.0    # Clear auto-exposure when reverting to original scan
         self.conversion_inputs = None
         img = self.read_image(self.file_path, max_long_side=1080)
         if img is not None:
@@ -640,7 +644,8 @@ class CCRImage:
 
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,
-                          color_profile=None, areas_override=None) -> np.ndarray:
+                          color_profile=None, areas_override=None,
+                          exposure_base=None) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
         live state the GUI thread may be mutating concurrently."""
@@ -652,18 +657,22 @@ class CCRImage:
         cb = self.contrast_base if contrast_base is None else contrast_base
         tb = self.temperature_base if temperature_base is None else temperature_base
         bb = self.brightness_base if brightness_base is None else brightness_base
+        eb = self.exposure_base if exposure_base is None else exposure_base
         profile = self.color_profile if color_profile is None else color_profile
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)
-        if not s and cb == 0 and tb == 0 and bb == 0 and not has_areas:
+        if not s and cb == 0 and tb == 0 and bb == 0 and eb == 0 and not has_areas:
             # No slider/base/area adjustments — but Black & White still has to
             # map the image to a single luminance channel.
             return self._to_grayscale(image) if profile == "bw" else image
         adjusted = adjust_image_opencl(image,
                      s.get('temperature', 0) + tb,
                      s.get('tint', 0),
-                     s.get('exposure', 0),
+                     # Auto-exposure (default-slope mode) rides the TONE-AWARE
+                     # exposure as a non-destructive base (UI slider stays 0):
+                     # highlights roll off instead of hard-clipping, midtones lift.
+                     s.get('exposure', 0) + eb,
                      # Brightness slider is half-strength per click; the
                      # always-on base offset (bb) keeps full weight so the
                      # default look is unchanged.

@@ -20,3 +20,6 @@ win_installer
 .DS_Store
 activation-server
 dmg_temp
+
+# qt-testing skill: offscreen widget screenshots
+scratch/

@@ -4,7 +4,7 @@ from core.ccr_image import CCRImage
 from core.ccr_processor import (ccr_normalize_with_reference, ccr_normalize_with_bwpoint,
                                 ccr_normalize_with_refparams, ccr_export_positive,
                                 auto_fine_angle, auto_frame,
-                                auto_frame_v2)
+                                auto_frame_v2, log_bwpoint_slopes)
 import os
 import glob
 import concurrent.futures
@@ -762,8 +762,9 @@ class CCRBackend:
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                max_long_side=max_long_side,
                                                output_colorspace=output_colorspace)
-                elif image_obj.reference_frame is None and self.black_point_bgr is not None and self.white_point_bgr is not None:
-                    # Legacy/un-snapshotted B/W point conversion — global anchors
+                elif image_obj.reference_frame is None and self.black_point_bgr is not None:
+                    # Legacy/un-snapshotted B/W point conversion — global anchors.
+                    # white_point_bgr may be None → default-slope mode.
                     ccr_normalize_with_bwpoint(image_obj, self.black_point_bgr, self.white_point_bgr,
                                                output_path=output_path, water_mark=not self.software_activated,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
@@ -962,6 +963,7 @@ class CCRBackend:
             dup.contrast_base = img.contrast_base
             dup.temperature_base = img.temperature_base
             dup.brightness_base = img.brightness_base
+            dup.exposure_base = getattr(img, "exposure_base", 0.0)
             dup.tint_balance_factor = getattr(img, "tint_balance_factor", 1.0)
             dup._catalog_signature = getattr(img, "_catalog_signature", None)
             # Clone area layers (deep — each nests settings + geometry) so the
@@ -1149,6 +1151,7 @@ class CCRBackend:
                 child.contrast_base = img_obj.contrast_base
                 child.temperature_base = img_obj.temperature_base
                 child.brightness_base = img_obj.brightness_base
+                child.exposure_base = getattr(img_obj, "exposure_base", 0.0)
                 if ((child.contrast_base, child.temperature_base,
                         child.brightness_base) != (0, 0, -8)
                         or img_obj.adjustment_settings.get("tint")):
@@ -1301,6 +1304,7 @@ class CCRBackend:
         parent.contrast_base = template.contrast_base
         parent.temperature_base = template.temperature_base
         parent.brightness_base = template.brightness_base
+        parent.exposure_base = getattr(template, "exposure_base", 0.0)
         parent._catalog_signature = getattr(template, "_catalog_signature", None)
         parent.update_thumbnail_and_preview()
 
@@ -1330,6 +1334,12 @@ class CCRBackend:
     def set_white_point(self, bgr_tuple):
         self.white_point_bgr = bgr_tuple
 
+    def clear_white_point(self):
+        """Drop the sampled white point so B/W-point conversion falls back to the
+        calibrated default slope (black point only). See
+        spec/optional-white-point-default-slope.md."""
+        self.white_point_bgr = None
+
     def set_black_point(self, bgr_tuple):
         self.black_point_bgr = bgr_tuple
 
@@ -1339,8 +1349,13 @@ class CCRBackend:
         pipeline as ccr_normalize_with_reference, but with user-specified B/W points
         instead of auto-detected percentiles.  Always converts from original scan data.
         """
-        if self.black_point_bgr is None or self.white_point_bgr is None:
-            raise ValueError("Both black and white points must be set before applying.")
+        if self.black_point_bgr is None:
+            raise ValueError("A black point (film base) must be set before applying.")
+        # Calibration: when both points are set, log the linear + density slopes
+        # they imply so a fixed default slope can be measured and baked in. With
+        # only a black point, conversion uses the baked default slope.
+        if self.white_point_bgr is not None:
+            log_bwpoint_slopes(self.black_point_bgr, self.white_point_bgr)
         total = len(self.images)
         if progress_callback:
             progress_callback(0, total)
@@ -1357,7 +1372,8 @@ class CCRBackend:
                 img.converted = True
                 img.conversion_inputs = {
                     "mode": "bw",
-                    "bw": (tuple(self.black_point_bgr), tuple(self.white_point_bgr)),
+                    "bw": (tuple(self.black_point_bgr),
+                           tuple(self.white_point_bgr) if self.white_point_bgr is not None else None),
                     "fine_rot": img.fine_rotation_angle,
                 }
                 img.update_thumbnail_and_preview()

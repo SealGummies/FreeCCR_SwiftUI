@@ -998,7 +998,87 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
     print(f"TOTAL CCR normalization time: {total_elapsed:.3f}s")
     return rgb_brightness_normalized
 
-def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
+# Calibrated DEFAULT SLOPE for the default-slope mode (used when only a black
+# point is sampled — no white point). The conversion runs in optical-DENSITY
+# (log) space so that re-sampling the black point under a new light source
+# cancels that light's per-channel scaling: log10(base/img) is invariant to a
+# per-channel factor k applied to both base and img. The slope is a SINGLE
+# SCALAR (contrast only) so no per-channel colour balance is baked in — all
+# balance comes from the per-light black-point divide. Calibrated as the mean
+# of the per-channel "DENSITY" values that log_bwpoint_slopes reports across
+# typical rolls / light sources (~0.69–1.10 observed → ~0.8). Adjust contrast
+# by changing this scalar (or with the contrast slider); white balance / the
+# Auto WB picker cleans up any residual per-image cast.
+DEFAULT_DENSITY_SLOPE = 0.8
+# Optional display gamma applied after the density map (1.0 = off / pure
+# density-linear). Raise toward ~2.2 only if the default render is too dark.
+DEFAULT_DENSITY_GAMMA = 1.0
+# Scan floor so log10(base/img) stays finite for near-black (very dense) pixels.
+_DENSITY_FLOOR = 1.0
+
+
+def _default_slope_invert(img_f: np.ndarray, black_point_bgr) -> np.ndarray:
+    """Density-space inversion for the black-point-only mode, using the baked
+    scalar DEFAULT_DENSITY_SLOPE. `img_f` is a float32 (H,W,3) BGR array.
+
+    Per channel: out = clip(DEFAULT_DENSITY_SLOPE * max(log10(base/img), 0), 0, 1),
+    then an optional display gamma, scaled to uint16. The per-channel base divide
+    is the ONLY place colour balance enters, and log10(base/img) cancels any
+    per-channel light-source scaling — so re-sampling the black point under a new
+    light keeps colour consistent without a white point."""
+    out = np.empty_like(img_f)
+    for c in range(3):
+        base = max(float(black_point_bgr[c]), 1.0)
+        ch = np.maximum(img_f[..., c], _DENSITY_FLOOR)   # copy; avoids /0 & log(0)
+        np.divide(base, ch, out=ch)                      # base / img
+        np.log10(ch, out=ch)                             # optical density above base
+        np.maximum(ch, 0.0, out=ch)                      # clamp (img brighter than base)
+        out[..., c] = ch
+    out *= np.float32(DEFAULT_DENSITY_SLOPE)             # single scalar = contrast
+    np.clip(out, 0.0, 1.0, out=out)
+    if DEFAULT_DENSITY_GAMMA != 1.0:
+        np.power(out, np.float32(1.0 / DEFAULT_DENSITY_GAMMA), out=out)
+    out *= np.float32(65535.0)
+    return out.astype(np.uint16)
+
+
+# --- Auto-exposure for default-slope mode (spec/auto-exposure-default-slope.md) ---
+AUTO_EXPOSURE_PERCENTILE = 98.0     # top-2% highlight
+AUTO_EXPOSURE_TARGET = 0.98         # nominal placement at 98% of full scale
+WHITE_EXCLUDE_FRACTION = 0.99       # luminance >= this is treated as holder/clear → excluded
+MIN_CONTENT_FRACTION = 0.005        # need >=0.5% non-white pixels to trust the estimate
+EXPOSURE_BASE_MIN = -100.0          # exposure-base clamp (-2 EV nominal)
+EXPOSURE_BASE_MAX = 100.0           # exposure-base clamp (+2 EV nominal)
+
+
+def compute_auto_exposure_gain(img_bgr: np.ndarray) -> float:
+    """Auto-exposure for default-slope mode: return the EXPOSURE-base value (in
+    exposure-slider units, where 2^(x/50) is the nominal stop multiplier) that
+    would place the (film-holder-excluded) AUTO_EXPOSURE_PERCENTILE luminance at
+    AUTO_EXPOSURE_TARGET of full scale.
+
+    The value is applied through the TONE-AWARE exposure (not a uniform gain), so
+    the boost mainly lifts midtones while highlights roll off near white instead
+    of hard-clipping — i.e. this is the nominal target; the top compresses
+    gracefully toward it. Pure-white pixels (luminance >= WHITE_EXCLUDE_FRACTION·
+    65535) are the film holder / clear surround and are excluded so they don't
+    peg the estimate. Returns 0.0 when there isn't enough non-white content."""
+    img = img_bgr.astype(np.float32, copy=False)
+    # BGR → luminance.
+    lum = 0.114 * img[..., 0] + 0.587 * img[..., 1] + 0.299 * img[..., 2]
+    keep = lum < (WHITE_EXCLUDE_FRACTION * 65535.0)
+    vals = lum[keep]
+    if vals.size < MIN_CONTENT_FRACTION * lum.size:
+        return 0.0
+    v98 = float(np.percentile(vals, AUTO_EXPOSURE_PERCENTILE))
+    if v98 <= 1.0:
+        return 0.0
+    g = (AUTO_EXPOSURE_TARGET * 65535.0) / v98
+    exposure_base = 50.0 * float(np.log2(g))
+    return float(np.clip(exposure_base, EXPOSURE_BASE_MIN, EXPOSURE_BASE_MAX))
+
+
+def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
                                output_path=None, water_mark=True, jpg_out=False,
                                jpg_quality=95, max_long_side=None,
                                output_colorspace="srgb"):
@@ -1010,6 +1090,9 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
                      Transparent areas → output black (0) after inversion.
     white_point_bgr: (B,G,R) scan values of dense/exposed film area (LOW values).
                      Dense areas → output white (65535) after inversion.
+                     If None, the default-slope mode is used: a density-space
+                     inversion with the baked scalar DEFAULT_DENSITY_SLOPE is
+                     applied to the black point alone (see _default_slope_invert).
 
     Pipeline: BWPN (user B/W points) → inversion → saturation boost → shadow correction
     ODAI is skipped because per-channel B/W point mapping already normalises channels.
@@ -1038,25 +1121,31 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     # With no_auto_bright=True in rawpy, film base and dense-area values are identical in every
     # frame. The sampled B/W points are applied directly as fixed per-channel anchors.
     img_f = img.astype(np.float32)
-    norm = np.empty_like(img_f)
-    for c in range(3):
-        p_hi = max(float(black_point_bgr[c]), 1.0)   # transparent film (film base) → maps to black
-        p_lo = max(float(white_point_bgr[c]), 1.0)   # dense film (exposed area) → maps to white
+    if white_point_bgr is None:
+        # --- Default-slope mode (black point only): density-space inversion ---
+        rgb_inverted = _default_slope_invert(img_f, black_point_bgr)
+        del img_f
+        print(f"BWPN (default slope): {time.time() - total_start_time:.3f}s")
+    else:
+        norm = np.empty_like(img_f)
+        for c in range(3):
+            p_hi = max(float(black_point_bgr[c]), 1.0)   # transparent film (film base) → maps to black
+            p_lo = max(float(white_point_bgr[c]), 1.0)   # dense film (exposed area) → maps to white
 
-        denom = p_hi - p_lo
-        if abs(denom) < 1.0:
-            norm[..., c] = 0.0
-            continue
-        np.subtract(img_f[..., c], p_lo, out=norm[..., c])
-        np.divide(norm[..., c], denom, out=norm[..., c])
-        np.multiply(norm[..., c], 65535.0, out=norm[..., c])
-        np.clip(norm[..., c], 0, 65535, out=norm[..., c])
-    del img_f
-    print(f"BWPN (user points): {time.time() - total_start_time:.3f}s")
+            denom = p_hi - p_lo
+            if abs(denom) < 1.0:
+                norm[..., c] = 0.0
+                continue
+            np.subtract(img_f[..., c], p_lo, out=norm[..., c])
+            np.divide(norm[..., c], denom, out=norm[..., c])
+            np.multiply(norm[..., c], 65535.0, out=norm[..., c])
+            np.clip(norm[..., c], 0, 65535, out=norm[..., c])
+        del img_f
+        print(f"BWPN (user points): {time.time() - total_start_time:.3f}s")
 
-    # --- Inversion (ODAI skipped: per-channel B/W points already equalise channels) ---
-    rgb_inverted = (65535.0 - norm).clip(0, 65535).astype(np.uint16)
-    del norm
+        # --- Inversion (ODAI skipped: per-channel B/W points already equalise channels) ---
+        rgb_inverted = (65535.0 - norm).clip(0, 65535).astype(np.uint16)
+        del norm
     gc.collect()
 
     # --- Post-invert "look" DISABLED (saturation boost + shadow warmth) ---
@@ -1107,6 +1196,13 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr,
     # contrast_base set to 0 to disable the baked-in contrast S-curve (was 40).
     ccr_image.contrast_base = 0
     ccr_image.temperature_base = 0
+
+    # Auto-exposure (default-slope mode only): compute once from the preview and
+    # store as a non-destructive uniform-gain base; export/zoom reuse it. With a
+    # white point the two-point map already sets the cut, so force it to 0.
+    if output_path is None:
+        ccr_image.exposure_base = (
+            compute_auto_exposure_gain(rgb_result) if white_point_bgr is None else 0.0)
 
     # --- User adjustments (export only) ---
     if output_path is not None:
@@ -1538,11 +1634,19 @@ def apply_reference_normalization(img: np.ndarray, p_lo, p_hi, od_factors) -> np
     return apply_postinvert_look(inverted)
 
 
-def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bgr) -> np.ndarray:
+def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bgr=None) -> np.ndarray:
     """B/W-point conversion at any resolution: absolute per-channel anchors +
     inversion + standard look — mirrors ccr_normalize_with_bwpoint's preview
-    path (the anchors are global constants, so no rescaling is needed)."""
+    path (the anchors are global constants, so no rescaling is needed).
+
+    When white_point_bgr is None, the default-slope mode is used: a density-space
+    inversion with the baked scalar DEFAULT_DENSITY_SLOPE is applied to the black
+    point alone (see _default_slope_invert). Otherwise the explicit two-point
+    math is used verbatim (bit-identical to the prior behaviour)."""
     img_f = img.astype(np.float32)
+    if white_point_bgr is None:
+        # Default-slope mode (black point only): density-space inversion.
+        return _default_slope_invert(img_f, black_point_bgr)
     norm = np.empty_like(img_f)
     for c in range(3):
         p_hi = max(float(black_point_bgr[c]), 1.0)
@@ -1560,6 +1664,49 @@ def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bg
     # zoom/hi-res replay matches the look-less preview/export path.
     return inverted
     # return apply_postinvert_look(inverted)
+
+
+def log_bwpoint_slopes(black_point_bgr, white_point_bgr):
+    """Diagnostic: report BOTH the LINEAR slope and the DENSITY-SPACE slope
+    implied by a user's B/W-point pick, so a fixed default slope can be
+    CALIBRATED from a typical roll and baked into the code. ONLY logs.
+
+    LINEAR slope  S_lin[c] = 65535 / (base[c] - white[c])  is exactly what the
+    CURRENT two-point method uses (inverted = S_lin * (base - img)). Bake it to
+    run the default mode directly in the existing linear pipeline (seamless
+    toggle, no new code). It is tied to absolute scan brightness, so it is valid
+    only when scans are exposed consistently (which the bw path already assumes).
+
+    DENSITY slope S_den[c] = 1 / log10(base[c] / white[c])  multiplies optical
+    density d = log10(base/img). Bake it for a brightness-INVARIANT default
+    (the scan exposure cancels in the log; cf. OpenEnlarge's FAITHFUL_SCALE), at
+    the cost of a log-space inversion whose look differs from the linear path.
+
+    Run on a representative frame, read the MEAN / per-channel values, bake one.
+    """
+    labels = ("B", "G", "R")
+    print("=== SLOPE CALIBRATION (B/W points) ===")
+    print(f"  black point (clear/base, BGR): {tuple(black_point_bgr)}")
+    print(f"  white point (dense,      BGR): {tuple(white_point_bgr)}")
+    lin, den = [], []
+    for c in range(3):
+        base = float(black_point_bgr[c])
+        white = float(white_point_bgr[c])
+        if base <= 0 or white <= 0 or base <= white:
+            print(f"  [{labels[c]}] invalid (base={base}, white={white}); skipped")
+            continue
+        s_lin = 65535.0 / (base - white)        # linear gain (current method)
+        d = float(np.log10(base / white))       # optical density base -> white
+        s_den = 1.0 / d                         # density slope: output 1.0 at D
+        lin.append(s_lin)
+        den.append(s_den)
+        print(f"  [{labels[c]}] LINEAR 65535/(base-white)={s_lin:.4f}    "
+              f"DENSITY 1/log10(base/white)={s_den:.4f}  (D={d:.4f})")
+    if lin:
+        print(f"  MEAN  linear = {sum(lin)/len(lin):.4f}   density = {sum(den)/len(den):.4f}")
+        print(f"  per-channel LINEAR  (B,G,R) = {[round(s, 4) for s in lin]}")
+        print(f"  per-channel DENSITY (B,G,R) = {[round(s, 4) for s in den]}")
+    print("=== bake the LINEAR vector (current pipeline) OR the DENSITY vector (log) ===")
 
 
 def auto_fine_angle(img16: np.ndarray, debug: bool = False) -> float:

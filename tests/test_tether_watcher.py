@@ -182,6 +182,34 @@ def test_worker_converts_with_bwpoint(tmp_path):
         ccr_backend.white_point_bgr = None
 
 
+def test_worker_converts_with_black_point_only(tmp_path):
+    """With only a black point set (no white point), the worker still converts
+    using the calibrated default slope and records white as None."""
+    ccr_backend.positive_mode = False
+    ccr_backend.black_point_bgr = (60000.0, 60000.0, 60000.0)  # clear base (high)
+    ccr_backend.white_point_bgr = None                         # default slope
+    try:
+        p = tmp_path / "neg_default.png"
+        px = (np.random.RandomState(9).rand(100, 140, 3) * 255).astype(np.uint8)
+        cv2.imwrite(str(p), px)
+
+        worker = TetherWatchWorker()
+        got = []
+        worker.captured.connect(lambda im: got.append(im))
+        worker.process(str(p))
+
+        assert len(got) == 1
+        img = got[0]
+        assert img.converted is True
+        assert img.conversion_inputs["mode"] == "bw"
+        bw = img.conversion_inputs["bw"]
+        assert tuple(bw[0]) == (60000.0, 60000.0, 60000.0)
+        assert bw[1] is None       # no white point → default-slope mode
+    finally:
+        ccr_backend.black_point_bgr = None
+        ccr_backend.white_point_bgr = None
+
+
 def test_worker_positive_mode_skips_conversion(tmp_path):
     """Positive mode → captures import as-is even when a B/W point is set."""
     ccr_backend.positive_mode = True
@@ -319,6 +347,6 @@ def test_session_start_clears_bwpoint(tmp_path, monkeypatch):
         assert w._tether_active is True
         assert ccr_backend.black_point_bgr is None
         assert ccr_backend.white_point_bgr is None
-        assert "No B/W point" in w.tether_banner._note.text()
+        assert "No black point" in w.tether_banner._note.text()
     finally:
         w.stop_tethering()
