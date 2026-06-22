@@ -12,6 +12,8 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton
 from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QPainterPath
 
+from ui import theme
+
 # Mirror ccr_processor's channel set / identity so the two agree by construction.
 CURVE_CHANNELS = ("rgb", "r", "g", "b")
 
@@ -84,9 +86,9 @@ class CurveCanvas(QWidget):
 
     _LINE_COLORS = {
         "rgb": QColor("#e8e8e8"),
-        "r": QColor("#d06666"),
-        "g": QColor("#66aa66"),
-        "b": QColor("#6688d0"),
+        "r": QColor(theme.CH_R),
+        "g": QColor(theme.CH_G),
+        "b": QColor(theme.CH_B),
     }
 
     def __init__(self, parent=None):
@@ -292,12 +294,12 @@ class CurveCanvas(QWidget):
         r = self._plot_rect()
 
         # Background
-        p.fillRect(self.rect(), QColor("#2b2b2b"))
-        p.setPen(QPen(QColor("#555"), 1))
+        p.fillRect(self.rect(), QColor(theme.Paint.CURVE_BG))
+        p.setPen(QPen(QColor(theme.BORDER_STRONG), 1))
         p.drawRect(r)
 
         # Grid (4x4)
-        p.setPen(QPen(QColor("#3d3d3d"), 1))
+        p.setPen(QPen(QColor(theme.Paint.CURVE_GRID), 1))
         for k in range(1, 4):
             gx = r.left() + r.width() * k / 4.0
             gy = r.top() + r.height() * k / 4.0
@@ -305,7 +307,7 @@ class CurveCanvas(QWidget):
             p.drawLine(QPointF(r.left(), gy), QPointF(r.right(), gy))
 
         # Identity diagonal reference
-        p.setPen(QPen(QColor("#666"), 1, Qt.DashLine))
+        p.setPen(QPen(QColor(theme.Paint.CURVE_IDENTITY), 1, Qt.DashLine))
         p.drawLine(self._to_widget(0, 0), self._to_widget(255, 255))
 
         pts = self._points[self._channel]
@@ -323,13 +325,14 @@ class CurveCanvas(QWidget):
             path.lineTo(self._to_widget(qx, min(255.0, max(0.0, qy))))
         line_color = self._LINE_COLORS.get(self._channel, QColor("#e8e8e8"))
         if not self._enabled:
-            line_color = QColor("#555")
+            line_color = QColor(theme.Paint.CURVE_NODE_DISABLED)
         p.setPen(QPen(line_color, 2))
         p.drawPath(path)
 
         # Control points
-        p.setPen(QPen(QColor("#222"), 1))
-        p.setBrush(QBrush(QColor("#f0f0f0") if self._enabled else QColor("#777")))
+        p.setPen(QPen(QColor(theme.Paint.CURVE_NODE_OUTLINE), 1))
+        p.setBrush(QBrush(QColor(theme.Paint.CURVE_NODE) if self._enabled
+                          else QColor(theme.Paint.CURVE_NODE_DISABLED)))
         for x, y in pts:
             w = self._to_widget(x, y)
             p.drawEllipse(w, self.POINT_RADIUS, self.POINT_RADIUS)
@@ -343,7 +346,7 @@ class CurveEditor(QWidget):
     editFinished = Signal()
 
     _CHANNEL_LABELS = (("rgb", "All"), ("r", "R"), ("g", "G"), ("b", "B"))
-    _BTN_TINT = {"rgb": "#bbbbbb", "r": "#d06666", "g": "#66aa66", "b": "#6688d0"}
+    _BTN_TINT = {"rgb": theme.TEXT_MUTED, "r": theme.CH_R, "g": theme.CH_G, "b": theme.CH_B}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -360,9 +363,9 @@ class CurveEditor(QWidget):
             btn.setCheckable(True)
             btn.setFixedHeight(22)
             btn.setStyleSheet(
-                "QPushButton { background: #3a3a3a; border: 1px solid #222; "
+                f"QPushButton {{ background: {theme.SURFACE}; border: 1px solid {theme.BORDER}; "
                 f"border-radius: 3px; color: {self._BTN_TINT[ch]}; font-size: 11px; }}"
-                "QPushButton:checked { background: #555; border: 2px solid #eee; }")
+                f"QPushButton:checked {{ background: {theme.SURFACE_ACTIVE}; border: 2px solid {theme.ACCENT}; }}")
             btn.clicked.connect(lambda _=False, c=ch: self._on_channel(c))
             btn_row.addWidget(btn)
             self._channel_buttons[ch] = btn

@@ -7,6 +7,7 @@ from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
 from core.ccr_backend import ccr_backend
 from core.ccr_processor import COLOR_BANDS, BAND_PARAMS, BAND_ADJUSTMENT_KEYS
 from widgets.curve_editor import CurveEditor
+from ui import theme
 import copy
 
 # Setting groups offered by the "Sync to All" dialog. The adjustment-key
@@ -85,9 +86,9 @@ class CollapsibleSection(QWidget):
         self._toggle_btn.setChecked(False)
         self._toggle_btn.setStyleSheet(
             "QPushButton { text-align: left; padding: 4px 6px; "
-            "background: #3a3a3a; border: none; border-radius: 4px; "
-            "color: #ccc; font-size: 11px; }"
-            "QPushButton:checked { background: #505050; }"
+            f"background: {theme.SURFACE}; border: none; border-radius: 4px; "
+            f"color: {theme.TEXT}; font-size: 11px; }}"
+            f"QPushButton:checked {{ background: {theme.SURFACE_ACTIVE}; }}"
         )
         self._toggle_btn.clicked.connect(self._on_toggle)
 
@@ -255,7 +256,7 @@ class SlidersPanel(QWidget):
         self.histogram_label.setFrameShape(QFrame.NoFrame)
         self.histogram_label.setText("")
         self.histogram_label.setStyleSheet(
-            "background-color: rgb(180,180,180); border: none; border-radius: 12px;"
+            f"background-color: rgb({theme.Paint.HIST_BG[0]},{theme.Paint.HIST_BG[1]},{theme.Paint.HIST_BG[2]}); border: none; border-radius: 12px;"
         )
         layout.addWidget(self.histogram_label)
 
@@ -292,7 +293,7 @@ class SlidersPanel(QWidget):
         layers_vbox.setContentsMargins(0, 0, 0, 0)
         layers_vbox.setSpacing(2)
         layers_title = QLabel("Layers")
-        layers_title.setStyleSheet("color: #888; font-size: 11px;")
+        layers_title.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layers_title.setAlignment(Qt.AlignCenter)
         layers_vbox.addWidget(layers_title)
         self._layers_list_vbox = QVBoxLayout()   # dynamic rows, rebuilt per image
@@ -329,7 +330,7 @@ class SlidersPanel(QWidget):
         # --- 10 existing sliders (sliders[0]–[9]) ---
         # --- Film B/W Point section — at the top, right below the histogram ---
         bwp_label = QLabel("Film B/W Point")
-        bwp_label.setStyleSheet("color: #888; font-size: 11px; margin-bottom: 2px;")
+        bwp_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px; margin-bottom: 2px;")
         bwp_label.setAlignment(Qt.AlignCenter)
         scroll_layout.addWidget(bwp_label)
 
@@ -348,7 +349,7 @@ class SlidersPanel(QWidget):
         scroll_layout.addLayout(bwp_row)
         # Shows which slope source the next conversion will use.
         self.bwp_mode_label = QLabel("")
-        self.bwp_mode_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         scroll_layout.addWidget(self.bwp_mode_label)
         self.convert_current_bwp_btn = QPushButton("Convert Current (B/W Point)")
         scroll_layout.addWidget(self.convert_current_bwp_btn)
@@ -468,7 +469,7 @@ class SlidersPanel(QWidget):
         # section's display position above.
         # Master group
         master_label = QLabel("Master")
-        master_label.setStyleSheet("color: #888; font-size: 11px; margin-top: 4px;")
+        master_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px; margin-top: 4px;")
         master_label.setAlignment(Qt.AlignCenter)
         self.od_section.add_widget(master_label)
         self.od_section.add_layout(self.create_slider("Input Gain"))
@@ -477,7 +478,7 @@ class SlidersPanel(QWidget):
 
         # R channel group
         r_label = QLabel("R Channel")
-        r_label.setStyleSheet("color: #c66; font-size: 11px; margin-top: 4px;")
+        r_label.setStyleSheet(f"color: {theme.CH_R}; font-size: 11px; margin-top: 4px;")
         r_label.setAlignment(Qt.AlignCenter)
         self.od_section.add_widget(r_label)
         self.od_section.add_layout(self.create_slider("R Shift"))
@@ -486,7 +487,7 @@ class SlidersPanel(QWidget):
 
         # G channel group
         g_label = QLabel("G Channel")
-        g_label.setStyleSheet("color: #6a6; font-size: 11px; margin-top: 4px;")
+        g_label.setStyleSheet(f"color: {theme.CH_G}; font-size: 11px; margin-top: 4px;")
         g_label.setAlignment(Qt.AlignCenter)
         self.od_section.add_widget(g_label)
         self.od_section.add_layout(self.create_slider("G Shift"))
@@ -495,7 +496,7 @@ class SlidersPanel(QWidget):
 
         # B channel group
         b_label = QLabel("B Channel")
-        b_label.setStyleSheet("color: #66c; font-size: 11px; margin-top: 4px;")
+        b_label.setStyleSheet(f"color: {theme.CH_B}; font-size: 11px; margin-top: 4px;")
         b_label.setAlignment(Qt.AlignCenter)
         self.od_section.add_widget(b_label)
         self.od_section.add_layout(self.create_slider("B Shift"))
@@ -505,11 +506,7 @@ class SlidersPanel(QWidget):
         # --- Populate Subtractive Saturations (per-color bands) ---
         # A swatch button per color selects which band's sliders are shown;
         # all 24 sliders exist (and feed adjustment_settings) regardless.
-        band_swatch_colors = {
-            "red": "#c0392b", "skin": "#d8956b", "yellow": "#c8b900",
-            "green": "#27ae60", "cyan": "#17a8b4", "blue": "#2f6fd0",
-            "purple": "#8e44ad",
-        }
+        band_swatch_colors = theme.BAND_COLORS
         self._band_buttons = {}
         self._band_pages = {}
         band_btn_row = QHBoxLayout()
@@ -521,8 +518,8 @@ class SlidersPanel(QWidget):
             btn.setToolTip(color.capitalize())
             btn.setStyleSheet(
                 f"QPushButton {{ background: {band_swatch_colors[color]}; "
-                "border: 1px solid #222; border-radius: 3px; }"
-                "QPushButton:checked { border: 2px solid #eee; }")
+                f"border: 1px solid {theme.BORDER}; border-radius: 3px; }}"
+                f"QPushButton:checked {{ border: 2px solid {theme.ACCENT}; }}")
             btn.clicked.connect(lambda _=False, c=color: self._show_band_page(c))
             band_btn_row.addWidget(btn)
             self._band_buttons[color] = btn
@@ -580,7 +577,7 @@ class SlidersPanel(QWidget):
         # --- Hint label — fixed at bottom, outside scroll area ---
         self.hint_label = QLabel()
         self.hint_label.setWordWrap(True)
-        self.hint_label.setStyleSheet("color: #666; font-size: 12px; margin-top: 8px;")
+        self.hint_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 12px; margin-top: 8px;")
         self.hint_label.setText("")
         layout.addWidget(self.hint_label)
 

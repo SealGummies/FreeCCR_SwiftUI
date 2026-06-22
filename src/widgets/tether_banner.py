@@ -3,11 +3,13 @@
 Inserted into ImagePreview's own internal layout (see spec §9.1.5) — NOT wrapped
 around image_preview, which would break its parent().parent() chains.
 
-Styled to fit FreeCCR's default (light) theme: a soft amber "active session"
+Styled to fit FreeCCR's neutral dark theme: a muted warning "active session"
 strip with a red recording dot and a clearly-visible Stop button.
 """
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QPushButton
+
+from ui import theme
 
 
 class TetherBanner(QWidget):
@@ -19,27 +21,28 @@ class TetherBanner(QWidget):
         # Scope the background to the banner itself (objectName selector) so the
         # child labels/button keep their own styling.
         self.setStyleSheet(
-            "#TetherBanner { background-color: #fff3cd; "
-            "border-bottom: 1px solid #e6cf87; }")
+            f"#TetherBanner {{ background-color: {theme.WARN_BG}; "
+            f"border-bottom: 1px solid {theme.WARN_BORDER}; }}")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 5, 12, 5)
         layout.setSpacing(8)
 
         self._dot = QLabel("●")  # ●
         self._dot.setStyleSheet(
-            "color: #d9534f; font-size: 13px; background: transparent;")
+            f"color: {theme.DANGER}; font-size: 13px; background: transparent;")
         self._status = QLabel("")
         self._status.setStyleSheet(
-            "color: #5c4a00; font-weight: bold; background: transparent;")
+            f"color: {theme.WARN_TEXT}; font-weight: bold; background: transparent;")
         self._note = QLabel("")
-        self._note.setStyleSheet("color: #9a6a00; background: transparent;")
+        self._note.setStyleSheet(
+            f"color: {theme.WARN_TEXT_MUTED}; background: transparent;")
         self._stop = QPushButton("Stop")
         self._stop.setFixedHeight(24)
         self._stop.setStyleSheet(
-            "QPushButton { background-color: #d9534f; color: white; border: none; "
-            "border-radius: 4px; padding: 2px 14px; }"
-            "QPushButton:hover { background-color: #c9302c; }"
-            "QPushButton:pressed { background-color: #ac2925; }")
+            f"QPushButton {{ background-color: {theme.DANGER}; color: white; border: none; "
+            f"border-radius: 4px; padding: 2px 14px; }}"
+            f"QPushButton:hover {{ background-color: {theme.DANGER_HOVER}; }}"
+            f"QPushButton:pressed {{ background-color: {theme.DANGER_PRESSED}; }}")
         self._stop.clicked.connect(self.stopRequested)
 
         layout.addWidget(self._dot)

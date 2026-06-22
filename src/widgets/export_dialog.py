@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from core.ccr_backend import ccr_backend
 from core import export_estimator
+from ui import theme
 from utils.export_naming import build_export_names, build_filename, resolve_conflicts
 from utils.unicode_path_utils import normalize_unicode_path, validate_unicode_path
 
@@ -126,7 +127,7 @@ class ExportSettingsDialog(QDialog):
         fields_layout.addWidget(self.filename_edit, 1)
         naming_layout.addLayout(fields_layout)
         hint = QLabel("Macros: {name} = original filename, {date}, {time}, {seq}")
-        hint.setStyleSheet("color: gray;")
+        hint.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         naming_layout.addWidget(hint)
         self.example_label = QLabel("")
         naming_layout.addWidget(self.example_label)
@@ -151,7 +152,7 @@ class ExportSettingsDialog(QDialog):
         form.addRow("Color space:", self.colorspace_combo)
         self.colorspace_hint = QLabel(
             "8-bit ProPhoto JPEG can band — prefer 16-bit TIFF for wide gamut.")
-        self.colorspace_hint.setStyleSheet("color: gray;")
+        self.colorspace_hint.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         self.colorspace_hint.setWordWrap(True)
         form.addRow("", self.colorspace_hint)
 

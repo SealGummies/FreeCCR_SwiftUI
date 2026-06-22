@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt, QObject, QThread, Signal
 
 from core import dust_detect
+from ui import theme
 
 
 class _DetectWorker(QObject):
@@ -154,7 +155,7 @@ class DustRemovalPanel(QWidget):
 
         hint = QLabel("Click or drag over dust to remove it.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(hint)
 
         manual_btns = QHBoxLayout()
@@ -174,14 +175,14 @@ class DustRemovalPanel(QWidget):
         self.ai_unavailable_label = QLabel(
             "AI detection unavailable in this build.")
         self.ai_unavailable_label.setWordWrap(True)
-        self.ai_unavailable_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.ai_unavailable_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(self.ai_unavailable_label)
 
         self.download_label = QLabel(
             "Download the local AI model (~150 MB) to detect dust "
             "automatically. One-time download.")
         self.download_label.setWordWrap(True)
-        self.download_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.download_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(self.download_label)
         self.download_btn = QPushButton("Download AI model (~150 MB)")
         self.download_btn.clicked.connect(self._on_download)
@@ -220,7 +221,7 @@ class DustRemovalPanel(QWidget):
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.status_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(self.status_label)
 
         layout.addStretch(1)
@@ -229,17 +230,17 @@ class DustRemovalPanel(QWidget):
         self.done_btn.setMinimumHeight(42)
         self.done_btn.setToolTip("Close dust removal and return to the adjustment sliders.")
         self.done_btn.setStyleSheet(
-            "QPushButton { background:#2d7d46; color:white; font-weight:bold; "
-            "font-size:13px; border:none; border-radius:5px; padding:8px; }"
-            "QPushButton:hover { background:#359152; }"
-            "QPushButton:pressed { background:#256b3b; }")
+            f"QPushButton {{ background:{theme.SUCCESS}; color:white; font-weight:bold; "
+            f"font-size:13px; border:none; border-radius:5px; padding:8px; }}"
+            f"QPushButton:hover {{ background:{theme.SUCCESS_HOVER}; }}"
+            f"QPushButton:pressed {{ background:{theme.SUCCESS_PRESSED}; }}")
         self.done_btn.clicked.connect(self._on_done)
         layout.addWidget(self.done_btn)
 
     @staticmethod
     def _section_label(text):
         lbl = QLabel(text)
-        lbl.setStyleSheet("color: #aaa; font-size: 11px; font-weight: bold; "
+        lbl.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px; font-weight: bold; "
                           "margin-top: 4px;")
         return lbl
 
