@@ -2166,6 +2166,25 @@ _CINEON_GREY_N = 470.0 / 1023.0             # 0.4594  (18% grey; InputGain pivot
 _NAMI_WHITE_TARGET = float(os.environ.get("FREECCR_NAMICOLOR_WHITE_TARGET", "665"))
 _NAMI_WHITE_TARGET_N = _NAMI_WHITE_TARGET / 1023.0   # 0.6500
 
+# --- Color-path toggles (to match DaVinci NamiColor) ----------------------- #
+# Our pipeline does Adobe->Rec.2020 BEFORE the density AND Rec.2020->Rec.709 in
+# the CST (a full, colorimetrically-correct gamut chain). DaVinci's NamiColor node
+# runs the density on the Adobe primaries DIRECTLY and its CST then treats them AS
+# Rec.2020 — so the extra input matrix is the likely source of the color shift.
+#   FREECCR_NAMICOLOR_ADOBE2REC2020=0  -> skip the input matrix (match DaVinci)
+#   FREECCR_NAMICOLOR_CST_MATRIX=0     -> drop the Rec.2020->Rec.709 step (test)
+NAMICOLOR_ADOBE2REC2020 = os.environ.get("FREECCR_NAMICOLOR_ADOBE2REC2020", "1") != "0"
+NAMICOLOR_CST_MATRIX = os.environ.get("FREECCR_NAMICOLOR_CST_MATRIX", "1") != "0"
+
+
+def _to_working_primaries(rgb_adobe_linear: np.ndarray) -> np.ndarray:
+    """Adobe-RGB-linear -> the primaries the density runs in. ON (default): the
+    correct Adobe->Rec.2020 matrix; OFF: pass the Adobe primaries through (what
+    DaVinci's NamiColor node does — the CST then mislabels them as Rec.2020)."""
+    if NAMICOLOR_ADOBE2REC2020:
+        return rgb_adobe_linear @ M_ADOBE2REC2020.T
+    return rgb_adobe_linear
+
 
 def _namicolor_density(lin_rec2020: np.ndarray) -> np.ndarray:
     """NamiColor negative density d = -log10(16*x), the slider-independent base
@@ -2184,7 +2203,7 @@ def _point_density(point_rgb) -> np.ndarray:
     matrix, so NO channel reversal here."""
     p = np.array([point_rgb[0], point_rgb[1], point_rgb[2]],
                  dtype=np.float32) / np.float32(65535.0)
-    rec = p @ M_ADOBE2REC2020.T
+    rec = _to_working_primaries(p)
     return _namicolor_density(rec).astype(np.float32)
 
 
@@ -2198,7 +2217,7 @@ def namicolor_anchors(img16_adobe_linear: np.ndarray,
     (no film holder / sprockets). Resolution-independent — compute once on the
     preview negative and cache. Returns (p_lo, p_hi)."""
     x = img16_adobe_linear.astype(np.float32) / np.float32(65535.0)
-    x = x @ M_ADOBE2REC2020.T
+    x = _to_working_primaries(x)
     d = _namicolor_density(x).reshape(-1, 3)
     p_lo = (np.percentile(d, _NAMI_LOW, axis=0).astype(np.float32)
             if black_point_bgr is None else _point_density(black_point_bgr))
@@ -2269,12 +2288,14 @@ def cineon_film_log_to_linear(cv01: np.ndarray) -> np.ndarray:
 
 
 def cineon_rec2020_to_rec709_g22(cv01: np.ndarray) -> np.ndarray:
-    """CST: Rec.2020 Cineon Film Log -> Rec.709 Gamma 2.2 (display, 0..1)."""
-    lin2020 = cineon_film_log_to_linear(cv01)
-    np.clip(lin2020, 0.0, None, out=lin2020)
-    lin709 = lin2020 @ M_REC2020_2_REC709.T
-    np.clip(lin709, 0.0, 1.0, out=lin709)
-    return np.power(lin709, np.float32(1.0 / 2.2))
+    """CST: Rec.2020 Cineon Film Log -> Rec.709 Gamma 2.2 (display, 0..1). The
+    Rec.2020->Rec.709 gamut step is gated by NAMICOLOR_CST_MATRIX (test toggle)."""
+    lin = cineon_film_log_to_linear(cv01)
+    np.clip(lin, 0.0, None, out=lin)
+    if NAMICOLOR_CST_MATRIX:
+        lin = lin @ M_REC2020_2_REC709.T
+    np.clip(lin, 0.0, 1.0, out=lin)
+    return np.power(lin, np.float32(1.0 / 2.2))
 
 
 def namicolor_process(img16_adobe_linear: np.ndarray, s: dict, anchors) -> np.ndarray:
@@ -2287,7 +2308,7 @@ def namicolor_process(img16_adobe_linear: np.ndarray, s: dict, anchors) -> np.nd
     Returns a display-referred (Rec.709 / Gamma 2.2) uint16 RGB image."""
     s = s or {}
     x = img16_adobe_linear.astype(np.float32) / np.float32(65535.0)
-    x = x @ M_ADOBE2REC2020.T
+    x = _to_working_primaries(x)
     log_cv = namicolor_channel_transform(x, s, anchors)
 
     # Middle stage: basic color tune IN LOG SPACE (Resolve node order). Reuse the
