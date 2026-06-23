@@ -57,14 +57,18 @@ bisect the master-gain offset until target == 0.998     # monotonic through the 
 store CCRImage.namicolor_gain_offset                    # applied live by apply_adjustments
 ```
 
-The bisection runs the real `namicolor_process` on a 256-px crop (~16 iters), so
-it is robust to the CST nonlinearity. The offset is bounded so the combined
-master gain stays below the `1/(1−gain)` singularity. It gains UP when the image
-is under-exposed (e.g. a conservative white point pinned the highlights below
-clip) and trims down when already over clip. Env: `FREECCR_NAMICOLOR_GAIN_PCT`,
-`FREECCR_NAMICOLOR_GAIN_TARGET`. Crop out the holder for the cleanest result (the
-99.8 percentile only ignores the top 0.2% spatially-unfiltered). Persisted in the
+The bisection runs the real `namicolor_process` on a 256-px image (~16 iters), so
+it is robust to the CST nonlinearity. **Holder/sprocket mask**: pixels that are
+white-clipped in all channels at *neutral* gain are excluded from the highlight
+statistic — the opaque holder maps ABOVE the white-point reference (denser than
+any real scene content), so this isolates and ignores it even with **no crop**
+(a crop still helps and makes the mask a no-op). The offset is bounded below the
+`1/(1−gain)` singularity. It gains UP when the image is under-exposed and trims
+down when over clip. Env: `FREECCR_NAMICOLOR_GAIN_PCT/_TARGET`. Persisted in the
 catalog and undo; cleared by a Whole-Image reset.
+
+> Caveat: with no crop a full-roll scan can contain *two frames*; one master-gain
+> can't expose both, so crop to a single frame for per-frame auto-exposure.
 
 ## 3. Pipeline placement
 `namicolor_process(img_adobe_linear, settings, auto_anchors)` (ported from PR #44)

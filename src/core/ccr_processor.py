@@ -2332,23 +2332,35 @@ def compute_namicolor_auto_gain(img16_adobe_linear: np.ndarray, s: dict, anchors
     """Master-gain slider OFFSET that pushes the post-CST high-percentile highlight
     (of the brightest channel) to the clipping target.
 
-    `img16_adobe_linear` should already be cropped to the image area (no holder /
-    sprockets). `s` is the user's settings (WITHOUT any existing auto-gain offset),
-    `anchors` the cached auto-levels anchors. Returns a float offset in
-    ch_master_gain slider units (add it to the slider value). Monotonic in the
-    offset, so a bisection on the actual pipeline output is robust to the CST's
-    nonlinearity."""
+    Works WITHOUT a crop: the sprocket holes / film holder are opaque, so they map
+    ABOVE the white-point reference (denser than any real scene content) and stay
+    white-clipped at neutral gain. Those neutral-clipped pixels are masked out of
+    the highlight statistic so they can't dominate the exposure — the real image
+    highlights are what get pushed to clip. A crop to the image area still helps
+    (and the mask is then a no-op). `s` is the user's settings WITHOUT any existing
+    auto-gain offset; returns a float offset in ch_master_gain slider units."""
     s = dict(s or {})
     base_mg = float(s.get('ch_master_gain', 0) or 0)
     small = _downsample_for_measure(img16_adobe_linear, 256)
     target = NAMICOLOR_AUTO_GAIN_TARGET
 
-    def highlight(offset: float) -> float:
+    def render(offset: float) -> np.ndarray:
         s['ch_master_gain'] = base_mg + offset
-        out = namicolor_process(small, s, anchors).astype(np.float32) / np.float32(65535.0)
-        # "any channel": the brightest channel's high percentile (the top
-        # (100-PCT)% — sprocket/holder specular — is allowed to clip past it).
-        return max(float(np.percentile(out[..., c], NAMICOLOR_AUTO_GAIN_PCT))
+        return namicolor_process(small, s, anchors).astype(np.float32) / np.float32(65535.0)
+
+    # Holder/sprocket mask: pixels white-clipped in ALL channels at neutral gain.
+    # With a B/W-point white anchor (or percentile), real scene content sits at or
+    # below the reference white, so only the opaque holder is fully clipped here.
+    base_render = render(0.0)
+    keep = ~np.all(base_render >= 0.999, axis=-1)
+    if keep.sum() < 0.02 * keep.size:   # nothing left to measure — don't mask
+        keep = np.ones(base_render.shape[:2], dtype=bool)
+
+    def highlight(offset: float) -> float:
+        out = render(offset)
+        # "any channel": the brightest channel's high percentile over the kept
+        # (non-holder) pixels; the top (100-PCT)% specular is allowed to clip.
+        return max(float(np.percentile(out[..., c][keep], NAMICOLOR_AUTO_GAIN_PCT))
                    for c in range(3))
 
     lo, hi = _NAMI_GAIN_OFFSET_MIN, _NAMI_GAIN_OFFSET_MAX

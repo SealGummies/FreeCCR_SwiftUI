@@ -158,6 +158,18 @@ class TestAutoGain(unittest.TestCase):
                  for c in range(3))
         self.assertAlmostEqual(hi, NAMICOLOR_AUTO_GAIN_TARGET, delta=0.03)
 
+    def test_ignores_holder_without_crop(self):
+        # An opaque holder block maps to permanent clipped-white; without masking
+        # it the auto-gain would slam to the floor trying to un-clip it. With the
+        # mask it ignores the holder and lifts the (under-exposed) image UP.
+        from core.ccr_processor import compute_namicolor_auto_gain, _NAMI_GAIN_OFFSET_MIN
+        img = _gradient_negative(64, 64)
+        img[:10, :10] = 5                      # opaque 'film holder' corner
+        anchors = namicolor_anchors(img, None, (1500, 1500, 1500))  # under-exposed
+        off = compute_namicolor_auto_gain(img, {}, anchors)
+        self.assertGreater(off, 0.0)                       # gained UP, not down
+        self.assertGreater(off, _NAMI_GAIN_OFFSET_MIN + 1)  # did not floor
+
     def test_already_bright_does_not_overshoot(self):
         from core.ccr_processor import compute_namicolor_auto_gain
         img = _gradient_negative()
