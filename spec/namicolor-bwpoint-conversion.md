@@ -43,6 +43,29 @@ A clear-base black point and a dense white point are *constant across the roll*
 (no_auto_bright decode), so the same global points anchor every frame; the
 percentile fallback is per-image.
 
+## 2.6 Auto gain (post-CST auto-exposure, hidden master-gain offset)
+
+A per-image **"Auto Gain"** button reads the **post-CST** result and finds a hidden
+offset added to `ch_master_gain` (the UI slider stays neutral) so the image's
+highlights just touch the right clipping line — *ignoring the brightest outliers*
+(sprocket holes / film holder):
+
+```
+measure over the crop region (image area); downsample for speed
+target = max channel of percentile(out_c, 99.8)        # ignores the top 0.2% (holder/specular)
+bisect the master-gain offset until target == 0.998     # monotonic through the CST
+store CCRImage.namicolor_gain_offset                    # applied live by apply_adjustments
+```
+
+The bisection runs the real `namicolor_process` on a 256-px crop (~16 iters), so
+it is robust to the CST nonlinearity. The offset is bounded so the combined
+master gain stays below the `1/(1−gain)` singularity. It gains UP when the image
+is under-exposed (e.g. a conservative white point pinned the highlights below
+clip) and trims down when already over clip. Env: `FREECCR_NAMICOLOR_GAIN_PCT`,
+`FREECCR_NAMICOLOR_GAIN_TARGET`. Crop out the holder for the cleanest result (the
+99.8 percentile only ignores the top 0.2% spatially-unfiltered). Persisted in the
+catalog and undo; cleared by a Whole-Image reset.
+
 ## 3. Pipeline placement
 `namicolor_process(img_adobe_linear, settings, auto_anchors)` (ported from PR #44)
 is called from `CCRImage.apply_adjustments` for every non-positive image (the

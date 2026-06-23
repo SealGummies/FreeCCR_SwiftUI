@@ -14,7 +14,7 @@ from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal,
                                 NAMICOLOR_CONVERSION, namicolor_process,
-                                namicolor_anchors)
+                                namicolor_anchors, compute_namicolor_auto_gain)
 from core import color_management
 from ui import theme
 
@@ -110,6 +110,8 @@ class CCRImage:
         # clockwise on screen, Qt convention).
         self.crop_rect: Optional[tuple[float, float, float, float]] = None
         self.crop_angle: float = 0.0
+        # Hidden NamiColor auto-gain: master-gain slider offset (UI stays neutral).
+        self.namicolor_gain_offset: float = 0.0
         # Area editing: local masked adjustment layers. Each area is a dict
         # {id, kind ("circle"|"gradient"), enabled, feather, angle, geometry
         # (normalized fractions), settings (a full adjustment_settings dict)}.
@@ -326,6 +328,26 @@ class CCRImage:
             meas, black_point_bgr=bp, white_point_bgr=wp)
         self._namicolor_anchor_sig = sig
         return self._namicolor_anchors_cache
+
+    def compute_namicolor_gain(self) -> float:
+        """Compute and store the hidden auto-gain master-gain offset for this
+        image: lift the highlights (over the crop / image area, ignoring the
+        brightest sprocket/holder outliers) until they just touch clipping after
+        the CST. Stored in `namicolor_gain_offset` and applied live by
+        apply_adjustments. Returns the offset (0.0 when not applicable)."""
+        if self.resized_raw is None or not self._namicolor_active():
+            self.namicolor_gain_offset = 0.0
+            return 0.0
+        crop = getattr(self, "crop_rect", None)
+        angle = getattr(self, "crop_angle", 0.0) or 0.0
+        meas = (apply_crop_to_image(self.resized_raw, crop, angle)
+                if crop else self.resized_raw)
+        # Measure with the user's settings only — the offset REPLACES any prior
+        # auto-gain, and is applied on top of ch_master_gain by apply_adjustments.
+        s = self.adjustment_settings or {}
+        self.namicolor_gain_offset = float(compute_namicolor_auto_gain(
+            meas, s, self._namicolor_anchors()))
+        return self.namicolor_gain_offset
 
     @staticmethod
     def _raw_color_postprocess_kwargs(positive: bool, preview: bool) -> dict:
@@ -721,7 +743,14 @@ class CCRImage:
         # Runs even with empty settings (a neutral conversion still inverts).
         # Curves / areas / B&W collapse below run on the resulting display image.
         if self._namicolor_active() and not getattr(self, "converted", False):
-            adjusted = namicolor_process(image, s or {}, self._namicolor_anchors())
+            # Hidden auto-gain: add the stored master-gain offset (the UI slider
+            # stays neutral). See compute_namicolor_gain / spec §2.6.
+            s_eff = s or {}
+            go = float(getattr(self, "namicolor_gain_offset", 0.0) or 0.0)
+            if go:
+                s_eff = {**s_eff,
+                         'ch_master_gain': float(s_eff.get('ch_master_gain', 0) or 0) + go}
+            adjusted = namicolor_process(image, s_eff, self._namicolor_anchors())
             curves = s.get('curves') if s else None
             if curves:
                 adjusted = apply_curves(adjusted, curves)
@@ -896,6 +925,7 @@ class CCRImage:
             "color_profile": self.color_profile,
             "crop_rect": self.crop_rect,
             "crop_angle": self.crop_angle,
+            "namicolor_gain_offset": getattr(self, "namicolor_gain_offset", 0.0),
             "rotation_angle": self.rotation_angle,
             "fine_rotation_angle": self.fine_rotation_angle,
             "horizontal_mirrored": self.horizontal_mirrored,
@@ -930,6 +960,7 @@ class CCRImage:
         self.color_profile = state.get("color_profile", "color")
         self.crop_rect = state["crop_rect"]
         self.crop_angle = state.get("crop_angle", 0.0)
+        self.namicolor_gain_offset = state.get("namicolor_gain_offset", 0.0)
         self.rotation_angle = state["rotation_angle"]
         self.fine_rotation_angle = state["fine_rotation_angle"]
         self.horizontal_mirrored = state["horizontal_mirrored"]

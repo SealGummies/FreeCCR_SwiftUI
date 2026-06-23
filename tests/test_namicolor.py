@@ -141,6 +141,33 @@ class TestBWPointAnchors(unittest.TestCase):
         self.assertGreater(int(out[0, 1].mean()), 60000)  # white point -> bright
 
 
+class TestAutoGain(unittest.TestCase):
+    def test_pushes_highlight_to_clip_target(self):
+        from core.ccr_processor import (compute_namicolor_auto_gain,
+                                         NAMICOLOR_AUTO_GAIN_PCT,
+                                         NAMICOLOR_AUTO_GAIN_TARGET)
+        img = _gradient_negative()
+        # Under-expose: pin the white anchor to a very dense point so the image
+        # highlights land well below clip; auto-gain must lift them to the target.
+        anchors = namicolor_anchors(img, None, (1500, 1500, 1500))
+        off = compute_namicolor_auto_gain(img, {}, anchors)
+        self.assertGreater(off, 0.0)   # it gained UP
+        out = (namicolor_process(img, {'ch_master_gain': off}, anchors)
+               .astype(np.float32) / 65535.0)
+        hi = max(float(np.percentile(out[..., c], NAMICOLOR_AUTO_GAIN_PCT))
+                 for c in range(3))
+        self.assertAlmostEqual(hi, NAMICOLOR_AUTO_GAIN_TARGET, delta=0.03)
+
+    def test_already_bright_does_not_overshoot(self):
+        from core.ccr_processor import compute_namicolor_auto_gain
+        img = _gradient_negative()
+        anchors = namicolor_anchors(img)   # percentile auto-levels -> already ~clip
+        off = compute_namicolor_auto_gain(img, {}, anchors)
+        out = (namicolor_process(img, {'ch_master_gain': off}, anchors)
+               .astype(np.float32) / 65535.0)
+        self.assertLessEqual(float(out.max()), 1.0 + 1e-6)
+
+
 class TestMonochromeGuard(unittest.TestCase):
     def test_namicolor_skips_monochrome(self):
         from core.ccr_image import CCRImage

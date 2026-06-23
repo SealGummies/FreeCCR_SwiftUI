@@ -166,6 +166,7 @@ def serialize_image(img) -> dict:
         "exposure_base": float(getattr(img, "exposure_base", 0.0)),
         "tint_balance_factor": float(getattr(img, "tint_balance_factor", 1.0)),
         "reference_frame": list(img.reference_frame) if img.reference_frame else None,
+        "namicolor_gain_offset": float(getattr(img, "namicolor_gain_offset", 0.0) or 0.0),
     }
 
 
@@ -375,6 +376,7 @@ def _restore_image(file_path: str, state: dict):
     crop = state.get("crop_rect")
     img.crop_rect = tuple(crop) if crop else None
     img.crop_angle = state.get("crop_angle", 0.0) or 0.0
+    img.namicolor_gain_offset = float(state.get("namicolor_gain_offset", 0.0) or 0.0)
     img.tint_balance_factor = state.get("tint_balance_factor",
                                         getattr(img, "tint_balance_factor", 1.0))
 

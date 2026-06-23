@@ -2305,6 +2305,66 @@ def namicolor_process(img16_adobe_linear: np.ndarray, s: dict, anchors) -> np.nd
     return np.clip(out * np.float32(65535.0), 0, 65535).astype(np.uint16)
 
 
+# --- Auto gain ------------------------------------------------------------- #
+# Reads the POST-CST result and finds a hidden master-gain OFFSET (added to the
+# ch_master_gain slider, not shown in the UI) that lifts the image highlights
+# until the brightest channel's high percentile just touches clipping — ignoring
+# the very brightest outliers (sprocket holes / film holder). Measured over the
+# crop region (image area) when one is set. See spec/namicolor-bwpoint-conversion.md.
+NAMICOLOR_AUTO_GAIN_PCT = float(os.environ.get("FREECCR_NAMICOLOR_GAIN_PCT", "99.8"))
+NAMICOLOR_AUTO_GAIN_TARGET = float(os.environ.get("FREECCR_NAMICOLOR_GAIN_TARGET", "0.998"))
+_NAMI_GAIN_OFFSET_MIN = -200.0
+_NAMI_GAIN_OFFSET_MAX = 250.0   # keeps the combined master gain below the 1/(1-gain) singularity
+
+
+def _downsample_for_measure(img16: np.ndarray, max_side: int = 256) -> np.ndarray:
+    """Cheap area-downsample for percentile measurement (stable at low res)."""
+    h, w = img16.shape[:2]
+    long_side = max(h, w)
+    if long_side <= max_side:
+        return img16
+    sc = max_side / float(long_side)
+    return cv2.resize(img16, (max(1, int(round(w * sc))), max(1, int(round(h * sc)))),
+                      interpolation=cv2.INTER_AREA)
+
+
+def compute_namicolor_auto_gain(img16_adobe_linear: np.ndarray, s: dict, anchors) -> float:
+    """Master-gain slider OFFSET that pushes the post-CST high-percentile highlight
+    (of the brightest channel) to the clipping target.
+
+    `img16_adobe_linear` should already be cropped to the image area (no holder /
+    sprockets). `s` is the user's settings (WITHOUT any existing auto-gain offset),
+    `anchors` the cached auto-levels anchors. Returns a float offset in
+    ch_master_gain slider units (add it to the slider value). Monotonic in the
+    offset, so a bisection on the actual pipeline output is robust to the CST's
+    nonlinearity."""
+    s = dict(s or {})
+    base_mg = float(s.get('ch_master_gain', 0) or 0)
+    small = _downsample_for_measure(img16_adobe_linear, 256)
+    target = NAMICOLOR_AUTO_GAIN_TARGET
+
+    def highlight(offset: float) -> float:
+        s['ch_master_gain'] = base_mg + offset
+        out = namicolor_process(small, s, anchors).astype(np.float32) / np.float32(65535.0)
+        # "any channel": the brightest channel's high percentile (the top
+        # (100-PCT)% — sprocket/holder specular — is allowed to clip past it).
+        return max(float(np.percentile(out[..., c], NAMICOLOR_AUTO_GAIN_PCT))
+                   for c in range(3))
+
+    lo, hi = _NAMI_GAIN_OFFSET_MIN, _NAMI_GAIN_OFFSET_MAX
+    if highlight(hi) <= target:   # too dark even at max gain — best effort
+        return hi
+    if highlight(lo) >= target:   # already over target at min gain — pull down
+        return lo
+    for _ in range(16):
+        mid = 0.5 * (lo + hi)
+        if highlight(mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
 def adjust_image(
     img16: np.ndarray,
     kelvin_shift: float = 0.0,

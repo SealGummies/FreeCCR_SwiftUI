@@ -1683,6 +1683,7 @@ class ImagePreview(QWidget):
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "exposure_base", 0.0),
+                getattr(img, "namicolor_gain_offset", 0.0),
                 getattr(img, "color_profile", "color"),
                 areas_sig, dust_sig)
 

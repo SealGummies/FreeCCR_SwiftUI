@@ -422,11 +422,20 @@ class SlidersPanel(QWidget):
         # points are app-global; "Apply to All" pushes the current points onto
         # every other loaded image (re-rendering their preview + thumbnail).
         # (spec/namicolor-bwpoint-conversion.md)
+        # Auto Gain: a hidden master-gain offset (UI sliders stay neutral) that
+        # lifts the current image's highlights until they just touch clipping
+        # after the CST, ignoring the brightest sprocket/holder outliers.
+        self.auto_gain_btn = QPushButton("Auto Gain")
+        self.auto_gain_btn.setFixedHeight(theme.CONTROL_H)
+        self.auto_gain_btn.setToolTip(
+            "Auto-expose this image: lift the highlights to clipping "
+            "(ignores sprocket holes / film holder). Crop to the image first for best results.")
         self.apply_all_bwp_btn = QPushButton("Apply to All")
         self.apply_all_bwp_btn.setFixedHeight(theme.CONTROL_H)
         self.apply_all_bwp_btn.setToolTip(
             "Re-render every loaded image with the current Black/White points")
         apply_all_row = theme.apply_button_row(QHBoxLayout())
+        apply_all_row.addWidget(self.auto_gain_btn)
         apply_all_row.addWidget(self.apply_all_bwp_btn)
         scroll_layout.addLayout(apply_all_row)
 
@@ -646,6 +655,7 @@ class SlidersPanel(QWidget):
         self.clear_white_point_btn.clicked.connect(self._on_clear_white_point)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
         self.apply_all_bwp_btn.clicked.connect(self._on_apply_bwpoint_to_all)
+        self.auto_gain_btn.clicked.connect(self._on_auto_gain)
 
         # --- Hint label — fixed at bottom, outside scroll area ---
         self.hint_label = QLabel()
@@ -819,7 +829,8 @@ class SlidersPanel(QWidget):
         Convert/Un-convert/Auto Frame actions are commented out (NamiColor
         converts negatives live). See spec/namicolor-bwpoint-conversion.md."""
         for btn in (self.white_point_btn, self.black_point_btn,
-                    self.clear_white_point_btn, self.apply_all_bwp_btn):
+                    self.clear_white_point_btn, self.apply_all_bwp_btn,
+                    self.auto_gain_btn):
             btn.setEnabled(enabled)
 
     def save_slider_values(self, image_id):
@@ -1193,6 +1204,10 @@ class SlidersPanel(QWidget):
                                                or getattr(img, "crop_angle", 0.0)):
                 img.crop_rect = None
                 img.crop_angle = 0.0
+            # The hidden NamiColor auto-gain offset is image-global like the crop;
+            # a Whole-Image reset clears it too.
+            if img.active_area_id is None:
+                img.namicolor_gain_offset = 0.0
         # Reset every slider to its default (0 for most, 10 for band_feather).
         for i, slider in enumerate(self.sliders):
             key = self.adjustment_keys[i] if i < len(self.adjustment_keys) else None
@@ -1514,6 +1529,33 @@ class SlidersPanel(QWidget):
             mw.image_preview.update_preview(idx)
         self.set_temporary_hint(f"Applied the B/W points to {done} image(s).",
                                 duration=3000)
+
+    def _on_auto_gain(self):
+        """Auto-expose the current image: compute + store the hidden master-gain
+        offset that lifts its highlights to clipping, then re-render."""
+        idx = getattr(self.image_preview, "current_idx", None)
+        if idx is None or not (0 <= idx < len(ccr_backend.images)):
+            return
+        img = ccr_backend.images[idx]
+        try:
+            off = img.compute_namicolor_gain()
+        except Exception as e:
+            print(f"Auto Gain failed: {e}")
+            self.set_temporary_hint("Auto Gain unavailable for this image.", duration=4000)
+            return
+        mw = self.parent().parent()
+        img.update_thumbnail_and_preview()
+        mw.image_preview.update_preview(idx)
+        try:
+            mw.thumbnail_list.update_thumbnail(idx)
+        except Exception:
+            pass
+        if abs(off) < 1e-3:
+            self.set_temporary_hint("Auto Gain: highlights already at clipping.",
+                                    duration=3000)
+        else:
+            self.set_temporary_hint("Auto Gain applied — highlights lifted to clipping.",
+                                    duration=3000)
 
     def on_bwpoint_sampled(self, mode):
         label = "White Point" if mode == "white" else "Black Point"
