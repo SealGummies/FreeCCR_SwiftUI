@@ -65,6 +65,8 @@ def main(argv=None):
                    help="normalised crop (image area; excludes holder/sprockets)")
     p.add_argument("--auto-gain", action="store_true",
                    help="auto-expose: lift highlights to clipping")
+    p.add_argument("--rotate", type=int, default=0, choices=(0, 90, 180, 270),
+                   help="coarse rotation applied on export (degrees clockwise)")
     p.add_argument("--tiff", action="store_true", help="write 16-bit TIFF instead of 8-bit")
     p.add_argument("--quality", type=int, default=95, help="JPEG quality (when -o is .jpg)")
     p.add_argument("--max-side", type=int, default=None, help="cap the long edge (px)")
@@ -99,6 +101,7 @@ def main(argv=None):
     if a.crop:
         img.crop_rect = tuple(a.crop)
         img.crop_angle = 0.0
+    img.rotation_angle = a.rotate
 
     if a.auto_gain:
         off = img.compute_namicolor_gain()
