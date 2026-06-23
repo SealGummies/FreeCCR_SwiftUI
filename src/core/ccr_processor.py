@@ -2410,9 +2410,26 @@ def _estimate_film_base(small: np.ndarray) -> np.ndarray:
 def namicolor_detect_frames(img16: np.ndarray, base_rgb=None):
     """Detect photographic frame(s) in a film scan. `img16` is the Adobe-linear
     negative; `base_rgb` is the clear film base (the sampled black point, RGB
-    order) — passed it is more accurate than the auto-estimate. Returns a list of
-    normalized (x1, y1, x2, y2) boxes, largest first, or [] when nothing
-    confident is found (the caller should then use the whole image)."""
+    order). Returns normalized (x1, y1, x2, y2) boxes, largest first, or [].
+
+    Prefers the LEARNED ONNX segmenter (core.frame_detect) — it reliably excludes
+    the sprocket strips / film base that the classical density heuristic could
+    not. Falls back to the classical heuristic when onnxruntime or the model file
+    is unavailable (e.g. a stripped build), so detection always degrades
+    gracefully rather than failing."""
+    try:
+        from core.frame_detect import detect_frames as _onnx_detect_frames
+        boxes = _onnx_detect_frames(img16)
+        if boxes:
+            return boxes
+    except Exception:
+        pass
+    return _heuristic_detect_frames(img16, base_rgb)
+
+
+def _heuristic_detect_frames(img16: np.ndarray, base_rgb=None):
+    """Classical density-above-base + projection fallback (see module docstring).
+    Used only when the ONNX segmenter is unavailable or finds nothing."""
     H, W = img16.shape[:2]
     sc = 900.0 / max(H, W)
     small = cv2.resize(img16, (max(1, int(W * sc)), max(1, int(H * sc))),

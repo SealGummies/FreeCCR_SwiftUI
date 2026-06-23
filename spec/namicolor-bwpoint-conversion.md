@@ -74,26 +74,33 @@ catalog and undo; cleared by a Whole-Image reset.
 ## 2.7 Frame detection (`namicolor_detect_frames`)
 
 Finds the photographic frame(s) inside a film scan, excluding the holder, sprocket
-holes, inter-frame gaps and edge markings. The signal is **density above the film
-base** (the sampled black point, or auto-estimated as the bright/flat color):
+holes, inter-frame gaps and edge markings.
 
-- Every **exposed** pixel — textured *or* smooth sky — is denser than the clear
-  unexposed base; the base / gaps / sprockets sit at base density; the holder is
-  opaque. (Brightness can't separate these — the frame's own skies/shadows overlap
-  the base and holder — but exposure-over-base can.)
-- Holder removed by **opacity** (near-black scan), not density, so bright skies
-  (dense but still transmitting) stay in the frame.
-- **Projection profiles**: a row profile isolates the frame band (sprocket / edge
-  rows fall below it); a column profile inside it splits side-by-side frames at the
-  inter-frame gaps. Handles single- and multi-frame strips.
-- Aspect/size filtered; returns `[]` (→ caller uses the whole image) when nothing
-  confident is found. Env `FREECCR_NAMICOLOR_FRAME=0` disables it.
+**Primary — learned ONNX segmenter (`core.frame_detect`).** A tiny U-Net (0.48 M
+params, ~1.9 MB ONNX, bundled in `src/models/`) segments the exposed frame region
+from luma at short-side 512, on the same onnxruntime CPU session the dust model
+uses (~50 ms). The box is read from the probability **projections** (row-mean →
+frame band, column-mean → side-by-side split), which is robust to stray pixels and
+reliably **excludes the sprocket strips** — the criterion every classical heuristic
+failed. Returns `[]` when onnxruntime or the model is absent. Trained on synthetic
+135 strips (real negative content composited onto synthetic base + sprockets at
+known rectangles → perfect masks); see `tools/frame_training/`.
+
+**Fallback — `_heuristic_detect_frames`.** Classical *density above the film base*
++ projection profiles (every exposed pixel is denser than the clear base; holder
+removed by opacity; row/column profiles isolate and split frames). Used only when
+the ONNX path is unavailable, so detection degrades gracefully.
 
 Wired as the **auto-gain measurement region** (crop ▸ detected-frame ▸ whole image)
-and as the CLI `--auto-frame` (auto-crop). Robust on normal-contrast frames and
-multi-frame strips; very low-contrast/near-base scenes fall back to the whole
-image. (The old brightness-based `auto_frame_v2` failed because the frame's own
-bright/dark areas overlap the base and holder in brightness.)
+and as the CLI `--auto-frame` (auto-crop). Env `FREECCR_NAMICOLOR_FRAME=0` disables
+the no-crop path entirely.
+
+> Why learned: threshold/flood/projection heuristics each traded one failure for
+> another on real scans (rebate leak, full-height sprocket inclusion, over-clamp,
+> mis-split) — see [[frame-detection-physics]]. Known gaps: **color 135 only**
+> (B&W / medium-format / reversal need their own synthetic recipe); a 2-up strip
+> whose gap stays above threshold returns one box (a model-data refinement, not a
+> brittle valley heuristic).
 
 ## 3. Pipeline placement
 `namicolor_process(img_adobe_linear, settings, auto_anchors)` (ported from PR #44)
