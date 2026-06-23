@@ -413,21 +413,22 @@ class SlidersPanel(QWidget):
         bwp_row.addWidget(self.white_point_btn)
         bwp_row.addWidget(self.clear_white_point_btn)
         scroll_layout.addLayout(bwp_row)
-        # Shows which slope source the next conversion will use.
+        # Shows which anchors the live NamiColor conversion is using.
         self.bwp_mode_label = QLabel("")
         self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         scroll_layout.addWidget(self.bwp_mode_label)
-        self.convert_current_bwp_btn = QPushButton("Convert Current")
-        self.convert_all_bwp_btn = QPushButton("Convert All")
-        # Convert Current is the section's primary (core single-image action);
-        # Convert All stays neutral and gets a count confirmation instead.
-        theme.style_button(self.convert_current_bwp_btn, "primary")
-        self.convert_current_bwp_btn.setFixedHeight(theme.CONTROL_H)
-        self.convert_all_bwp_btn.setFixedHeight(theme.CONTROL_H)
-        convert_row = theme.apply_button_row(QHBoxLayout())
-        convert_row.addWidget(self.convert_current_bwp_btn)
-        convert_row.addWidget(self.convert_all_bwp_btn)
-        scroll_layout.addLayout(convert_row)
+        # --- Convert Current / Convert All buttons removed: NamiColor converts
+        # --- negatives LIVE — sampling a B/W point re-renders immediately, no
+        # --- explicit Convert step. (spec/namicolor-bwpoint-conversion.md)
+        # self.convert_current_bwp_btn = QPushButton("Convert Current")
+        # self.convert_all_bwp_btn = QPushButton("Convert All")
+        # theme.style_button(self.convert_current_bwp_btn, "primary")
+        # self.convert_current_bwp_btn.setFixedHeight(theme.CONTROL_H)
+        # self.convert_all_bwp_btn.setFixedHeight(theme.CONTROL_H)
+        # convert_row = theme.apply_button_row(QHBoxLayout())
+        # convert_row.addWidget(self.convert_current_bwp_btn)
+        # convert_row.addWidget(self.convert_all_bwp_btn)
+        # scroll_layout.addLayout(convert_row)
 
         # Separator between B/W Point tools and the adjustment sliders
         scroll_layout.addWidget(theme.section_separator())
@@ -644,8 +645,9 @@ class SlidersPanel(QWidget):
         self.white_point_btn.clicked.connect(self._on_set_white_point)
         self.clear_white_point_btn.clicked.connect(self._on_clear_white_point)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
-        self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
-        self.convert_all_bwp_btn.clicked.connect(self._on_convert_all_bwpoint)
+        # Convert Current / Convert All removed — conversion is live (see above).
+        # self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
+        # self.convert_all_bwp_btn.clicked.connect(self._on_convert_all_bwpoint)
 
         # --- Hint label — fixed at bottom, outside scroll area ---
         self.hint_label = QLabel()
@@ -818,7 +820,7 @@ class SlidersPanel(QWidget):
         convert. The toolbar's Convert/Un-convert/Auto Frame are gated
         separately in ImagePreview."""
         for btn in (self.white_point_btn, self.black_point_btn,
-                    self.convert_current_bwp_btn, self.convert_all_bwp_btn):
+                    self.clear_white_point_btn):
             btn.setEnabled(enabled)
 
     def save_slider_values(self, image_id):
@@ -1427,34 +1429,49 @@ class SlidersPanel(QWidget):
                 "<b>Black Point:</b> Draw a rect over the transparent/clear film base.", duration=6000)
 
     def _on_clear_white_point(self):
-        """Clear the sampled white point so conversion uses the calibrated
-        default slope (black point only)."""
+        """Clear the sampled white point so the live conversion auto-fits the
+        white end by percentile again."""
         ccr_backend.clear_white_point()
         mw = self.parent().parent()
         if hasattr(mw, "persist_bwpoint"):
             mw.persist_bwpoint()
         self._update_bwp_mode_label()
-        if ccr_backend.black_point_bgr is None:
-            self.set_temporary_hint(
-                "White point cleared. Set a <b>Black Point</b> (film base), then "
-                "Convert to use the <b>default slope</b>.", duration=6000)
-        else:
-            self.set_temporary_hint(
-                "White point cleared — conversion will use the calibrated "
-                "<b>default slope</b>. Click <b>Convert</b> to apply.", duration=6000)
+        self._rerender_for_bwpoint_change()
+        self.set_temporary_hint(
+            "White point cleared — the white end auto-fits by percentile again.",
+            duration=5000)
 
     def _update_bwp_mode_label(self):
-        """Reflect which slope source the next B/W-point conversion will use."""
+        """Reflect which anchors the live NamiColor conversion is using: a sampled
+        B/W point pins that end to Cineon 95/685; an unsampled end auto-fits by
+        percentile."""
         if not hasattr(self, "bwp_mode_label"):
             return
         bp_set = ccr_backend.black_point_bgr is not None
         wp_set = ccr_backend.white_point_bgr is not None
-        if not bp_set:
-            self.bwp_mode_label.setText("")
+        if bp_set and wp_set:
+            self.bwp_mode_label.setText("Anchors: black + white points")
+        elif bp_set:
+            self.bwp_mode_label.setText("Anchors: black point (white = auto)")
         elif wp_set:
-            self.bwp_mode_label.setText("Slope source: white point (two-point)")
+            self.bwp_mode_label.setText("Anchors: white point (black = auto)")
         else:
-            self.bwp_mode_label.setText("Slope source: default slope (black point only)")
+            self.bwp_mode_label.setText("Anchors: auto levels (percentile)")
+
+    def _rerender_for_bwpoint_change(self):
+        """The Film B/W points are app-global and feed the live NamiColor
+        conversion, so a change re-renders every frame. The current image is
+        recomputed immediately for instant feedback; thumbnails refresh too (each
+        image's cached anchors invalidate because the points changed)."""
+        mw = self.parent().parent()
+        idx = getattr(self.image_preview, "current_idx", None)
+        if idx is not None and 0 <= idx < len(ccr_backend.images):
+            ccr_backend.images[idx].update_thumbnail_and_preview()
+            mw.image_preview.update_preview(idx)
+        try:
+            mw.thumbnail_list.update_all_thumbnails()
+        except Exception:
+            pass
 
     def on_bwpoint_sampled(self, mode):
         label = "White Point" if mode == "white" else "Black Point"
@@ -1466,17 +1483,19 @@ class SlidersPanel(QWidget):
         if hasattr(mw, "persist_bwpoint"):
             mw.persist_bwpoint()
         self._update_bwp_mode_label()
+        # Live: the sampled point takes effect immediately (no Convert step).
+        self._rerender_for_bwpoint_change()
         if bp_set and wp_set:
             self.set_temporary_hint(
-                f"{label} sampled! Both points set — click <b>Convert All</b>.", duration=5000)
+                f"{label} sampled — black & white points pin the levels.", duration=4000)
         elif bp_set:
-            # Black point alone is enough — default slope fills in for the white.
             self.set_temporary_hint(
-                "Black Point sampled! Click <b>Convert</b> to use the default slope, "
-                "or set a <b>White Point</b> for a custom slope.", duration=6000)
+                "Black Point sampled — white end auto-fits by percentile. "
+                "Set a <b>White Point</b> on the densest area to pin it.", duration=5000)
         else:
             self.set_temporary_hint(
-                "White Point sampled! Now set the <b>Black Point</b> (film base).", duration=5000)
+                "White Point sampled — black end auto-fits by percentile. "
+                "Set a <b>Black Point</b> (clear film base) to pin it.", duration=5000)
 
     def _on_convert_current_bwpoint(self):
         if ccr_backend.black_point_bgr is None:

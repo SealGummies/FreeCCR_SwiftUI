@@ -9,7 +9,7 @@ from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QP
                            QImage)
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
-from core.ccr_processor import apply_dust_removal
+from core.ccr_processor import apply_dust_removal, NAMICOLOR_CONVERSION
 from widgets.export_dialog import ExportSettingsDialog
 from ui import theme
 import math
@@ -186,28 +186,29 @@ class GraphicsImageView(QGraphicsView):
                 self.scene().removeItem(self._bw_rect_item)
                 self._bw_rect_item = None
             self.viewport().update()
-        elif (event.button() == Qt.LeftButton
-              and self.parent_widget.pixmap_item is not None
-              and not ccr_backend.positive_mode):
-            # Reference frames belong to the negative-conversion workflow only.
-            self.drawing_reference = True
-            self._drag_start = self.mapToScene(event.pos())
-            self._drag_end = self._drag_start
-            if self.reference_rect_item:
-                self.scene().removeItem(self.reference_rect_item)
-                self.reference_rect_item = None
-            self.viewport().update()
-        elif event.button() == Qt.RightButton:
-            # Remove reference frame on right click
-            if self.reference_rect_item:
-                self.scene().removeItem(self.reference_rect_item)
-                self.reference_rect_item = None
-            # Also clear in parent widget
-            self.parent_widget.reference_rect_item = None
-            # Clear in backend
-            ccr_backend.set_reference_frame_by_index(self.parent_widget.current_idx, None)
-            self.drawing_reference = False
-            self.viewport().update()
+        # --- Reference-frame drawing / right-click removal — commented out;
+        # --- NamiColor converts negatives live with no reference frame. With
+        # --- drawing_reference never set True, the reference blocks in
+        # --- mouseMove/mouseReleaseEvent stay inert. (spec/namicolor-bwpoint-conversion.md)
+        # elif (event.button() == Qt.LeftButton
+        #       and self.parent_widget.pixmap_item is not None
+        #       and not ccr_backend.positive_mode):
+        #     self.drawing_reference = True
+        #     self._drag_start = self.mapToScene(event.pos())
+        #     self._drag_end = self._drag_start
+        #     if self.reference_rect_item:
+        #         self.scene().removeItem(self.reference_rect_item)
+        #         self.reference_rect_item = None
+        #     self.viewport().update()
+        # elif event.button() == Qt.RightButton:
+        #     # Remove reference frame on right click
+        #     if self.reference_rect_item:
+        #         self.scene().removeItem(self.reference_rect_item)
+        #         self.reference_rect_item = None
+        #     self.parent_widget.reference_rect_item = None
+        #     ccr_backend.set_reference_frame_by_index(self.parent_widget.current_idx, None)
+        #     self.drawing_reference = False
+        #     self.viewport().update()
         else:
             super().mousePressEvent(event)
 
@@ -627,10 +628,12 @@ class ImagePreview(QWidget):
         auto_icon = theme.load_tinted_icon(resource_path("icons/auto.png"))
         if auto_icon.isNull():
             auto_icon = QIcon.fromTheme("view-refresh")
-        self.auto_frame_action = QAction(auto_icon, "Auto Frame", self)
-        self.auto_frame_action.triggered.connect(self.auto_frame)
-        self.toolbar.addAction(self.auto_frame_action)
-        add_spacer()
+        # --- Reference-frame conversion (Auto Frame) — commented out; NamiColor
+        # --- converts negatives live (spec/namicolor-bwpoint-conversion.md).
+        # self.auto_frame_action = QAction(auto_icon, "Auto Frame", self)
+        # self.auto_frame_action.triggered.connect(self.auto_frame)
+        # self.toolbar.addAction(self.auto_frame_action)
+        # add_spacer()
 
         rotate_left_icon = theme.load_tinted_icon(resource_path("icons/rotate-left-icon-size_512.png"))
         if rotate_left_icon.isNull():
@@ -699,22 +702,24 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(self.dust_action)
         add_spacer()
 
-        self.convert_action = QAction("Convert", self)
-        self.convert_action.triggered.connect(self.convert_ccr)
-        self.toolbar.addAction(self.convert_action)
-        add_spacer()
-
-        self.unconvert_action = QAction("Un-convert", self)
-        self.unconvert_action.triggered.connect(self.unconvert_ccr)
-        self.toolbar.addAction(self.unconvert_action)
-        # Destructive revert → red text when enabled, muted when disabled.
-        _unconv_btn = self.toolbar.widgetForAction(self.unconvert_action)
-        if _unconv_btn is not None:
-            _unconv_btn.setStyleSheet(
-                f"QToolButton {{ color: {theme.DANGER}; }}"
-                f"QToolButton:hover {{ color: {theme.DANGER_HOVER}; }}"
-                f"QToolButton:disabled {{ color: {theme.TEXT_DISABLED}; }}")
-        add_spacer()
+        # --- Reference-frame conversion (Convert / Un-convert) — commented out;
+        # --- NamiColor converts negatives live (spec/namicolor-bwpoint-conversion.md).
+        # self.convert_action = QAction("Convert", self)
+        # self.convert_action.triggered.connect(self.convert_ccr)
+        # self.toolbar.addAction(self.convert_action)
+        # add_spacer()
+        #
+        # self.unconvert_action = QAction("Un-convert", self)
+        # self.unconvert_action.triggered.connect(self.unconvert_ccr)
+        # self.toolbar.addAction(self.unconvert_action)
+        # # Destructive revert → red text when enabled, muted when disabled.
+        # _unconv_btn = self.toolbar.widgetForAction(self.unconvert_action)
+        # if _unconv_btn is not None:
+        #     _unconv_btn.setStyleSheet(
+        #         f"QToolButton {{ color: {theme.DANGER}; }}"
+        #         f"QToolButton:hover {{ color: {theme.DANGER_HOVER}; }}"
+        #         f"QToolButton:disabled {{ color: {theme.TEXT_DISABLED}; }}")
+        # add_spacer()
 
         self.export_action = QAction("Export…", self)
         self.export_action.triggered.connect(self.open_export_dialog)
@@ -926,8 +931,10 @@ class ImagePreview(QWidget):
             self.confirm_crop()
         elif self.slice_mode:
             self.confirm_slices()
-        else:
-            self.convert_ccr()
+        # --- Enter no longer triggers reference-frame conversion (NamiColor
+        # --- converts negatives live). (spec/namicolor-bwpoint-conversion.md)
+        # else:
+        #     self.convert_ccr()
 
     def _on_escape_key(self):
         if self.crop_mode:
@@ -1088,32 +1095,28 @@ class ImagePreview(QWidget):
             self.pixmap_item = QGraphicsPixmapItem(preview_img)
             self.scene.addItem(self.pixmap_item)
 
-            ref = getattr(ccr_backend.images[idx], "reference_frame", None)
-            print("Loaded reference_frame from backend:", ref)
-            if ref:
-                # Backend rect is in full-image coords; map into the displayed
-                # (possibly cropped) pixmap's coordinate space and clip to it.
-                # With a rotated crop displayed the frame would not be
-                # axis-aligned in display space, so it is not drawn at all.
-                if self._crop_display_angle == 0.0:
-                    x1, y1, x2, y2 = ref
-                    rect = QRectF(x1, y1, x2 - x1, y2 - y1)
-                    if self._crop_display_transform is not None:
-                        inv = self._crop_display_transform.inverted()[0]
-                        rect = inv.mapRect(rect).intersected(
-                            QRectF(0, 0, preview_img.width(), preview_img.height()))
-                    if not rect.isEmpty():
-                        self.reference_rect_item = QGraphicsRectItem(rect)
-                        pen = QPen(QColor(255, 0, 0, 180), 2, Qt.DashLine)
-                        self.reference_rect_item.setPen(pen)
-                        self.scene.addItem(self.reference_rect_item)
-
-            elif not ccr_backend.positive_mode:
-                # Show hint when no reference frame exists (negative mode only —
-                # positive mode has no reference frame / conversion step).
+            # --- Reference-frame overlay — commented out (NamiColor converts
+            # --- live; no reference frame is drawn). spec/namicolor-bwpoint-conversion.md
+            # ref = getattr(ccr_backend.images[idx], "reference_frame", None)
+            # if ref:
+            #     if self._crop_display_angle == 0.0:
+            #         x1, y1, x2, y2 = ref
+            #         rect = QRectF(x1, y1, x2 - x1, y2 - y1)
+            #         if self._crop_display_transform is not None:
+            #             inv = self._crop_display_transform.inverted()[0]
+            #             rect = inv.mapRect(rect).intersected(
+            #                 QRectF(0, 0, preview_img.width(), preview_img.height()))
+            #         if not rect.isEmpty():
+            #             self.reference_rect_item = QGraphicsRectItem(rect)
+            #             pen = QPen(QColor(255, 0, 0, 180), 2, Qt.DashLine)
+            #             self.reference_rect_item.setPen(pen)
+            #             self.scene.addItem(self.reference_rect_item)
+            if NAMICOLOR_CONVERSION and not ccr_backend.positive_mode:
+                # NamiColor converts live; guide the user to the B/W points.
                 self.parent().parent().sliders_panel.set_hint(
-                    "<b>Hint:</b><br>Draw a frame around the image + some film base (orange/brown). "
-                    "Avoid white backlight or black film holder areas. Left-drag to draw, right-click to remove."
+                    "<b>Live NamiColor conversion.</b><br>Sample <b>Set Black Point</b> on the "
+                    "clear film base and <b>Set White Point</b> on the densest area to pin the "
+                    "levels (unsampled ends auto-fit by percentile), then refine with the sliders."
                 )
 
 
@@ -1359,23 +1362,30 @@ class ImagePreview(QWidget):
         positive = ccr_backend.positive_mode
         has_image = (self.current_idx is not None
                      and 0 <= self.current_idx < len(ccr_backend.images))
-        # Negative-only toolbar actions are greyed in positive mode.
-        self.convert_action.setEnabled(not positive)
-        self.auto_frame_action.setEnabled(not positive)
-        self.unconvert_action.setEnabled(self.current_converted and not positive)
-        # Positive mode: every loaded image is exportable (no conversion needed).
+        # NamiColor conversion replaces the v0.2.3 reference / B-W-point bake:
+        # negatives convert LIVE, so their sliders + export are enabled with no
+        # Convert step. See spec/namicolor-bwpoint-conversion.md.
+        namicolor = NAMICOLOR_CONVERSION and not positive
+        # --- Reference-frame conversion actions: commented out (NamiColor owns
+        # --- the conversion now). The Convert / Auto Frame / Un-convert toolbar
+        # --- actions are no longer created (see initUI).
+        # self.convert_action.setEnabled(not positive)
+        # self.auto_frame_action.setEnabled(not positive)
+        # self.unconvert_action.setEnabled(self.current_converted and not positive)
+        # Positive mode / NamiColor: every loaded image is exportable (no explicit
+        # conversion needed).
         self.export_action.setEnabled(
-            (positive and len(ccr_backend.images) > 0)
+            ((positive or namicolor) and len(ccr_backend.images) > 0)
             or any(img.converted for img in ccr_backend.images))
         parent = self.parent()
         if hasattr(parent.parent(), "sliders_panel"):
-            # Adjustments are available for a converted negative OR for any image
-            # in positive mode.
-            sliders_enabled = self.current_converted or (positive and has_image)
-            print("Setting sliders enabled:", sliders_enabled, "(positive:", positive, ")")
+            # Adjustments are available for a converted negative, for any image in
+            # positive mode, OR for any negative under the NamiColor conversion.
+            sliders_enabled = (self.current_converted
+                               or ((positive or namicolor) and has_image))
             sliders_panel = parent.parent().sliders_panel
             sliders_panel.set_sliders_enabled(sliders_enabled)
-            # Film B/W Point tools are negative-only.
+            # Film B/W Point tools drive the live anchors — enabled for negatives.
             if hasattr(sliders_panel, "set_negative_controls_enabled"):
                 sliders_panel.set_negative_controls_enabled(not positive)
             # Dust removal follows the same gate as the adjustment sliders.
@@ -3579,9 +3589,11 @@ class HiResDetailWorker(QThread):
         self._brightness_base = img_obj.brightness_base
         self._exposure_base = getattr(img_obj, "exposure_base", 0.0)
         self._converted = img_obj.converted
-        # Captured at request time (thread-safe): positive mode skips the
-        # negative display auto-brightness, like update_thumbnail_and_preview.
+        # Captured at request time (thread-safe): positive mode AND the NamiColor
+        # conversion both skip the negative display auto-brightness, like
+        # update_thumbnail_and_preview — their output is already a positive.
         self._positive_mode = ccr_backend.positive_mode
+        self._namicolor = img_obj._namicolor_active()
         ci = getattr(img_obj, "conversion_inputs", None)
         self._conversion_inputs = dict(ci) if ci else None
 
@@ -3606,10 +3618,11 @@ class HiResDetailWorker(QThread):
                 brightness_base=self._brightness_base,
                 exposure_base=self._exposure_base,
                 areas_override=self._areas)
-            if not self._converted and not self._positive_mode:
+            if not self._converted and not self._positive_mode and not self._namicolor:
                 # Mirror the preview pipeline: adjustments first, then the
                 # display-only auto-brightness stretch for raw negatives
-                # (skipped in positive mode — the decode is already exposed).
+                # (skipped in positive AND NamiColor mode — those outputs are
+                # already a finished positive).
                 display = self._img._auto_brightness_for_preview(display)
             display8 = _np.ascontiguousarray(
                 _cv2.convertScaleAbs(display, alpha=255.0 / 65535.0))
