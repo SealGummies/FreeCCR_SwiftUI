@@ -12,7 +12,8 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
                                 apply_area_layers, apply_crop_to_image,
-                                apply_dust_removal)
+                                apply_dust_removal,
+                                NAMICOLOR_EXPERIMENT, namicolor_process)
 from core import color_management
 from ui import theme
 
@@ -287,6 +288,14 @@ class CCRImage:
         except Exception:
             return False
 
+    def _namicolor_active(self) -> bool:
+        """Whether this image renders through the experimental NamiColor
+        pipeline: the master switch is on, it's a color negative (not global
+        Positive mode, not a monochrome scan). See spec/namicolor-conversion.md."""
+        return (bool(NAMICOLOR_EXPERIMENT)
+                and not self._positive_mode_active()
+                and not getattr(self, "is_monochrome", False))
+
     @staticmethod
     def _raw_color_postprocess_kwargs(positive: bool, preview: bool) -> dict:
         """rawpy.postprocess kwargs for a (non-monochrome) RAW decode.
@@ -316,6 +325,13 @@ class CCRImage:
                 output_color=rawpy.ColorSpace.sRGB,
                 four_color_rgb=False,
             )
+        # NamiColor experiment: decode to Adobe RGB / linear (the author's
+        # DaVinci step 1) so NamiColor's Adobe->Rec.2020 matrix lands correctly.
+        # White balance stays off — NamiColor balances the orange mask itself
+        # via the per-channel Channel Levels. Classic flow keeps the raw-sensor
+        # readout the v0.2.3 inversion expects.
+        output_color = (rawpy.ColorSpace.Adobe if NAMICOLOR_EXPERIMENT
+                        else rawpy.ColorSpace.raw)
         return dict(
             output_bps=16,
             no_auto_bright=True,      # Consistent absolute sensor values across all frames
@@ -325,7 +341,7 @@ class CCRImage:
             half_size=preview,        # Process at half resolution - much faster!
             use_camera_wb=False,      # No camera white balance
             use_auto_wb=False,        # No auto white balance
-            output_color=rawpy.ColorSpace.raw,  # Raw color space (no color correction)
+            output_color=output_color,
             no_auto_scale=True,       # No automatic scaling
             four_color_rgb=False,     # Standard 3-color processing
         )
@@ -386,6 +402,11 @@ class CCRImage:
                     except Exception as e:
                         logging.warning(f"Error detecting monochrome sensor: {e}")
                         is_monochrome = False
+
+                    # Remember the sensor type so the NamiColor pipeline can skip
+                    # monochrome scans (its Adobe->Rec.2020 matrix + per-channel
+                    # log would tint a [G,G,G] grayscale image).
+                    self.is_monochrome = is_monochrome
 
                     # Global Positive mode decodes color RAWs as normal sRGB
                     # photos (monochrome sensors are left on their own path).
@@ -558,7 +579,8 @@ class CCRImage:
         # correctly-exposed positive too, so it skips the negative auto-brightness
         # as well (the adjustments own the look).
         display_img = (adjusted_img
-                       if (self.converted or self._positive_mode_active())
+                       if (self.converted or self._positive_mode_active()
+                           or self._namicolor_active())
                        else self._auto_brightness_for_preview(adjusted_img))
 
         # Create thumbnail
@@ -665,6 +687,21 @@ class CCRImage:
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)
+        # NamiColor experiment: a color negative converts LIVE through the
+        # NamiColor log pipeline (driven by the Channel Levels sliders) instead
+        # of the v0.2.3 reference / B&W-point bake. Runs even when `s` is empty
+        # because a neutral NamiColor still inverts. Curves / areas / B&W
+        # collapse below operate on the resulting display image, unchanged.
+        if self._namicolor_active() and not getattr(self, "converted", False):
+            adjusted = namicolor_process(image, s or {})
+            curves = s.get('curves') if s else None
+            if curves:
+                adjusted = apply_curves(adjusted, curves)
+            if has_areas:
+                adjusted = apply_area_layers(adjusted, areas, self._adjust_for_area)
+            if profile == "bw":
+                adjusted = self._to_grayscale(adjusted)
+            return adjusted
         if not s and cb == 0 and tb == 0 and bb == 0 and eb == 0 and not has_areas:
             # No slider/base/area adjustments — but Black & White still has to
             # map the image to a single luminance channel.

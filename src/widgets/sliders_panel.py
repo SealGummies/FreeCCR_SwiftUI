@@ -533,7 +533,7 @@ class SlidersPanel(QWidget):
         scroll_layout.addWidget(self.band_section)
 
         scroll_layout.addWidget(_section_separator())
-        self.od_section = CollapsibleSection("Channel Levels")
+        self.od_section = CollapsibleSection("NamiColor")
         scroll_layout.addWidget(self.od_section)
 
         # --- Populate Channel Levels (sliders[10]–[21]) ---
@@ -818,6 +818,7 @@ class SlidersPanel(QWidget):
         convert. The toolbar's Convert/Un-convert/Auto Frame are gated
         separately in ImagePreview."""
         for btn in (self.white_point_btn, self.black_point_btn,
+                    self.clear_white_point_btn,
                     self.convert_current_bwp_btn, self.convert_all_bwp_btn):
             btn.setEnabled(enabled)
 

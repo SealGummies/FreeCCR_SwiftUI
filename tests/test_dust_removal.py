@@ -27,7 +27,8 @@ import cv2  # noqa: E402
 from core import catalog, dust_detect  # noqa: E402
 from core.ccr_image import CCRImage  # noqa: E402
 from core.ccr_processor import (apply_dust_removal,  # noqa: E402
-                                rasterize_dust_mask)
+                                rasterize_dust_mask,
+                                NAMICOLOR_EXPERIMENT, namicolor_process)
 
 
 def _flat_with_speck(h=100, w=100, base=30000, speck=60000, cx=50, cy=50, r=4):
@@ -104,6 +105,16 @@ class TestApplyAdjustmentsIntegration:
 
         src = _flat_with_speck()
         out = img.apply_adjustments(src)
+        if NAMICOLOR_EXPERIMENT:
+            # The neutral negative is NamiColor-converted, so it's no longer a
+            # pass-through — but dust still runs FIRST (spec/namicolor-conversion.md).
+            # Prove that by checking the speck pixel differs with vs. without healing,
+            # while a clean corner is identical either way.
+            img.dust_spots = []
+            out_unhealed = img.apply_adjustments(src)
+            assert not np.array_equal(out[50, 50], out_unhealed[50, 50])
+            assert np.array_equal(out[0:10, 0:10], out_unhealed[0:10, 0:10])
+            return
         # Speck healed even though every slider/base is neutral.
         assert int(out[50, 50, 0]) < 55000
         assert np.array_equal(out[0:10, 0:10], src[0:10, 0:10])
@@ -117,6 +128,11 @@ class TestApplyAdjustmentsIntegration:
         img.dust_spots = []
         src = _flat_with_speck()
         out = img.apply_adjustments(src)
+        if NAMICOLOR_EXPERIMENT:
+            # No dust + neutral sliders -> the output is exactly the NamiColor
+            # render of the input (dust removal was a no-op).
+            assert np.array_equal(out, namicolor_process(src, {}))
+            return
         assert np.array_equal(out, src)
 
 

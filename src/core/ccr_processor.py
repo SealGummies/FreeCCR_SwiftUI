@@ -2113,6 +2113,149 @@ def compute_neutral_temp_tint(r: float, g: float, b: float,
     return int(round(temp_slider)), int(round(tint_slider))
 
 
+# =========================================================================== #
+# NamiColor experimental conversion  (spec/namicolor-conversion.md)
+# -------------------------------------------------------------------------- #
+# Real NamiColor (Wavechaser/NamiColor) log-space inversion driven by the
+# existing "Channel Levels" sliders, followed by an in-log creative tune and a
+# Rec.2020 Cineon-Film-Log -> Rec.709/Gamma-2.2 CST. Master-switched so the
+# classic v0.2.3 reference / B&W-point flow can be restored by flipping it off.
+# =========================================================================== #
+
+# Master switch: when on, color negatives convert live via NamiColor instead of
+# the v0.2.3 methods (which are greyed in the UI). FREECCR_NAMICOLOR=0 restores
+# the classic flow.
+NAMICOLOR_EXPERIMENT = os.environ.get("FREECCR_NAMICOLOR", "1") != "0"
+# Fit-to-Cineon-Base step (places Dmin at code value ~95). On by default.
+NAMICOLOR_FIT_CINEON = os.environ.get("FREECCR_NAMICOLOR_FIT", "1") != "0"
+
+# Slider -> NamiColor-parameter scales (env-tunable; the author dials by eye).
+_NAMI_INPUTGAIN_DEN = float(os.environ.get("FREECCR_NAMICOLOR_IG", "100"))   # 2**(v/den)
+_NAMI_SHIFT_DEN     = float(os.environ.get("FREECCR_NAMICOLOR_SHIFT", "200"))
+_NAMI_GAIN_DEN      = float(os.environ.get("FREECCR_NAMICOLOR_GAIN", "300"))
+_NAMI_BLACK_DEN     = float(os.environ.get("FREECCR_NAMICOLOR_BLACK", "300"))
+
+# Adobe RGB (D65) linear -> Rec.2020 (D65) linear (NamiColor DCTL constants).
+M_ADOBE2REC2020 = np.array([
+    [0.86965940, 0.08676942, 0.03409159],
+    [0.09357638, 0.90511022, 0.00546303],
+    [0.01676546, 0.06225891, 0.92799144],
+], dtype=np.float32)
+
+# Rec.2020 (D65) linear -> Rec.709 (D65) linear.
+M_REC2020_2_REC709 = np.array([
+    [1.66049100, -0.58764114, -0.07284986],
+    [-0.12455047, 1.13289990, -0.00834942],
+    [-0.01815076, -0.10057889, 1.11872966],
+], dtype=np.float32)
+
+# Cineon (Kodak) film-log reference code values on a 0..1023 scale.
+_CINEON_BLACK = 95.0     # Dmin
+_CINEON_WHITE = 685.0    # 90% diffuse white
+_CINEON_NG = 0.6         # negative gamma
+_CINEON_FIT = 93.0 / 1023.0   # fit-to-base offset
+
+
+def _namicolor_param_scales(s: dict):
+    """Map the integer [-100, 100] Channel-Levels sliders to NamiColor params.
+
+    Returns (input_gain, shifts[3], gains[3], blacks[3]) where shifts/gains are
+    already master+per-channel combined, in R, G, B order."""
+    s = s or {}
+    g = lambda k: float(s.get(k, 0) or 0)
+    input_gain = 2.0 ** (g('ch_input_gain') / _NAMI_INPUTGAIN_DEN)   # 0->1.0
+    mshift = g('ch_master_shift') / _NAMI_SHIFT_DEN
+    mgain = g('ch_master_gain') / _NAMI_GAIN_DEN
+    shifts = [g(f'ch_{c}_shift') / _NAMI_SHIFT_DEN + mshift for c in 'rgb']
+    gains = [g(f'ch_{c}_gain') / _NAMI_GAIN_DEN + mgain for c in 'rgb']
+    blacks = [g(f'ch_{c}_blackpoint') / _NAMI_BLACK_DEN for c in 'rgb']
+    return input_gain, shifts, gains, blacks
+
+
+def namicolor_channel_transform(lin_rec2020: np.ndarray, s: dict) -> np.ndarray:
+    """NamiColor negatives transform: linear Rec.2020 -> Cineon-Film-Log
+    normalized code values (cv/1023), float32. Per channel:
+        d = -log10(16*x) ; d = d*InputGain + 1 ; d += shift
+        d = (d + black) / ((1 - gain) + black) ; optional fit-to-Cineon.
+    A brighter scan pixel (scene shadow) yields a LOWER output (inversion)."""
+    input_gain, shifts, gains, blacks = _namicolor_param_scales(s)
+    out = np.empty_like(lin_rec2020, dtype=np.float32)
+    for c in range(3):
+        x = np.maximum(lin_rec2020[..., c].astype(np.float32), 1e-6)
+        d = -np.log10(16.0 * x)
+        d = d * np.float32(input_gain) + np.float32(1.0)
+        if shifts[c]:
+            d = d + np.float32(shifts[c])
+        denom = (1.0 - gains[c]) + blacks[c]
+        # Keep the divide safe and sign-stable near zero.
+        if abs(denom) < 1e-3:
+            denom = 1e-3 if denom >= 0 else -1e-3
+        d = (d + np.float32(blacks[c])) / np.float32(denom)
+        if NAMICOLOR_FIT_CINEON:
+            d = (d + np.float32(_CINEON_FIT)) / np.float32(1.0 + _CINEON_FIT)
+        out[..., c] = d
+    return out
+
+
+def cineon_film_log_to_linear(cv01: np.ndarray) -> np.ndarray:
+    """Cineon (Kodak) film-log -> scene-linear. Input is normalized code value
+    (cv/1023). 685/1023 -> 1.0, 95/1023 -> ~0.0, values above white go >1."""
+    cv = np.asarray(cv01, dtype=np.float32) * np.float32(1023.0)
+    gain = 1.0 / (1.0 - 10.0 ** ((_CINEON_BLACK - _CINEON_WHITE) * 0.002 / _CINEON_NG))
+    offset = gain - 1.0
+    lin = np.float32(gain) * np.power(
+        np.float32(10.0), (cv - np.float32(_CINEON_WHITE)) * np.float32(0.002 / _CINEON_NG)
+    ) - np.float32(offset)
+    return lin
+
+
+def cineon_rec2020_to_rec709_g22(cv01: np.ndarray) -> np.ndarray:
+    """CST: Rec.2020 Cineon Film Log -> Rec.709 Gamma 2.2 (display, 0..1)."""
+    lin2020 = cineon_film_log_to_linear(cv01)
+    np.clip(lin2020, 0.0, None, out=lin2020)
+    lin709 = lin2020 @ M_REC2020_2_REC709.T
+    np.clip(lin709, 0.0, 1.0, out=lin709)
+    return np.power(lin709, np.float32(1.0 / 2.2))
+
+
+def namicolor_process(img16_adobe_linear: np.ndarray, s: dict) -> np.ndarray:
+    """Full NamiColor pipeline for one frame.
+
+    img16_adobe_linear: uint16 RGB, Adobe-RGB primaries, linear gamma.
+    NamiColor (Channel Levels) -> in-log creative tune (Main sliders) -> CST.
+    Returns a display-referred (Rec.709 / Gamma 2.2) uint16 RGB image."""
+    s = s or {}
+    x = img16_adobe_linear.astype(np.float32) / np.float32(65535.0)
+    # Adobe RGB linear -> Rec.2020 linear.
+    x = x @ M_ADOBE2REC2020.T
+    # NamiColor inversion -> Cineon-Film-Log normalized code values.
+    log_cv = namicolor_channel_transform(x, s)
+
+    # Middle stage: basic color tune IN LOG SPACE, exactly like the Resolve node
+    # order. Reuse the Main-slider math; the Channel Levels were consumed above,
+    # so ch_* are zero here, and bands are deferred (see spec §1 non-goals).
+    log_u16 = np.clip(log_cv * np.float32(65535.0), 0, 65535).astype(np.uint16)
+    graded = adjust_image(
+        log_u16,
+        kelvin_shift=float(s.get('temperature', 0) or 0),
+        tint_shift=float(s.get('tint', 0) or 0),
+        exposure=float(s.get('exposure', 0) or 0),
+        # Brightness slider is half-strength per click in the normal path too.
+        brightness=0.5 * float(s.get('brightness', 0) or 0),
+        blackpoint=float(s.get('black_point', 0) or 0),
+        whitepoint=float(s.get('white_point', 0) or 0),
+        contrast=float(s.get('contrast', 0) or 0),
+        saturation=float(s.get('saturation', 0) or 0),
+        highlights=float(s.get('highlights', 0) or 0),
+        shadows=float(s.get('shadows', 0) or 0),
+        sub_saturation=float(s.get('sub_saturation', 0) or 0),
+    ).astype(np.float32) / np.float32(65535.0)
+
+    # CST -> display.
+    out = cineon_rec2020_to_rec709_g22(graded)
+    return np.clip(out * np.float32(65535.0), 0, 65535).astype(np.uint16)
+
+
 def adjust_image(
     img16: np.ndarray,
     kelvin_shift: float = 0.0,

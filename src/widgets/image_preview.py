@@ -9,7 +9,7 @@ from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QP
                            QImage)
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
-from core.ccr_processor import apply_dust_removal
+from core.ccr_processor import apply_dust_removal, NAMICOLOR_EXPERIMENT
 from widgets.export_dialog import ExportSettingsDialog
 from ui import theme
 import math
@@ -188,8 +188,11 @@ class GraphicsImageView(QGraphicsView):
             self.viewport().update()
         elif (event.button() == Qt.LeftButton
               and self.parent_widget.pixmap_item is not None
-              and not ccr_backend.positive_mode):
-            # Reference frames belong to the negative-conversion workflow only.
+              and not ccr_backend.positive_mode
+              and not NAMICOLOR_EXPERIMENT):
+            # Reference frames belong to the v0.2.3 negative-conversion workflow
+            # only — disabled in positive mode and under the NamiColor experiment
+            # (which inverts live with no reference frame).
             self.drawing_reference = True
             self._drag_start = self.mapToScene(event.pos())
             self._drag_end = self._drag_start
@@ -1108,6 +1111,15 @@ class ImagePreview(QWidget):
                         self.reference_rect_item.setPen(pen)
                         self.scene.addItem(self.reference_rect_item)
 
+            elif NAMICOLOR_EXPERIMENT and not ccr_backend.positive_mode:
+                # NamiColor experiment: no reference frame — the negative inverts
+                # live from the NamiColor (Channel Levels) sliders.
+                self.parent().parent().sliders_panel.set_hint(
+                    "<b>NamiColor (experimental):</b><br>This negative is converted live. "
+                    "Open the <b>NamiColor</b> section and balance each channel (Blackpoint / Gain / Shift) "
+                    "so the histogram's darkest point sits just below the shadows and the brightest 1% "
+                    "near the top, then tune with the main sliders."
+                )
             elif not ccr_backend.positive_mode:
                 # Show hint when no reference frame exists (negative mode only —
                 # positive mode has no reference frame / conversion step).
@@ -1359,25 +1371,33 @@ class ImagePreview(QWidget):
         positive = ccr_backend.positive_mode
         has_image = (self.current_idx is not None
                      and 0 <= self.current_idx < len(ccr_backend.images))
-        # Negative-only toolbar actions are greyed in positive mode.
-        self.convert_action.setEnabled(not positive)
-        self.auto_frame_action.setEnabled(not positive)
-        self.unconvert_action.setEnabled(self.current_converted and not positive)
-        # Positive mode: every loaded image is exportable (no conversion needed).
+        # NamiColor experiment: the v0.2.3 conversion methods are replaced by a
+        # live NamiColor render, so their controls are greyed and negatives are
+        # editable/exportable without a Convert step.
+        namicolor = NAMICOLOR_EXPERIMENT and not positive
+        # Negative-only toolbar actions are greyed in positive mode (and while
+        # the NamiColor experiment owns the conversion).
+        self.convert_action.setEnabled(not positive and not namicolor)
+        self.auto_frame_action.setEnabled(not positive and not namicolor)
+        self.unconvert_action.setEnabled(
+            self.current_converted and not positive and not namicolor)
+        # Positive mode / NamiColor: every loaded image is exportable (no
+        # explicit conversion needed).
         self.export_action.setEnabled(
-            (positive and len(ccr_backend.images) > 0)
+            ((positive or namicolor) and len(ccr_backend.images) > 0)
             or any(img.converted for img in ccr_backend.images))
         parent = self.parent()
         if hasattr(parent.parent(), "sliders_panel"):
-            # Adjustments are available for a converted negative OR for any image
-            # in positive mode.
-            sliders_enabled = self.current_converted or (positive and has_image)
-            print("Setting sliders enabled:", sliders_enabled, "(positive:", positive, ")")
+            # Adjustments are available for a converted negative, for any image
+            # in positive mode, OR for any negative under the NamiColor pipeline.
+            sliders_enabled = (self.current_converted
+                               or ((positive or namicolor) and has_image))
             sliders_panel = parent.parent().sliders_panel
             sliders_panel.set_sliders_enabled(sliders_enabled)
-            # Film B/W Point tools are negative-only.
+            # Film B/W Point tools are negative-only — and also greyed while the
+            # NamiColor experiment replaces the B/W-point conversion.
             if hasattr(sliders_panel, "set_negative_controls_enabled"):
-                sliders_panel.set_negative_controls_enabled(not positive)
+                sliders_panel.set_negative_controls_enabled(not positive and not namicolor)
             # Dust removal follows the same gate as the adjustment sliders.
             if hasattr(self, "dust_action"):
                 self.dust_action.setEnabled(sliders_enabled)
@@ -3579,9 +3599,11 @@ class HiResDetailWorker(QThread):
         self._brightness_base = img_obj.brightness_base
         self._exposure_base = getattr(img_obj, "exposure_base", 0.0)
         self._converted = img_obj.converted
-        # Captured at request time (thread-safe): positive mode skips the
-        # negative display auto-brightness, like update_thumbnail_and_preview.
+        # Captured at request time (thread-safe): positive mode AND the NamiColor
+        # pipeline both skip the negative display auto-brightness, exactly like
+        # update_thumbnail_and_preview — their output is already a proper positive.
         self._positive_mode = ccr_backend.positive_mode
+        self._namicolor = img_obj._namicolor_active()
         ci = getattr(img_obj, "conversion_inputs", None)
         self._conversion_inputs = dict(ci) if ci else None
 
@@ -3606,10 +3628,11 @@ class HiResDetailWorker(QThread):
                 brightness_base=self._brightness_base,
                 exposure_base=self._exposure_base,
                 areas_override=self._areas)
-            if not self._converted and not self._positive_mode:
+            if not self._converted and not self._positive_mode and not self._namicolor:
                 # Mirror the preview pipeline: adjustments first, then the
                 # display-only auto-brightness stretch for raw negatives
-                # (skipped in positive mode — the decode is already exposed).
+                # (skipped in positive AND NamiColor mode — those outputs are
+                # already a finished, properly-exposed positive).
                 display = self._img._auto_brightness_for_preview(display)
             display8 = _np.ascontiguousarray(
                 _cv2.convertScaleAbs(display, alpha=255.0 / 65535.0))

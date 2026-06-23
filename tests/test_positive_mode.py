@@ -54,9 +54,15 @@ class TestRawPostprocessKwargs:
         assert "no_auto_scale" not in kw
 
     def test_negative_is_the_original_raw_readout(self):
+        from core.ccr_processor import NAMICOLOR_EXPERIMENT
         kw = CCRImage._raw_color_postprocess_kwargs(positive=False, preview=False)
-        # Regression guard: the greenish raw-sensor decode the inverter expects.
-        assert kw["output_color"] == rawpy.ColorSpace.raw
+        if NAMICOLOR_EXPERIMENT:
+            # NamiColor experiment decodes to Adobe RGB / linear (the author's
+            # DaVinci step 1). See spec/namicolor-conversion.md.
+            assert kw["output_color"] == rawpy.ColorSpace.Adobe
+        else:
+            # Classic: the greenish raw-sensor decode the inverter expects.
+            assert kw["output_color"] == rawpy.ColorSpace.raw
         assert kw["gamma"] == (1, 1)
         assert kw["no_auto_bright"] is True
         assert kw["use_camera_wb"] is False
@@ -204,6 +210,7 @@ class TestBackendPositiveMode:
         assert "positive" in calls and "reference" not in calls
 
     def test_export_routes_to_negative_when_off(self, backend, monkeypatch):
+        from core.ccr_backend import NAMICOLOR_EXPERIMENT
         calls = {}
         monkeypatch.setattr("core.ccr_backend.ccr_export_positive",
                             lambda *a, **k: calls.setdefault("positive", k))
@@ -214,7 +221,12 @@ class TestBackendPositiveMode:
         backend.black_point_bgr = None
         backend.white_point_bgr = None
         assert backend.export_image_by_index(0, "out.tiff") is True
-        assert "reference" in calls and "positive" not in calls
+        if NAMICOLOR_EXPERIMENT:
+            # NamiColor replaces the negative conversion entirely: a negative
+            # exports through the live positive path (spec/namicolor-conversion.md).
+            assert "positive" in calls and "reference" not in calls
+        else:
+            assert "reference" in calls and "positive" not in calls
 
     def test_reprocess_drops_conversion_keeps_adjustments(self, backend):
         img = _StubBackendImage(converted=True,
