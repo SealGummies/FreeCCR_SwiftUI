@@ -8,10 +8,12 @@ image color). Installed once at app start via ``apply_theme(app)`` (see
 See ``spec/visual-redesign.md`` for the design rationale and token table.
 """
 
+import os
 import sys
+import tempfile
 
 from PySide6.QtCore import Qt, QObject, QEvent
-from PySide6.QtGui import QColor, QPalette, QIcon, QPixmap, QPainter
+from PySide6.QtGui import QColor, QPalette, QIcon, QPixmap, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 # --------------------------------------------------------------------------- #
@@ -201,7 +203,7 @@ QComboBox {
     border: 1px solid %(border)s; border-radius: %(r_sm)dpx; padding: 2px 6px;
 }
 QComboBox:hover { border-color: %(border_strong)s; }
-QComboBox::drop-down { border: none; width: 18px; }
+QComboBox::drop-down { border: none; width: 22px; }
 QComboBox QAbstractItemView {
     background-color: %(panel)s; color: %(text)s;
     border: 1px solid %(border)s;
@@ -293,9 +295,13 @@ QLabel[caption="true"] { color: %(text_muted)s; font-size: %(fs_caption)dpx; }
 """
 
 
-def global_qss() -> str:
-    """The central stylesheet, built from the tokens above (one source of truth)."""
-    return _QSS_TEMPLATE % {
+def global_qss(chevron_path=None) -> str:
+    """The central stylesheet, built from the tokens above (one source of truth).
+
+    ``chevron_path`` (from :func:`_ensure_chevron_icon`) adds the combo dropdown
+    arrow; omitted (e.g. in tests) the base combo styling still applies.
+    """
+    qss = _QSS_TEMPLATE % {
         "window": WINDOW, "canvas": CANVAS, "panel": PANEL, "surface": SURFACE,
         "surface_hover": SURFACE_HOVER, "surface_active": SURFACE_ACTIVE,
         "border": BORDER, "border_strong": BORDER_STRONG,
@@ -303,6 +309,11 @@ def global_qss() -> str:
         "accent": ACCENT, "selection_bg": SELECTION_BG, "selection_text": SELECTION_TEXT,
         "r_sm": RADIUS_SM, "r_md": RADIUS_MD, "fs_caption": FS_CAPTION,
     }
+    if chevron_path:
+        cp = str(chevron_path).replace("\\", "/")
+        qss += (f"\nQComboBox::down-arrow {{ image: url({cp});"
+                f" width: 12px; height: 12px; margin-right: 6px; }}\n")
+    return qss
 
 
 def load_tinted_icon(abs_path: str, color: str = ICON,
@@ -412,14 +423,44 @@ def apply_button_row(layout, *, spacing=GAP_BTN):
 
 
 def section_separator():
-    """The one canonical horizontal rule between functional regions."""
+    """The one canonical horizontal rule between functional regions — a 1px line
+    with section spacing above/below. A plain HLine coloured via ``color:`` is
+    invisible on the dark theme, so the line is painted via ``background-color``.
+    """
     from PySide6.QtWidgets import QFrame
     sep = QFrame()
-    sep.setFrameShape(QFrame.HLine)
-    sep.setFrameShadow(QFrame.Sunken)
     sep.setStyleSheet(
-        f"color: {BORDER}; margin-top: {SPACE_LG}px; margin-bottom: {SPACE_SM}px;")
+        f"QFrame {{ background-color: {BORDER_STRONG}; min-height: 1px; max-height: 1px;"
+        f" margin-top: {SPACE_LG}px; margin-bottom: {SPACE_SM}px; }}")
     return sep
+
+
+_CHEVRON_PATH = None
+
+
+def _ensure_chevron_icon() -> str:
+    """Generate the combo dropdown chevron PNG once; return its path for QSS
+    ``image: url(...)``. Requires a running QApplication (uses QPixmap/QPainter).
+
+    Qt suppresses the native combo arrow once the combo is stylesheet-styled and
+    the QSS border-triangle trick renders as a blocky shape, so we paint a clean
+    chevron and reference it as the down-arrow image.
+    """
+    global _CHEVRON_PATH
+    if _CHEVRON_PATH and os.path.exists(_CHEVRON_PATH):
+        return _CHEVRON_PATH
+    path = os.path.join(tempfile.gettempdir(), "freeccr_chevron_down.png")
+    pm = QPixmap(12, 12)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(qcolor(TEXT_MUTED), 1.6))
+    p.drawLine(3, 4, 6, 8)   # ╲
+    p.drawLine(6, 8, 9, 4)   # ╱  → a downward chevron ˅
+    p.end()
+    pm.save(path)
+    _CHEVRON_PATH = path
+    return path
 
 
 def section_header_qss():
@@ -437,7 +478,7 @@ def apply_theme(app, settings=None) -> None:
     """
     app.setStyle("Fusion")
     app.setPalette(build_palette())
-    app.setStyleSheet(global_qss())
+    app.setStyleSheet(global_qss(_ensure_chevron_icon()))
 
 
 def apply_windows_dark_titlebar(widget) -> bool:
