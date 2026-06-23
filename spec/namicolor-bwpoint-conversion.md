@@ -58,18 +58,20 @@ store CCRImage.namicolor_gain_offset                    # applied live by apply_
 ```
 
 The bisection runs the real `namicolor_process` on a 256-px image (~16 iters), so
-it is robust to the CST nonlinearity. **Holder/sprocket mask**: pixels that are
-white-clipped in all channels at *neutral* gain are excluded from the highlight
-statistic — the opaque holder maps ABOVE the white-point reference (denser than
-any real scene content), so this isolates and ignores it even with **no crop**
-(a crop still helps and makes the mask a no-op). The offset is bounded below the
-`1/(1−gain)` singularity. It gains UP when the image is under-exposed and trims
-down when over clip. Env: `FREECCR_NAMICOLOR_GAIN_PCT/_TARGET`. Persisted in the
-catalog and undo; cleared by a Whole-Image reset.
+it is robust to the CST nonlinearity. The measurement region is the **crop area**
+when set, else the whole image (frame auto-detection is intentionally NOT used
+here). **Holder/sprocket mask**: pixels that are white-clipped in all channels at
+*neutral* gain are excluded from the highlight statistic — the opaque holder maps
+ABOVE the white-point reference (denser than any real scene content), so this
+ignores it even with no crop. The offset is bounded below the `1/(1−gain)`
+singularity; it gains UP when under-exposed and trims down when over clip. Env:
+`FREECCR_NAMICOLOR_GAIN_PCT/_TARGET`. Persisted in the catalog and undo.
 
-> The **frame detection** below resolves this: with no crop, auto-gain measures
-> inside the detected photographic frame, so the holder/sprockets/second frame
-> don't skew the exposure.
+**Automatic, no buttons.** Auto-gain is per-image and runs as part of the
+**recalculate** triggered on every anchor change (set black, set white, or clear)
+— there are no manual *Auto Gain* / *Apply to All* buttons. The single **✕**
+button clears BOTH the black and white points. Crop to the image first for the
+best auto-exposure.
 
 ## 2.7 Frame detection (`namicolor_detect_frames`)
 
@@ -91,9 +93,9 @@ known rectangles → perfect masks); see `tools/frame_training/`.
 removed by opacity; row/column profiles isolate and split frames). Used only when
 the ONNX path is unavailable, so detection degrades gracefully.
 
-Wired as the **auto-gain measurement region** (crop ▸ detected-frame ▸ whole image)
-and as the CLI `--auto-frame` (auto-crop). Env `FREECCR_NAMICOLOR_FRAME=0` disables
-the no-crop path entirely.
+Wired into the CLI `--auto-frame` (auto-crop). It is **not** currently used for the
+in-app auto-gain region (that uses the crop area, §2.6); `namicolor_detect_frames`
+remains available for explicit/headless use.
 
 > Why learned: threshold/flood/projection heuristics each traded one failure for
 > another on real scans (rebate leak, full-height sprocket inclusion, over-clamp,

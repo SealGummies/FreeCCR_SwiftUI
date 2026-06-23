@@ -1347,6 +1347,10 @@ class CCRBackend:
     def set_black_point(self, bgr_tuple):
         self.black_point_bgr = bgr_tuple
 
+    def clear_black_point(self):
+        """Drop the sampled black point (film base)."""
+        self.black_point_bgr = None
+
     def apply_bwpoint_to_all_images(self, progress_callback=None):
         """
         Apply B/W point film negative conversion to all loaded images using the same

@@ -398,46 +398,30 @@ class SlidersPanel(QWidget):
 
         bwp_row = theme.apply_button_row(QHBoxLayout())
         self.white_point_btn = QPushButton("Set White Point")
-        # Small "clear" button: drops the white point so conversion uses the
-        # calibrated default slope (black point only).
-        self.clear_white_point_btn = QPushButton("✕")
-        self.clear_white_point_btn.setFixedWidth(theme.GLYPH_W)
-        self.clear_white_point_btn.setFixedHeight(theme.CONTROL_H)
-        self.clear_white_point_btn.setToolTip(
-            "Clear the white point — use the calibrated default slope instead")
-        theme.style_button(self.clear_white_point_btn, "danger", glyph_only=True)
+        # Small "clear" button: drops BOTH the black and white points so the live
+        # conversion auto-fits both ends by percentile again.
+        self.clear_bwp_btn = QPushButton("✕")
+        self.clear_bwp_btn.setFixedWidth(theme.GLYPH_W)
+        self.clear_bwp_btn.setFixedHeight(theme.CONTROL_H)
+        self.clear_bwp_btn.setToolTip(
+            "Clear both the black and white points — auto-fit both ends by percentile")
+        theme.style_button(self.clear_bwp_btn, "danger", glyph_only=True)
         self.black_point_btn = QPushButton("Set Black Point")
         self.black_point_btn.setFixedHeight(theme.CONTROL_H)
         self.white_point_btn.setFixedHeight(theme.CONTROL_H)
         bwp_row.addWidget(self.black_point_btn)
         bwp_row.addWidget(self.white_point_btn)
-        bwp_row.addWidget(self.clear_white_point_btn)
+        bwp_row.addWidget(self.clear_bwp_btn)
         scroll_layout.addLayout(bwp_row)
         # Shows which anchors the live NamiColor conversion is using.
         self.bwp_mode_label = QLabel("")
         self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         scroll_layout.addWidget(self.bwp_mode_label)
-        # NamiColor converts negatives LIVE, so the current image re-renders the
-        # moment a B/W point is sampled — no per-image Convert step. The B/W
-        # points are app-global; "Apply to All" pushes the current points onto
-        # every other loaded image (re-rendering their preview + thumbnail).
+        # NamiColor converts negatives LIVE. The B/W points are app-global; every
+        # anchor change (set black, set white, or clear) automatically RECALCULATES
+        # — re-running per-image auto-gain and re-rendering every loaded image — so
+        # there are no manual "Auto Gain" / "Apply to All" buttons.
         # (spec/namicolor-bwpoint-conversion.md)
-        # Auto Gain: a hidden master-gain offset (UI sliders stay neutral) that
-        # lifts the current image's highlights until they just touch clipping
-        # after the CST, ignoring the brightest sprocket/holder outliers.
-        self.auto_gain_btn = QPushButton("Auto Gain")
-        self.auto_gain_btn.setFixedHeight(theme.CONTROL_H)
-        self.auto_gain_btn.setToolTip(
-            "Auto-expose this image: lift the highlights to clipping "
-            "(ignores sprocket holes / film holder). Crop to the image first for best results.")
-        self.apply_all_bwp_btn = QPushButton("Apply to All")
-        self.apply_all_bwp_btn.setFixedHeight(theme.CONTROL_H)
-        self.apply_all_bwp_btn.setToolTip(
-            "Re-render every loaded image with the current Black/White points")
-        apply_all_row = theme.apply_button_row(QHBoxLayout())
-        apply_all_row.addWidget(self.auto_gain_btn)
-        apply_all_row.addWidget(self.apply_all_bwp_btn)
-        scroll_layout.addLayout(apply_all_row)
 
         # Separator between B/W Point tools and the adjustment sliders
         scroll_layout.addWidget(theme.section_separator())
@@ -652,10 +636,8 @@ class SlidersPanel(QWidget):
         self.crop_btn.clicked.connect(self._on_crop_clicked)
         self.slice_btn.clicked.connect(self._on_slice_clicked)
         self.white_point_btn.clicked.connect(self._on_set_white_point)
-        self.clear_white_point_btn.clicked.connect(self._on_clear_white_point)
+        self.clear_bwp_btn.clicked.connect(self._on_clear_bwpoint)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
-        self.apply_all_bwp_btn.clicked.connect(self._on_apply_bwpoint_to_all)
-        self.auto_gain_btn.clicked.connect(self._on_auto_gain)
 
         # --- Hint label — fixed at bottom, outside scroll area ---
         self.hint_label = QLabel()
@@ -829,8 +811,7 @@ class SlidersPanel(QWidget):
         Convert/Un-convert/Auto Frame actions are commented out (NamiColor
         converts negatives live). See spec/namicolor-bwpoint-conversion.md."""
         for btn in (self.white_point_btn, self.black_point_btn,
-                    self.clear_white_point_btn, self.apply_all_bwp_btn,
-                    self.auto_gain_btn):
+                    self.clear_bwp_btn):
             btn.setEnabled(enabled)
 
     def save_slider_values(self, image_id):
@@ -1442,17 +1423,18 @@ class SlidersPanel(QWidget):
             self.set_temporary_hint(
                 "<b>Black Point:</b> Draw a rect over the transparent/clear film base.", duration=6000)
 
-    def _on_clear_white_point(self):
-        """Clear the sampled white point so the live conversion auto-fits the
-        white end by percentile again."""
+    def _on_clear_bwpoint(self):
+        """Clear BOTH the black and white points so the live conversion auto-fits
+        both ends by percentile again, then recalculate every image."""
+        ccr_backend.clear_black_point()
         ccr_backend.clear_white_point()
         mw = self.parent().parent()
         if hasattr(mw, "persist_bwpoint"):
             mw.persist_bwpoint()
         self._update_bwp_mode_label()
-        self._rerender_for_bwpoint_change()
+        self._recalculate_all()
         self.set_temporary_hint(
-            "White point cleared — the white end auto-fits by percentile again.",
+            "Black & white points cleared — both ends auto-fit by percentile again.",
             duration=5000)
 
     def _update_bwp_mode_label(self):
@@ -1472,52 +1454,31 @@ class SlidersPanel(QWidget):
         else:
             self.bwp_mode_label.setText("Anchors: auto levels (percentile)")
 
-    def _rerender_for_bwpoint_change(self):
-        """The Film B/W points are app-global and feed the live NamiColor
-        conversion, so a change re-renders the CURRENT image immediately for
-        instant feedback. Other images keep their cached previews until viewed or
-        until "Apply to All" reprocesses them (their cached anchors invalidate
-        because the points are part of the cache key)."""
-        mw = self.parent().parent()
-        idx = getattr(self.image_preview, "current_idx", None)
-        if idx is not None and 0 <= idx < len(ccr_backend.images):
-            ccr_backend.images[idx].update_thumbnail_and_preview()
-            mw.image_preview.update_preview(idx)
-            try:
-                mw.thumbnail_list.update_thumbnail(idx)
-            except Exception:
-                pass
-
-    def _on_apply_bwpoint_to_all(self):
-        """Re-render EVERY loaded image with the current (global) Film B/W points.
-        NamiColor converts live, so this just reprocesses each image's preview +
-        thumbnail (each one's cached anchors invalidate because the points are part
-        of the cache key). Runs on the GUI thread with a cancellable progress
-        dialog, since QPixmap generation must happen there."""
+    def _recalculate_all(self):
+        """Recalculate EVERY loaded image with the current (global) Film B/W
+        points: re-run each image's hidden auto-gain (over its crop area) and
+        re-render its preview + thumbnail. Triggered automatically on every anchor
+        change (set black, set white, or clear) — there are no manual Auto Gain /
+        Apply to All buttons. Runs on the GUI thread with a cancellable progress
+        dialog (QPixmap generation must happen there); the dialog only appears if
+        the pass takes a moment. See spec/namicolor-bwpoint-conversion.md."""
         from PySide6.QtWidgets import QProgressDialog
         from PySide6.QtCore import Qt
         n = len(ccr_backend.images)
         if n == 0:
             return
-        if (ccr_backend.black_point_bgr is None
-                and ccr_backend.white_point_bgr is None):
-            self.set_temporary_hint(
-                "Sample a Black and/or White Point first, then Apply to All.",
-                duration=4000)
-            return
         mw = self.parent().parent()
-        dlg = QProgressDialog("Applying B/W points to all images…", "Cancel", 0, n, self)
+        dlg = QProgressDialog("Recalculating…", "Cancel", 0, n, self)
         dlg.setWindowModality(Qt.WindowModal)
-        dlg.setMinimumDuration(0)
-        done = 0
+        dlg.setMinimumDuration(400)
         for i, img in enumerate(ccr_backend.images):
             if dlg.wasCanceled():
                 break
             try:
+                img.compute_namicolor_gain()      # per-image auto-gain (crop area)
                 img.update_thumbnail_and_preview()
-                done += 1
             except Exception as e:
-                print(f"Apply to All failed for image {i}: {e}")
+                print(f"Recalculate failed for image {i}: {e}")
             dlg.setValue(i + 1)
         dlg.close()
         try:
@@ -1527,35 +1488,6 @@ class SlidersPanel(QWidget):
         idx = getattr(self.image_preview, "current_idx", None)
         if idx is not None and 0 <= idx < len(ccr_backend.images):
             mw.image_preview.update_preview(idx)
-        self.set_temporary_hint(f"Applied the B/W points to {done} image(s).",
-                                duration=3000)
-
-    def _on_auto_gain(self):
-        """Auto-expose the current image: compute + store the hidden master-gain
-        offset that lifts its highlights to clipping, then re-render."""
-        idx = getattr(self.image_preview, "current_idx", None)
-        if idx is None or not (0 <= idx < len(ccr_backend.images)):
-            return
-        img = ccr_backend.images[idx]
-        try:
-            off = img.compute_namicolor_gain()
-        except Exception as e:
-            print(f"Auto Gain failed: {e}")
-            self.set_temporary_hint("Auto Gain unavailable for this image.", duration=4000)
-            return
-        mw = self.parent().parent()
-        img.update_thumbnail_and_preview()
-        mw.image_preview.update_preview(idx)
-        try:
-            mw.thumbnail_list.update_thumbnail(idx)
-        except Exception:
-            pass
-        if abs(off) < 1e-3:
-            self.set_temporary_hint("Auto Gain: highlights already at clipping.",
-                                    duration=3000)
-        else:
-            self.set_temporary_hint("Auto Gain applied — highlights lifted to clipping.",
-                                    duration=3000)
 
     def on_bwpoint_sampled(self, mode):
         label = "White Point" if mode == "white" else "Black Point"
@@ -1567,8 +1499,9 @@ class SlidersPanel(QWidget):
         if hasattr(mw, "persist_bwpoint"):
             mw.persist_bwpoint()
         self._update_bwp_mode_label()
-        # Live: the sampled point takes effect immediately (no Convert step).
-        self._rerender_for_bwpoint_change()
+        # Live: sampling an anchor recalculates every image immediately (per-image
+        # auto-gain + re-render) — no manual Auto Gain / Apply to All step.
+        self._recalculate_all()
         if bp_set and wp_set:
             self.set_temporary_hint(
                 f"{label} sampled — black & white points pin the levels.", duration=4000)
