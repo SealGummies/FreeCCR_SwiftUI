@@ -58,7 +58,10 @@ class ExportSettingsDialog(QDialog):
         self._positive_mode = bool(getattr(ccr_backend, "positive_mode", False))
 
         def _exportable(img):
-            return img.converted or self._positive_mode
+            # NamiColor negatives convert LIVE (never flagged `converted`) but still
+            # export as positives — treat an active NamiColor image as exportable.
+            return (img.converted or self._positive_mode
+                    or getattr(img, "_namicolor_active", lambda: False)())
 
         self._converted_indices = [idx for idx, img in enumerate(ccr_backend.images)
                                    if _exportable(img)]

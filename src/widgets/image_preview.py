@@ -3461,8 +3461,11 @@ class ImagePreview(QWidget):
     def open_export_dialog(self, checked=False, default_scope=None):
         # `checked` absorbs the bool QAction.triggered emits; `default_scope`
         # is passed by callers (e.g. the thumbnail right-click "Export").
+        # NamiColor negatives convert LIVE (never flagged `converted`) but still
+        # export as positives, so _shows_as_positive() counts as exportable too.
         if not (ccr_backend.positive_mode and ccr_backend.images) and \
-                not any(img.converted for img in ccr_backend.images):
+                not any(img.converted or _shows_as_positive(img)
+                        for img in ccr_backend.images):
             QMessageBox.information(self, "Nothing to Export",
                                     "Convert at least one image before exporting.")
             return
