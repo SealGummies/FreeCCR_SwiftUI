@@ -80,5 +80,16 @@ live conversion), with `auto_anchors` computed by a new
 ## 6. Known limitations / future
 - Histogram is post-CST (no Cineon-log parade) — dial by eye, as in PR #44.
 - Export ICC is tagged sRGB while pixels are Rec.709/2.2 (shared primaries).
-- Reference-frame code is commented, not deleted; catalogs with `mode:"ref"` /
-  `mode:"bw"` conversions are not replayed (the live path supersedes them).
+- Reference-frame code is commented, not deleted; the now-orphaned handler
+  methods (`convert_ccr` / `unconvert_ccr` / `auto_frame`, the B/W `_on_convert_*`
+  handlers, AutoFrameWorker/Dialog) remain as parked dead code.
+- **Old catalogs are NOT replayed**: a stored v0.2.3 `mode:"ref"`/`mode:"bw"`
+  bake would be wrong against the Adobe-linear decode, so `catalog._replay_conversion`
+  is skipped when NamiColor is on — the image loads unconverted and converts live.
+- **Tethering**: `TetherWatchWorker._convert` no-ops under NamiColor — captures
+  convert live from the global B/W points instead of baking.
+- `FREECCR_NAMICOLOR=0` is debug-only: it disables the live conversion but the
+  reference-frame UI is commented out, so negatives can't be converted that way.
+- Anchors are measured on the preview-resolution negative and reused for export
+  (intentional — keeps preview and export identical; density percentiles are
+  scale-stable).

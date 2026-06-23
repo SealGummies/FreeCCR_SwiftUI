@@ -203,7 +203,13 @@ class TetherWatchWorker(QObject):
         conversion_inputs snapshot the export/catalog paths replay). Mirrors
         CCRBackend.apply_bwpoint_to_all_images. On failure the image is left
         unconverted but still importable."""
-        from core.ccr_processor import ccr_normalize_with_bwpoint
+        from core.ccr_processor import NAMICOLOR_CONVERSION, ccr_normalize_with_bwpoint
+        if NAMICOLOR_CONVERSION:
+            # NamiColor converts negatives LIVE from the global B/W points — no
+            # bake, and the Adobe-linear decode is incompatible with the old
+            # bwpoint normalize. Leave the capture unconverted; its preview/export
+            # render through the live NamiColor path. See spec/namicolor-bwpoint-conversion.md.
+            return
         try:
             processed = ccr_normalize_with_bwpoint(img, black, white)
             if processed is not None:

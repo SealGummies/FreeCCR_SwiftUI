@@ -387,8 +387,15 @@ def _restore_image(file_path: str, state: dict):
         positive = bool(ccr_backend.positive_mode)
     except Exception:
         positive = False
+    # The NamiColor conversion converts negatives LIVE from the global B/W points
+    # / percentiles and decodes to Adobe-linear, so a stored v0.2.3 reference /
+    # B-W bake must NOT be replayed onto it (it expects raw-sensor data and would
+    # come out colour-wrong). Leaving `converted` False routes the image through
+    # the live NamiColor path. See spec/namicolor-bwpoint-conversion.md §6.
+    from core.ccr_processor import NAMICOLOR_CONVERSION
     ci = _ci_from_json(state.get("conversion_inputs"))
-    if state.get("converted") and ci is not None and not positive:
+    if (state.get("converted") and ci is not None and not positive
+            and not NAMICOLOR_CONVERSION):
         _replay_conversion(img, ci)
 
     # Bases AFTER the replay (the bw pipeline writes its own defaults)

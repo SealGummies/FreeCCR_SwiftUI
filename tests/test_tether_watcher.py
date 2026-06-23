@@ -171,12 +171,18 @@ def test_worker_converts_with_bwpoint(tmp_path):
 
         assert len(got) == 1
         img = got[0]
-        assert img.converted is True
-        assert img.conversion_inputs is not None
-        assert img.conversion_inputs["mode"] == "bw"
-        bw = img.conversion_inputs["bw"]
-        assert tuple(bw[0]) == (60000.0, 60000.0, 60000.0)
-        assert tuple(bw[1]) == (5000.0, 5000.0, 5000.0)
+        from core.ccr_processor import NAMICOLOR_CONVERSION
+        if NAMICOLOR_CONVERSION:
+            # NamiColor converts captures LIVE from the global B/W points — the
+            # worker no longer bakes (spec/namicolor-bwpoint-conversion.md).
+            assert img.converted is False
+        else:
+            assert img.converted is True
+            assert img.conversion_inputs is not None
+            assert img.conversion_inputs["mode"] == "bw"
+            bw = img.conversion_inputs["bw"]
+            assert tuple(bw[0]) == (60000.0, 60000.0, 60000.0)
+            assert tuple(bw[1]) == (5000.0, 5000.0, 5000.0)
     finally:
         ccr_backend.black_point_bgr = None
         ccr_backend.white_point_bgr = None
@@ -200,11 +206,15 @@ def test_worker_converts_with_black_point_only(tmp_path):
 
         assert len(got) == 1
         img = got[0]
-        assert img.converted is True
-        assert img.conversion_inputs["mode"] == "bw"
-        bw = img.conversion_inputs["bw"]
-        assert tuple(bw[0]) == (60000.0, 60000.0, 60000.0)
-        assert bw[1] is None       # no white point → default-slope mode
+        from core.ccr_processor import NAMICOLOR_CONVERSION
+        if NAMICOLOR_CONVERSION:
+            assert img.converted is False   # NamiColor converts live; no bake
+        else:
+            assert img.converted is True
+            assert img.conversion_inputs["mode"] == "bw"
+            bw = img.conversion_inputs["bw"]
+            assert tuple(bw[0]) == (60000.0, 60000.0, 60000.0)
+            assert bw[1] is None       # no white point → default-slope mode
     finally:
         ccr_backend.black_point_bgr = None
         ccr_backend.white_point_bgr = None

@@ -816,9 +816,10 @@ class SlidersPanel(QWidget):
 
     def set_negative_controls_enabled(self, enabled: bool):
         """Enable/disable the film-negative-only controls (the Film B/W Point
-        tools). Disabled in global Positive mode, where there is nothing to
-        convert. The toolbar's Convert/Un-convert/Auto Frame are gated
-        separately in ImagePreview."""
+        tools that pin the live NamiColor anchors). Disabled in global Positive
+        mode, where there is nothing to sample. The old reference-frame
+        Convert/Un-convert/Auto Frame actions are commented out (NamiColor
+        converts negatives live). See spec/namicolor-bwpoint-conversion.md."""
         for btn in (self.white_point_btn, self.black_point_btn,
                     self.clear_white_point_btn):
             btn.setEnabled(enabled)

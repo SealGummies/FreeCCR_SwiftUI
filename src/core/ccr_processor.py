@@ -1278,10 +1278,13 @@ def ccr_export_positive(ccr_image, output_path=None, water_mark=True, jpg_out=Fa
                         jpg_quality=95, max_long_side=None, output_colorspace="srgb"):
     """Positive-mode processing/export: NO negative inversion.
 
-    The image is already a normal positive (decoded in sRGB; see
-    spec/positive-mode.md), so this just applies the user adjustments, crop,
-    orientation, optional watermark and output colour space — mirroring the
-    bwpoint export tail without the normalization step.
+    Two callers: (1) global Positive mode — the image is already a normal positive
+    (decoded in sRGB; see spec/positive-mode.md); (2) a NamiColor negative — decoded
+    Adobe-RGB/linear and converted LIVE inside apply_adjustments (NamiColor invert +
+    auto-levels + Cineon->Rec.709 CST; see spec/namicolor-bwpoint-conversion.md).
+    Either way this just applies the user adjustments, crop, orientation, optional
+    watermark and output colour space — mirroring the bwpoint export tail without a
+    separate normalization step.
 
     output_path is None returns the adjusted in-memory array (parity with the
     other normalize functions); otherwise the file is written and None returned.

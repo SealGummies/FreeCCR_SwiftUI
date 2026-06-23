@@ -77,6 +77,12 @@ class TestCatalogRoundTrip:
         catalog.update_for_images([img], path=cat)
 
         restored = catalog.create_images_for_path(path, path=cat)[0]
+        from core.ccr_processor import NAMICOLOR_CONVERSION
+        if NAMICOLOR_CONVERSION:
+            # NamiColor converts live; the stored v0.2.3 reference bake is NOT
+            # replayed (spec/namicolor-bwpoint-conversion.md §6).
+            assert not restored.converted
+            return
         assert restored.converted
         assert restored.conversion_inputs == img.conversion_inputs
         np.testing.assert_allclose(restored.resized_raw.astype(np.int64),
@@ -101,6 +107,12 @@ class TestCatalogRoundTrip:
                ["negative_s1.png", "negative_s2.png"]
         assert restored[0].source_ops == ccr_backend.images[0].source_ops
         assert restored[0].adjustment_settings == {"contrast": 20}
+        from core.ccr_processor import NAMICOLOR_CONVERSION
+        if NAMICOLOR_CONVERSION:
+            # NamiColor converts live; slices are not replayed from the bake.
+            for r in restored:
+                assert not r.converted
+            return
         for r, orig in zip(restored, originals):
             assert r.converted
             assert r.conversion_inputs["mode"] == "ref_params"
@@ -123,6 +135,10 @@ class TestCatalogRoundTrip:
         catalog.update_for_images([img], path=cat)
 
         restored = catalog.create_images_for_path(path, path=cat)[0]
+        from core.ccr_processor import NAMICOLOR_CONVERSION
+        if NAMICOLOR_CONVERSION:
+            assert not restored.converted   # converts live, no replay
+            return
         assert restored.converted
         assert restored.conversion_inputs["mode"] == "bw"
         # bases written by the bw pipeline must match what was stored
@@ -228,7 +244,10 @@ class TestCatalogInvalidation:
         img.reference_frame = None  # user right-clicked the frame away
         catalog.update_for_images([img], path=cat)
         restored = catalog.create_images_for_path(path, path=cat)[0]
-        assert restored.converted
+        from core.ccr_processor import NAMICOLOR_CONVERSION
+        if not NAMICOLOR_CONVERSION:
+            assert restored.converted   # classic: the reference bake is replayed
+        # The cleared reference frame must stay cleared regardless of conversion.
         assert restored.reference_frame is None
 
 

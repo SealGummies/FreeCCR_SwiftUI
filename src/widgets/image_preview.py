@@ -136,7 +136,7 @@ class GraphicsImageView(QGraphicsView):
                 and self.parent_widget.pixmap_item is not None):
             # Middle-button drag pans the (zoomed) image — works in any mode,
             # but not while another interaction or space-pan is already active.
-            interaction_active = (self.drawing_reference or self._space_pan
+            interaction_active = (self._space_pan
                                   or self._bw_drag_start is not None
                                   or self.parent_widget.crop_mode
                                   or (self.parent_widget.dust_mode
@@ -186,6 +186,7 @@ class GraphicsImageView(QGraphicsView):
                 self.scene().removeItem(self._bw_rect_item)
                 self._bw_rect_item = None
             self.viewport().update()
+            return
         # --- Reference-frame drawing / right-click removal — commented out;
         # --- NamiColor converts negatives live with no reference frame. With
         # --- drawing_reference never set True, the reference blocks in
@@ -250,10 +251,11 @@ class GraphicsImageView(QGraphicsView):
         if self.bwpoint_mode and self._bw_drag_start is not None:
             self._bw_drag_end = self.mapToScene(event.pos())
             self._update_bw_rect(self._bw_drag_start, self._bw_drag_end)
-        elif self.drawing_reference:
-            self._drag_end = self.mapToScene(event.pos())
-            self.viewport().update()
-            self.parent_widget.update_reference_rect(self._drag_start, self._drag_end)
+        # --- Reference-frame drag update — commented out (NamiColor converts live).
+        # elif self.drawing_reference:
+        #     self._drag_end = self.mapToScene(event.pos())
+        #     self.viewport().update()
+        #     self.parent_widget.update_reference_rect(self._drag_start, self._drag_end)
 
     def _update_bw_rect(self, start, end):
         """Draw the B/W point selection rect on the canvas."""
@@ -428,55 +430,46 @@ class GraphicsImageView(QGraphicsView):
                                 pass
             return
 
-        if self.drawing_reference and event.button() == Qt.LeftButton:
-            self._drag_end = self.mapToScene(event.pos())
-            self.drawing_reference = False
-
-            # Build the base (coarse) transform (same as in update_reference_rect)
-            cx = self.parent_widget.current_pixmap.width() / 2
-            cy = self.parent_widget.current_pixmap.height() / 2
-            base_transform = QTransform()
-            base_transform.translate(cx, cy)
-
-            if self.parent_widget.current_vertical_flip:
-                base_transform.scale(1, -1)
-            if self.parent_widget.current_horizontal_flip:
-                base_transform.scale(-1, 1)
-            if self.parent_widget.current_rotation:
-                base_transform.rotate(self.parent_widget.current_rotation)
-            base_transform.translate(-cx, -cy)
-
-            if not base_transform.isInvertible():
-                return
-            inv_transform = base_transform.inverted()[0]
-            start_local = inv_transform.map(self._drag_start)
-            end_local = inv_transform.map(self._drag_end)
-
-            x1, y1 = start_local.x(), start_local.y()
-            x2, y2 = end_local.x(), end_local.y()
-            x, y = min(x1, x2), min(y1, y2)
-            x2, y2 = max(x1, x2), max(y1, y2)
-            w, h = x2 - x, y2 - y
-            if w > 20 and h > 20:
-                # Map from displayed (possibly cropped/rotated) coords to
-                # full-image coords. All FOUR corners must be mapped — under
-                # a rotated crop the two-diagonal AABB degenerates — and the
-                # minimum size re-checked in full-image space.
-                pw = self.parent_widget
-                pts = [pw.map_displayed_to_full(px, py)
-                       for px, py in ((x, y), (x2, y), (x, y2), (x2, y2))]
-                fx1 = int(min(p[0] for p in pts))
-                fy1 = int(min(p[1] for p in pts))
-                fx2 = int(max(p[0] for p in pts))
-                fy2 = int(max(p[1] for p in pts))
-                if (fx2 - fx1) > 20 and (fy2 - fy1) > 20:
-                    ccr_backend.set_reference_frame_by_index(
-                        pw.current_idx, (fx1, fy1, fx2, fy2))
-                    pw.parent().parent().sliders_panel.set_temporary_hint(
-                        "<b>Hint:</b><br>Reference frame set! Click the Convert button to view the updates.",
-                        duration=5000
-                    )
-                    print("Set reference frame:", (fx1, fy1, fx2, fy2))
+        # --- Reference-frame finalization — commented out (NamiColor converts
+        # --- live; drawing_reference is never set True). spec/namicolor-bwpoint-conversion.md
+        # if self.drawing_reference and event.button() == Qt.LeftButton:
+        #     self._drag_end = self.mapToScene(event.pos())
+        #     self.drawing_reference = False
+        #     cx = self.parent_widget.current_pixmap.width() / 2
+        #     cy = self.parent_widget.current_pixmap.height() / 2
+        #     base_transform = QTransform()
+        #     base_transform.translate(cx, cy)
+        #     if self.parent_widget.current_vertical_flip:
+        #         base_transform.scale(1, -1)
+        #     if self.parent_widget.current_horizontal_flip:
+        #         base_transform.scale(-1, 1)
+        #     if self.parent_widget.current_rotation:
+        #         base_transform.rotate(self.parent_widget.current_rotation)
+        #     base_transform.translate(-cx, -cy)
+        #     if not base_transform.isInvertible():
+        #         return
+        #     inv_transform = base_transform.inverted()[0]
+        #     start_local = inv_transform.map(self._drag_start)
+        #     end_local = inv_transform.map(self._drag_end)
+        #     x1, y1 = start_local.x(), start_local.y()
+        #     x2, y2 = end_local.x(), end_local.y()
+        #     x, y = min(x1, x2), min(y1, y2)
+        #     x2, y2 = max(x1, x2), max(y1, y2)
+        #     w, h = x2 - x, y2 - y
+        #     if w > 20 and h > 20:
+        #         pw = self.parent_widget
+        #         pts = [pw.map_displayed_to_full(px, py)
+        #                for px, py in ((x, y), (x2, y), (x, y2), (x2, y2))]
+        #         fx1 = int(min(p[0] for p in pts))
+        #         fy1 = int(min(p[1] for p in pts))
+        #         fx2 = int(max(p[0] for p in pts))
+        #         fy2 = int(max(p[1] for p in pts))
+        #         if (fx2 - fx1) > 20 and (fy2 - fy1) > 20:
+        #             ccr_backend.set_reference_frame_by_index(
+        #                 pw.current_idx, (fx1, fy1, fx2, fy2))
+        #             pw.parent().parent().sliders_panel.set_temporary_hint(
+        #                 "<b>Hint:</b><br>Reference frame set! Click Convert to view.",
+        #                 duration=5000)
         self.parent_widget.update_preview(self.parent_widget.current_idx)
 
     def resizeEvent(self, event):
