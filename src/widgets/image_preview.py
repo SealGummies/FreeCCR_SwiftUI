@@ -13,6 +13,16 @@ from core.ccr_processor import apply_dust_removal, NAMICOLOR_CONVERSION
 from widgets.export_dialog import ExportSettingsDialog
 from ui import theme
 import math
+
+
+def _shows_as_positive(img) -> bool:
+    """True when an image is displayed as a finished positive — a converted
+    negative, global Positive mode, or a live NamiColor negative. Tolerant of
+    lightweight test stubs that lack _namicolor_active()."""
+    if getattr(img, "converted", False) or ccr_backend.positive_mode:
+        return True
+    fn = getattr(img, "_namicolor_active", None)
+    return bool(fn()) if callable(fn) else False
 import copy
 import sys
 import os
@@ -985,7 +995,7 @@ class ImagePreview(QWidget):
         if self.area_mode and not self._area_rerender:
             active_gone = img_obj_now.get_area(
                 getattr(img_obj_now, "active_area_id", None)) is None
-            editable = img_obj_now.converted or ccr_backend.positive_mode
+            editable = _shows_as_positive(img_obj_now)
             if not same_image or active_gone or not editable:
                 self._exit_area_mode()
         # Dust mode leaves on an image switch (like crop/area), so a half-drawn
@@ -1021,8 +1031,9 @@ class ImagePreview(QWidget):
 
         # Display-level crop: show only the cropped region, except in crop
         # mode where the full image is shown so the user can adjust/regret.
-        # Skipped for un-converted images: the crop tool is disabled there,
-        # and the full negative (incl. film base) is needed to draw frames.
+        # Applied for a displayed positive: a converted negative, positive mode,
+        # or a live NamiColor negative. (A raw un-converted negative would show
+        # its full frame so the crop has no effect.)
         prev_display_transform = self._crop_display_transform
         self._crop_display_transform = None
         self._crop_display_angle = 0.0
@@ -1031,7 +1042,7 @@ class ImagePreview(QWidget):
         if (preview_img is not None and not preview_img.isNull()
                 and crop is not None and not self.crop_mode and not self.slice_mode
                 and not self.area_mode and not self.dust_mode
-                and (ccr_backend.images[idx].converted or ccr_backend.positive_mode)):
+                and _shows_as_positive(ccr_backend.images[idx])):
             if crop_angle:
                 extracted = self._extract_rotated_crop(preview_img, crop, crop_angle)
                 if extracted is not None:
@@ -1571,8 +1582,7 @@ class ImagePreview(QWidget):
             return False
         img = (ccr_backend.get_image_by_index(self.current_idx)
                if self.current_idx is not None else None)
-        if img is None or not (getattr(img, "converted", False)
-                               or ccr_backend.positive_mode):
+        if img is None or not _shows_as_positive(img):
             return False
         crop = getattr(img, "crop_rect", None)
         if crop is None:
@@ -1773,7 +1783,7 @@ class ImagePreview(QWidget):
         angle = getattr(img, "crop_angle", 0.0) or 0.0
         crop_active = (crop is not None and not self.crop_mode
                        and not self.slice_mode
-                       and (img.converted or ccr_backend.positive_mode))
+                       and _shows_as_positive(img))
         crop_sig = (crop, angle) if crop_active else None
         if cache.get("display_pm") is not None and cache.get("crop_sig") == crop_sig:
             return cache["display_pm"]
@@ -3586,7 +3596,8 @@ class HiResDetailWorker(QThread):
         # conversion both skip the negative display auto-brightness, like
         # update_thumbnail_and_preview — their output is already a positive.
         self._positive_mode = ccr_backend.positive_mode
-        self._namicolor = img_obj._namicolor_active()
+        _na = getattr(img_obj, "_namicolor_active", None)
+        self._namicolor = bool(_na()) if callable(_na) else False
         ci = getattr(img_obj, "conversion_inputs", None)
         self._conversion_inputs = dict(ci) if ci else None
 

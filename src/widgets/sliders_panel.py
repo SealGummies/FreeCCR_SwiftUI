@@ -417,18 +417,18 @@ class SlidersPanel(QWidget):
         self.bwp_mode_label = QLabel("")
         self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         scroll_layout.addWidget(self.bwp_mode_label)
-        # --- Convert Current / Convert All buttons removed: NamiColor converts
-        # --- negatives LIVE — sampling a B/W point re-renders immediately, no
-        # --- explicit Convert step. (spec/namicolor-bwpoint-conversion.md)
-        # self.convert_current_bwp_btn = QPushButton("Convert Current")
-        # self.convert_all_bwp_btn = QPushButton("Convert All")
-        # theme.style_button(self.convert_current_bwp_btn, "primary")
-        # self.convert_current_bwp_btn.setFixedHeight(theme.CONTROL_H)
-        # self.convert_all_bwp_btn.setFixedHeight(theme.CONTROL_H)
-        # convert_row = theme.apply_button_row(QHBoxLayout())
-        # convert_row.addWidget(self.convert_current_bwp_btn)
-        # convert_row.addWidget(self.convert_all_bwp_btn)
-        # scroll_layout.addLayout(convert_row)
+        # NamiColor converts negatives LIVE, so the current image re-renders the
+        # moment a B/W point is sampled — no per-image Convert step. The B/W
+        # points are app-global; "Apply to All" pushes the current points onto
+        # every other loaded image (re-rendering their preview + thumbnail).
+        # (spec/namicolor-bwpoint-conversion.md)
+        self.apply_all_bwp_btn = QPushButton("Apply to All")
+        self.apply_all_bwp_btn.setFixedHeight(theme.CONTROL_H)
+        self.apply_all_bwp_btn.setToolTip(
+            "Re-render every loaded image with the current Black/White points")
+        apply_all_row = theme.apply_button_row(QHBoxLayout())
+        apply_all_row.addWidget(self.apply_all_bwp_btn)
+        scroll_layout.addLayout(apply_all_row)
 
         # Separator between B/W Point tools and the adjustment sliders
         scroll_layout.addWidget(theme.section_separator())
@@ -645,9 +645,7 @@ class SlidersPanel(QWidget):
         self.white_point_btn.clicked.connect(self._on_set_white_point)
         self.clear_white_point_btn.clicked.connect(self._on_clear_white_point)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
-        # Convert Current / Convert All removed — conversion is live (see above).
-        # self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
-        # self.convert_all_bwp_btn.clicked.connect(self._on_convert_all_bwpoint)
+        self.apply_all_bwp_btn.clicked.connect(self._on_apply_bwpoint_to_all)
 
         # --- Hint label — fixed at bottom, outside scroll area ---
         self.hint_label = QLabel()
@@ -821,7 +819,7 @@ class SlidersPanel(QWidget):
         Convert/Un-convert/Auto Frame actions are commented out (NamiColor
         converts negatives live). See spec/namicolor-bwpoint-conversion.md."""
         for btn in (self.white_point_btn, self.black_point_btn,
-                    self.clear_white_point_btn):
+                    self.clear_white_point_btn, self.apply_all_bwp_btn):
             btn.setEnabled(enabled)
 
     def save_slider_values(self, image_id):
@@ -1461,18 +1459,61 @@ class SlidersPanel(QWidget):
 
     def _rerender_for_bwpoint_change(self):
         """The Film B/W points are app-global and feed the live NamiColor
-        conversion, so a change re-renders every frame. The current image is
-        recomputed immediately for instant feedback; thumbnails refresh too (each
-        image's cached anchors invalidate because the points changed)."""
+        conversion, so a change re-renders the CURRENT image immediately for
+        instant feedback. Other images keep their cached previews until viewed or
+        until "Apply to All" reprocesses them (their cached anchors invalidate
+        because the points are part of the cache key)."""
         mw = self.parent().parent()
         idx = getattr(self.image_preview, "current_idx", None)
         if idx is not None and 0 <= idx < len(ccr_backend.images):
             ccr_backend.images[idx].update_thumbnail_and_preview()
             mw.image_preview.update_preview(idx)
+            try:
+                mw.thumbnail_list.update_thumbnail(idx)
+            except Exception:
+                pass
+
+    def _on_apply_bwpoint_to_all(self):
+        """Re-render EVERY loaded image with the current (global) Film B/W points.
+        NamiColor converts live, so this just reprocesses each image's preview +
+        thumbnail (each one's cached anchors invalidate because the points are part
+        of the cache key). Runs on the GUI thread with a cancellable progress
+        dialog, since QPixmap generation must happen there."""
+        from PySide6.QtWidgets import QProgressDialog
+        from PySide6.QtCore import Qt
+        n = len(ccr_backend.images)
+        if n == 0:
+            return
+        if (ccr_backend.black_point_bgr is None
+                and ccr_backend.white_point_bgr is None):
+            self.set_temporary_hint(
+                "Sample a Black and/or White Point first, then Apply to All.",
+                duration=4000)
+            return
+        mw = self.parent().parent()
+        dlg = QProgressDialog("Applying B/W points to all images…", "Cancel", 0, n, self)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        done = 0
+        for i, img in enumerate(ccr_backend.images):
+            if dlg.wasCanceled():
+                break
+            try:
+                img.update_thumbnail_and_preview()
+                done += 1
+            except Exception as e:
+                print(f"Apply to All failed for image {i}: {e}")
+            dlg.setValue(i + 1)
+        dlg.close()
         try:
             mw.thumbnail_list.update_all_thumbnails()
         except Exception:
             pass
+        idx = getattr(self.image_preview, "current_idx", None)
+        if idx is not None and 0 <= idx < len(ccr_backend.images):
+            mw.image_preview.update_preview(idx)
+        self.set_temporary_hint(f"Applied the B/W points to {done} image(s).",
+                                duration=3000)
 
     def on_bwpoint_sampled(self, mode):
         label = "White Point" if mode == "white" else "Black Point"
