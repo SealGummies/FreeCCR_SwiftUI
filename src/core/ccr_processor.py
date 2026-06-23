@@ -2129,11 +2129,14 @@ NAMICOLOR_EXPERIMENT = os.environ.get("FREECCR_NAMICOLOR", "1") != "0"
 # Fit-to-Cineon-Base step (places Dmin at code value ~95). On by default.
 NAMICOLOR_FIT_CINEON = os.environ.get("FREECCR_NAMICOLOR_FIT", "1") != "0"
 
-# Auto-levels: fit each channel's darkest->95/1023 and brightest->685/1023 the
-# moment a negative loads; the sliders then refine on top (spec §2.5). Default on.
+# Auto-levels (spec §2.5): a hidden, post-invert per-channel correction the app
+# holds for the user — the UI sliders stay neutral (0) and the user's moves ADD
+# on top. Maps each channel's lowest 0.5% of the inverted image to Cineon
+# 95/1023 and the highest 0.5% to 685/1023, measured over the actual image area
+# (the crop region when set). Default on.
 NAMICOLOR_AUTO = os.environ.get("FREECCR_NAMICOLOR_AUTO", "1") != "0"
-_NAMI_LOW  = float(os.environ.get("FREECCR_NAMICOLOR_LOW", "1.0"))    # -> 95/1023
-_NAMI_HIGH = float(os.environ.get("FREECCR_NAMICOLOR_HIGH", "99.0"))  # -> 685/1023
+_NAMI_LOW  = float(os.environ.get("FREECCR_NAMICOLOR_LOW", "0.5"))    # lowest 0.5% -> 95/1023
+_NAMI_HIGH = float(os.environ.get("FREECCR_NAMICOLOR_HIGH", "99.5"))  # highest 0.5% -> 685/1023
 
 # Slider -> NamiColor-parameter scales (env-tunable; the author dials by eye).
 _NAMI_INPUTGAIN_DEN = float(os.environ.get("FREECCR_NAMICOLOR_IG", "100"))   # 2**(v/den)
@@ -2175,9 +2178,14 @@ def _namicolor_density(lin_rec2020: np.ndarray) -> np.ndarray:
 
 
 def namicolor_auto_anchors(img16_adobe_linear: np.ndarray):
-    """Per-channel (R,G,B) low/high density percentiles for auto-levels: map each
-    channel's p_lo -> 95/1023 and p_hi -> 685/1023. Resolution-independent, so
-    compute once on the preview negative and cache. Returns (p_lo[3], p_hi[3])."""
+    """The hidden auto-levels correction: per-channel (R,G,B) low/high percentiles
+    of the INVERTED image (the density that NamiColor produces), so the lowest
+    0.5% of each channel maps to 95/1023 and the highest 0.5% to 685/1023.
+
+    Pass `img16_adobe_linear` already cropped to the actual image area (no film
+    holder / sprockets). Resolution-independent, so compute once on the preview
+    negative and cache. Returns (p_lo[3], p_hi[3]) — the offset the app holds for
+    the user while the UI sliders stay neutral."""
     x = img16_adobe_linear.astype(np.float32) / np.float32(65535.0)
     x = x @ M_ADOBE2REC2020.T
     d = _namicolor_density(x).reshape(-1, 3)
@@ -2221,9 +2229,13 @@ def namicolor_channel_transform(lin_rec2020: np.ndarray, s: dict,
         if anchors is not None:
             p_lo, p_hi = anchors
             span = max(float(p_hi[c]) - float(p_lo[c]), 1e-4)
-            # Auto-fit: darkest part -> 95/1023, brightest -> 685/1023.
+            # Hidden auto-levels correction (app-held offset; UI sliders stay
+            # neutral): lowest 0.5% -> 95/1023, highest 0.5% -> 685/1023. The
+            # slider terms below then ADD on top of this (all sliders 0 = pure
+            # auto). A brighter scan pixel still yields a LOWER cv (inversion).
             d = B + (d - np.float32(p_lo[c])) * np.float32((float(W) - float(B)) / span)
-            # InputGain becomes a master contrast about Cineon 18% grey.
+            # InputGain is the only master that isn't an additive nudge — a
+            # contrast about Cineon 18% grey (neutral at the slider's 0).
             if input_gain != 1.0:
                 d = G + (d - G) * np.float32(input_gain)
         else:
