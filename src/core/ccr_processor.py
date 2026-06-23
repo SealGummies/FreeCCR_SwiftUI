@@ -2167,13 +2167,16 @@ def _namicolor_density(lin_rec2020: np.ndarray) -> np.ndarray:
     return -np.log10(x)
 
 
-def _point_density(point_bgr) -> np.ndarray:
-    """Per-channel (R,G,B) density of a sampled Film B/W point. `point_bgr` is a
-    (B,G,R) scan value in the Adobe-linear decode; returns the Rec.2020 density
-    used as that end's auto-levels anchor."""
-    rgb = np.array([point_bgr[2], point_bgr[1], point_bgr[0]],
-                   dtype=np.float32) / np.float32(65535.0)
-    rec = rgb @ M_ADOBE2REC2020.T
+def _point_density(point_rgb) -> np.ndarray:
+    """Per-channel (R,G,B) density of a sampled Film B/W point, used as that end's
+    auto-levels anchor. `point_rgb` is the (ch0, ch1, ch2) average of the
+    Adobe-linear working image at the sampled region — the app variable is named
+    "..._bgr" but resized_raw (and the sample) are RGB-order (rawpy output; the
+    non-RAW path converts BGR->RGB), the same order namicolor_anchors feeds the
+    matrix, so NO channel reversal here."""
+    p = np.array([point_rgb[0], point_rgb[1], point_rgb[2]],
+                 dtype=np.float32) / np.float32(65535.0)
+    rec = p @ M_ADOBE2REC2020.T
     return _namicolor_density(rec).astype(np.float32)
 
 

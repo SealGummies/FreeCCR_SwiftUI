@@ -113,6 +113,14 @@ class TestBWPointAnchors(unittest.TestCase):
         np.testing.assert_allclose(lo, base_lo, rtol=1e-5)
         self.assertFalse(np.allclose(hi, base_hi))
 
+    def test_point_channel_order_no_rb_swap(self):
+        # The sampled point is RGB-order (resized_raw is RGB). A point bright in R
+        # and dark in B must give a LOWER density anchor for R than for B — guards
+        # against an R/B reversal in _point_density.
+        from core.ccr_processor import _point_density
+        d = _point_density((60000, 20000, 4000))   # (R high, G mid, B low)
+        self.assertLess(float(d[0]), float(d[2]))
+
     def test_high_anchor_kept_above_low(self):
         # A mis-sampled pair (black darker than white) must not invert the channel.
         img = _gradient_negative()
