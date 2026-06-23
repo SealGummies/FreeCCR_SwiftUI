@@ -8,9 +8,14 @@ percentiles. Conversion is **live/automatic** — no Convert buttons.
 ## 1. Goals / Non-goals
 ### Goals
 - Replace the B/W-point conversion **calculation** with NamiColor invert + CST.
-- Per channel: **black point → 95/1023**, **white point → 685/1023** (Cineon).
+- Per channel: **black point → 95/1023** (Cineon black), **white point → the
+  white TARGET** (`_NAMI_WHITE_TARGET`, default **665**/1023 — just below the 685
+  Cineon white for a bit of highlight headroom; env `FREECCR_NAMICOLOR_WHITE_TARGET`).
   If a point is unset, use the percentile for that end (low 0.5% → 95, high
-  99.5% → 685). Neither set ⇒ pure percentile auto-levels (the experiment).
+  99.5% → the white target). Neither set ⇒ pure percentile auto-levels.
+- **B/W points are session-only**: never persisted across restarts, and **reset on
+  every file load** (`ccr_backend.load_images_from_files`). Tether captures keep
+  the in-session points (different load path).
 - **Live**: the negative always shows the converted positive; sampling a point
   re-renders immediately. Remove **Convert Current** / **Convert All**.
 - The NamiColor "Channel Levels" sliders remain a neutral-by-default refinement
@@ -33,11 +38,12 @@ Adobe→Rec.2020 linear scan):
 
 ```
 p_lo[c] = density(black_point)[c]   if black set   else percentile(d_c, 0.5)   # → 95/1023
-p_hi[c] = density(white_point)[c]   if white set   else percentile(d_c, 99.5)  # → 685/1023
+p_hi[c] = density(white_point)[c]   if white set   else percentile(d_c, 99.5)  # → white target (665)
 ```
 where `density(point)` = `−log10(16 · (point_rgb/65535 @ M_ADOBE2REC2020ᵀ))`.
 Clamp `p_hi ≥ p_lo + ε` per channel. Then the existing NamiColor affine maps
-`[p_lo, p_hi] → [95/1023, 685/1023]` and the CST renders to Rec.709/2.2.
+`[p_lo, p_hi] → [95/1023, 665/1023]` (white target, headroom below the 685 Cineon
+white the CST decodes to 1.0) and the CST renders to Rec.709/2.2.
 
 A clear-base black point and a dense white point are *constant across the roll*
 (no_auto_bright decode), so the same global points anchor every frame; the

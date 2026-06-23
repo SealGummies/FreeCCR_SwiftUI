@@ -56,6 +56,11 @@ class CCRBackend:
         """Load files (with catalog restore). Returns the number of FILES
         that produced at least one image (a sliced file yields several)."""
         self.images.clear()
+        # Loading a new batch resets the global Film B/W point anchors — they are
+        # per-session/per-batch and never persisted across restarts. (Folder loads
+        # route through here too; tether captures use a different path.)
+        self.black_point_bgr = None
+        self.white_point_bgr = None
         self.file_paths = file_paths
         # Preserved removal states belong to the previous batch (the open
         # flows save the catalog before loading a new one)

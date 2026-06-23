@@ -181,9 +181,8 @@ class MainWindow(QMainWindow):
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
 
-        # Restore a persisted global B/W point (set in a prior session) so
-        # tethering can auto-convert captures right away. Before any image loads.
-        self._restore_bwpoint()
+        # B/W points are SESSION-ONLY — not restored from a prior session, and
+        # reset on every file load (see ccr_backend.load_images_from_files).
 
         self.installEventFilter(self)
         self.create_menu()
@@ -527,6 +526,11 @@ class MainWindow(QMainWindow):
         """Called when the loader thread finishes. Nulls the references so isRunning() is never called on a deleted C++ object."""
         self._loader_thread = None
         self._loader_worker = None
+        # The batch load reset the global B/W anchors — refresh the panel label.
+        try:
+            self.sliders_panel._update_bwp_mode_label()
+        except Exception:
+            pass
 
     def _stop_loader_if_running(self):
         """Cancel and join any in-progress loader thread."""
@@ -904,20 +908,10 @@ class MainWindow(QMainWindow):
             self._tether_worker = None
 
     def persist_bwpoint(self):
-        """Write the current global B/W point to QSettings (spec §4.1) and, if a
-        tethering session is live, refresh the banner so its note reflects the
-        new B/W state immediately (e.g. drops the 'unconverted' warning)."""
-        bp = encode_bwpoint(ccr_backend.black_point_bgr)
-        if bp is not None:
-            self._settings.setValue("convert/black_point_bgr", bp)
-        # A cleared white point must be removed, else it would be restored next
-        # session and override the default-slope choice.
-        if ccr_backend.white_point_bgr is None:
-            self._settings.remove("convert/white_point_bgr")
-        else:
-            wp = encode_bwpoint(ccr_backend.white_point_bgr)
-            if wp is not None:
-                self._settings.setValue("convert/white_point_bgr", wp)
+        """B/W points are SESSION-ONLY now — NOT persisted across restarts (they
+        reset on every file load). This only refreshes the tether banner so its
+        note reflects the new B/W state immediately (e.g. drops the 'unconverted'
+        warning). Kept under the old name so its callers need no change."""
         self.refresh_tether_banner()
 
     def refresh_tether_banner(self):
@@ -959,17 +953,6 @@ class MainWindow(QMainWindow):
         self.sliders_panel.set_temporary_hint(
             "<b>Black Point:</b> draw a rectangle over the clear film base, then "
             "set the White Point on the dense / exposed area.", duration=9000)
-
-    def _restore_bwpoint(self):
-        """Restore a persisted global B/W point into the backend at startup."""
-        bp = decode_bwpoint(
-            self._settings.value("convert/black_point_bgr", "", type=str))
-        wp = decode_bwpoint(
-            self._settings.value("convert/white_point_bgr", "", type=str))
-        if bp is not None:
-            ccr_backend.set_black_point(bp)
-        if wp is not None:
-            ccr_backend.set_white_point(wp)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Up, Qt.Key_Down):

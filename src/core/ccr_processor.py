@@ -2158,8 +2158,13 @@ _CINEON_BLACK = 95.0     # Dmin
 _CINEON_WHITE = 685.0    # 90% diffuse white
 _CINEON_NG = 0.6         # negative gamma
 _CINEON_BLACK_N = _CINEON_BLACK / 1023.0    # 0.0929  (black point / lowest -> here)
-_CINEON_WHITE_N = _CINEON_WHITE / 1023.0    # 0.6696  (white point / highest -> here)
+_CINEON_WHITE_N = _CINEON_WHITE / 1023.0    # 0.6696  (Cineon white; CST decode -> 1.0)
 _CINEON_GREY_N = 470.0 / 1023.0             # 0.4594  (18% grey; InputGain pivot)
+# Auto-fit maps the highest values to slightly BELOW the 685 Cineon white for a
+# bit of highlight headroom — they decode just under display white instead of
+# clipping. Tunable via env (the CST white reference stays 685).
+_NAMI_WHITE_TARGET = float(os.environ.get("FREECCR_NAMICOLOR_WHITE_TARGET", "665"))
+_NAMI_WHITE_TARGET_N = _NAMI_WHITE_TARGET / 1023.0   # 0.6500
 
 
 def _namicolor_density(lin_rec2020: np.ndarray) -> np.ndarray:
@@ -2223,13 +2228,15 @@ def namicolor_channel_transform(lin_rec2020: np.ndarray, s: dict,
                                 anchors) -> np.ndarray:
     """NamiColor invert + auto-levels: linear Rec.2020 -> Cineon-Film-Log
     normalized code values (cv/1023). `anchors` (p_lo[3], p_hi[3]) fit each
-    channel's p_lo -> 95/1023 and p_hi -> 685/1023; the Channel-Levels sliders
-    then ADD on top (all sliders 0 => the pure auto fit, so the UI reads neutral).
-    A brighter scan pixel (scene shadow) yields a LOWER cv (inversion)."""
+    channel's p_lo -> 95/1023 (Cineon black) and p_hi -> the white TARGET
+    (_NAMI_WHITE_TARGET, default 665 — just below the 685 Cineon white for
+    highlight headroom); the Channel-Levels sliders then ADD on top (all sliders 0
+    => the pure auto fit, so the UI reads neutral). A brighter scan pixel (scene
+    shadow) yields a LOWER cv (inversion)."""
     input_gain, shifts, gains, blacks = _namicolor_param_scales(s)
     d_all = _namicolor_density(lin_rec2020)
     out = np.empty_like(d_all, dtype=np.float32)
-    B, W, G = np.float32(_CINEON_BLACK_N), np.float32(_CINEON_WHITE_N), np.float32(_CINEON_GREY_N)
+    B, W, G = np.float32(_CINEON_BLACK_N), np.float32(_NAMI_WHITE_TARGET_N), np.float32(_CINEON_GREY_N)
     p_lo, p_hi = anchors
     for c in range(3):
         d = d_all[..., c]
