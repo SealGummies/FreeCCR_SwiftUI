@@ -160,6 +160,28 @@ class TestAutoLevels(unittest.TestCase):
         self.assertGreater(float(boosted[..., 0].mean()), float(base[..., 0].mean()))
 
 
+class TestAutoLevelsCropRegion(unittest.TestCase):
+    def test_anchors_measured_over_crop_region(self):
+        # Auto-levels measures the "actual image area" = the crop region, so a
+        # film-holder border excluded by the crop must NOT steal the white point.
+        from core.ccr_image import CCRImage
+        from core.ccr_processor import NAMICOLOR_AUTO
+        if not NAMICOLOR_AUTO:
+            self.skipTest("auto-levels disabled")
+        img = CCRImage.__new__(CCRImage)
+        full = _gradient_negative(h=40, w=40)
+        full[:, 20:] = 200            # opaque 'holder' (dark = highest density)
+        img.resized_raw = full
+        img.crop_rect = None
+        img.crop_angle = 0.0
+        _, p_hi_full = img._namicolor_auto_anchors()
+        # Crop to the left (image) half — excludes the holder.
+        img.crop_rect = (0.0, 0.0, 0.5, 1.0)
+        _, p_hi_crop = img._namicolor_auto_anchors()
+        # The holder pushes the full-frame high anchor up; cropping it out drops it.
+        self.assertTrue(all(p_hi_crop[c] < p_hi_full[c] for c in range(3)))
+
+
 class TestMonochromeGuard(unittest.TestCase):
     def test_namicolor_skips_monochrome(self):
         # A monochrome scan must NOT route through NamiColor (its Adobe->Rec.2020
