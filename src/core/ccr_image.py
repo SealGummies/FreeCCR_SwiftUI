@@ -14,6 +14,7 @@ from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal)
 from core import color_management
+from ui import theme
 
 # Import optional libraries with fallbacks
 try:
@@ -588,7 +589,8 @@ class CCRImage:
         hist_height = 150
         hist_width = 256
         alpha = 0.33  # transparency for histogram curves
-        hist_img_f = np.full((hist_height, hist_width, 3), 180.0, dtype=np.float32)
+        hist_img_f = np.full((hist_height, hist_width, 3),
+                             float(theme.Paint.HIST_BG[0]), dtype=np.float32)
 
         # Find the global max value across all channels for adaptive scaling
         max_val = max([hist[c].mean() for c in hist]) * 6
@@ -599,7 +601,8 @@ class CCRImage:
         # RGB order: hist_img is rendered via QImage Format_RGB888, not cv2.imshow,
         # so colors must be RGB — (255,0,0) draws the R-data curve in red.
         for channel, color in zip(('r', 'g', 'b'),
-                                  ((255, 0, 0), (0, 255, 0), (0, 0, 255))):
+                                  (theme.Paint.HIST_R, theme.Paint.HIST_G,
+                                   theme.Paint.HIST_B)):
             h_scaled = np.clip((hist[channel] / scale) * (hist_height - 1),
                                0, hist_height - 1)
             col_tops = hist_height - h_scaled.astype(np.int32)  # (256,)
@@ -610,7 +613,7 @@ class CCRImage:
 
         hist_img = hist_img_f.astype(np.uint8)
         # Where all three channels overlap, set to white
-        hist_img[masks[0] & masks[1] & masks[2]] = (235, 235, 235)
+        hist_img[masks[0] & masks[1] & masks[2]] = theme.Paint.HIST_PEAK
         hist_img = np.ascontiguousarray(hist_img)
 
         self.histogram_image = QPixmap.fromImage(self.generate_qimage_from_np_array_8(hist_img))

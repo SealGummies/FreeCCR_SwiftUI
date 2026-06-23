@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, Q
 from core.ccr_backend import ccr_backend
 from core.ccr_processor import apply_dust_removal
 from widgets.export_dialog import ExportSettingsDialog
+from ui import theme
 import math
 import copy
 import sys
@@ -609,17 +610,13 @@ class ImagePreview(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.layout = QVBoxLayout()
-        self.layout.setContentsMargins(40, 0, 40, 0)
+        # Canvas fills its column; the gap to neighbours comes from the main
+        # frame's inter-column gutter (was a 40px margin → an oversized gap).
+        self.layout.setContentsMargins(0, 0, 0, 0)
 
         # Toolbar
         self.toolbar = QToolBar()
         self.toolbar.setIconSize(QSize(24, 24))
-        self.toolbar.setStyleSheet("""
-    QToolButton { color: red; }
-    QToolButton:enabled { color: black; }
-    QToolButton:!hover { color: black; }
-    QToolButton:disabled { color: gray; }
-""")
 
         def add_spacer(width=5):
             spacer = QWidget()
@@ -627,7 +624,7 @@ class ImagePreview(QWidget):
             spacer.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
             self.toolbar.addWidget(spacer)
 
-        auto_icon = QIcon(resource_path("icons/auto.png"))
+        auto_icon = theme.load_tinted_icon(resource_path("icons/auto.png"))
         if auto_icon.isNull():
             auto_icon = QIcon.fromTheme("view-refresh")
         self.auto_frame_action = QAction(auto_icon, "Auto Frame", self)
@@ -635,7 +632,7 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(self.auto_frame_action)
         add_spacer()
 
-        rotate_left_icon = QIcon(resource_path("icons/rotate-left-icon-size_512.png"))
+        rotate_left_icon = theme.load_tinted_icon(resource_path("icons/rotate-left-icon-size_512.png"))
         if rotate_left_icon.isNull():
             rotate_left_icon = QIcon.fromTheme("view-refresh")
         rotate_left_action = QAction(rotate_left_icon, "Rotate Left", self)
@@ -643,7 +640,7 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(rotate_left_action)
         add_spacer()
 
-        rotate_right_icon = QIcon(resource_path("icons/rotate-right-icon-size_512.png"))
+        rotate_right_icon = theme.load_tinted_icon(resource_path("icons/rotate-right-icon-size_512.png"))
         if rotate_right_icon.isNull():
             rotate_right_icon = QIcon.fromTheme("view-refresh")
         rotate_right_action = QAction(rotate_right_icon, "Rotate Right", self)
@@ -651,7 +648,7 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(rotate_right_action)
         add_spacer()
 
-        mirror_v_icon = QIcon(resource_path("icons/vertical-mirror-icon.png"))
+        mirror_v_icon = theme.load_tinted_icon(resource_path("icons/vertical-mirror-icon.png"))
         if mirror_v_icon.isNull():
             mirror_v_icon = QIcon.fromTheme("view-refresh")
         mirror_v_action = QAction(mirror_v_icon, "Mirror Vertical", self)
@@ -659,7 +656,7 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(mirror_v_action)
         add_spacer()
 
-        mirror_h_icon = QIcon(resource_path("icons/horizontal-mirror-icon.png"))
+        mirror_h_icon = theme.load_tinted_icon(resource_path("icons/horizontal-mirror-icon.png"))
         if mirror_h_icon.isNull():
             mirror_h_icon = QIcon.fromTheme("view-refresh")
         mirror_h_action = QAction(mirror_h_icon, "Mirror Horizontal", self)
@@ -710,6 +707,13 @@ class ImagePreview(QWidget):
         self.unconvert_action = QAction("Un-convert", self)
         self.unconvert_action.triggered.connect(self.unconvert_ccr)
         self.toolbar.addAction(self.unconvert_action)
+        # Destructive revert → red text when enabled, muted when disabled.
+        _unconv_btn = self.toolbar.widgetForAction(self.unconvert_action)
+        if _unconv_btn is not None:
+            _unconv_btn.setStyleSheet(
+                f"QToolButton {{ color: {theme.DANGER}; }}"
+                f"QToolButton:hover {{ color: {theme.DANGER_HOVER}; }}"
+                f"QToolButton:disabled {{ color: {theme.TEXT_DISABLED}; }}")
         add_spacer()
 
         self.export_action = QAction("Export…", self)

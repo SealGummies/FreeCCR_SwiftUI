@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from core.ccr_backend import ccr_backend
 from core import export_estimator
+from ui import theme
 from utils.export_naming import build_export_names, build_filename, resolve_conflicts
 from utils.unicode_path_utils import normalize_unicode_path, validate_unicode_path
 
@@ -45,7 +46,8 @@ class ExportSettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Export")
         self.setModal(True)
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(theme.DIALOG_W_MD)
+        theme.apply_windows_dark_titlebar(self)  # dark native title bar (Win10/11)
 
         self.plan: Optional[ExportPlan] = None
         self._current_idx = current_idx
@@ -81,6 +83,7 @@ class ExportSettingsDialog(QDialog):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
+        theme.apply_panel_spacing(layout, margin=theme.SPACE_XL, spacing=theme.GAP_SECTION)
 
         # Scope
         scope_group = QGroupBox("Export scope")
@@ -108,6 +111,7 @@ class ExportSettingsDialog(QDialog):
 
         # Destination
         dest_layout = QHBoxLayout()
+        dest_layout.setSpacing(theme.GAP_BTN)
         dest_layout.addWidget(QLabel("Destination:"))
         self.dest_edit = QLineEdit()
         self.dest_edit.textChanged.connect(self._on_dest_changed)
@@ -126,7 +130,7 @@ class ExportSettingsDialog(QDialog):
         fields_layout.addWidget(self.filename_edit, 1)
         naming_layout.addLayout(fields_layout)
         hint = QLabel("Macros: {name} = original filename, {date}, {time}, {seq}")
-        hint.setStyleSheet("color: gray;")
+        hint.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         naming_layout.addWidget(hint)
         self.example_label = QLabel("")
         naming_layout.addWidget(self.example_label)
@@ -135,6 +139,8 @@ class ExportSettingsDialog(QDialog):
 
         # Format / quality / estimate / resize / conflicts
         form = QFormLayout()
+        form.setHorizontalSpacing(theme.GAP_BTN)
+        form.setVerticalSpacing(theme.GAP_ROW)
         self.format_combo = QComboBox()
         self.format_combo.addItem("TIFF 16-bit (lossless)", "tiff")
         self.format_combo.addItem("JPEG", "jpeg")
@@ -151,16 +157,17 @@ class ExportSettingsDialog(QDialog):
         form.addRow("Color space:", self.colorspace_combo)
         self.colorspace_hint = QLabel(
             "8-bit ProPhoto JPEG can band — prefer 16-bit TIFF for wide gamut.")
-        self.colorspace_hint.setStyleSheet("color: gray;")
+        self.colorspace_hint.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         self.colorspace_hint.setWordWrap(True)
         form.addRow("", self.colorspace_hint)
 
         quality_layout = QHBoxLayout()
+        quality_layout.setSpacing(theme.GAP_BTN)
         self.quality_slider = QSlider(Qt.Horizontal)
         self.quality_slider.setRange(1, 100)
         self.quality_slider.setValue(92)
         self.quality_value_label = QLabel("92")
-        self.quality_value_label.setMinimumWidth(28)
+        self.quality_value_label.setMinimumWidth(theme.VALUE_COL_W)
         quality_layout.addWidget(self.quality_slider, 1)
         quality_layout.addWidget(self.quality_value_label)
         self.quality_slider.valueChanged.connect(self._on_quality_changed)
@@ -190,15 +197,21 @@ class ExportSettingsDialog(QDialog):
         layout.addWidget(self.open_folder_checkbox)
 
         # Buttons
+        layout.addWidget(theme.section_separator())
         button_layout = QHBoxLayout()
+        button_layout.setSpacing(theme.GAP_BTN)
         button_layout.addStretch(1)
         self.export_button = QPushButton("Export")
-        self.export_button.setDefault(True)
+        self.export_button.setFixedHeight(theme.CONTROL_H_LG)
         self.export_button.clicked.connect(self._on_export_clicked)
         cancel_button = QPushButton("Cancel")
+        cancel_button.setFixedHeight(theme.CONTROL_H)
         cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(self.export_button)
+        # Export is the deliberate commit → primary + dialog default; Cancel recedes.
+        theme.style_button(self.export_button, "primary", default=True)
+        theme.style_button(cancel_button, "secondary")
         button_layout.addWidget(cancel_button)
+        button_layout.addWidget(self.export_button)
         layout.addLayout(button_layout)
 
         # Debounced size estimation

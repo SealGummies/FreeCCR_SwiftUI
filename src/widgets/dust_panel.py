@@ -13,10 +13,12 @@ unavailable/needs-download state and the manual brush is unaffected.
 See spec/dust-removal.md.
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                                QPushButton, QSlider, QFrame, QProgressBar)
+                                QPushButton, QSlider, QFrame, QProgressBar,
+                                QMessageBox)
 from PySide6.QtCore import Qt, QObject, QThread, Signal
 
 from core import dust_detect
+from ui import theme
 
 
 class _DetectWorker(QObject):
@@ -127,8 +129,7 @@ class DustRemovalPanel(QWidget):
     # --- UI ---------------------------------------------------------------
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        theme.apply_panel_spacing(layout)
 
         header = QLabel("Dust Removal")
         header.setAlignment(Qt.AlignCenter)
@@ -138,14 +139,16 @@ class DustRemovalPanel(QWidget):
         # --- Manual section ---
         layout.addWidget(self._section_label("Manual"))
         brush_row = QHBoxLayout()
+        brush_row.setSpacing(theme.GAP_TIGHT)
         brush_lbl = QLabel("Brush size")
-        brush_lbl.setMinimumWidth(70)
+        brush_lbl.setFixedWidth(theme.LABEL_COL_W)
         self.brush_slider = QSlider(Qt.Horizontal)
         self.brush_slider.setMinimum(2)     # r = value/1000  ->  0.002 .. 0.200
         self.brush_slider.setMaximum(200)
         self.brush_slider.setValue(12)      # 0.012 (1.2% of image width)
+        self.brush_slider.setFixedHeight(theme.CONTROL_H)
         self.brush_value = QLabel("1.2%")
-        self.brush_value.setMinimumWidth(40)
+        self.brush_value.setFixedWidth(theme.VALUE_COL_W)
         self.brush_slider.valueChanged.connect(self._on_brush_changed)
         brush_row.addWidget(brush_lbl)
         brush_row.addWidget(self.brush_slider)
@@ -154,14 +157,16 @@ class DustRemovalPanel(QWidget):
 
         hint = QLabel("Click or drag over dust to remove it.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(hint)
 
         manual_btns = QHBoxLayout()
+        theme.apply_button_row(manual_btns)
         self.undo_btn = QPushButton("Undo last spot")
         self.undo_btn.clicked.connect(self._on_undo_last)
         self.clear_btn = QPushButton("Clear all")
         self.clear_btn.clicked.connect(self._on_clear_all)
+        theme.style_button(self.clear_btn, "danger")  # removes all spots
         manual_btns.addWidget(self.undo_btn)
         manual_btns.addWidget(self.clear_btn)
         layout.addLayout(manual_btns)
@@ -174,16 +179,17 @@ class DustRemovalPanel(QWidget):
         self.ai_unavailable_label = QLabel(
             "AI detection unavailable in this build.")
         self.ai_unavailable_label.setWordWrap(True)
-        self.ai_unavailable_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.ai_unavailable_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(self.ai_unavailable_label)
 
         self.download_label = QLabel(
             "Download the local AI model (~150 MB) to detect dust "
             "automatically. One-time download.")
         self.download_label.setWordWrap(True)
-        self.download_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.download_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(self.download_label)
         self.download_btn = QPushButton("Download AI model (~150 MB)")
+        self.download_btn.setFixedHeight(theme.CONTROL_H)
         self.download_btn.clicked.connect(self._on_download)
         layout.addWidget(self.download_btn)
         self.progress_bar = QProgressBar()
@@ -191,14 +197,16 @@ class DustRemovalPanel(QWidget):
         layout.addWidget(self.progress_bar)
 
         sens_row = QHBoxLayout()
+        sens_row.setSpacing(theme.GAP_TIGHT)
         self.sensitivity_label = QLabel("Sensitivity")
-        self.sensitivity_label.setMinimumWidth(70)
+        self.sensitivity_label.setFixedWidth(theme.LABEL_COL_W)
         self.sensitivity_slider = QSlider(Qt.Horizontal)
         self.sensitivity_slider.setMinimum(0)
         self.sensitivity_slider.setMaximum(100)
         self.sensitivity_slider.setValue(35)  # conservative default — fewer false positives
+        self.sensitivity_slider.setFixedHeight(theme.CONTROL_H)
         self.sensitivity_value = QLabel("35")
-        self.sensitivity_value.setMinimumWidth(40)
+        self.sensitivity_value.setFixedWidth(theme.VALUE_COL_W)
         self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
         sens_row.addWidget(self.sensitivity_label)
         sens_row.addWidget(self.sensitivity_slider)
@@ -207,10 +215,12 @@ class DustRemovalPanel(QWidget):
         layout.addLayout(sens_row)
 
         self.detect_btn = QPushButton("Detect && Remove")
+        self.detect_btn.setFixedHeight(theme.CONTROL_H)
         self.detect_btn.clicked.connect(self._on_detect)
         layout.addWidget(self.detect_btn)
 
         self.detect_all_btn = QPushButton("Detect && Remove — All Images")
+        self.detect_all_btn.setFixedHeight(theme.CONTROL_H)
         self.detect_all_btn.setToolTip(
             "Run AI dust detection on every converted image — each scan is "
             "detected on its own (not by copying spots), at the current "
@@ -220,36 +230,28 @@ class DustRemovalPanel(QWidget):
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.status_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(self.status_label)
 
         layout.addStretch(1)
 
         self.done_btn = QPushButton("✓  Done")
-        self.done_btn.setMinimumHeight(42)
+        self.done_btn.setMinimumHeight(theme.CONTROL_H_LG)
         self.done_btn.setToolTip("Close dust removal and return to the adjustment sliders.")
-        self.done_btn.setStyleSheet(
-            "QPushButton { background:#2d7d46; color:white; font-weight:bold; "
-            "font-size:13px; border:none; border-radius:5px; padding:8px; }"
-            "QPushButton:hover { background:#359152; }"
-            "QPushButton:pressed { background:#256b3b; }")
+        # The panel's commit action → neutral primary (no success-green chrome).
+        theme.style_button(self.done_btn, "primary")
         self.done_btn.clicked.connect(self._on_done)
         layout.addWidget(self.done_btn)
 
     @staticmethod
     def _section_label(text):
         lbl = QLabel(text)
-        lbl.setStyleSheet("color: #aaa; font-size: 11px; font-weight: bold; "
-                          "margin-top: 4px;")
+        lbl.setStyleSheet(theme.section_header_qss())
         return lbl
 
     @staticmethod
     def _separator():
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setFrameShadow(QFrame.Sunken)
-        sep.setStyleSheet("margin-top: 6px; margin-bottom: 2px;")
-        return sep
+        return theme.section_separator()
 
     # --- Public API used by MainWindow / ImagePreview ---------------------
     def bind_image(self):
@@ -284,6 +286,17 @@ class DustRemovalPanel(QWidget):
             self.status_label.setText("Nothing to undo.")
 
     def _on_clear_all(self):
+        from core.ccr_backend import ccr_backend
+        img = ccr_backend.get_image_by_index(self.image_preview.current_idx)
+        n = len(getattr(img, "dust_spots", []) or []) if img is not None else 0
+        if n == 0:
+            self.status_label.setText("No dust spots to clear.")
+            return
+        if QMessageBox.question(
+                self, "Clear All Dust Spots",
+                f"Remove all {n} dust spot{'s' if n != 1 else ''} from this image?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
         if self.image_preview.dust_clear_all():
             self._prob = None  # spots gone; a re-detect should start fresh
             self.status_label.setText("Cleared all dust spots.")
@@ -372,6 +385,13 @@ class DustRemovalPanel(QWidget):
                    and getattr(im, "resized_raw", None) is not None]
         if not targets:
             self.status_label.setText("No converted images to detect on.")
+            return
+        n = len(targets)
+        if QMessageBox.question(
+                self, "Detect on All Images",
+                f"Run AI dust detection on all {n} image{'s' if n != 1 else ''}? "
+                "This may take a while.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         self._detecting_all = True
         self.detect_btn.setEnabled(False)
