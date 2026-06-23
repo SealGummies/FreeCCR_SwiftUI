@@ -319,7 +319,12 @@ class SlidersPanel(QWidget):
         self.histogram_label.setStyleSheet(
             f"background-color: rgb({theme.Paint.HIST_BG[0]},{theme.Paint.HIST_BG[1]},{theme.Paint.HIST_BG[2]}); border: none; border-radius: 12px;"
         )
-        layout.addWidget(self.histogram_label)
+        # Inset to match the content below so it isn't flush against the panel's
+        # right border (the scroll area below keeps its scrollbar at the edge).
+        hist_row = QHBoxLayout()
+        hist_row.setContentsMargins(theme.GAP_PANEL, theme.GAP_PANEL, theme.GAP_PANEL, 0)
+        hist_row.addWidget(self.histogram_label)
+        layout.addLayout(hist_row)
 
         # --- Scrollable middle section ---
         scroll_content = QWidget()

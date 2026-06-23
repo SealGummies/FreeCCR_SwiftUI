@@ -610,7 +610,9 @@ class ImagePreview(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.layout = QVBoxLayout()
-        self.layout.setContentsMargins(40, 0, 40, 0)
+        # Canvas fills its column; the gap to neighbours comes from the main
+        # frame's inter-column gutter (was a 40px margin → an oversized gap).
+        self.layout.setContentsMargins(0, 0, 0, 0)
 
         # Toolbar
         self.toolbar = QToolBar()
