@@ -12,7 +12,9 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
                                 apply_area_layers, apply_crop_to_image,
-                                apply_dust_removal)
+                                apply_dust_removal,
+                                NAMICOLOR_CONVERSION, namicolor_process,
+                                namicolor_anchors)
 from core import color_management
 from ui import theme
 
@@ -287,6 +289,44 @@ class CCRImage:
         except Exception:
             return False
 
+    def _namicolor_active(self) -> bool:
+        """Whether this image renders through the NamiColor conversion: enabled,
+        a color negative (not global Positive mode, not a monochrome scan).
+        See spec/namicolor-bwpoint-conversion.md."""
+        return (bool(NAMICOLOR_CONVERSION)
+                and not self._positive_mode_active()
+                and not getattr(self, "is_monochrome", False))
+
+    def _namicolor_anchors(self):
+        """Cached per-channel auto-levels anchors (p_lo->95/1023, p_hi->685/1023).
+
+        The app-global Film B/W points pin the low/high anchors when sampled;
+        unsampled ends fall back to this frame's 0.5%/99.5% density percentiles.
+        Measured ONCE on the preview-resolution negative, over the crop region
+        when set, and cached keyed by (id(resized_raw), crop, angle, B/W points)
+        so preview, zoom and export fit identically and a re-sampled point
+        recomputes. Returns None when there's no source to measure."""
+        src = self.resized_raw
+        if src is None:
+            return None
+        try:
+            from core.ccr_backend import ccr_backend
+            bp = ccr_backend.black_point_bgr
+            wp = ccr_backend.white_point_bgr
+        except Exception:
+            bp = wp = None
+        crop = getattr(self, "crop_rect", None)
+        angle = getattr(self, "crop_angle", 0.0) or 0.0
+        sig = (id(src), crop, angle, bp, wp)
+        if (getattr(self, "_namicolor_anchor_sig", None) == sig
+                and getattr(self, "_namicolor_anchors_cache", None) is not None):
+            return self._namicolor_anchors_cache
+        meas = apply_crop_to_image(src, crop, angle) if crop else src
+        self._namicolor_anchors_cache = namicolor_anchors(
+            meas, black_point_bgr=bp, white_point_bgr=wp)
+        self._namicolor_anchor_sig = sig
+        return self._namicolor_anchors_cache
+
     @staticmethod
     def _raw_color_postprocess_kwargs(positive: bool, preview: bool) -> dict:
         """rawpy.postprocess kwargs for a (non-monochrome) RAW decode.
@@ -316,6 +356,12 @@ class CCRImage:
                 output_color=rawpy.ColorSpace.sRGB,
                 four_color_rgb=False,
             )
+        # NamiColor conversion decodes negatives to Adobe RGB / linear (so
+        # NamiColor's Adobe->Rec.2020 matrix + Cineon CST are colour-faithful).
+        # White balance stays off — the per-channel B/W-point/percentile
+        # auto-levels balances the orange mask. See spec/namicolor-bwpoint-conversion.md.
+        output_color = (rawpy.ColorSpace.Adobe if NAMICOLOR_CONVERSION
+                        else rawpy.ColorSpace.raw)
         return dict(
             output_bps=16,
             no_auto_bright=True,      # Consistent absolute sensor values across all frames
@@ -325,7 +371,7 @@ class CCRImage:
             half_size=preview,        # Process at half resolution - much faster!
             use_camera_wb=False,      # No camera white balance
             use_auto_wb=False,        # No auto white balance
-            output_color=rawpy.ColorSpace.raw,  # Raw color space (no color correction)
+            output_color=output_color,
             no_auto_scale=True,       # No automatic scaling
             four_color_rgb=False,     # Standard 3-color processing
         )
@@ -386,6 +432,10 @@ class CCRImage:
                     except Exception as e:
                         logging.warning(f"Error detecting monochrome sensor: {e}")
                         is_monochrome = False
+
+                    # Remember sensor type so NamiColor skips monochrome scans
+                    # (its Adobe->Rec.2020 matrix would tint a [G,G,G] image).
+                    self.is_monochrome = is_monochrome
 
                     # Global Positive mode decodes color RAWs as normal sRGB
                     # photos (monochrome sensors are left on their own path).
@@ -558,7 +608,8 @@ class CCRImage:
         # correctly-exposed positive too, so it skips the negative auto-brightness
         # as well (the adjustments own the look).
         display_img = (adjusted_img
-                       if (self.converted or self._positive_mode_active())
+                       if (self.converted or self._positive_mode_active()
+                           or self._namicolor_active())
                        else self._auto_brightness_for_preview(adjusted_img))
 
         # Create thumbnail
@@ -665,6 +716,20 @@ class CCRImage:
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)
+        # NamiColor conversion: a color negative converts LIVE (NamiColor invert +
+        # auto-levels anchored by the Film B/W points / percentiles, then the CST).
+        # Runs even with empty settings (a neutral conversion still inverts).
+        # Curves / areas / B&W collapse below run on the resulting display image.
+        if self._namicolor_active() and not getattr(self, "converted", False):
+            adjusted = namicolor_process(image, s or {}, self._namicolor_anchors())
+            curves = s.get('curves') if s else None
+            if curves:
+                adjusted = apply_curves(adjusted, curves)
+            if has_areas:
+                adjusted = apply_area_layers(adjusted, areas, self._adjust_for_area)
+            if profile == "bw":
+                adjusted = self._to_grayscale(adjusted)
+            return adjusted
         if not s and cb == 0 and tb == 0 and bb == 0 and eb == 0 and not has_areas:
             # No slider/base/area adjustments — but Black & White still has to
             # map the image to a single luminance channel.

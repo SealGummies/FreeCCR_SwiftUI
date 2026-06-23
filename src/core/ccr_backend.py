@@ -4,7 +4,8 @@ from core.ccr_image import CCRImage
 from core.ccr_processor import (ccr_normalize_with_reference, ccr_normalize_with_bwpoint,
                                 ccr_normalize_with_refparams, ccr_export_positive,
                                 auto_fine_angle, auto_frame,
-                                auto_frame_v2, log_bwpoint_slopes)
+                                auto_frame_v2, log_bwpoint_slopes,
+                                NAMICOLOR_CONVERSION)
 import os
 import glob
 import concurrent.futures
@@ -733,9 +734,12 @@ class CCRBackend:
         if idx is not None and 0 <= idx < len(self.images):
             image_obj = self.images[idx]
             try:
-                if self.positive_mode:
+                if self.positive_mode or (NAMICOLOR_CONVERSION and not image_obj.converted):
                     # Positive mode: export the adjusted positive directly — no
-                    # inversion, regardless of any leftover reference_frame.
+                    # inversion. NamiColor conversion: the live render IS the
+                    # positive (Adobe-linear decode + apply_adjustments runs
+                    # NamiColor with the B/W-point/percentile anchors), so it
+                    # exports through the same path.
                     ccr_export_positive(image_obj, output_path=output_path,
                                         water_mark=not self.software_activated,
                                         jpg_out=jpg_output, jpg_quality=jpg_quality,

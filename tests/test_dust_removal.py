@@ -89,7 +89,7 @@ class TestApplyDustRemoval:
 
 # --- apply_adjustments integration (dust runs before the early-return guard) -
 class TestApplyAdjustmentsIntegration:
-    def test_dust_only_image_still_inpaints(self, tmp_path):
+    def test_dust_only_image_still_inpaints(self, tmp_path, monkeypatch):
         # Build a bare CCRImage; neutralize bases so apply_adjustments takes the
         # early-return path AFTER dust removal (proving dust runs before it).
         path = str(tmp_path / "x.png")
@@ -101,6 +101,13 @@ class TestApplyAdjustmentsIntegration:
         img.brightness_base = 0
         img.color_profile = "color"
         img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}]
+        # NamiColor replaces the neutral negative pass-through; dust integration
+        # is orthogonal, so exercise it on the classic identity pipeline (positive
+        # mode) where "no slider change" is a true pass-through.
+        from core.ccr_processor import NAMICOLOR_CONVERSION
+        from core.ccr_backend import ccr_backend
+        if NAMICOLOR_CONVERSION:
+            monkeypatch.setattr(ccr_backend, "positive_mode", True)
 
         src = _flat_with_speck()
         out = img.apply_adjustments(src)
@@ -108,13 +115,17 @@ class TestApplyAdjustmentsIntegration:
         assert int(out[50, 50, 0]) < 55000
         assert np.array_equal(out[0:10, 0:10], src[0:10, 0:10])
 
-    def test_no_dust_no_change_in_neutral_pipeline(self, tmp_path):
+    def test_no_dust_no_change_in_neutral_pipeline(self, tmp_path, monkeypatch):
         path = str(tmp_path / "y.png")
         cv2.imwrite(path, np.zeros((10, 10, 3), np.uint8))
         img = CCRImage(path)
         img.adjustment_settings = {}
         img.contrast_base = img.temperature_base = img.brightness_base = 0
         img.dust_spots = []
+        from core.ccr_processor import NAMICOLOR_CONVERSION
+        from core.ccr_backend import ccr_backend
+        if NAMICOLOR_CONVERSION:
+            monkeypatch.setattr(ccr_backend, "positive_mode", True)
         src = _flat_with_speck()
         out = img.apply_adjustments(src)
         assert np.array_equal(out, src)
