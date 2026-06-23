@@ -2377,6 +2377,97 @@ def compute_namicolor_auto_gain(img16_adobe_linear: np.ndarray, s: dict, anchors
     return 0.5 * (lo + hi)
 
 
+# --- Frame detection ------------------------------------------------------- #
+# Find the photographic frame(s) inside a film scan (excluding the holder,
+# sprocket holes, inter-frame gaps and edge markings). The signal is "density
+# above the film base": every EXPOSED pixel — textured boats or smooth sky — is
+# denser than the clear unexposed base, while the base / gaps / sprockets sit at
+# base density and the holder is opaque. Brightness can't separate these (the
+# frame's own skies/shadows overlap the base/holder); exposure-over-base can.
+# Used as the auto-gain measurement region and for auto-crop. Returns [] (->
+# caller falls back to the whole image) when no confident frame is found.
+NAMICOLOR_FRAME_DETECT = os.environ.get("FREECCR_NAMICOLOR_FRAME", "1") != "0"
+
+
+def _frame_luma(a: np.ndarray) -> np.ndarray:
+    return 0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]
+
+
+def _estimate_film_base(small: np.ndarray) -> np.ndarray:
+    """Film base = the bright, FLAT region (clear unexposed film): a high
+    percentile of the low-texture pixels, per channel."""
+    g = _frame_luma(small)
+    gn = (g - g.min()) / (np.ptp(g) + 1e-6)
+    m = cv2.boxFilter(gn, -1, (9, 9))
+    sq = cv2.boxFilter(gn * gn, -1, (9, 9))
+    st = np.sqrt(np.maximum(sq - m * m, 0))
+    flat = st < np.percentile(st, 45)
+    if flat.sum() < 0.05 * flat.size:
+        flat = np.ones_like(flat)
+    return np.array([np.percentile(small[..., c][flat], 78) for c in range(3)], np.float32)
+
+
+def namicolor_detect_frames(img16: np.ndarray, base_rgb=None):
+    """Detect photographic frame(s) in a film scan. `img16` is the Adobe-linear
+    negative; `base_rgb` is the clear film base (the sampled black point, RGB
+    order) — passed it is more accurate than the auto-estimate. Returns a list of
+    normalized (x1, y1, x2, y2) boxes, largest first, or [] when nothing
+    confident is found (the caller should then use the whole image)."""
+    H, W = img16.shape[:2]
+    sc = 900.0 / max(H, W)
+    small = cv2.resize(img16, (max(1, int(W * sc)), max(1, int(H * sc))),
+                       interpolation=cv2.INTER_AREA).astype(np.float32)
+    sh, sw = small.shape[:2]
+    base = (np.asarray(base_rgb, np.float32) if base_rgb is not None
+            else _estimate_film_base(small))
+    base = np.maximum(base, 1.0)
+    d = np.maximum(-np.log10(np.clip(small / base[None, None, :], 1e-4, None)), 0).mean(2)
+    base_luma = float(_frame_luma(base))
+    # Holder = opaque (transmits ~no light) — distinct from a bright sky, which is
+    # dense but still transmits. Exclude by darkness, not by density.
+    holder = _frame_luma(small) < 0.06 * base_luma
+    exposed = ((d > 0.08) & ~holder).astype(np.float32)
+
+    # Projection profiles: the film layout is regular, so a row profile isolates
+    # the frame band (sprocket / edge-marking rows fall below it) and a column
+    # profile inside that band splits side-by-side frames at the inter-frame gaps
+    # (clear base, not exposed). This handles single AND multi-frame strips.
+    def _runs(prof, thr, minlen):
+        on = prof > thr; out = []; s = None
+        for i, v in enumerate(on):
+            if v and s is None:
+                s = i
+            elif (not v) and s is not None:
+                if i - s >= minlen:
+                    out.append((s, i))
+                s = None
+        if s is not None and len(on) - s >= minlen:
+            out.append((s, len(on)))
+        return out
+
+    rp = cv2.GaussianBlur(exposed.mean(1).reshape(-1, 1), (0, 0), 3).ravel()
+    ybands = _runs(rp, 0.45, int(0.15 * sh))
+    if not ybands:
+        return []
+    y0, y1 = max(ybands, key=lambda r: r[1] - r[0])
+    cp = cv2.GaussianBlur(exposed[y0:y1].mean(0).reshape(-1, 1), (0, 0), 4).ravel()
+    xsegs = _runs(cp, 0.5, int(0.10 * sw))
+    ai = sh * sw
+    frames = []
+    for (x0, x1) in xsegs:
+        bw, bh = x1 - x0, y1 - y0
+        asp = bw / max(bh, 1)
+        if asp < 0.4 or asp > 2.6:        # drop slivers / edge-text strips
+            continue
+        if bw * bh < 0.06 * ai:
+            continue
+        frames.append((bw * bh, (x0 / sw, y0 / sh, x1 / sw, y1 / sh)))
+    frames.sort(key=lambda f: -f[0])
+    if not frames or frames[0][0] < 0.10 * ai:    # nothing confident -> whole image
+        return []
+    return [f[1] for f in frames]
+
+
 def adjust_image(
     img16: np.ndarray,
     kelvin_shift: float = 0.0,

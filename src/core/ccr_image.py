@@ -14,7 +14,8 @@ from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal,
                                 NAMICOLOR_CONVERSION, namicolor_process,
-                                namicolor_anchors, compute_namicolor_auto_gain)
+                                namicolor_anchors, compute_namicolor_auto_gain,
+                                NAMICOLOR_FRAME_DETECT, namicolor_detect_frames)
 from core import color_management
 from ui import theme
 
@@ -340,8 +341,23 @@ class CCRImage:
             return 0.0
         crop = getattr(self, "crop_rect", None)
         angle = getattr(self, "crop_angle", 0.0) or 0.0
-        meas = (apply_crop_to_image(self.resized_raw, crop, angle)
-                if crop else self.resized_raw)
+        if crop:
+            meas = apply_crop_to_image(self.resized_raw, crop, angle)
+        else:
+            # No crop: auto-gain over the auto-detected photographic frame so the
+            # holder / sprockets / a second frame don't skew the exposure. Falls
+            # back to the whole image (the auto-gain's own holder mask still
+            # protects it) when no frame is confidently found.
+            meas = self.resized_raw
+            if NAMICOLOR_FRAME_DETECT:
+                try:
+                    from core.ccr_backend import ccr_backend
+                    base = ccr_backend.black_point_bgr   # clear film base, RGB order
+                except Exception:
+                    base = None
+                frames = namicolor_detect_frames(self.resized_raw, base_rgb=base)
+                if frames:
+                    meas = apply_crop_to_image(self.resized_raw, frames[0], 0.0)
         # Measure with the user's settings only — the offset REPLACES any prior
         # auto-gain, and is applied on top of ch_master_gain by apply_adjustments.
         s = self.adjustment_settings or {}

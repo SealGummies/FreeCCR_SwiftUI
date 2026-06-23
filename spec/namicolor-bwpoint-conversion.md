@@ -67,8 +67,33 @@ any real scene content), so this isolates and ignores it even with **no crop**
 down when over clip. Env: `FREECCR_NAMICOLOR_GAIN_PCT/_TARGET`. Persisted in the
 catalog and undo; cleared by a Whole-Image reset.
 
-> Caveat: with no crop a full-roll scan can contain *two frames*; one master-gain
-> can't expose both, so crop to a single frame for per-frame auto-exposure.
+> The **frame detection** below resolves this: with no crop, auto-gain measures
+> inside the detected photographic frame, so the holder/sprockets/second frame
+> don't skew the exposure.
+
+## 2.7 Frame detection (`namicolor_detect_frames`)
+
+Finds the photographic frame(s) inside a film scan, excluding the holder, sprocket
+holes, inter-frame gaps and edge markings. The signal is **density above the film
+base** (the sampled black point, or auto-estimated as the bright/flat color):
+
+- Every **exposed** pixel — textured *or* smooth sky — is denser than the clear
+  unexposed base; the base / gaps / sprockets sit at base density; the holder is
+  opaque. (Brightness can't separate these — the frame's own skies/shadows overlap
+  the base and holder — but exposure-over-base can.)
+- Holder removed by **opacity** (near-black scan), not density, so bright skies
+  (dense but still transmitting) stay in the frame.
+- **Projection profiles**: a row profile isolates the frame band (sprocket / edge
+  rows fall below it); a column profile inside it splits side-by-side frames at the
+  inter-frame gaps. Handles single- and multi-frame strips.
+- Aspect/size filtered; returns `[]` (→ caller uses the whole image) when nothing
+  confident is found. Env `FREECCR_NAMICOLOR_FRAME=0` disables it.
+
+Wired as the **auto-gain measurement region** (crop ▸ detected-frame ▸ whole image)
+and as the CLI `--auto-frame` (auto-crop). Robust on normal-contrast frames and
+multi-frame strips; very low-contrast/near-base scenes fall back to the whole
+image. (The old brightness-based `auto_frame_v2` failed because the frame's own
+bright/dark areas overlap the base and holder in brightness.)
 
 ## 3. Pipeline placement
 `namicolor_process(img_adobe_linear, settings, auto_anchors)` (ported from PR #44)

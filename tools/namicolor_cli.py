@@ -63,6 +63,9 @@ def main(argv=None):
                    help="pixel rect to sample the dense/exposed area (white point)")
     p.add_argument("--crop", type=_rect, metavar="x1,y1,x2,y2",
                    help="normalised crop (image area; excludes holder/sprockets)")
+    p.add_argument("--auto-frame", action="store_true",
+                   help="auto-detect the photographic frame and crop to it "
+                        "(ignores holder/sprockets); overridden by an explicit --crop")
     p.add_argument("--auto-gain", action="store_true",
                    help="auto-expose: lift highlights to clipping")
     p.add_argument("--rotate", type=int, default=0, choices=(0, 90, 180, 270),
@@ -101,6 +104,15 @@ def main(argv=None):
     if a.crop:
         img.crop_rect = tuple(a.crop)
         img.crop_angle = 0.0
+    elif a.auto_frame:
+        from core.ccr_processor import namicolor_detect_frames
+        frames = namicolor_detect_frames(img.resized_raw, base_rgb=ccr_backend.black_point_bgr)
+        if frames:
+            img.crop_rect = tuple(frames[0]); img.crop_angle = 0.0
+            print("auto-frame crop:", tuple(round(v, 3) for v in frames[0]),
+                  f"({len(frames)} frame(s) found)")
+        else:
+            print("auto-frame: no confident frame — using the full image")
     img.rotation_angle = a.rotate
 
     if a.auto_gain:

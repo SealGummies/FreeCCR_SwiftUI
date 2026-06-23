@@ -180,6 +180,27 @@ class TestAutoGain(unittest.TestCase):
         self.assertLessEqual(float(out.max()), 1.0 + 1e-6)
 
 
+class TestFrameDetect(unittest.TestCase):
+    def test_detects_exposed_frame_in_base(self):
+        from core.ccr_processor import namicolor_detect_frames
+        rng = np.random.default_rng(0)
+        base = (50000, 50000, 50000)             # clear film base (bright)
+        img = np.full((400, 600, 3), base, np.uint16)
+        # an EXPOSED, textured frame in the centre (denser = lower values)
+        img[80:320, 120:480] = (rng.random((240, 360, 3)) * 15000 + 6000).astype(np.uint16)
+        frames = namicolor_detect_frames(img, base_rgb=base)
+        self.assertGreaterEqual(len(frames), 1)
+        x1, y1, x2, y2 = frames[0]
+        self.assertLess(x1, 0.35); self.assertGreater(x2, 0.65)   # spans the frame
+        self.assertLess(y1, 0.35); self.assertGreater(y2, 0.65)
+
+    def test_no_frame_returns_empty(self):
+        # A flat all-base scan (no exposed content) -> no confident frame.
+        from core.ccr_processor import namicolor_detect_frames
+        img = np.full((300, 400, 3), (50000, 50000, 50000), np.uint16)
+        self.assertEqual(namicolor_detect_frames(img, base_rgb=(50000, 50000, 50000)), [])
+
+
 class TestMonochromeGuard(unittest.TestCase):
     def test_namicolor_skips_monochrome(self):
         from core.ccr_image import CCRImage
