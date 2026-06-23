@@ -2129,6 +2129,12 @@ NAMICOLOR_EXPERIMENT = os.environ.get("FREECCR_NAMICOLOR", "1") != "0"
 # Fit-to-Cineon-Base step (places Dmin at code value ~95). On by default.
 NAMICOLOR_FIT_CINEON = os.environ.get("FREECCR_NAMICOLOR_FIT", "1") != "0"
 
+# Auto-levels: fit each channel's darkest->95/1023 and brightest->685/1023 the
+# moment a negative loads; the sliders then refine on top (spec §2.5). Default on.
+NAMICOLOR_AUTO = os.environ.get("FREECCR_NAMICOLOR_AUTO", "1") != "0"
+_NAMI_LOW  = float(os.environ.get("FREECCR_NAMICOLOR_LOW", "1.0"))    # -> 95/1023
+_NAMI_HIGH = float(os.environ.get("FREECCR_NAMICOLOR_HIGH", "99.0"))  # -> 685/1023
+
 # Slider -> NamiColor-parameter scales (env-tunable; the author dials by eye).
 _NAMI_INPUTGAIN_DEN = float(os.environ.get("FREECCR_NAMICOLOR_IG", "100"))   # 2**(v/den)
 _NAMI_SHIFT_DEN     = float(os.environ.get("FREECCR_NAMICOLOR_SHIFT", "200"))
@@ -2154,6 +2160,30 @@ _CINEON_BLACK = 95.0     # Dmin
 _CINEON_WHITE = 685.0    # 90% diffuse white
 _CINEON_NG = 0.6         # negative gamma
 _CINEON_FIT = 93.0 / 1023.0   # fit-to-base offset
+# Normalized Cineon anchors (cv/1023) used as auto-levels targets / pivots.
+_CINEON_BLACK_N = _CINEON_BLACK / 1023.0    # 0.0929  (darkest -> here)
+_CINEON_WHITE_N = _CINEON_WHITE / 1023.0    # 0.6696  (brightest -> here)
+_CINEON_GREY_N = 470.0 / 1023.0             # 0.4594  (18% grey; InputGain pivot)
+
+
+def _namicolor_density(lin_rec2020: np.ndarray) -> np.ndarray:
+    """NamiColor negative density d = -log10(16*x), the slider-independent base
+    of the inversion (higher x = scene shadow -> lower d). Operates on linear
+    Rec.2020, returns float32 of the same shape."""
+    x = np.maximum(16.0 * lin_rec2020.astype(np.float32), np.float32(1e-6))
+    return -np.log10(x)
+
+
+def namicolor_auto_anchors(img16_adobe_linear: np.ndarray):
+    """Per-channel (R,G,B) low/high density percentiles for auto-levels: map each
+    channel's p_lo -> 95/1023 and p_hi -> 685/1023. Resolution-independent, so
+    compute once on the preview negative and cache. Returns (p_lo[3], p_hi[3])."""
+    x = img16_adobe_linear.astype(np.float32) / np.float32(65535.0)
+    x = x @ M_ADOBE2REC2020.T
+    d = _namicolor_density(x).reshape(-1, 3)
+    p_lo = np.percentile(d, _NAMI_LOW, axis=0).astype(np.float32)
+    p_hi = np.percentile(d, _NAMI_HIGH, axis=0).astype(np.float32)
+    return p_lo, p_hi
 
 
 def _namicolor_param_scales(s: dict):
@@ -2172,18 +2202,33 @@ def _namicolor_param_scales(s: dict):
     return input_gain, shifts, gains, blacks
 
 
-def namicolor_channel_transform(lin_rec2020: np.ndarray, s: dict) -> np.ndarray:
+def namicolor_channel_transform(lin_rec2020: np.ndarray, s: dict,
+                                anchors=None) -> np.ndarray:
     """NamiColor negatives transform: linear Rec.2020 -> Cineon-Film-Log
-    normalized code values (cv/1023), float32. Per channel:
-        d = -log10(16*x) ; d = d*InputGain + 1 ; d += shift
-        d = (d + black) / ((1 - gain) + black) ; optional fit-to-Cineon.
-    A brighter scan pixel (scene shadow) yields a LOWER output (inversion)."""
+    normalized code values (cv/1023), float32.
+
+    With `anchors` (p_lo[3], p_hi[3]) the AUTO-LEVELS path fits each channel's
+    p_lo -> 95/1023 and p_hi -> 685/1023, then the sliders refine on top (all
+    sliders 0 => pure auto fit). Without anchors, the legacy manual placement
+    (d*InputGain + 1, then fit-to-Cineon) is used. Either way a brighter scan
+    pixel (scene shadow) yields a LOWER output (inversion)."""
     input_gain, shifts, gains, blacks = _namicolor_param_scales(s)
-    out = np.empty_like(lin_rec2020, dtype=np.float32)
+    d_all = _namicolor_density(lin_rec2020)
+    out = np.empty_like(d_all, dtype=np.float32)
+    B, W, G = np.float32(_CINEON_BLACK_N), np.float32(_CINEON_WHITE_N), np.float32(_CINEON_GREY_N)
     for c in range(3):
-        x = np.maximum(lin_rec2020[..., c].astype(np.float32), 1e-6)
-        d = -np.log10(16.0 * x)
-        d = d * np.float32(input_gain) + np.float32(1.0)
+        d = d_all[..., c]
+        if anchors is not None:
+            p_lo, p_hi = anchors
+            span = max(float(p_hi[c]) - float(p_lo[c]), 1e-4)
+            # Auto-fit: darkest part -> 95/1023, brightest -> 685/1023.
+            d = B + (d - np.float32(p_lo[c])) * np.float32((float(W) - float(B)) / span)
+            # InputGain becomes a master contrast about Cineon 18% grey.
+            if input_gain != 1.0:
+                d = G + (d - G) * np.float32(input_gain)
+        else:
+            # Legacy manual placement (no auto-levels).
+            d = d * np.float32(input_gain) + np.float32(1.0)
         if shifts[c]:
             d = d + np.float32(shifts[c])
         denom = (1.0 - gains[c]) + blacks[c]
@@ -2191,7 +2236,7 @@ def namicolor_channel_transform(lin_rec2020: np.ndarray, s: dict) -> np.ndarray:
         if abs(denom) < 1e-3:
             denom = 1e-3 if denom >= 0 else -1e-3
         d = (d + np.float32(blacks[c])) / np.float32(denom)
-        if NAMICOLOR_FIT_CINEON:
+        if anchors is None and NAMICOLOR_FIT_CINEON:
             d = (d + np.float32(_CINEON_FIT)) / np.float32(1.0 + _CINEON_FIT)
         out[..., c] = d
     return out
@@ -2218,18 +2263,27 @@ def cineon_rec2020_to_rec709_g22(cv01: np.ndarray) -> np.ndarray:
     return np.power(lin709, np.float32(1.0 / 2.2))
 
 
-def namicolor_process(img16_adobe_linear: np.ndarray, s: dict) -> np.ndarray:
+def namicolor_process(img16_adobe_linear: np.ndarray, s: dict,
+                      auto_anchors=None) -> np.ndarray:
     """Full NamiColor pipeline for one frame.
 
     img16_adobe_linear: uint16 RGB, Adobe-RGB primaries, linear gamma.
+    auto_anchors: optional (p_lo[3], p_hi[3]) for auto-levels — pass the cached
+    anchors from the preview negative so preview/zoom/export fit identically.
+    When None and NAMICOLOR_AUTO is on, anchors are computed from THIS frame.
     NamiColor (Channel Levels) -> in-log creative tune (Main sliders) -> CST.
     Returns a display-referred (Rec.709 / Gamma 2.2) uint16 RGB image."""
     s = s or {}
     x = img16_adobe_linear.astype(np.float32) / np.float32(65535.0)
     # Adobe RGB linear -> Rec.2020 linear.
     x = x @ M_ADOBE2REC2020.T
+    anchors = auto_anchors
+    if anchors is None and NAMICOLOR_AUTO:
+        d = _namicolor_density(x).reshape(-1, 3)
+        anchors = (np.percentile(d, _NAMI_LOW, axis=0).astype(np.float32),
+                   np.percentile(d, _NAMI_HIGH, axis=0).astype(np.float32))
     # NamiColor inversion -> Cineon-Film-Log normalized code values.
-    log_cv = namicolor_channel_transform(x, s)
+    log_cv = namicolor_channel_transform(x, s, anchors=anchors)
 
     # Middle stage: basic color tune IN LOG SPACE, exactly like the Resolve node
     # order. Reuse the Main-slider math; the Channel Levels were consumed above,

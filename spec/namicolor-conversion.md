@@ -25,9 +25,17 @@ restore the classic v0.2.3 reference / B-W-point conversion.
   are **disabled (greyed)**. A loaded color negative is shown as a *live*
   NamiColor positive, recomputed on every slider change.
 
+### Auto-levels (added — see §2.5)
+- The conversion now **auto-fits each channel**: the darkest part of each channel
+  maps to Cineon **95/1023**, the brightest part to **685/1023**, automatically,
+  the moment a negative loads. The NamiColor sliders then **refine on top** (all
+  sliders at 0 = the pure auto result). This replaces the manual-only neutral
+  placement of the first pass.
+
 ### Non-goals (for now)
-- No automatic fit-to-95/685, no auto white balance, no auto frame detection —
-  the author wants to dial it in by hand against the histogram.
+- No auto frame detection / sprocket-hole exclusion — auto-levels measures over
+  the user's crop region if one is set, else the whole frame (robust percentiles
+  blunt small borders; crop out the film holder for the cleanest fit).
 - No log-domain scope yet (FreeCCR's histogram is computed on the final
   display image, not the pre-CST Cineon-log signal). Known limitation, see §7.
 - No GPU/OpenCL kernel for the NamiColor path yet — CPU/numpy only. Preview is
@@ -75,6 +83,38 @@ valid NamiColor inversion** — the sliders only refine it.
 Denominator `(1 - gain) + black` is clamped away from 0 so the divide is safe.
 Scales are starting points (tunable via `FREECCR_NAMICOLOR_*`); the author tunes
 by eye against the parade/histogram.
+
+## 2.5 Auto-levels (default on, `FREECCR_NAMICOLOR_AUTO`)
+
+Instead of the manual neutral placement above, the conversion now auto-fits each
+channel's density into the Cineon range. Per channel `c`, from the raw density
+`d = −log10(16·x)` (slider-independent):
+
+```
+p_lo[c] = percentile(d_c, LOW)     # LOW  = 1.0   (env FREECCR_NAMICOLOR_LOW)
+p_hi[c] = percentile(d_c, HIGH)    # HIGH = 99.0  (env FREECCR_NAMICOLOR_HIGH)
+d = B + (d − p_lo[c]) · (W − B) / (p_hi[c] − p_lo[c])     # B = 95/1023, W = 685/1023
+```
+
+So each channel's **darkest part → 95/1023** and **brightest 1% → 685/1023**,
+automatically — which both fills the display range and neutralises the orange
+mask (each channel independently spans the same code-value range). This replaces
+the `·InputGain + 1` neutral anchor and the fit-to-Cineon step.
+
+**Refinement.** The NamiColor sliders then nudge the auto-fitted `d` (all sliders
+at 0 ⇒ the pure auto result):
+```
+if InputGain ≠ 1: d = G + (d − G)·InputGain     # master contrast about Cineon grey G = 470/1023
+d = d + chShift + MasterShift
+d = (d + chBlack) / ((1 − chGain − MasterGain) + chBlack)
+```
+
+**Anchors** are measured once on the preview-resolution negative (resolution-
+independent; percentiles of density are ~stable across scale) and **cached** on
+the `CCRImage`, keyed by `(id(resized_raw), crop_rect, crop_angle)`, so preview,
+hi-res zoom, and export all use the same fit. Measured over the crop region when
+a crop is set, else the whole frame. A flat/featureless channel (`p_hi==p_lo`)
+falls back to mapping that channel to black (no range to fit).
 
 ## 3. CST: Rec.2020 Cineon Film Log → Rec.709 Gamma 2.2
 

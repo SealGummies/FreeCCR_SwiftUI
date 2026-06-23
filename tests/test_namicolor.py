@@ -19,9 +19,21 @@ from core.ccr_processor import (  # noqa: E402
     cineon_film_log_to_linear,
     namicolor_channel_transform,
     namicolor_process,
+    namicolor_auto_anchors,
     _CINEON_BLACK,
     _CINEON_WHITE,
 )
+
+
+def _gradient_negative(h=48, w=48, scale=(1.0, 1.0, 1.0)):
+    """A synthetic negative with real tonal RANGE (auto-levels needs range).
+    Linear scan ramps left->right from 0.05 (clear/shadow) to 0.6 (dense/highlight);
+    `scale` offsets each channel's level to fake a per-channel cast."""
+    ramp = np.linspace(0.05, 0.6, w, dtype=np.float32)
+    img = np.empty((h, w, 3), np.float32)
+    for c in range(3):
+        img[..., c] = ramp[None, :] * np.float32(scale[c])
+    return np.clip(img * 65535.0, 0, 65535).astype(np.uint16)
 
 
 class TestCineonDecode(unittest.TestCase):
@@ -96,30 +108,56 @@ class TestNamiColorProcess(unittest.TestCase):
         self.assertTrue(np.all(out <= 65535))
 
     def test_inversion_dark_negative_to_bright_positive(self):
-        # A DARK scan region (low linear = dense film = scene highlight on the
-        # negative... actually low transmittance = scene highlight) inverts to a
-        # BRIGHT positive; a BRIGHT scan region inverts to a DARK positive.
-        dark = np.full((8, 8, 3), 300, dtype=np.uint16)    # low linear
-        bright = np.full((8, 8, 3), 40000, dtype=np.uint16)  # high linear
-        out_dark = namicolor_process(dark, {})
-        out_bright = namicolor_process(bright, {})
-        self.assertGreater(float(out_dark.mean()), float(out_bright.mean()))
-
-    def test_neutral_input_stays_near_neutral(self):
-        # ~0.3 linear: a representative negative base level that lands mid-range
-        # under the neutral NamiColor transform (won't clip to Cineon superwhite).
-        img = np.full((8, 8, 3), 20000, dtype=np.uint16)
-        out = namicolor_process(img, {})
-        ch = out.reshape(-1, 3).mean(axis=0)
-        spread = float(ch.max() - ch.min())
-        # A neutral grey negative should not develop a huge color cast.
-        self.assertLess(spread, 6000)
+        # A DARK scan region (low linear) inverts to a BRIGHT positive; a BRIGHT
+        # scan region inverts to a DARK positive. Left of the ramp is the darkest
+        # scan, right is the brightest.
+        out = namicolor_process(_gradient_negative(), {})
+        left = float(out[:, 0].mean())     # darkest scan column
+        right = float(out[:, -1].mean())   # brightest scan column
+        self.assertGreater(left, right)
 
     def test_brightness_slider_changes_output(self):
-        img = np.full((8, 8, 3), 20000, dtype=np.uint16)  # mid-range, non-clipping
+        img = _gradient_negative()
         base = namicolor_process(img, {})
         brighter = namicolor_process(img, {'brightness': 80})
         self.assertNotAlmostEqual(float(base.mean()), float(brighter.mean()), places=1)
+
+
+class TestAutoLevels(unittest.TestCase):
+    def test_anchors_low_below_high(self):
+        p_lo, p_hi = namicolor_auto_anchors(_gradient_negative())
+        self.assertTrue(np.all(p_hi > p_lo))
+
+    def test_auto_fit_fills_display_range(self):
+        # Auto-fit maps each channel's darkest->95 (display ~black) and
+        # brightest->685 (display ~white), so the output spans the range.
+        out = namicolor_process(_gradient_negative(), {})
+        self.assertLess(float(out.min()), 6000)      # near black
+        self.assertGreater(float(out.max()), 60000)  # near white
+
+    def test_auto_neutralizes_per_channel_cast(self):
+        # A per-channel level cast (orange mask): R/G/B sit in different linear
+        # ranges. Per-channel auto-fit places each into the SAME Cineon range, so
+        # the output channels come out balanced (cast neutralized).
+        cast = namicolor_process(_gradient_negative(scale=(1.0, 0.7, 0.4)), {})
+        chan_means = cast.reshape(-1, 3).mean(axis=0)
+        spread = float(chan_means.max() - chan_means.min())
+        self.assertLess(spread, 1500)
+
+    def test_passed_anchors_match_self_computed(self):
+        # Passing cached anchors must match letting namicolor_process compute them.
+        img = _gradient_negative(scale=(1.0, 0.8, 0.5))
+        anchors = namicolor_auto_anchors(img)
+        a = namicolor_process(img, {}, auto_anchors=anchors)
+        b = namicolor_process(img, {})
+        np.testing.assert_array_equal(a, b)
+
+    def test_sliders_refine_on_top_of_auto(self):
+        # All sliders 0 = pure auto; a per-channel gain nudges that channel.
+        img = _gradient_negative()
+        base = namicolor_process(img, {})
+        boosted = namicolor_process(img, {'ch_r_gain': 60})
+        self.assertGreater(float(boosted[..., 0].mean()), float(base[..., 0].mean()))
 
 
 class TestMonochromeGuard(unittest.TestCase):

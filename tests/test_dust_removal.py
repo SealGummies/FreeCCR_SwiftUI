@@ -27,8 +27,8 @@ import cv2  # noqa: E402
 from core import catalog, dust_detect  # noqa: E402
 from core.ccr_image import CCRImage  # noqa: E402
 from core.ccr_processor import (apply_dust_removal,  # noqa: E402
-                                rasterize_dust_mask,
-                                NAMICOLOR_EXPERIMENT, namicolor_process)
+                                rasterize_dust_mask, NAMICOLOR_EXPERIMENT)
+from core.ccr_backend import ccr_backend  # noqa: E402
 
 
 def _flat_with_speck(h=100, w=100, base=30000, speck=60000, cx=50, cy=50, r=4):
@@ -90,7 +90,7 @@ class TestApplyDustRemoval:
 
 # --- apply_adjustments integration (dust runs before the early-return guard) -
 class TestApplyAdjustmentsIntegration:
-    def test_dust_only_image_still_inpaints(self, tmp_path):
+    def test_dust_only_image_still_inpaints(self, tmp_path, monkeypatch):
         # Build a bare CCRImage; neutralize bases so apply_adjustments takes the
         # early-return path AFTER dust removal (proving dust runs before it).
         path = str(tmp_path / "x.png")
@@ -102,37 +102,29 @@ class TestApplyAdjustmentsIntegration:
         img.brightness_base = 0
         img.color_profile = "color"
         img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}]
+        # NamiColor (with auto-levels) replaces the neutral negative pass-through;
+        # dust integration is orthogonal, so exercise it on the classic identity
+        # pipeline (positive mode) where "no slider change" is a true pass-through.
+        if NAMICOLOR_EXPERIMENT:
+            monkeypatch.setattr(ccr_backend, "positive_mode", True)
 
         src = _flat_with_speck()
         out = img.apply_adjustments(src)
-        if NAMICOLOR_EXPERIMENT:
-            # The neutral negative is NamiColor-converted, so it's no longer a
-            # pass-through — but dust still runs FIRST (spec/namicolor-conversion.md).
-            # Prove that by checking the speck pixel differs with vs. without healing,
-            # while a clean corner is identical either way.
-            img.dust_spots = []
-            out_unhealed = img.apply_adjustments(src)
-            assert not np.array_equal(out[50, 50], out_unhealed[50, 50])
-            assert np.array_equal(out[0:10, 0:10], out_unhealed[0:10, 0:10])
-            return
         # Speck healed even though every slider/base is neutral.
         assert int(out[50, 50, 0]) < 55000
         assert np.array_equal(out[0:10, 0:10], src[0:10, 0:10])
 
-    def test_no_dust_no_change_in_neutral_pipeline(self, tmp_path):
+    def test_no_dust_no_change_in_neutral_pipeline(self, tmp_path, monkeypatch):
         path = str(tmp_path / "y.png")
         cv2.imwrite(path, np.zeros((10, 10, 3), np.uint8))
         img = CCRImage(path)
         img.adjustment_settings = {}
         img.contrast_base = img.temperature_base = img.brightness_base = 0
         img.dust_spots = []
+        if NAMICOLOR_EXPERIMENT:
+            monkeypatch.setattr(ccr_backend, "positive_mode", True)
         src = _flat_with_speck()
         out = img.apply_adjustments(src)
-        if NAMICOLOR_EXPERIMENT:
-            # No dust + neutral sliders -> the output is exactly the NamiColor
-            # render of the input (dust removal was a no-op).
-            assert np.array_equal(out, namicolor_process(src, {}))
-            return
         assert np.array_equal(out, src)
 
 

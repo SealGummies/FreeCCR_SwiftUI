@@ -13,7 +13,8 @@ from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal,
-                                NAMICOLOR_EXPERIMENT, namicolor_process)
+                                NAMICOLOR_EXPERIMENT, NAMICOLOR_AUTO,
+                                namicolor_process, namicolor_auto_anchors)
 from core import color_management
 from ui import theme
 
@@ -295,6 +296,32 @@ class CCRImage:
         return (bool(NAMICOLOR_EXPERIMENT)
                 and not self._positive_mode_active()
                 and not getattr(self, "is_monochrome", False))
+
+    def _namicolor_auto_anchors(self):
+        """Cached per-channel auto-levels anchors (p_lo, p_hi) for NamiColor —
+        the darkest/brightest density per channel, mapped to Cineon 95/685.
+
+        Measured ONCE on the preview-resolution negative (resolution-independent),
+        over the crop region when set, and cached keyed by
+        (id(resized_raw), crop_rect, crop_angle) so preview, hi-res zoom, and
+        export all fit identically. Returns None when auto-levels is off or there
+        is no source to measure (the pipeline then falls back to manual placement
+        or computes anchors from the frame it's handed). See spec §2.5."""
+        if not NAMICOLOR_AUTO:
+            return None
+        src = self.resized_raw
+        if src is None:
+            return None
+        crop = getattr(self, "crop_rect", None)
+        angle = getattr(self, "crop_angle", 0.0) or 0.0
+        sig = (id(src), crop, angle)
+        if (getattr(self, "_namicolor_auto_sig", None) == sig
+                and getattr(self, "_namicolor_auto", None) is not None):
+            return self._namicolor_auto
+        meas = apply_crop_to_image(src, crop, angle) if crop else src
+        self._namicolor_auto = namicolor_auto_anchors(meas)
+        self._namicolor_auto_sig = sig
+        return self._namicolor_auto
 
     @staticmethod
     def _raw_color_postprocess_kwargs(positive: bool, preview: bool) -> dict:
@@ -693,7 +720,8 @@ class CCRImage:
         # because a neutral NamiColor still inverts. Curves / areas / B&W
         # collapse below operate on the resulting display image, unchanged.
         if self._namicolor_active() and not getattr(self, "converted", False):
-            adjusted = namicolor_process(image, s or {})
+            adjusted = namicolor_process(image, s or {},
+                                         auto_anchors=self._namicolor_auto_anchors())
             curves = s.get('curves') if s else None
             if curves:
                 adjusted = apply_curves(adjusted, curves)
