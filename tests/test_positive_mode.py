@@ -57,16 +57,15 @@ class TestRawPostprocessKwargs:
         from core.ccr_processor import NAMICOLOR_CONVERSION
         kw = CCRImage._raw_color_postprocess_kwargs(positive=False, preview=False)
         if NAMICOLOR_CONVERSION:
-            # NamiColor conversion decodes negatives to Adobe RGB / linear with
-            # as-shot WB (it then auto-WBs the film base). spec/namicolor-bwpoint-conversion.md.
+            # NamiColor conversion decodes negatives to Adobe RGB / linear
+            # (spec/namicolor-bwpoint-conversion.md).
             assert kw["output_color"] == rawpy.ColorSpace.Adobe
-            assert kw["use_camera_wb"] is True
         else:
-            # Classic: the greenish raw-sensor decode the inverter expects (no WB).
+            # Classic: the greenish raw-sensor decode the inverter expects.
             assert kw["output_color"] == rawpy.ColorSpace.raw
-            assert kw["use_camera_wb"] is False
         assert kw["gamma"] == (1, 1)
         assert kw["no_auto_bright"] is True
+        assert kw["use_camera_wb"] is False
         assert kw["use_auto_wb"] is False
         assert kw["no_auto_scale"] is True
 
