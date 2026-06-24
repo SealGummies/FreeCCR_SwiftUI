@@ -266,6 +266,11 @@ class CCRImage:
         identically (resolution-independent point operation)."""
         if arr is None:
             return arr
+        # DNG carries its own embedded camera profile (rawpy honours it on
+        # decode), so burning in an external input ICC on top would
+        # double-correct the colour — skip it for .dng sources only.
+        if os.path.splitext(self.file_path)[1].lower() == ".dng":
+            return arr
         profile = color_management.get_active_input_profile()
         if profile is None:
             return arr

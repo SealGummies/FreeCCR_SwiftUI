@@ -56,6 +56,12 @@ class CCRBackend:
         that produced at least one image (a sliced file yields several)."""
         self.images.clear()
         self.file_paths = file_paths
+        # A fresh batch is a new roll: drop any B/W point sampled from the
+        # previous roll so its film base / dense-area density can't carry over
+        # (different stocks differ). Only the in-memory fields are cleared — the
+        # QSettings copy is intact and still restores at next app start.
+        self.black_point_bgr = None
+        self.white_point_bgr = None
         # Preserved removal states belong to the previous batch (the open
         # flows save the catalog before loading a new one)
         self._catalog_preserved = {}
@@ -1339,6 +1345,11 @@ class CCRBackend:
         calibrated default slope (black point only). See
         spec/optional-white-point-default-slope.md."""
         self.white_point_bgr = None
+
+    def clear_black_point(self):
+        """Drop the sampled black point (film base). With no black point the
+        B/W-point section needs a fresh Set Black Point before converting."""
+        self.black_point_bgr = None
 
     def set_black_point(self, bgr_tuple):
         self.black_point_bgr = bgr_tuple

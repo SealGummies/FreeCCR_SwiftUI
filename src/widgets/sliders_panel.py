@@ -1427,21 +1427,17 @@ class SlidersPanel(QWidget):
                 "<b>Black Point:</b> Draw a rect over the transparent/clear film base.", duration=6000)
 
     def _on_clear_white_point(self):
-        """Clear the sampled white point so conversion uses the calibrated
-        default slope (black point only)."""
+        """Clear BOTH sampled B/W points (black film base + white dense point),
+        resetting the Film B/W Point section."""
+        ccr_backend.clear_black_point()
         ccr_backend.clear_white_point()
         mw = self.parent().parent()
         if hasattr(mw, "persist_bwpoint"):
             mw.persist_bwpoint()
         self._update_bwp_mode_label()
-        if ccr_backend.black_point_bgr is None:
-            self.set_temporary_hint(
-                "White point cleared. Set a <b>Black Point</b> (film base), then "
-                "Convert to use the <b>default slope</b>.", duration=6000)
-        else:
-            self.set_temporary_hint(
-                "White point cleared — conversion will use the calibrated "
-                "<b>default slope</b>. Click <b>Convert</b> to apply.", duration=6000)
+        self.set_temporary_hint(
+            "B/W points cleared. Set a <b>Black Point</b> (film base) "
+            "before converting.", duration=6000)
 
     def _update_bwp_mode_label(self):
         """Reflect which slope source the next B/W-point conversion will use."""
