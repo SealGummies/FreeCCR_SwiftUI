@@ -41,6 +41,10 @@ class CCRBackend:
         self.positive_mode: bool = False
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
+        # TEST staging: when False, NamiColor negatives show the decoded image with
+        # the film base auto-WB'd to neutral grey (NOT inverted); when True, the
+        # full NamiColor conversion runs. Toggled by the "Initiate NamiColor" button.
+        self.namicolor_initiated: bool = False
         # Global input ICC profile (one app-wide setting; applied to every
         # decode before conversion/adjustments). The parsed profile lives in
         # color_management's module-level holder; these mirror it for the UI.

@@ -393,7 +393,9 @@ class CCRImage:
             user_flip=0,              # No rotation
             demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,  # Simple linear demosaic
             half_size=preview,        # Process at half resolution - much faster!
-            use_camera_wb=False,      # No camera white balance
+            # As-shot WB for NamiColor (it then auto-WBs the film base); the classic
+            # inverter wants the raw sensor readout with no WB.
+            use_camera_wb=NAMICOLOR_CONVERSION,
             use_auto_wb=False,        # No auto white balance
             output_color=output_color,
             no_auto_scale=True,       # No automatic scaling
@@ -720,6 +722,29 @@ class CCRImage:
             return image
         return apply_dust_removal(image, spots)
 
+    def _namicolor_base_wb(self, image: np.ndarray) -> np.ndarray:
+        """Auto white-balance the film base to neutral grey (before the NamiColor
+        invert). Base = the sampled black point if set, else auto-detected as the
+        bright/flat clear-film colour. Scales each channel so the base is neutral,
+        removing the orange mask consistently regardless of scene content."""
+        try:
+            import cv2
+            from core.ccr_backend import ccr_backend
+            base = ccr_backend.black_point_bgr
+            if base is None:
+                from core.frame_detect import _estimate_film_base
+                H, W = image.shape[:2]
+                sc = 400.0 / max(H, W)
+                small = cv2.resize(image, (max(1, int(W * sc)), max(1, int(H * sc))),
+                                   interpolation=cv2.INTER_AREA).astype(np.float32)
+                base = _estimate_film_base(small)
+            base = np.maximum(np.asarray(base, np.float32), 1.0)
+            mult = base[1] / base                       # neutralize each channel to green
+            return np.clip(image.astype(np.float32) * mult[None, None, :],
+                           0, 65535).astype(image.dtype)
+        except Exception:
+            return image
+
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,
                           color_profile=None, areas_override=None,
@@ -745,6 +770,15 @@ class CCRImage:
         # Runs even with empty settings (a neutral conversion still inverts).
         # Curves / areas / B&W collapse below run on the resulting display image.
         if self._namicolor_active() and not getattr(self, "converted", False):
+            from core.ccr_backend import ccr_backend
+            # NEW pipeline: auto-WB the film base to neutral grey BEFORE the invert.
+            image = self._namicolor_base_wb(image)
+            if not getattr(ccr_backend, "namicolor_initiated", False):
+                # TEST staging: show the decoded + base-WB'd NEGATIVE (gamma for
+                # display), NOT inverted. The "Initiate NamiColor" button converts.
+                disp = (np.power(np.clip(image.astype(np.float32) / 65535.0, 0, 1),
+                                 1 / 2.2) * 65535.0).astype(np.uint16)
+                return self._to_grayscale(disp) if profile == "bw" else disp
             # Hidden auto-gain: add the stored master-gain offset (the UI slider
             # stays neutral). See compute_namicolor_gain / spec §2.6.
             s_eff = s or {}
@@ -752,7 +786,7 @@ class CCRImage:
             if go:
                 s_eff = {**s_eff,
                          'ch_master_gain': float(s_eff.get('ch_master_gain', 0) or 0) + go}
-            adjusted = namicolor_process(image, s_eff, self._namicolor_anchors())
+            adjusted = namicolor_process(image, s_eff, namicolor_anchors(image, None, None))
             curves = s.get('curves') if s else None
             if curves:
                 adjusted = apply_curves(adjusted, curves)

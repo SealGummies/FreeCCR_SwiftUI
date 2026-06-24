@@ -417,11 +417,16 @@ class SlidersPanel(QWidget):
         self.bwp_mode_label = QLabel("")
         self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         scroll_layout.addWidget(self.bwp_mode_label)
-        # NamiColor converts negatives LIVE. The B/W points are app-global; every
-        # anchor change (set black, set white, or clear) automatically RECALCULATES
-        # — re-running per-image auto-gain and re-rendering every loaded image — so
-        # there are no manual "Auto Gain" / "Apply to All" buttons.
-        # (spec/namicolor-bwpoint-conversion.md)
+        # TEST staging button. OFF (default): the canvas shows the decoded negative
+        # with the film base auto-WB'd to neutral grey (not inverted). ON: runs the
+        # full NamiColor conversion. Toggles ccr_backend.namicolor_initiated.
+        self.initiate_namicolor_btn = QPushButton("Initiate NamiColor")
+        self.initiate_namicolor_btn.setCheckable(True)
+        self.initiate_namicolor_btn.setFixedHeight(theme.CONTROL_H)
+        self.initiate_namicolor_btn.setToolTip(
+            "OFF: show the decoded image, film base white-balanced to neutral grey.\n"
+            "ON: run the NamiColor conversion.")
+        scroll_layout.addWidget(self.initiate_namicolor_btn)
 
         # Separator between B/W Point tools and the adjustment sliders
         scroll_layout.addWidget(theme.section_separator())
@@ -638,6 +643,7 @@ class SlidersPanel(QWidget):
         self.white_point_btn.clicked.connect(self._on_set_white_point)
         self.clear_bwp_btn.clicked.connect(self._on_clear_bwpoint)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
+        self.initiate_namicolor_btn.toggled.connect(self._on_initiate_namicolor)
 
         # --- Hint label — fixed at bottom, outside scroll area ---
         self.hint_label = QLabel()
@@ -811,7 +817,7 @@ class SlidersPanel(QWidget):
         Convert/Un-convert/Auto Frame actions are commented out (NamiColor
         converts negatives live). See spec/namicolor-bwpoint-conversion.md."""
         for btn in (self.white_point_btn, self.black_point_btn,
-                    self.clear_bwp_btn):
+                    self.clear_bwp_btn, self.initiate_namicolor_btn):
             btn.setEnabled(enabled)
 
     def save_slider_values(self, image_id):
@@ -1422,6 +1428,14 @@ class SlidersPanel(QWidget):
             self.image_preview.set_bwpoint_mode("black")
             self.set_temporary_hint(
                 "<b>Black Point:</b> Draw a rect over the transparent/clear film base.", duration=6000)
+
+    def _on_initiate_namicolor(self, checked):
+        """TEST toggle: OFF shows the decoded + film-base-WB'd negative; ON runs the
+        full NamiColor conversion. Re-renders every image."""
+        ccr_backend.namicolor_initiated = bool(checked)
+        self.initiate_namicolor_btn.setText(
+            "NamiColor: ON" if checked else "Initiate NamiColor")
+        self._recalculate_all()
 
     def _on_clear_bwpoint(self):
         """Clear BOTH the black and white points so the live conversion auto-fits
