@@ -274,7 +274,10 @@ class CCRImage:
         if profile is None:
             return arr
         try:
-            return profile.apply(arr)
+            # NamiColor expects LINEAR Adobe-ish input and does its own per-channel
+            # auto-levels; emit linear + soft roll-off there (a hard clip spikes
+            # red/orange saturation). Positive/classic/export keep sRGB-encoded.
+            return profile.apply(arr, linear_target=self._namicolor_active())
         except Exception as e:
             logging.warning(f"Input ICC profile could not be applied: {e}")
             return arr

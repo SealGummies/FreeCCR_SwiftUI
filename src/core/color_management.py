@@ -373,6 +373,19 @@ def _eval_para(func: int, p: list, x: np.ndarray) -> np.ndarray:
     raise UnsupportedICCError(f"unsupported parametric curve type {func}")
 
 
+def _soft_gamut_rolloff(x: np.ndarray, knee: float = 0.8) -> np.ndarray:
+    """Compress values above `knee` smoothly into [knee, 1.0) instead of hard-
+    clipping to 1.0. Used on the NamiColor path so an out-of-gamut highlight (e.g. a
+    saturated red lifted by the camera matrix) rolls off rather than slamming the
+    channel ceiling — a hard clip destroys the per-channel tonal structure that
+    NamiColor's per-channel auto-levels rebalance, which is what spikes red/orange
+    saturation (see the IT8 ICC over-saturation analysis)."""
+    out = np.array(x, dtype=np.float32, copy=True)
+    hi = out > knee
+    out[hi] = knee + (1.0 - knee) * np.tanh((out[hi] - knee) / (1.0 - knee))
+    return out
+
+
 class InputProfile:
     """A parsed RGB matrix-shaper input profile that converts decoded device
     pixels into the working sRGB encoding."""
@@ -417,14 +430,24 @@ class InputProfile:
             pass
         return ""
 
-    def apply(self, rgb_u16: np.ndarray) -> np.ndarray:
-        """Convert HxWx3 uint16 device RGB into uint16 sRGB-encoded working RGB."""
+    def apply(self, rgb_u16: np.ndarray, linear_target: bool = False) -> np.ndarray:
+        """Convert HxWx3 uint16 device RGB into the working space.
+
+        linear_target=False (default): sRGB-ENCODED display working RGB, hard-clipped
+        to the [0,1] gamut — for the positive / classic / export paths.
+        linear_target=True: LINEAR working RGB with a SOFT highlight roll-off instead
+        of a hard clip — for the NamiColor path, which expects linear input and runs
+        its own per-channel auto-levels. A hard clip there destroys the per-channel
+        structure those levels rebalance and spikes red/orange saturation."""
         if rgb_u16.ndim != 3 or rgb_u16.shape[2] != 3 or rgb_u16.dtype != np.uint16:
             return rgb_u16
         # LUTs are length 65536, so a uint16 value indexes them directly.
         lin = np.empty(rgb_u16.shape, dtype=np.float32)
         for c in range(3):
             lin[..., c] = self._luts[c][rgb_u16[..., c]]
-        srgb_lin = lin @ self._matrix.T
-        out = srgb_encode(np.clip(srgb_lin, 0.0, 1.0))
-        return np.rint(out * 65535.0).astype(np.uint16)
+        work_lin = lin @ self._matrix.T
+        if linear_target:
+            out = _soft_gamut_rolloff(np.maximum(work_lin, 0.0))   # linear, soft roll-off
+        else:
+            out = srgb_encode(np.clip(work_lin, 0.0, 1.0))         # display sRGB (unchanged)
+        return np.rint(np.clip(out, 0.0, 1.0) * 65535.0).astype(np.uint16)
