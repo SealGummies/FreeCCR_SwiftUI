@@ -2165,6 +2165,9 @@ _CINEON_GREY_N = 470.0 / 1023.0             # 0.4594  (18% grey; InputGain pivot
 # headroom is handled by auto-gain, not by lowering this. Tunable via env.
 _NAMI_WHITE_TARGET = float(os.environ.get("FREECCR_NAMICOLOR_WHITE_TARGET", "685"))
 _NAMI_WHITE_TARGET_N = _NAMI_WHITE_TARGET / 1023.0   # 0.6696
+# Rec.2020 luma weights — used to build a single shared (green-dominant) high anchor
+# for the AUTO (no sampled white point) path so every channel shares one gain.
+_LUMA_DENSITY_W = np.array([0.2627, 0.6780, 0.0593], dtype=np.float32)
 
 # Adobe RGB -> Rec.2020 input matrix, exactly as the NamiColor 3.1 DCTL does it
 # (github.com/Wavechaser/NamiColor). NOTE: the DCTL applies it IN-PLACE and
@@ -2222,8 +2225,21 @@ def namicolor_anchors(img16_adobe_linear: np.ndarray,
     d = _namicolor_density(x).reshape(-1, 3)
     p_lo = (np.percentile(d, _NAMI_LOW, axis=0).astype(np.float32)
             if black_point_bgr is None else _point_density(black_point_bgr))
-    p_hi = (np.percentile(d, _NAMI_HIGH, axis=0).astype(np.float32)
-            if white_point_bgr is None else _point_density(white_point_bgr))
+    if white_point_bgr is not None:
+        # Sampled white POINT: a per-channel high anchor that pins each channel's
+        # white, precisely neutralizing the orange mask (and consistent across frames
+        # since the point is app-global).
+        p_hi = _point_density(white_point_bgr)
+    else:
+        # AUTO fallback (no sampled white): a GLOBAL high anchor — set every channel's
+        # span to the shared luma span so the tone fit applies ONE uniform gain. A
+        # per-channel percentile high is content-dependent and casts each frame
+        # differently (greens collapse, frame-to-frame inconsistency); the shared gain
+        # keeps frames consistent and preserves the per-channel-base-neutralized colour.
+        luma_lo = float(np.asarray(p_lo, np.float32) @ _LUMA_DENSITY_W)
+        luma_hi = float(np.percentile(d @ _LUMA_DENSITY_W, _NAMI_HIGH))
+        span_global = max(luma_hi - luma_lo, 1e-4)
+        p_hi = (np.asarray(p_lo, np.float32) + np.float32(span_global))
     # Keep the high anchor strictly above the low one per channel (a mis-sampled
     # point must not invert the channel).
     p_hi = np.maximum(p_hi, p_lo + np.float32(1e-3)).astype(np.float32)
@@ -2262,6 +2278,8 @@ def namicolor_channel_transform(lin_rec2020: np.ndarray, s: dict,
         d = d_all[..., c]
         span = max(float(p_hi[c]) - float(p_lo[c]), 1e-4)
         # Auto-levels: black point / lowest -> 95/1023, white point / highest -> 685/1023.
+        # (For AUTO with no sampled white, namicolor_anchors makes p_hi a GLOBAL anchor
+        # so this span is shared across channels — see there.)
         d = B + (d - np.float32(p_lo[c])) * np.float32((float(W) - float(B)) / span)
         # InputGain is a master contrast about Cineon 18% grey (neutral at 0).
         if input_gain != 1.0:
