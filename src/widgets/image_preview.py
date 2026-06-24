@@ -428,7 +428,11 @@ class GraphicsImageView(QGraphicsView):
                         y2 = max(0, min(y2, h))
                         if (x2 - x1) >= 5 and (y2 - y1) >= 5:
                             crop = raw_data[y1:y2, x1:x2, :]
-                            means = np.mean(crop.reshape(-1, 3), axis=0)
+                            # MEDIAN, not mean: the B/W-point anchor drives the
+                            # per-channel alignment, so a few stray sprocket /
+                            # holder / dust pixels in the drawn rect must not skew
+                            # it (a contaminated mean warm-shifts the whole frame).
+                            means = np.median(crop.reshape(-1, 3), axis=0)
                             bgr_tuple = (float(means[0]), float(means[1]), float(means[2]))
                             if mode == "black":
                                 ccr_backend.set_black_point(bgr_tuple)

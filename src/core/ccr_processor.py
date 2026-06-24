@@ -2160,30 +2160,31 @@ _CINEON_NG = 0.6         # negative gamma
 _CINEON_BLACK_N = _CINEON_BLACK / 1023.0    # 0.0929  (black point / lowest -> here)
 _CINEON_WHITE_N = _CINEON_WHITE / 1023.0    # 0.6696  (Cineon white; CST decode -> 1.0)
 _CINEON_GREY_N = 470.0 / 1023.0             # 0.4594  (18% grey; InputGain pivot)
-# Auto-fit maps the highest values to slightly BELOW the 685 Cineon white for a
-# bit of highlight headroom — they decode just under display white instead of
-# clipping. Tunable via env (the CST white reference stays 685).
-_NAMI_WHITE_TARGET = float(os.environ.get("FREECCR_NAMICOLOR_WHITE_TARGET", "665"))
-_NAMI_WHITE_TARGET_N = _NAMI_WHITE_TARGET / 1023.0   # 0.6500
+# Auto-fit maps the highest values to the white target. 685 matches the NamiColor
+# DCTL's "Fit to Cineon Base" white (the CST decodes 685 -> 1.0); highlight
+# headroom is handled by auto-gain, not by lowering this. Tunable via env.
+_NAMI_WHITE_TARGET = float(os.environ.get("FREECCR_NAMICOLOR_WHITE_TARGET", "685"))
+_NAMI_WHITE_TARGET_N = _NAMI_WHITE_TARGET / 1023.0   # 0.6696
 
-# --- Color-path toggles (to match DaVinci NamiColor) ----------------------- #
-# Our pipeline does Adobe->Rec.2020 BEFORE the density AND Rec.2020->Rec.709 in
-# the CST (a full, colorimetrically-correct gamut chain). DaVinci's NamiColor node
-# runs the density on the Adobe primaries DIRECTLY and its CST then treats them AS
-# Rec.2020 — so the extra input matrix is the likely source of the color shift.
-#   FREECCR_NAMICOLOR_ADOBE2REC2020=0  -> skip the input matrix (match DaVinci)
-#   FREECCR_NAMICOLOR_CST_MATRIX=0     -> drop the Rec.2020->Rec.709 step (test)
+# Adobe RGB -> Rec.2020 input matrix, exactly as the NamiColor 3.1 DCTL does it
+# (github.com/Wavechaser/NamiColor). NOTE: the DCTL applies it IN-PLACE and
+# SEQUENTIALLY — the G row reuses the just-overwritten R, the B row the new R & G.
+# That quirk is part of the NamiColor look, so we replicate it verbatim rather than
+# use a clean matrix. Env FREECCR_NAMICOLOR_ADOBE2REC2020=0 bypasses it.
 NAMICOLOR_ADOBE2REC2020 = os.environ.get("FREECCR_NAMICOLOR_ADOBE2REC2020", "1") != "0"
 NAMICOLOR_CST_MATRIX = os.environ.get("FREECCR_NAMICOLOR_CST_MATRIX", "1") != "0"
 
 
 def _to_working_primaries(rgb_adobe_linear: np.ndarray) -> np.ndarray:
-    """Adobe-RGB-linear -> the primaries the density runs in. ON (default): the
-    correct Adobe->Rec.2020 matrix; OFF: pass the Adobe primaries through (what
-    DaVinci's NamiColor node does — the CST then mislabels them as Rec.2020)."""
-    if NAMICOLOR_ADOBE2REC2020:
-        return rgb_adobe_linear @ M_ADOBE2REC2020.T
-    return rgb_adobe_linear
+    """Adobe-RGB-linear -> Rec.2020, verbatim from the NamiColor 3.1 DCTL (in-place
+    sequential overwrite). OFF: pass Adobe primaries through unchanged."""
+    if not NAMICOLOR_ADOBE2REC2020:
+        return rgb_adobe_linear
+    r, g, b = rgb_adobe_linear[..., 0], rgb_adobe_linear[..., 1], rgb_adobe_linear[..., 2]
+    r = r * 0.86965940 + g * 0.08676942 + b * 0.03409159
+    g = r * 0.09357638 + g * 0.90511022 + b * 0.00546303   # uses the NEW r
+    b = r * 0.01676546 + g * 0.06225891 + b * 0.92799144   # uses the NEW r, g
+    return np.stack([r, g, b], axis=-1)
 
 
 def _namicolor_density(lin_rec2020: np.ndarray) -> np.ndarray:
