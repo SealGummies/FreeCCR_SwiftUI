@@ -354,6 +354,10 @@ class MainWindow(QMainWindow):
         self.clear_input_icc_action.triggered.connect(self.clear_input_icc_profile)
         self._refresh_input_icc_menu()
 
+        # Build a camera input profile from a photographed IT8 target.
+        self.it8_profile_action = file_menu.addAction("Create Camera Profile from IT8…")
+        self.it8_profile_action.triggered.connect(self.create_camera_profile_from_it8)
+
         # Add Help menu with About, Licenses, Activation, and Help actions
         help_menu = menu_bar.addMenu("Help")
         about_action = help_menu.addAction("About")
@@ -377,7 +381,6 @@ class MainWindow(QMainWindow):
             self.clear_input_icc_action.setEnabled(False)
 
     def set_input_icc_profile(self):
-        from core.color_management import UnsupportedICCError
         start_dir = self._settings.value("import/last_icc_dir", "", type=str)
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Input ICC Profile", start_dir,
@@ -385,6 +388,13 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._settings.setValue("import/last_icc_dir", os.path.dirname(path))
+        self._apply_input_icc_path(path)
+
+    def _apply_input_icc_path(self, path: str) -> bool:
+        """Activate `path` as the global input ICC profile (parse, persist,
+        reprocess). Returns True on success. Shared by the file picker and the
+        IT8 camera-profile wizard's 'apply now'."""
+        from core.color_management import UnsupportedICCError
         try:
             name = ccr_backend.set_input_icc(path)
         except UnsupportedICCError as e:
@@ -393,16 +403,37 @@ class MainWindow(QMainWindow):
                 f"This profile can't be used as an input profile:\n\n{e}\n\n"
                 "Only RGB matrix-shaper profiles are supported "
                 "(LUT-based, cLUT, or CMYK profiles are not).")
-            return
+            return False
         except Exception as e:
             QMessageBox.warning(self, "Input ICC Profile Error",
                                 f"Could not load the ICC profile:\n\n{e}")
-            return
+            return False
         self._settings.setValue("import/input_icc_path", ccr_backend.input_icc_path)
         self._refresh_input_icc_menu()
         self._reprocess_after_input_icc_change()
         self.sliders_panel.set_temporary_hint(
             f"Input ICC profile set: {name}", duration=3000)
+        return True
+
+    def create_camera_profile_from_it8(self):
+        """Open the IT8 wizard; on success optionally activate the new profile."""
+        from widgets.it8_profile_dialog import IT8ProfileDialog
+        current_path = None
+        idx = self.image_preview.current_idx
+        if idx is not None:
+            img = ccr_backend.get_image_by_index(idx)
+            if img is not None:
+                current_path = img.file_path
+        dlg = IT8ProfileDialog(self, current_path=current_path)
+        if dlg.exec() != QDialog.Accepted or not dlg.saved_path:
+            return
+        base = os.path.basename(dlg.saved_path)
+        if dlg.apply_now and self._apply_input_icc_path(dlg.saved_path):
+            self.sliders_panel.set_temporary_hint(
+                f"Camera profile saved and applied: {base}", duration=4000)
+        else:
+            self.sliders_panel.set_temporary_hint(
+                f"Camera profile saved: {base}", duration=4000)
 
     def clear_input_icc_profile(self):
         ccr_backend.clear_input_icc()

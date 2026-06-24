@@ -266,6 +266,11 @@ class CCRImage:
         identically (resolution-independent point operation)."""
         if arr is None:
             return arr
+        # DNG carries its own embedded camera profile (rawpy honours it on
+        # decode), so burning in an external input ICC on top would
+        # double-correct the colour — skip it for .dng sources only.
+        if os.path.splitext(self.file_path)[1].lower() == ".dng":
+            return arr
         profile = color_management.get_active_input_profile()
         if profile is None:
             return arr
@@ -330,13 +335,22 @@ class CCRImage:
             four_color_rgb=False,     # Standard 3-color processing
         )
 
-    def read_image(self, file_path: str, preview = True, max_long_side: Optional[int] = None) -> Optional[np.ndarray]:
+    def read_image(self, file_path: str, preview = True, max_long_side: Optional[int] = None,
+                   positive_override: Optional[bool] = None, apply_input_icc: bool = True) -> Optional[np.ndarray]:
         """
         Read an image file. preview=True decodes RAW at half size.
         max_long_side, when given, downsizes to that size INSIDE the reader —
         for RAW this happens before white-level scaling (both steps are
         linear, so the order only changes values by <=3 LSB, and scaling at
         preview size instead of decode size saves ~100 ms per image).
+
+        positive_override / apply_input_icc let a caller pin the decode space
+        without mutating global state (used by the IT8 camera-profiling decode,
+        see spec/it8-camera-profile.md §6.1): positive_override=False forces the
+        raw-linear negative decode regardless of the live Positive-mode toggle,
+        and apply_input_icc=False skips burning in the active input ICC profile —
+        together they yield the bare device RGB an input profile is fitted on.
+        Both default to current behaviour, so existing callers are unaffected.
         """
         # Ensure file path is properly encoded for Unicode support
         file_path = os.path.normpath(file_path)
@@ -348,8 +362,10 @@ class CCRImage:
 
         # Read the global Positive-mode flag once per call so every branch of
         # this decode (RAW vs non-RAW, white-level, input ICC) uses one
-        # consistent value (spec/positive-mode.md §3 "read once").
-        positive_mode = self._positive_mode_active()
+        # consistent value (spec/positive-mode.md §3 "read once"). A caller may
+        # override it (e.g. force the raw-linear decode for IT8 profiling).
+        positive_mode = (self._positive_mode_active() if positive_override is None
+                         else bool(positive_override))
 
         if ext in [".cr3", ".cr2", ".nef", ".arw", ".dng", ".rw2", ".orf", ".raf", ".srw", ".pef", ".3fr"]:
             try:
@@ -440,8 +456,11 @@ class CCRImage:
                 # Burn in the global input ICC (if any) on the decoded scan,
                 # before negative conversion / adjustments. Skipped in positive
                 # mode (the decode is already a ready sRGB positive — the input
-                # ICC is a negative-scanning tool).
-                return rgb if positive_decode else self._apply_input_icc(rgb)
+                # ICC is a negative-scanning tool) and when the caller opted out
+                # (apply_input_icc=False, e.g. IT8 profiling wants bare device RGB).
+                if positive_decode or not apply_input_icc:
+                    return rgb
+                return self._apply_input_icc(rgb)
             except Exception as e:
                 logging.exception(f"Failed to read RAW image: {file_path}")
                 return None
@@ -528,8 +547,11 @@ class CCRImage:
             if max_long_side:
                 img = self.resize_image_to_max_pixel(img, max_long_side)
             # Burn in the global input ICC (if any) before conversion/adjustments.
-            # Skipped in positive mode (treat the file as a ready sRGB positive).
-            return img if positive_mode else self._apply_input_icc(img)
+            # Skipped in positive mode (treat the file as a ready sRGB positive)
+            # and when the caller opted out (apply_input_icc=False).
+            if positive_mode or not apply_input_icc:
+                return img
+            return self._apply_input_icc(img)
         
     def update_thumbnail_and_preview(self, thumbnail_size: int = 156, preview_size: int = 1080) -> None:
         """

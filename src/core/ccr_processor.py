@@ -200,35 +200,14 @@ def _initialize_opencl():
                 }
             }
 
-            // Exposure (Adobe-like, tone-aware to preserve highlights)
+            // Gain — IDENTICAL to Channel Levels "Master Gain" (ch_master_gain):
+            // uniform linear gain out = in / (1 - v/300), hard-clipped to [0,1].
             if (exposure != 0.0f) {
-                // Calculate luminance for tone-aware exposure mapping
-                float img_norm_r = r / 65535.0f;
-                float img_norm_g = g / 65535.0f;
-                float img_norm_b = b / 65535.0f;
-                float luminance = img_norm_r * 0.299f + img_norm_g * 0.587f + img_norm_b * 0.114f;
-                
-                // Create smooth, continuous tone-aware exposure curve
-                float transition_midpoint = 0.80f;   // Where the curve inflection point is (80% luminance)
-                float transition_width = 0.15f;      // Controls smoothness of transition
-                float min_strength = 0.03f;          // Minimum exposure effect in pure highlights (3%)
-                float max_strength = 1.0f;           // Maximum exposure effect in shadows/midtones
-                
-                // Smooth sigmoid-like curve for continuous transition
-                float exposure_curve = min_strength + (max_strength - min_strength) * (
-                    1.0f / (1.0f + exp((luminance - transition_midpoint) / transition_width))
-                );
-                
-                // Apply tone-aware exposure
-                float exposure_scale = exposure * 2.0f / 100.0f;
-                float exposure_factor = pow(2.0f, exposure_scale);  // Base exposure factor in stops (±2 EV)
-                
-                // Create per-pixel exposure factors
-                float pixel_exposure_factor = 1.0f + (exposure_factor - 1.0f) * exposure_curve;
-                
-                r *= pixel_exposure_factor;
-                g *= pixel_exposure_factor;
-                b *= pixel_exposure_factor;
+                float gm = clamp(exposure, -100.0f, 100.0f) / 300.0f;
+                float wv = 1.0f - gm;
+                r = clamp((r / 65535.0f) / wv, 0.0f, 1.0f) * 65535.0f;
+                g = clamp((g / 65535.0f) / wv, 0.0f, 1.0f) * 65535.0f;
+                b = clamp((b / 65535.0f) / wv, 0.0f, 1.0f) * 65535.0f;
             }
             
             // Brightness (Adobe-like: lift lower midtones, preserve highlights)
@@ -2267,36 +2246,13 @@ def adjust_image(
             img[..., 0] *= r_scale  # R  
             img[..., 2] *= b_scale  # B
 
-    # Exposure (Adobe-like, tone-aware to preserve highlights)
+    # Gain — IDENTICAL to Channel Levels "Master Gain" (ch_master_gain): a uniform
+    # linear gain out = in / (1 - v/300), hard-clipped to [0,1]. Same /300 mapping
+    # so moving "Gain" tracks Master Gain 1:1 (v=100 -> 1.5x, v=-100 -> 0.75x).
     if exposure != 0.0:
-        # Calculate luminance for tone-aware exposure mapping
-        img_norm = img / 65535.0
-        luminance = np.dot(img_norm[..., :3], [0.299, 0.587, 0.114])
-        
-        # Create smooth, continuous tone-aware exposure curve
-        # Full effect in shadows/midtones, smoothly reduced effect in highlights
-        # Using a smooth sigmoid-like transition instead of sharp cutoff
-        transition_midpoint = 0.80   # Where the curve inflection point is (80% luminance)
-        transition_width = 0.15      # Controls smoothness of transition
-        min_strength = 0.03          # Minimum exposure effect in pure highlights (15%)
-        max_strength = 1.0           # Maximum exposure effect in shadows/midtones
-        
-        # Smooth sigmoid-like curve for continuous transition
-        # Formula: strength = min + (max-min) * (1 / (1 + exp((lum - mid) / width)))
-        exposure_curve = min_strength + (max_strength - min_strength) * (
-            1.0 / (1.0 + np.exp((luminance - transition_midpoint) / transition_width))
-        )
-        
-        # Expand curve to match image dimensions
-        exposure_curve = np.expand_dims(exposure_curve, axis=-1)
-        
-        # Apply tone-aware exposure
-        exposure_factor = 2 ** exposure_scale  # Base exposure factor in stops
-        
-        # Create per-pixel exposure factors
-        pixel_exposure_factors = 1.0 + (exposure_factor - 1.0) * exposure_curve
-        
-        img *= pixel_exposure_factors
+        gm = np.clip(exposure, -100.0, 100.0) / 300.0   # match ch_master_gain
+        white_val = 1.0 - gm                            # black_val is 0
+        img = np.clip(img / 65535.0 / white_val, 0.0, 1.0) * 65535.0
     
     # Brightness
     if brightness != 0.0:
