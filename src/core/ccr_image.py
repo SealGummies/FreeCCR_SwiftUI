@@ -268,20 +268,24 @@ class CCRImage:
             new_h = int(h * max_long_side / w)
         return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    def _apply_input_icc(self, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    def _apply_input_icc(self, arr: Optional[np.ndarray],
+                         as_shot_wb=None) -> Optional[np.ndarray]:
         """Convert a freshly-decoded scan from the globally-assigned input ICC
         profile into the working LINEAR Adobe RGB space (the same space the
         no-ICC decode produces, so the density-based inversion sees consistent
         linear data), before any conversion or adjustment. No-op when no input
         profile is set. Applied inside read_image so preview, hi-res zoom, and
-        export all inherit it identically (resolution-independent point op)."""
+        export all inherit it identically (resolution-independent point op).
+
+        The camera matrix consumes WHITE-BALANCED data, so the frame's as-shot
+        neutral is threaded through (mirrors _apply_input_dcp)."""
         if arr is None:
             return arr
         profile = color_management.get_active_input_profile()
         if profile is None:
             return arr
         try:
-            return profile.apply(arr)
+            return profile.apply(arr, as_shot_wb=as_shot_wb)
         except Exception as e:
             logging.warning(f"Input ICC profile could not be applied: {e}")
             return arr
@@ -539,7 +543,7 @@ class CCRImage:
                     return rgb
                 if color_management.get_active_dcp_profile() is not None:
                     return self._apply_input_dcp(rgb, as_shot_wb)
-                return self._apply_input_icc(rgb)
+                return self._apply_input_icc(rgb, as_shot_wb)
             except Exception as e:
                 logging.exception(f"Failed to read RAW image: {file_path}")
                 return None
@@ -632,7 +636,7 @@ class CCRImage:
                 return img
             if color_management.get_active_dcp_profile() is not None:
                 return self._apply_input_dcp(img, None)
-            return self._apply_input_icc(img)
+            return self._apply_input_icc(img, None)
         
     def update_thumbnail_and_preview(self, thumbnail_size: int = 156, preview_size: int = 1080) -> None:
         """

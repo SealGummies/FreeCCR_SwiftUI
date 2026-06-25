@@ -23,8 +23,23 @@ D50 = np.array(cm.D50_XYZ)
 M0 = np.array([[0.46, 0.31, 0.17], [0.23, 0.70, 0.07], [0.02, 0.12, 0.93]])
 
 
+def _pin(M):
+    """Pin so balanced white (1,1,1) -> D50 exactly (the white-relative anchor a
+    real fit's matrix carries: M @ (1,1,1) == D50)."""
+    M = np.asarray(M, float)
+    return np.diag(D50 / (M @ np.ones(3))) @ M
+
+
+M0P = _pin(M0)            # white-relative variant for build-contract assertions
+
+
 class _Fit:
-    def __init__(self, m): self.matrix = m
+    # NEW convention: `matrix` (M_f) maps WHITE-BALANCED device RGB -> XYZ D50
+    # (M_f @ (1,1,1) == D50) and `wb_mult` is the green-normalised WB (raw ->
+    # balanced, wb_mult[1] == 1). build_camera_dcp consumes both.
+    def __init__(self, m, wb=None):
+        self.matrix = np.asarray(m, dtype=np.float64)
+        self.wb_mult = np.ones(3) if wb is None else np.asarray(wb, dtype=np.float64)
 
 
 def _neutral(M):
@@ -37,14 +52,23 @@ def _neutral(M):
 # --------------------------------------------------------------------------- #
 
 def test_build_parse_roundtrip():
-    data = dcp.build_camera_dcp(_Fit(M0), "Cam D50", illuminant=23)
+    # A fit with a non-trivial WB so FM != inv(CM): ForwardMatrix1 == the fit's
+    # matrix exactly; ColorMatrix1 == inv(M @ diag(wb)) (NOT inv(FM)) — the two
+    # differ by the white-balance diagonal (DNG spec 1.6, ch.6).
+    wb = np.array([1.9, 1.0, 1.4])
+    fit = _Fit(M0P, wb)                    # white-relative matrix (M @ 1 == D50)
+    data = dcp.build_camera_dcp(fit, "Cam D50", illuminant=23)
     assert data[0:2] == b'II' and struct.unpack('<H', data[2:4])[0] == 42
     p = dcp.parse_dcp_bytes(data)
     assert p.name == "Cam D50" and p.illuminant_1 == 23
     assert p.has_forward and not p.is_dual
-    N = _neutral(M0)
-    np.testing.assert_allclose(p.forward_matrix_1, M0 @ np.diag(N), atol=1e-4)
-    np.testing.assert_allclose(p.color_matrix_1, np.linalg.inv(M0 @ np.diag(N)), atol=1e-4)
+    np.testing.assert_allclose(p.forward_matrix_1, M0P, atol=1e-4)
+    np.testing.assert_allclose(p.color_matrix_1, np.linalg.inv(M0P @ np.diag(wb)),
+                               atol=1e-4)
+    # ForwardMatrix is white-relative: FM @ (1,1,1) == D50.
+    np.testing.assert_allclose(np.asarray(p.forward_matrix_1) @ np.ones(3), D50, atol=1e-4)
+    # The camera neutral is the green-normalised raw neutral: CM @ D50 == 1/wb.
+    np.testing.assert_allclose(np.asarray(p.color_matrix_1) @ D50, 1.0 / wb, atol=1e-4)
 
 
 def test_parse_big_endian_mm():
@@ -73,23 +97,29 @@ def test_inline_short_and_negative_srational():
 # --------------------------------------------------------------------------- #
 
 def test_apply_forward_roundtrip_and_icc_parity():
-    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0), "c"))
-    N = _neutral(M0)
+    # FM is now white-relative (M @ 1 == D50); apply white-balances the raw by the
+    # green-normalised as-shot WB before the ForwardMatrix, so the expected linear
+    # Adobe is (balanced_raw) @ (A @ FM).T.
+    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0P), "c"))
+    N = _neutral(M0P)
+    as_shot = 1.0 / N
     rng = np.random.default_rng(0)
     cam = np.clip(N * rng.uniform(0, 1, (8, 8, 3)), 0, 1)     # in-range after WB
     cam_u16 = (cam * 65535).astype(np.uint16)
-    out = dcp.apply_dcp(p, cam_u16, as_shot_wb=1.0 / N)
-    expect = np.clip((cam_u16 / 65535.0) @ (cm.M_XYZ_D50_2_ADOBE @ M0).T, 0, 1)
+    out = dcp.apply_dcp(p, cam_u16, as_shot_wb=as_shot)
+    balanced = (cam_u16 / 65535.0) * (as_shot / as_shot[1])  # green-normalised WB
+    expect = np.clip(balanced @ (cm.M_XYZ_D50_2_ADOBE @ M0P).T, 0, 1)
     assert np.abs(out.astype(int) - np.rint(expect * 65535).astype(int)).max() <= 3
-    # parity: the same fit as a matrix ICC produces the same linear-Adobe output.
-    mp = cm.InputProfile.from_bytes(it8.build_camera_icc(_Fit(M0), "m"))
-    assert np.abs(out.astype(int) - mp.apply(cam_u16).astype(int)).max() <= 3
+    # parity: the same fit as a matrix ICC produces the same linear-Adobe output
+    # (the ICC path white-balances with the same as-shot WB).
+    mp = cm.InputProfile.from_bytes(it8.build_camera_icc(_Fit(M0P), "m"))
+    assert np.abs(out.astype(int) - mp.apply(cam_u16, as_shot_wb=as_shot).astype(int)).max() <= 3
 
 
 def test_apply_is_linear_not_srgb():
     # A 50% linear-Adobe grey must come out ~mid (linear), not sRGB-bumped (~0.73).
-    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0), "c"))
-    N = _neutral(M0)
+    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0P), "c"))
+    N = _neutral(M0P)
     cam = np.clip(N * 0.5, 0, 1)
     cam_u16 = np.tile((cam * 65535).astype(np.uint16).reshape(1, 1, 3), (2, 2, 1))
     out = dcp.apply_dcp(p, cam_u16, as_shot_wb=1.0 / N)[0, 0].astype(float) / 65535.0
@@ -143,7 +173,8 @@ def test_dual_illuminant_weight_and_blend():
 # --------------------------------------------------------------------------- #
 
 def test_synthetic_camera_roundtrip():
-    # IT8 reference patches; camera-native device via inv(M0); build DCP; apply;
+    # IT8 reference patches; the camera is (white-relative matrix M0P, WB `wb`):
+    # raw = (inv(M0P) @ XYZ) / wb. Build DCP from the fit; apply with as_shot_wb=wb;
     # back to XYZ -> Lab gives avg dE2000 ~ 0 (the DCP reproduces the chart).
     patches = {}
     for k, Y in enumerate(np.linspace(89, 3, 24)):
@@ -152,17 +183,19 @@ def test_synthetic_camera_roundtrip():
     for cid in it8.COLOR_IDS[:60]:
         Y = rng.uniform(8, 80)
         patches[cid] = np.array([Y * rng.uniform(0.8, 1.2), Y, Y * rng.uniform(0.6, 1.1)])
-    N = _neutral(M0)
-    fit = _Fit(M0)
+    wb = np.array([2.0, 1.0, 1.5])              # raw -> balanced (green == 1)
+    fit = _Fit(M0P, wb)
     p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(fit, "c"))
     Ainv = np.linalg.inv(cm.M_XYZ_D50_2_ADOBE)
+    Minv = np.linalg.inv(M0P)
     de = []
     for xyz in patches.values():
-        cam = np.linalg.inv(M0) @ (xyz / 100.0)               # camera-native device
-        if np.any(cam < 0) or np.any(cam * (1.0 / N) > 1):    # skip out-of-gamut/clipped
+        balanced = Minv @ (xyz / 100.0)                       # balanced device
+        raw = balanced / wb                                   # camera-native raw
+        if np.any(raw < 0) or np.any(balanced > 1):           # skip out-of-gamut/clipped
             continue
-        cu = np.tile((np.clip(cam, 0, 1) * 65535).astype(np.uint16).reshape(1, 1, 3), (2, 2, 1))
-        out = dcp.apply_dcp(p, cu, as_shot_wb=1.0 / N)[0, 0].astype(float) / 65535.0
+        cu = np.tile((np.clip(raw, 0, 1) * 65535).astype(np.uint16).reshape(1, 1, 3), (2, 2, 1))
+        out = dcp.apply_dcp(p, cu, as_shot_wb=wb)[0, 0].astype(float) / 65535.0
         got = (Ainv @ out) * 100.0
         de.append(float(it8.delta_e_2000(it8.xyz_to_lab(got), it8.xyz_to_lab(xyz))[0]))
     assert len(de) > 20 and float(np.mean(de)) < 0.5
@@ -318,13 +351,17 @@ def test_apply_as_shot_wb_none_is_unbalanced():
 def test_apply_highlight_not_preclipped():
     # d*m can exceed 1 (film-base highlights); the matrix must see the unclipped
     # value (clip only at the final Adobe output), matching the ICC path.
-    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0), "c"))
-    N = _neutral(M0)
-    m = (1.0 / N) * 1.4
-    cam = (np.clip(N * 0.9, 0, 1) * 65535).astype(np.uint16)    # d*m ≈ 1.26 in-channel
+    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0P), "c"))
+    N = _neutral(M0P)
+    # A strong green-normalised WB (m[1] == 1) pushes a balanced channel well past
+    # 1.0 (~2.34) — a film-base highlight the matrix must see UNCLIPPED.
+    m = np.array([2.6, 1.0, 1.9])
+    cam = (np.clip(N * 0.9, 0, 1) * 65535).astype(np.uint16)
     img = np.tile(cam.reshape(1, 1, 3), (2, 2, 1))
+    assert (cam / 65535.0 * m).max() > 1.0                         # genuinely > 1 pre-matrix
     out = dcp.apply_dcp(p, img, as_shot_wb=m)[0, 0]
     FM = p.forward_matrix_1
+    # m is already green-normalised, so it is the exact balance apply uses.
     expect = np.clip(((cam / 65535.0 * m) @ FM.T) @ cm.M_XYZ_D50_2_ADOBE.T, 0, 1)
     np.testing.assert_allclose(out / 65535.0, expect, atol=1e-3)   # no pre-matrix clip
 

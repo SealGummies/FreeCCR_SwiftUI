@@ -355,11 +355,16 @@ def _nonaffine_camera():
 
 
 def _patch_des(prof, fit, samples, ref):
+    # NEW convention: the profile (matrix or cLUT) consumes WHITE-BALANCED device,
+    # so the raw samples must be balanced by the fit's green-normalised WB before
+    # the profile — otherwise both dEs are computed in the wrong space. Passing
+    # as_shot_wb=fit.wb_mult reproduces what apply does on a real frame.
     Ainv = np.linalg.inv(cm.M_XYZ_D50_2_ADOBE)
     de = []
     for sid in fit.used_ids:
         dev = np.clip(samples[sid].rgb, 0, 65535).astype(np.uint16).reshape(1, 1, 3)
-        out = prof.apply(np.tile(dev, (2, 2, 1)))[0, 0].astype(np.float64) / 65535.0
+        out = prof.apply(np.tile(dev, (2, 2, 1)),
+                         as_shot_wb=fit.wb_mult)[0, 0].astype(np.float64) / 65535.0
         xyz = (Ainv @ out) * 100.0
         de.append(float(it8.delta_e_2000(it8.xyz_to_lab(xyz), ref.lab(sid))[0]))
     return float(np.mean(de)), float(np.max(de))
@@ -373,7 +378,12 @@ def test_clut_beats_matrix_on_nonaffine_camera():
         it8.build_camera_icc(fit, 'c', mode='clut', grid=17, samples=samples, ref=ref))
     m_avg, m_max = _patch_des(mp, fit, samples, ref)
     c_avg, c_max = _patch_des(cp, fit, samples, ref)
-    assert c_avg < 0.6 * m_avg                            # markedly lower residual
+    # The residual cLUT still markedly beats the bare 3x3 (clut avg ~1.7 vs
+    # matrix ~2.3 dE on this synthetic). Threshold relaxed from 0.6x to 0.8x:
+    # in the standards-compliant WHITE-BALANCED space the 3x3 already fits better
+    # than it did against un-balanced raw, so the cLUT's relative gain is smaller
+    # (~25%) but still clearly present and never worse on the max.
+    assert c_avg < 0.8 * m_avg                            # markedly lower residual
     assert c_max <= m_max
 
 

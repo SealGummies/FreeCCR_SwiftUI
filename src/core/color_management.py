@@ -469,32 +469,55 @@ class InputProfile:
             pass
         return ""
 
-    def apply(self, rgb_u16: np.ndarray) -> np.ndarray:
-        """Convert HxWx3 uint16 device RGB into uint16 **linear Adobe RGB** — the
-        exact working space the no-ICC negative decode produces, so the
+    @staticmethod
+    def _wb_gains(as_shot_wb):
+        """Green-normalised white-balance multipliers from the frame's as-shot
+        neutral (raw.camera_whitebalance), or None to skip balancing."""
+        if as_shot_wb is None:
+            return None
+        m = np.asarray(as_shot_wb, dtype=np.float32)[:3].copy()
+        m[m <= 0] = 1.0
+        if m[1] > 0:
+            m = m / m[1]
+        return m
+
+    def apply(self, rgb_u16: np.ndarray, as_shot_wb=None) -> np.ndarray:
+        """Convert HxWx3 uint16 camera device RGB into uint16 **linear Adobe RGB**
+        — the exact working space the no-ICC negative decode produces, so the
         density-based inversion downstream (-log10(value/full)) reads consistent
-        LINEAR data. Emitting sRGB-gamma-encoded data here mis-feeds that optical
-        density and casts the converted image (severe green/blue shift)."""
+        LINEAR data.
+
+        The matrix is a standard camera-profile matrix, so it consumes
+        WHITE-BALANCED data: the raw is balanced with the frame's as-shot neutral
+        (as_shot_wb, green-normalised) before the matrix — exactly what a DNG
+        ForwardMatrix or a RawTherapee input ICC expects. as_shot_wb=None (e.g. a
+        non-RAW input) skips balancing (degraded path)."""
         if rgb_u16.ndim != 3 or rgb_u16.shape[2] != 3 or rgb_u16.dtype != np.uint16:
             return rgb_u16
+        m = self._wb_gains(as_shot_wb)
         if self._kind == "clut":
-            return self._apply_clut(rgb_u16)
+            return self._apply_clut(rgb_u16, m)
         # LUTs are length 65536, so a uint16 value indexes them directly.
         lin = np.empty(rgb_u16.shape, dtype=np.float32)
         for c in range(3):
             lin[..., c] = self._luts[c][rgb_u16[..., c]]
-        adobe_lin = lin @ self._matrix.T                 # device -> linear Adobe RGB
+        if m is not None:
+            lin = lin * m                                # white balance (raw -> balanced)
+        adobe_lin = lin @ self._matrix.T                 # balanced -> linear Adobe RGB
         out = np.clip(adobe_lin, 0.0, 1.0)               # stay linear (no sRGB OETF)
         return np.rint(out * 65535.0).astype(np.uint16)
 
-    def _apply_clut(self, rgb_u16: np.ndarray) -> np.ndarray:
-        """cLUT apply: device input curves -> tetrahedral CLUT interpolation ->
-        XYZ(D50) -> linear Adobe RGB. Same uint16 linear-Adobe output as the
-        matrix path, so the downstream density inversion is untouched."""
+    def _apply_clut(self, rgb_u16: np.ndarray, m=None) -> np.ndarray:
+        """cLUT apply: white-balance -> tetrahedral CLUT interpolation -> XYZ(D50)
+        -> linear Adobe RGB. The CLUT is built in balanced device space, so the
+        raw is balanced (and clamped into the [0,1] node grid) before the lookup
+        — same uint16 linear-Adobe output as the matrix path."""
         clut = self._clut
         lin = np.empty(rgb_u16.shape, dtype=np.float32)
         for c in range(3):                               # input curves (65536 LUTs)
             lin[..., c] = clut.in_luts[c][rgb_u16[..., c]]
+        if m is not None:
+            lin = np.clip(lin * m, 0.0, 1.0)             # balance into the [0,1] grid
         xyz = _clut_interp_tetra(lin, clut)              # (...,3) XYZ D50 (Y=1)
         adobe_lin = xyz @ M_XYZ_D50_2_ADOBE.T            # -> linear Adobe RGB
         out = np.clip(adobe_lin, 0.0, 1.0)               # stay linear (no sRGB OETF)
