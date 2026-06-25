@@ -186,11 +186,13 @@ class CCRImage:
         
         return balance_factor
 
-    def reload_image(self) -> None:
-        """
-        Reload the image from the file path and update resized_raw, thumbnail, and preview.
-        This is useful if the image file has been modified externally.
-        """
+    def reload_image_decode_only(self) -> bool:
+        """Re-decode resized_raw + tint balance and reset the base offsets,
+        WITHOUT building the QPixmap thumbnail/preview (QPixmap must be created
+        on the GUI thread). Returns True on success. This is the thread-safe,
+        slow part of a reload — the bulk-reset path runs it concurrently across
+        a thread pool, then builds previews on the main thread via
+        update_thumbnail_and_preview()."""
         self.contrast_base = 0      # Clear base offsets when reverting to original scan
         self.temperature_base = 0
         # -8 is the negative-look baseline; positives reset to a neutral 0 so the
@@ -199,13 +201,21 @@ class CCRImage:
         self.exposure_base = 0.0    # Clear auto-exposure when reverting to original scan
         self.conversion_inputs = None
         img = self.read_image(self.file_path, max_long_side=1080)
-        if img is not None:
-            self.resized_raw = img
-            # Recalculate tint balance factor for the new image
-            self.tint_balance_factor = self._calculate_tint_balance_factor()
-            self.update_thumbnail_and_preview()
-        else:
+        if img is None:
             logging.error(f"Failed to reload image: {self.file_path}")
+            return False
+        self.resized_raw = img
+        # Recalculate tint balance factor for the new image
+        self.tint_balance_factor = self._calculate_tint_balance_factor()
+        return True
+
+    def reload_image(self) -> None:
+        """
+        Reload the image from the file path and update resized_raw, thumbnail, and preview.
+        This is useful if the image file has been modified externally.
+        """
+        if self.reload_image_decode_only():
+            self.update_thumbnail_and_preview()
 
     def _apply_source_ops(self, img: Optional[np.ndarray]) -> Optional[np.ndarray]:
         """Apply this image's slice chain to a decoded image: each op rotates
