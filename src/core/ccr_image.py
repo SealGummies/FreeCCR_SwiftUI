@@ -82,6 +82,10 @@ class CCRImage:
         self.slice_parent: Optional[Dict[str, Any]] = slice_parent
         self.thumbnail = thumbnail
         self.resized_raw = resized_raw
+        # Camera profile (ICC/DCP/none) this image's decode was graded under;
+        # stamped on every working decode so the thumbnail can flag a mismatch
+        # when the active profile changes. Not persisted (a reload re-stamps).
+        self.profile_signature = None
         self.reference_frame = reference_frame
         self.resized_preview = None  # Placeholder for resized preview, if needed later
         self.adjustment_settings = adjustment_settings if adjustment_settings is not None else {}
@@ -162,7 +166,8 @@ class CCRImage:
             
             # Calculate tint balance factor once during loading
             self.tint_balance_factor = self._calculate_tint_balance_factor()
-            
+            self._stamp_profile_signature()
+
             # Populate thumbnail and preview
             self.update_thumbnail_and_preview()
         else:
@@ -207,6 +212,7 @@ class CCRImage:
         self.resized_raw = img
         # Recalculate tint balance factor for the new image
         self.tint_balance_factor = self._calculate_tint_balance_factor()
+        self._stamp_profile_signature()
         return True
 
     def reload_image(self) -> None:
@@ -278,7 +284,7 @@ class CCRImage:
         if arr is None:
             return arr
         profile = color_management.get_active_input_profile()
-        if profile is None:
+        if profile is None or color_management.input_profile_disabled():
             return arr
         try:
             return profile.apply(arr)
@@ -291,9 +297,9 @@ class CCRImage:
         — an input ICC **or** a DCP is active (mirrors the apply guard). Drives the
         negative RAW decode: a profiled decode is camera-native raw with absolute
         sensor values (no_auto_scale=True + manual white-level scaling); the
-        unprofiled default decode is Adobe RGB, rawpy-auto-scaled."""
-        return (color_management.get_active_input_profile() is not None
-                or color_management.get_active_dcp_profile() is not None)
+        unprofiled default decode is Adobe RGB, rawpy-auto-scaled. False when the
+        profile is temporarily disabled."""
+        return color_management.camera_profile_active()
 
     def _apply_input_dcp(self, arr, as_shot_wb) -> Optional[np.ndarray]:
         """Burn the globally-active DCP into a freshly-decoded camera-native scan
@@ -302,7 +308,7 @@ class CCRImage:
         if arr is None:
             return arr
         profile = color_management.get_active_dcp_profile()
-        if profile is None:
+        if profile is None or color_management.input_profile_disabled():
             return arr
         try:
             from core import dcp_profile
@@ -310,6 +316,16 @@ class CCRImage:
         except Exception as e:
             logging.warning(f"DCP profile could not be applied: {e}")
             return arr
+
+    def _stamp_profile_signature(self):
+        """Record which camera profile this image's working decode was graded
+        under, so the thumbnail can flag a mismatch when the active profile (or
+        the disable toggle / Positive mode) later changes."""
+        try:
+            from core.ccr_backend import ccr_backend
+            self.profile_signature = ccr_backend.active_profile_signature()
+        except Exception:
+            self.profile_signature = None
 
     @staticmethod
     def _positive_mode_active() -> bool:

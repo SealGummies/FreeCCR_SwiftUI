@@ -584,6 +584,28 @@ class CCRBackend:
             except Exception as e:
                 print(f"Failed to convert image at index {idx}: {e}")
 
+    def active_profile_signature(self) -> str:
+        """The camera-profile signature an image decoded NOW would be graded
+        under: 'none' in Positive mode (the profile isn't applied) or when the
+        profile is disabled/unset, else 'icc:<desc>' / 'dcp:<name>'. Drives the
+        per-image thumbnail mismatch warning."""
+        from core import color_management
+        if self.positive_mode:
+            return "none"
+        return color_management.active_profile_signature()
+
+    @staticmethod
+    def _profile_content_id(path):
+        """A short content hash of a profile file, attached to the active profile
+        so the per-image grading signature distinguishes two different profiles
+        that happen to share a description/name (or both lack one)."""
+        import hashlib
+        try:
+            with open(path, "rb") as f:
+                return hashlib.md5(f.read()).hexdigest()[:12]
+        except OSError:
+            return None
+
     # --- Global input ICC profile -----------------------------------------
     def _input_icc_storage_path(self) -> str:
         """Persistent working-copy path inside the app-data folder (next to the
@@ -605,6 +627,7 @@ class CCRBackend:
         if (os.path.normcase(os.path.abspath(src_path))
                 != os.path.normcase(os.path.abspath(storage))):
             shutil.copyfile(src_path, storage)
+        profile.content_id = self._profile_content_id(src_path)
         color_management.set_active_input_profile(profile)
         self.clear_input_dcp()                       # ICC and DCP are exclusive
         self.input_icc_path = storage
@@ -620,6 +643,7 @@ class CCRBackend:
         except Exception as e:
             print(f"Could not load saved input ICC {storage_path}: {e}")
             return None
+        profile.content_id = self._profile_content_id(storage_path)
         color_management.set_active_input_profile(profile)
         self.input_icc_path = storage_path
         self.input_icc_name = profile.description or os.path.basename(storage_path)
@@ -654,6 +678,7 @@ class CCRBackend:
         if (os.path.normcase(os.path.abspath(src_path))
                 != os.path.normcase(os.path.abspath(storage))):
             shutil.copyfile(src_path, storage)
+        profile.content_id = self._profile_content_id(src_path)
         color_management.set_active_dcp_profile(profile)
         self.clear_input_icc()                       # DCP and ICC are exclusive
         self.input_dcp_path = storage
@@ -667,6 +692,7 @@ class CCRBackend:
         except Exception as e:
             print(f"Could not load saved DCP {storage_path}: {e}")
             return None
+        profile.content_id = self._profile_content_id(storage_path)
         color_management.set_active_dcp_profile(profile)
         self.input_dcp_path = storage_path
         self.input_dcp_name = profile.name or os.path.basename(storage_path)

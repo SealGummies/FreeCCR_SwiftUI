@@ -196,7 +196,8 @@ class ThumbnailList(QWidget):
                 QApplication.processEvents()
         self.thumbnail_list.setIconSize(QSize(156, 156))
         self.count_label.setText(f"Total: {image_count} image(s)")
-        
+        self.refresh_profile_warnings()
+
         # Set current index to 0 if there are items
         if image_count > 0:
             self.thumbnail_list.setCurrentRow(0)
@@ -254,6 +255,7 @@ class ThumbnailList(QWidget):
         self.thumbnail_list.addItem(item)
         self.count_label.setText(
             f"Total: {ccr_backend.get_image_count()} image(s)")
+        self.refresh_profile_warnings()
         if select:
             self.thumbnail_list.setCurrentRow(self.thumbnail_list.count() - 1)
         return True
@@ -284,6 +286,64 @@ class ThumbnailList(QWidget):
         """Backend indices of the selected thumbnails, ascending."""
         return sorted({item.data(Qt.UserRole)
                        for item in self.thumbnail_list.selectedItems()})
+
+    # --- Camera-profile mismatch flagging ---------------------------------
+    def _profile_mismatch(self, idx) -> bool:
+        """True if the image was graded under a different camera profile than the
+        one active now (so it should be re-graded / flagged)."""
+        img = ccr_backend.get_image_by_index(idx)
+        if img is None:
+            return False
+        sig = getattr(img, "profile_signature", None)
+        return sig is not None and sig != ccr_backend.active_profile_signature()
+
+    def refresh_profile_warnings(self):
+        """Flag every thumbnail whose image was graded under a different camera
+        profile than the active one — ⚠ prefix + amber text + tooltip. Called on
+        load/append and whenever the active profile (or disable / Positive mode)
+        changes."""
+        active = ccr_backend.active_profile_signature()
+        warn = theme.qcolor(theme.WARN_TEXT)
+        normal = theme.qcolor(theme.TEXT)
+        for row in range(self.thumbnail_list.count()):
+            item = self.thumbnail_list.item(row)
+            idx = item.data(Qt.UserRole)
+            img = ccr_backend.get_image_by_index(idx)
+            if img is None:
+                continue
+            filename = (getattr(img, "display_name", None)
+                        or os.path.basename(img.file_path))
+            sig = getattr(img, "profile_signature", None)
+            mism = sig is not None and sig != active
+            item.setText(("⚠ " + filename) if mism else filename)
+            item.setForeground(warn if mism else normal)
+            item.setToolTip(
+                "Graded under a different camera profile.\nRight-click ▸ "
+                "Replace with current camera profile." if mism else "")
+
+    def replace_with_current_profile(self, indices):
+        """Re-grade the given image(s) under the current camera profile by
+        re-decoding + resetting them (drops their edits, like Reset). Bulk-safe."""
+        if not indices:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            changed = ccr_backend.reset_images_by_indices(indices)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not changed:
+            return
+        for idx in indices:
+            self.update_thumbnail(idx)
+        self.refresh_profile_warnings()
+        current = self.thumbnail_list.currentItem()
+        if current is not None:
+            cur_idx = current.data(Qt.UserRole)
+            mw = self._main_window()
+            mw.image_preview.update_preview(cur_idx)
+            mw.sliders_panel.set_current_idx(cur_idx)
+            mw.image_preview._update_unconvert_action_state()
+        ccr_backend.save_catalog()
 
     def show_context_menu(self, pos):
         if getattr(self, "_rebuilding", False):
@@ -318,6 +378,15 @@ class ThumbnailList(QWidget):
         if slice_count:
             slice_suffix = f" ({slice_count})" if slice_count > 1 else ""
             reset_slice_action = menu.addAction(f"Reset Slice{slice_suffix}")
+        # "Replace with current camera profile" — only for images in the selection
+        # graded under a different profile (re-decodes them, like Reset).
+        mismatched = [i for i in indices if self._profile_mismatch(i)]
+        replace_action = None
+        if mismatched:
+            menu.addSeparator()
+            rsuffix = f" ({len(mismatched)})" if len(mismatched) > 1 else ""
+            replace_action = menu.addAction(
+                f"Replace with current camera profile{rsuffix}")
         action = menu.exec_(self.thumbnail_list.mapToGlobal(pos))
         if action == duplicate_action:
             self.duplicate_images(indices)
@@ -330,6 +399,8 @@ class ThumbnailList(QWidget):
             self.reset_images(indices)
         elif reset_slice_action is not None and action == reset_slice_action:
             self.reset_slices(indices)
+        elif replace_action is not None and action == replace_action:
+            self.replace_with_current_profile(mismatched)
 
     def duplicate_images(self, indices):
         created = ccr_backend.duplicate_images_by_indices(indices)
