@@ -195,11 +195,15 @@ class MainWindow(QMainWindow):
         if saved_icc and os.path.exists(saved_icc):
             if ccr_backend.load_input_icc_from_storage(saved_icc) is None:
                 self._settings.remove("import/input_icc_path")
-            self._refresh_input_icc_menu()
+            self._refresh_profile_ui()
         elif saved_dcp and os.path.exists(saved_dcp):
             if ccr_backend.load_input_dcp_from_storage(saved_dcp) is None:
                 self._settings.remove("import/input_dcp_path")
-            self._refresh_input_icc_menu()
+            self._refresh_profile_ui()
+        # Restore the persistent "disable camera profile" toggle.
+        from core import color_management as _cm
+        _cm.set_input_profile_disabled(
+            self._settings.value("import/input_profile_disabled", False, type=bool))
 
         # Ctrl+Z (Cmd+Z on macOS): undo the last action on the current image;
         # repeated presses walk further back through the undo stack.
@@ -350,23 +354,12 @@ class MainWindow(QMainWindow):
         export_action.setShortcut("Ctrl+E")
         export_action.triggered.connect(self.image_preview.open_export_dialog)
 
-        # Input ICC profile: a single, global, persistent profile applied to
-        # every image at decode time, before conversion/adjustments.
+        # Settings — the colour-management features (input ICC/DCP, the IT8
+        # camera-profile wizard, Positive mode) live in its Color Management tab.
         file_menu.addSeparator()
-        self.input_icc_action = file_menu.addAction("Set Input ICC Profile…")
-        self.input_icc_action.triggered.connect(self.set_input_icc_profile)
-        self.clear_input_icc_action = file_menu.addAction("Clear Input ICC Profile")
-        self.clear_input_icc_action.triggered.connect(self.clear_input_icc_profile)
-        # DCP (DNG camera profile) — exclusive alternative to the input ICC.
-        self.input_dcp_action = file_menu.addAction("Load DCP Profile…")
-        self.input_dcp_action.triggered.connect(self.set_input_dcp_profile)
-        self.clear_input_dcp_action = file_menu.addAction("Clear DCP Profile")
-        self.clear_input_dcp_action.triggered.connect(self.clear_input_dcp_profile)
-        self._refresh_input_icc_menu()
-
-        # Build a camera input profile from a photographed IT8 target.
-        self.it8_profile_action = file_menu.addAction("Create Camera Profile from IT8…")
-        self.it8_profile_action.triggered.connect(self.create_camera_profile_from_it8)
+        settings_action = file_menu.addAction("Settings…")
+        settings_action.setShortcut("Ctrl+,")
+        settings_action.triggered.connect(self.open_settings)
 
         # Add Help menu with About, Licenses, Activation, and Help actions
         help_menu = menu_bar.addMenu("Help")
@@ -379,24 +372,39 @@ class MainWindow(QMainWindow):
         help_action = help_menu.addAction("Help")
         help_action.triggered.connect(self.open_help_website)
 
-    # --- Input ICC profile (global, persistent) ---------------------------
-    def _refresh_input_icc_menu(self):
-        """Reflect the active input profile (ICC or DCP) in the File-menu actions."""
-        name = getattr(ccr_backend, "input_icc_name", None)
-        if name:
-            self.input_icc_action.setText(f"Input ICC: {name}…")
-            self.clear_input_icc_action.setEnabled(True)
-        else:
-            self.input_icc_action.setText("Set Input ICC Profile…")
-            self.clear_input_icc_action.setEnabled(False)
-        if hasattr(self, "input_dcp_action"):
-            dcp_name = getattr(ccr_backend, "input_dcp_name", None)
-            if dcp_name:
-                self.input_dcp_action.setText(f"DCP: {dcp_name}…")
-                self.clear_input_dcp_action.setEnabled(True)
-            else:
-                self.input_dcp_action.setText("Load DCP Profile…")
-                self.clear_input_dcp_action.setEnabled(False)
+    # --- Color management (global input profile, lives in Settings) -------
+    def open_settings(self):
+        """Open the Settings dialog (Color Management tab holds the input
+        ICC/DCP, the IT8 wizard, and Positive mode)."""
+        from widgets.settings_dialog import SettingsDialog
+        dlg = SettingsDialog(self)
+        self._settings_dialog = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._settings_dialog = None
+
+    def _refresh_profile_ui(self):
+        """Reflect the active input profile in the Settings dialog when it is
+        open (the active profile is shown there now, not in the File menu)."""
+        dlg = getattr(self, "_settings_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.refresh_color_management()
+
+    def _refresh_profile_mismatch(self):
+        """A camera-profile change does NOT re-decode loaded images (chosen
+        behaviour). Instead it re-flags the thumbnails whose image was graded
+        under a different profile, so the user can re-grade them on demand."""
+        self.thumbnail_list.refresh_profile_warnings()
+
+    def set_camera_profile_disabled(self, disabled: bool):
+        """Temporarily disable applying the active camera profile (persisted).
+        Like a profile change, it re-flags mismatches rather than re-decoding."""
+        from core import color_management
+        color_management.set_input_profile_disabled(bool(disabled))
+        self._settings.setValue("import/input_profile_disabled", bool(disabled))
+        self._refresh_profile_mismatch()
+        self._refresh_profile_ui()
 
     def set_input_icc_profile(self):
         start_dir = self._settings.value("import/last_icc_dir", "", type=str)
@@ -428,8 +436,8 @@ class MainWindow(QMainWindow):
             return False
         self._settings.setValue("import/input_icc_path", ccr_backend.input_icc_path)
         self._settings.remove("import/input_dcp_path")   # ICC cleared the DCP
-        self._refresh_input_icc_menu()
-        self._reprocess_after_input_icc_change()
+        self._refresh_profile_ui()
+        self._refresh_profile_mismatch()
         self.sliders_panel.set_temporary_hint(
             f"Input ICC profile set: {name}", duration=3000)
         return True
@@ -460,8 +468,8 @@ class MainWindow(QMainWindow):
             return False
         self._settings.setValue("import/input_dcp_path", ccr_backend.input_dcp_path)
         self._settings.remove("import/input_icc_path")   # DCP cleared the ICC
-        self._refresh_input_icc_menu()
-        self._reprocess_after_input_icc_change()
+        self._refresh_profile_ui()
+        self._refresh_profile_mismatch()
         msg = f"DCP profile set: {name}"
         _raw = (".cr3", ".cr2", ".nef", ".arw", ".dng", ".rw2", ".orf",
                 ".raf", ".srw", ".pef", ".3fr")
@@ -474,8 +482,9 @@ class MainWindow(QMainWindow):
     def clear_input_dcp_profile(self):
         ccr_backend.clear_input_dcp()
         self._settings.remove("import/input_dcp_path")
-        self._refresh_input_icc_menu()
-        self._reprocess_after_input_icc_change()
+        self._clear_profile_disabled()
+        self._refresh_profile_ui()
+        self._refresh_profile_mismatch()
         self.sliders_panel.set_temporary_hint("DCP profile cleared.", duration=3000)
 
     def create_camera_profile_from_it8(self):
@@ -505,31 +514,18 @@ class MainWindow(QMainWindow):
     def clear_input_icc_profile(self):
         ccr_backend.clear_input_icc()
         self._settings.remove("import/input_icc_path")
-        self._refresh_input_icc_menu()
-        self._reprocess_after_input_icc_change()
+        self._clear_profile_disabled()
+        self._refresh_profile_ui()
+        self._refresh_profile_mismatch()
         self.sliders_panel.set_temporary_hint("Input ICC profile cleared.", duration=3000)
 
-    def _reprocess_after_input_icc_change(self):
-        """A change to the input ICC fully resets every loaded image (the decode
-        itself changes, so a conversion from the old decode can't be reused),
-        then refreshes the UI."""
-        if not ccr_backend.images:
-            return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            ccr_backend.reprocess_all_for_input_icc_change()
-        finally:
-            QApplication.restoreOverrideCursor()
-        # Every image was re-decoded and reset, so the zoom hi-res cache is stale.
-        self.image_preview._release_hires(refresh=False)
-        self.thumbnail_list.update_all_thumbnails()
-        cur = self.image_preview.current_idx
-        if cur is not None:
-            self.image_preview.update_preview(cur)
-            self.sliders_panel.set_current_idx(cur)   # reflect the cleared settings
-        else:
-            self.image_preview._update_unconvert_action_state()
-        ccr_backend.save_catalog()
+    def _clear_profile_disabled(self):
+        """Reset the persistent 'disable camera profile' flag — there is no
+        profile left to disable, so it must not silently re-arm when a future
+        profile is set."""
+        from core import color_management
+        color_management.set_input_profile_disabled(False)
+        self._settings.setValue("import/input_profile_disabled", False)
 
     # --- Positive mode (global, persistent) -------------------------------
     def on_positive_mode_toggled(self, checked: bool):
@@ -538,6 +534,9 @@ class MainWindow(QMainWindow):
         Mirrors the input-ICC reprocess. See spec/positive-mode.md."""
         ccr_backend.positive_mode = bool(checked)
         self._settings.setValue("import/positive_mode", bool(checked))
+        # Keep the thumbnail-panel checkbox in step when the toggle comes from the
+        # Settings dialog (set_positive_checkbox blocks its own signal).
+        self.thumbnail_list.set_positive_checkbox(bool(checked))
         if ccr_backend.images:
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
@@ -559,6 +558,11 @@ class MainWindow(QMainWindow):
             # No images yet — just refresh the gating so the toolbar reflects
             # the new mode immediately.
             self.image_preview._update_unconvert_action_state()
+        # Positive mode flips the effective profile signature (-> 'none') and
+        # re-stamps every image, so re-flag the thumbnail mismatch warnings —
+        # otherwise stale ⚠ markers persist (update_all_thumbnails only redraws
+        # icons, never the item text/colour).
+        self.thumbnail_list.refresh_profile_warnings()
         self.sliders_panel.set_temporary_hint(
             "Positive mode on — adjust any image directly."
             if checked else "Positive mode off — film-negative tools restored.",
