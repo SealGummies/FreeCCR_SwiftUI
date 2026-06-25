@@ -224,6 +224,35 @@ class TestContentIdSignature:
         assert cm.active_profile_signature() == "icc:MyCam"
 
 
+class TestIT8FormatSelector:
+    """The IT8 wizard exposes an explicit ICC-vs-DCP Output-format selector."""
+
+    def _dlg(self):
+        from widgets.it8_profile_dialog import IT8ProfileDialog
+        return IT8ProfileDialog(None)
+
+    def test_default_is_icc_with_type_choice(self):
+        d = self._dlg()
+        assert d._is_dcp() is False
+        assert d.type_combo.isEnabled() is True          # matrix/cLUT available
+        assert d._default_save_path().endswith(".icc")
+
+    def test_dcp_forces_matrix_and_dcp_extension(self):
+        d = self._dlg()
+        d.format_combo.setCurrentIndex(1)                # DCP
+        assert d._is_dcp() is True
+        assert d.type_combo.isEnabled() is False         # cLUT is ICC-only
+        assert d.type_combo.currentIndex() == 0          # forced 3×3 matrix
+        assert d._default_save_path().endswith(".dcp")
+
+    def test_format_switch_syncs_path_extension(self):
+        d = self._dlg()
+        d.format_combo.setCurrentIndex(1)
+        d.save_path_edit.setText("X/p.dcp")
+        d.format_combo.setCurrentIndex(0)                # back to ICC
+        assert d.save_path_edit.text().endswith(".icc")
+
+
 # --------------------------------------------------------------------------- #
 # SettingsDialog: structure, status reflection, disable + positive wiring
 # --------------------------------------------------------------------------- #
