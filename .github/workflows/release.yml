@@ -64,7 +64,7 @@ jobs:
             ⚠️ **macOS may say the app is "damaged and can't be opened" — it isn't.** FreeCCR isn't notarized by Apple, so Gatekeeper blocks unsigned downloads on first launch. Clear the quarantine flag once by running this in **Terminal**:
 
             ```
-            xattr -r -d com.apple.quarantine /Applications/FreeCCR.app
+            xattr -d com.apple.quarantine /Applications/FreeCCR.app
             ```
 
             Then open the app normally.
@@ -155,7 +155,7 @@ jobs:
             ⚠️ **macOS may say the app is "damaged and can't be opened" — it isn't.** FreeCCR isn't notarized by Apple, so Gatekeeper blocks unsigned downloads on first launch. Clear the quarantine flag once by running this in **Terminal**:
 
             ```
-            xattr -r -d com.apple.quarantine /Applications/FreeCCR.app
+            xattr -d com.apple.quarantine /Applications/FreeCCR.app
             ```
 
             Then open the app normally.
