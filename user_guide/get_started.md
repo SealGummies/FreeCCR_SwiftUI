@@ -13,18 +13,18 @@ The evaluation version allows unlimited use of all features, though exported ima
 - **File → Load Individual Images** to select specific files
 - Supported formats: RAW files (CR3, CR2, NEF, ARW, DNG, etc.) and standard images (TIFF, JPEG, PNG)
 
-### Step 3: Use Auto Feature
-Click the **Auto** button in the top left corner. The software will automatically scan all imported images, draw reference frames, and convert them. Note that if you have already manually drawn a reference frame for an image, the Auto feature will preserve your settings and continue processing the next available image.
+### Step 3: Draw the Reference Frame
+**Right-click and drag** on the image to draw a reference frame around the picture area plus some surrounding **film base** (the orange/brown border). A **right-click without dragging** clears the frame. The conversion samples this frame to neutralise the film's colour cast, so its placement matters.
 
-### Step 4: Set Reference Frame Manually if Needed
-Since AI features aren't perfect, the auto feature may incorrectly position the reference frame, potentially causing color cast issues in converted images. Consider manually redrawing the reference frame if you notice:
+### Step 4: Check the Reference Frame
+A poorly placed frame can cause colour casts. Redraw it (right-click and drag) if it includes any of:
 - Sprocket holes or portions of sprocket holes within the frame boundary
 - Multiple images or unintended areas captured within the selection
 - Film holder components included in the frame area
 - Complete absence of film base (we strongly recommend including some film base area surrounding your image for optimal results)
 
-### Step 5: Re-convert the Image
-Click the **Convert** button in the top toolbar, or press **Enter**, to re-run the negative conversion process.
+### Step 5: Convert the Image
+Click the **Convert** button in the top toolbar to run the negative conversion.
 
 ### Step 6: (Optional) Fine-tune with Color Correction
 Use the adjustment sliders on the right panel:
@@ -70,9 +70,9 @@ The direct output of the images is scientific and color accurate, but you can al
 
 ### Batch Processing
 1. **Load all images** from your scan folder
-2. **Auto Frame All Images** to detect frames automatically  
-3. **Review and adjust** frames manually if needed
-5. **Export batch** when satisfied with results
+2. **Draw a reference frame** on each image (right-click and drag)
+3. **Convert** each image and review the result
+4. **Export batch** when satisfied with results
 
 ### Color Correction Best Practices
 - Start with **Temperature and Tint** to establish proper white balance
@@ -102,8 +102,8 @@ A: Adjust the Reference Frame to include only the image area, + film base. Never
 **Q: Colors look unnatural or oversaturated**
 A: If you use an RGB light source and adjust it to 5500K for scanning negatives, the output can sometimes be overly saturated. You can simply adjust the saturation slider to your liking, or when scanning, adjust the RGB light so that your film base appears gray.
 
-**Q: Auto Frame detection fails**
-A: Some complex images may require manual frame selection. Right-click and drag to define the frame boundaries manually.
+**Q: How do I set the reference frame?**
+A: Right-click and drag on the image to define the frame boundaries; right-click without dragging clears it. Include the picture plus some film base, and avoid sprocket holes and the scanning backlight.
 
 **Q: Application runs slowly with large files**
 A: CCR processes images at high quality. For faster preview, the app automatically resizes working images while maintaining full resolution for export.
