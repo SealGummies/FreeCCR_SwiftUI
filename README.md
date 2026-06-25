@@ -59,7 +59,7 @@ Unzip `FreeCCR_macOS_<version>.zip` and move `FreeCCR.app` to your **Application
 Because the app isn't notarized, Gatekeeper may block the first launch with a *"damaged and can't be opened"* message. **The app isn't damaged** — macOS just flags unsigned downloads. Clear the quarantine flag once in Terminal:
 
 ```bash
-xattr -r -d com.apple.quarantine /Applications/FreeCCR.app
+xattr -d com.apple.quarantine /Applications/FreeCCR.app
 ```
 
 Then open it normally. (Alternatively: right-click the app → **Open** → **Open**.)

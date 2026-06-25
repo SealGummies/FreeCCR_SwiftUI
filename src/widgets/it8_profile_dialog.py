@@ -29,6 +29,18 @@ from utils.unicode_path_utils import normalize_unicode_path, validate_unicode_pa
 _REF_URL = "http://www.targets.coloraid.de/"
 
 
+def _illuminant_enum(illum: str) -> int:
+    """Map the wizard's capture-light label to a DNG CalibrationIlluminant
+    (EXIF LightSource) code. The fit is D50-referenced, so this is metadata for a
+    single-illuminant DCP; tungsten/fluorescent are tagged, everything else D50."""
+    s = (illum or "").lower()
+    if "tungsten" in s:
+        return 17                                    # Standard light A
+    if "fluor" in s:
+        return 2                                     # Fluorescent
+    return 23                                        # D50
+
+
 def _gamma_stretch_to_qimage(arr_u16: np.ndarray) -> QImage:
     """8-bit gamma-stretched view of a raw-linear 16-bit RGB array (display
     only — the fit always uses the linear data)."""
@@ -56,7 +68,7 @@ class IT8PatchLocator(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(520, 360)
+        self.setMinimumSize(820, 480)
         self.setMouseTracking(True)
         self._qimg: Optional[QImage] = None
         self._base = None                 # decoded array as given
@@ -65,6 +77,7 @@ class IT8PatchLocator(QWidget):
         self._iw = self._ih = 0
         self._quad = []                   # 4 (x,y) array-space corners TL,TR,BR,BL
         self._gray_offset = 0.0
+        self._invalid_ids = set()         # ids the dialog flagged clipped/off-frame
         self._mode = "classic"            # "classic" (12x22 + GS strip) | "block"
         self._rows = []                   # block mode: row letters
         self._cols = []                   # block mode: column numbers
@@ -104,6 +117,14 @@ class IT8PatchLocator(QWidget):
         self._mode = "block"
         self._rows, self._cols = list(rows), list(cols)
         self.update(); self.changed.emit()
+
+    def set_invalid_ids(self, ids):
+        """Ids whose sampled patch is invalid (clipped or off-frame); their dots
+        are drawn red. Computed by the dialog after each (re)sample."""
+        new = set(ids)
+        if new != self._invalid_ids:
+            self._invalid_ids = new
+            self.update()
 
     def image_array(self):
         return self._work
@@ -176,17 +197,19 @@ class IT8PatchLocator(QWidget):
         p.setBrush(Qt.NoBrush)
         p.drawPolygon(poly)
 
-        # Sample dots (colour vs gray differ in colour).
+        # Sample dots (colour vs gray differ in colour; invalid patches red).
         pts = self.points()
         for sid, (x, y) in pts.items():
             w = self._a2w(x, y)
-            if not target.contains(w):
-                p.setPen(QPen(QColor(220, 80, 80), 1))   # out of frame -> red
+            bad = (not target.contains(w)) or sid in self._invalid_ids
+            if bad:
+                p.setPen(QPen(QColor(230, 70, 70), 2))   # invalid/off-frame -> red
             elif sid.startswith("GS"):
                 p.setPen(QPen(QColor(120, 170, 255), 1))
             else:
                 p.setPen(QPen(QColor(255, 230, 90), 1))
-            p.drawEllipse(w, 1.6, 1.6)
+            r = 2.6 if bad else 1.6                       # enlarge bad dots
+            p.drawEllipse(w, r, r)
 
         # Corner handles.
         for i, (x, y) in enumerate(self._quad):
@@ -239,7 +262,18 @@ class IT8ProfileDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Create Camera Profile from IT8")
         self.setModal(True)
-        self.setMinimumSize(720, 560)
+        # Big enough for accurate corner placement (≥1024 wide), but clamp the
+        # floor to the screen so the nav row can't be pushed off a small display.
+        scr = self.screen() or QApplication.primaryScreen()
+        avail = scr.availableGeometry() if scr is not None else None
+        min_w, min_h, init_w, init_h = 1024, 700, 1120, 780
+        if avail is not None:
+            min_w = min(min_w, avail.width() - 40)
+            min_h = min(min_h, avail.height() - 80)
+            init_w = min(init_w, avail.width() - 40)
+            init_h = min(init_h, avail.height() - 80)
+        self.setMinimumSize(min_w, min_h)
+        self.resize(max(min_w, init_w), max(min_h, init_h))
         self._settings = QSettings("FreeCCR", "FreeCCR")
 
         self._current_path = current_path
@@ -251,6 +285,13 @@ class IT8ProfileDialog(QDialog):
         self._mode = "classic"             # "classic" (GS strip) | "block" (plain grid)
         self.saved_path: Optional[str] = None
         self.apply_now = False
+        # Multi-card targets (block mode): samples accumulate across up to 3
+        # photographed cards before the fit. _mapped_cards holds the finalised
+        # sample dicts of the cards already mapped; the card in the locator is
+        # the current one. _all_samples is the merged set the fit consumes.
+        self._mapped_cards: list = []
+        self._all_samples: dict = {}
+        self._n_images = 1
 
         self.stack = QStackedWidget(self)
         self.stack.addWidget(self._build_target_page())
@@ -374,6 +415,10 @@ class IT8ProfileDialog(QDialog):
         self.gray_slider.valueChanged.connect(
             lambda v: self.locator.set_gray_offset(v / 1000.0))
         ctl.addWidget(self.gray_slider)
+        # Multi-card progress indicator (block-mode targets only).
+        self.card_label = QLabel("")
+        self.card_label.setStyleSheet("color:#9cc4ff; font-weight:bold;")
+        ctl.addWidget(self.card_label)
         ctl.addStretch(1)
         self.locate_status = QLabel("")
         ctl.addWidget(self.locate_status)
@@ -427,8 +472,15 @@ class IT8ProfileDialog(QDialog):
         self.illum_combo.setEditable(True)
         self.illum_combo.addItems(["Daylight", "Strobe/Flash", "Tungsten",
                                    "Fluorescent", "Other"])
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["3×3 matrix", "cLUT (higher accuracy)"])
+        self.type_combo.setToolTip(
+            "3×3 matrix: a compact, well-behaved linear profile. cLUT: a 3-D "
+            "lookup table that also corrects the saturated-corner residuals a "
+            "matrix can't reach (uses the full sampled patch set).")
         form.addRow("Profile name:", self.name_edit)
         form.addRow("Illuminant:", self.illum_combo)
+        form.addRow("Profile type:", self.type_combo)
         lay.addLayout(form)
         lay.addStretch(1)
         return w
@@ -469,7 +521,22 @@ class IT8ProfileDialog(QDialog):
         if path:
             self._set_target(path)
 
+    def _reset_card_accum(self):
+        """Discard any in-progress multi-card accumulation. The target shot and
+        reference define what the mapped cards belong to, so changing either
+        must throw the accumulated cards away — otherwise samples from an
+        abandoned session silently contaminate the next fit."""
+        self._mapped_cards = []
+        self._all_samples = {}
+        self._n_images = 1
+        self._fit = None
+        # Let the block range re-seed from the (possibly new) reference extent.
+        if hasattr(self, "tl_edit"):
+            self.tl_edit.clear()
+            self.br_edit.clear()
+
     def _set_target(self, path):
+        self._reset_card_accum()           # a new target starts a fresh session
         self._target_path = path
         self._target_img = None            # force re-decode on Next
         raw = ", ".join((".dng", ".arw", ".nef", ".cr2", ".cr3", ".raf",
@@ -528,6 +595,7 @@ class IT8ProfileDialog(QDialog):
             QMessageBox.warning(self, "Reference File",
                                 f"Could not read the reference file:\n\n{e}")
             return
+        self._reset_card_accum()           # a new reference starts a fresh session
         self._ref = ref
         # Classic IT8 has a GS0..GS23 strip; anything else is a plain grid that
         # the user delimits with corner patch ids (block mode).
@@ -563,19 +631,153 @@ class IT8ProfileDialog(QDialog):
     def _update_locate_status(self):
         img = self.locator.image_array()
         if img is None or self._ref is None:
+            self.locator.set_invalid_ids(set())
             return
         pts = self.locator.points()
         nc, nr = self.locator.grid_dims()
         samples = it8.sample_patches(img, pts, self.locator.quad(),
                                      ncols=nc, nrows=nr)
         in_ref = [sid for sid in samples if sid in self._ref.patches]
-        valid = sum(1 for sid in in_ref if samples[sid].valid)
+        invalid = [sid for sid in in_ref if not samples[sid].valid]
+        self.locator.set_invalid_ids(set(invalid))
+        valid = len(in_ref) - len(invalid)
         warn = ""
         if ("GS0" in samples and "GS23" in samples
                 and samples["GS0"].valid and samples["GS23"].valid):
             if samples["GS0"].rgb.mean() < samples["GS23"].rgb.mean():
                 warn = "  ⚠ GS0 darker than GS23 — try Flip 180°"
-        self.locate_status.setText(f"Valid patches: {valid}/{len(in_ref)}{warn}")
+        if invalid:
+            shown = ", ".join(invalid[:10])
+            more = (f", … (+{len(invalid) - 10} more)"
+                    if len(invalid) > 10 else "")
+            self.locate_status.setText(
+                f"Valid patches: {valid}/{len(in_ref)} — "
+                f"<span style='color:#e64646;'>invalid (red): {shown}{more}"
+                f"</span>{warn}")
+            self.locate_status.setToolTip(
+                "Invalid patches (drawn red — highlight-clipped, essentially "
+                "black, or off-frame; nudge the corners or re-expose):\n"
+                + ", ".join(invalid))
+        else:
+            self.locate_status.setText(
+                f"Valid patches: {valid}/{len(in_ref)}{warn}")
+            self.locate_status.setToolTip("")
+
+    # ------------------------------------------------------------------ #
+    # Page 3b — multi-card mapping (block-mode targets split across cards)
+    # ------------------------------------------------------------------ #
+    def _sample_current(self):
+        """Sample the card currently in the locator -> {id: PatchSample}, or
+        None if no image is loaded."""
+        img = self.locator.image_array()
+        if img is None:
+            return None
+        pts = self.locator.points()
+        nc, nr = self.locator.grid_dims()
+        return it8.sample_patches(img, pts, self.locator.quad(),
+                                  ncols=nc, nrows=nr)
+
+    def _should_ask_more(self) -> bool:
+        """Offer another card only for block-mode targets, at most twice (so up
+        to 3 cards total, e.g. columns 1-24 / 25-48 / 49-72), and only while no
+        fit has been built yet — so Back-from-build → Next just re-fits instead
+        of re-popping the prompt. A target/reference change clears _fit."""
+        return (self._mode == "block" and len(self._mapped_cards) < 2
+                and self._fit is None)
+
+    def _prompt_map_another(self) -> str:
+        """Ask whether to map another card. Returns 'another' or 'build'."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Map another image?")
+        n = len(self._mapped_cards) + 1
+        box.setText(f"Mapped {n} image(s) so far.")
+        box.setInformativeText(
+            "Some IT8 targets are split across several physical cards (e.g. "
+            "columns 1–24, 25–48, 49–72). If you photographed more than one "
+            "card, map the next image now — its patches are added to the same "
+            "profile. Otherwise build the profile from what you've mapped.")
+        another = box.addButton("Map another image…", QMessageBox.AcceptRole)
+        box.addButton("Build profile", QMessageBox.RejectRole)
+        box.setDefaultButton(another)
+        box.exec()
+        return "another" if box.clickedButton() is another else "build"
+
+    def _browse_next_target(self) -> Optional[str]:
+        start = self._settings.value("files/last_open_dir", "", type=str)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select the next IT8 card image", start,
+            "Images (*.dng *.tif *.tiff *.arw *.nef *.cr2 *.cr3 *.raf *.png "
+            "*.jpg *.jpeg *.rw2 *.3fr *.fff);;All Files (*)")
+        return path or None
+
+    def _load_card_image(self, path: str) -> bool:
+        """Decode `path` and load it into the locator as the next card. Returns
+        False (with a message shown) on a bad path / decode failure."""
+        norm = normalize_unicode_path(path)
+        if not validate_unicode_path(norm):
+            QMessageBox.warning(self, "Unicode Path",
+                                "This file path can't be processed. Please move "
+                                "it to a simpler path.")
+            return False
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            arr = it8.decode_target(norm)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Decode Error",
+                                 f"Could not read the card image:\n\n{e}")
+            return False
+        QApplication.restoreOverrideCursor()
+        if arr is None or arr.ndim != 3:
+            QMessageBox.critical(self, "Decode Error",
+                                 "Could not decode the card image.")
+            return False
+        self._target_path = path
+        self._target_img = arr
+        self.locator.set_image(arr)        # resets the quad for the new shot
+        self._locator_arr = arr
+        return True
+
+    def _advance_block_ids(self):
+        """Shift the block's patch-id range to the next card's columns. If the
+        previous card already reached the chart edge there is no distinct next
+        block to advance into (the shift would collapse to a single column or
+        overlap), so leave the ids for the user to set by hand."""
+        if self._mode != "block":
+            return
+        max_col = None
+        extent = self._ref_extent()
+        if extent:
+            m = re.match(r'^[A-Za-z](\d+)$', extent[1])
+            if m:
+                max_col = int(m.group(1))
+        try:
+            prev_rows, prev_cols = it8.parse_block(self.tl_edit.text(),
+                                                   self.br_edit.text())
+            tl, br = it8.next_block_ids(self.tl_edit.text(),
+                                       self.br_edit.text(), max_col)
+            new_rows, new_cols = it8.parse_block(tl, br)
+        except ValueError:
+            return
+        if len(new_cols) < 2 or min(new_cols) <= max(prev_cols):
+            QMessageBox.information(
+                self, "Set this card's patches",
+                "Couldn't auto-advance the patch-id range — the previous card "
+                "already reached the edge of the chart. Set the top-left / "
+                "bottom-right patch ids for this card by hand.")
+            return
+        self.tl_edit.setText(tl)
+        self.br_edit.setText(br)
+        self._apply_block_ids()
+
+    def _update_card_banner(self):
+        if self._mode == "block":
+            n = len(self._mapped_cards) + 1
+            self.card_label.setText(f"Card {n} of up to 3")
+            self.card_label.setVisible(True)
+        else:
+            self.card_label.setVisible(False)
 
     # ------------------------------------------------------------------ #
     # Page 4 — build
@@ -584,10 +786,9 @@ class IT8ProfileDialog(QDialog):
         err = None
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            pts = self.locator.points()
-            nc, nr = self.locator.grid_dims()
-            samples = it8.sample_patches(self.locator.image_array(), pts,
-                                         self.locator.quad(), ncols=nc, nrows=nr)
+            # _all_samples is the merge of every mapped card; fall back to the
+            # current card alone if the fit is somehow reached un-accumulated.
+            samples = self._all_samples or self._sample_current() or {}
             fit = it8.fit_camera_matrix(samples, self._ref)
         except it8.IT8ReferenceError as e:
             fit, err = None, str(e)
@@ -603,6 +804,8 @@ class IT8ProfileDialog(QDialog):
             chip, colour = "OK", "#b08a00"
         else:
             chip, colour = "Check placement / capture", "#b03030"
+        combined = (f" · combined from {self._n_images} images"
+                    if self._n_images > 1 else "")
         self.quality_label.setText(
             f"<span style='background:{colour};color:white;padding:2px 8px;'>"
             f"{chip}</span>  &nbsp; "
@@ -610,7 +813,7 @@ class IT8ProfileDialog(QDialog):
             f"95th {fit.p95_de:.2f} · max {fit.max_de:.2f}<br>"
             f"Patches used: {len(fit.used_ids)} · dropped "
             f"(clipped/missing): {len(fit.dropped_ids)} · "
-            f"white-balanced on {fit.wb_id}")
+            f"white-balanced on {fit.wb_id}{combined}")
         self.worst_list.clear()
         for sid, de in fit.per_patch[:20]:
             self.worst_list.addItem(f"{sid}\tΔE {de:.2f}")
@@ -633,12 +836,12 @@ class IT8ProfileDialog(QDialog):
         return os.path.join(folder, f"{safe}.icc")
 
     def _choose_save_path(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save camera ICC profile", self.save_path_edit.text(),
-            "ICC Profiles (*.icc)")
+        path, sel = QFileDialog.getSaveFileName(
+            self, "Save camera profile", self.save_path_edit.text(),
+            "ICC profile (*.icc);;DNG camera profile (*.dcp)")
         if path:
-            if not path.lower().endswith(".icc"):
-                path += ".icc"
+            if not path.lower().endswith((".icc", ".dcp")):
+                path += ".dcp" if "dcp" in sel.lower() else ".icc"
             self.save_path_edit.setText(path)
 
     def _do_save(self) -> bool:
@@ -649,11 +852,27 @@ class IT8ProfileDialog(QDialog):
         illum = self.illum_combo.currentText().strip()
         name = self.name_edit.text().strip() or "Camera Profile"
         desc = f"{name} ({illum})" if illum else name
+        clut = self.type_combo.currentIndex() == 1
+        if path.lower().endswith(".dcp") and clut:
+            QMessageBox.information(
+                self, "DCP is matrix-only",
+                "DCP export writes a 3×3 matrix profile; the cLUT "
+                "(higher-accuracy) correction is not included. Save as .icc to "
+                "keep the cLUT.")
         try:
-            icc = it8.build_camera_icc(self._fit, desc)
+            if path.lower().endswith(".dcp"):
+                from core import dcp_profile
+                blob = dcp_profile.build_camera_dcp(
+                    self._fit, desc, illuminant=_illuminant_enum(illum))
+            elif clut:
+                blob = it8.build_camera_icc(
+                    self._fit, desc, mode="clut", grid=17,
+                    samples=self._all_samples, ref=self._ref)
+            else:
+                blob = it8.build_camera_icc(self._fit, desc)
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "wb") as f:
-                f.write(icc)
+                f.write(blob)
         except Exception as e:
             QMessageBox.critical(self, "Save Error",
                                  f"Could not write the profile:\n\n{e}")
@@ -685,6 +904,26 @@ class IT8ProfileDialog(QDialog):
                                         "Load a reference file.")
                 return
         elif i == self.PAGE_LOCATE:
+            cur = self._sample_current()
+            if cur is None:
+                QMessageBox.information(self, "Locate",
+                                        "No target image to sample.")
+                return
+            # Offer to map another card (up to 3 total) before fitting.
+            if self._should_ask_more() and self._prompt_map_another() == "another":
+                path = self._browse_next_target()
+                if not path:
+                    return                        # browse cancelled — stay put
+                self._mapped_cards.append(cur)
+                if not self._load_card_image(path):
+                    self._mapped_cards.pop()      # decode failed — roll back
+                    return
+                self._advance_block_ids()
+                self._update_card_banner()
+                self._update_locate_status()
+                return                            # stay on locate for next card
+            self._n_images = len(self._mapped_cards) + 1
+            self._all_samples = it8.merge_samples(self._mapped_cards + [cur])
             if not self._run_fit():
                 return
         elif i == self.PAGE_BUILD:
@@ -723,8 +962,10 @@ class IT8ProfileDialog(QDialog):
                 "<b>Step 3 — Locate the patches</b> — drag the four green "
                 "corners onto the outer corners of the patch grid you "
                 "photographed. Set the top-left / bottom-right patch ids below "
-                "to match the block in frame, then nudge the corners until every "
-                "dot sits inside its patch.")
+                "to match the block <i>in this frame</i>, then nudge the corners "
+                "until every dot sits inside its patch. If the target is split "
+                "across several cards (e.g. columns 1–24, 25–48, 49–72), map just "
+                "this card — you'll be asked for the next one.")
             extent = self._ref_extent()
             if extent and not self.tl_edit.text():
                 self.tl_edit.setText(extent[0])
@@ -740,6 +981,7 @@ class IT8ProfileDialog(QDialog):
                 "corners onto the outer corners of the 12×22 colour grid. "
                 "Yellow dots are colour patches, blue dots the grayscale strip.")
             self.locator.set_layout_classic()
+        self._update_card_banner()
 
     def _update_nav(self):
         i = self.stack.currentIndex()

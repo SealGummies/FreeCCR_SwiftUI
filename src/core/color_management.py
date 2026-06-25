@@ -24,7 +24,8 @@ via tifffile tag 34675 and to parse + build a transform under littleCMS).
 from __future__ import annotations
 
 import struct
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -48,6 +49,21 @@ def set_active_input_profile(profile) -> None:
 
 def get_active_input_profile():
     return _active_input_profile
+
+
+# Global active DCP (DNG camera profile). Mutually exclusive with the input ICC
+# (a single "input colour transform" slot with two possible kinds). Stored
+# opaquely here so ccr_image can read it without importing dcp_profile/backend.
+_active_dcp_profile = None
+
+
+def set_active_dcp_profile(profile) -> None:
+    global _active_dcp_profile
+    _active_dcp_profile = profile
+
+
+def get_active_dcp_profile():
+    return _active_dcp_profile
 
 
 def load_input_profile(path: str) -> "InputProfile":
@@ -94,6 +110,20 @@ M_SRGB2PROPHOTO = M_XYZ2PROPHOTO @ M_BRADFORD_D65_D50 @ M_SRGB2XYZ
 _M_SRGB2PROPHOTO_F32 = M_SRGB2PROPHOTO.astype(np.float32)   # export math runs in float32
 # Combined XYZ(D50) -> linear sRGB(D65) (used by InputProfile to reach working space).
 M_XYZ_D50_2_SRGB = M_XYZ2SRGB @ M_BRADFORD_D50_D65
+
+# Adobe RGB (1998) primaries -> XYZ (D65); columns are the Adobe primaries.
+M_ADOBE2XYZ_D65 = np.array([
+    [0.5767309, 0.1855540, 0.1881852],
+    [0.2973769, 0.6273491, 0.0752741],
+    [0.0270343, 0.0706872, 0.9911085],
+], dtype=np.float64)
+M_XYZ2ADOBE_D65 = np.linalg.inv(M_ADOBE2XYZ_D65)            # XYZ(D65) -> linear Adobe
+# Combined XYZ(D50) -> LINEAR Adobe RGB. The negative pipeline's no-ICC decode is
+# linear Adobe RGB (output_color=Adobe, gamma=(1,1)) and the density-based
+# inversion reads -log10(value/full) assuming LINEAR input, so an input ICC must
+# land an image in this SAME linear-Adobe space (NOT sRGB-gamma-encoded) — else the
+# optical-density cast balance mis-reads every channel and casts the result.
+M_XYZ_D50_2_ADOBE = M_XYZ2ADOBE_D65 @ M_BRADFORD_D50_D65
 
 # D50 PCS white point (ICC reference illuminant).
 D50_XYZ = (0.9642, 1.0000, 0.8249)
@@ -378,31 +408,53 @@ class InputProfile:
     pixels into the working sRGB encoding."""
 
     def __init__(self, combined_matrix: np.ndarray, luts: list, desc: str):
-        self._matrix = combined_matrix.astype(np.float32)   # device-linRGB -> linear sRGB
+        self._kind = "matrix"                               # "matrix" | "clut"
+        self._matrix = combined_matrix.astype(np.float32)   # device-linRGB -> linear Adobe RGB
         # 3 device->linear LUTs, length 65536 so a uint16 value indexes directly.
         self._luts = [np.ascontiguousarray(l, dtype=np.float32) for l in luts]
+        self._clut: Optional["_CLUT"] = None
         self.description = desc
+
+    @classmethod
+    def _from_clut(cls, clut: "_CLUT", desc: str) -> "InputProfile":
+        """Build a LUT-based (cLUT / A2B) input profile — same apply contract
+        (device RGB -> linear Adobe RGB), interpolated through the CLUT."""
+        self = cls.__new__(cls)
+        self._kind = "clut"
+        self._matrix = None
+        self._luts = None
+        self._clut = clut
+        self.description = desc
+        return self
 
     @classmethod
     def from_bytes(cls, icc: bytes) -> "InputProfile":
         tags = _read_tag_table(icc)
         if icc[16:20] != b'RGB ':
             raise UnsupportedICCError("input profile is not an RGB profile")
+        # Matrix-shaper: colorant + TRC tags. Kept verbatim (byte-identical path).
         needed = [b'rXYZ', b'gXYZ', b'bXYZ', b'rTRC', b'gTRC', b'bTRC']
-        if any(t not in tags for t in needed):
-            # Missing colorant/TRC tags => LUT-based or otherwise unsupported.
-            raise UnsupportedICCError(
-                "only RGB matrix-shaper ICC profiles are supported "
-                "(LUT/cLUT/CMYK profiles are not)")
-        r = _parse_xyz(icc, tags[b'rXYZ'][0])
-        g = _parse_xyz(icc, tags[b'gXYZ'][0])
-        b = _parse_xyz(icc, tags[b'bXYZ'][0])
-        m_colorants = np.stack([r, g, b], axis=1)        # columns = primaries (XYZ D50)
-        combined = M_XYZ_D50_2_SRGB @ m_colorants        # device-linRGB -> linear sRGB
-        luts = [_parse_trc_to_lut(icc, tags[t][0])
-                for t in (b'rTRC', b'gTRC', b'bTRC')]
-        desc = cls._read_desc(icc, tags)
-        return cls(combined, luts, desc)
+        if all(t in tags for t in needed):
+            r = _parse_xyz(icc, tags[b'rXYZ'][0])
+            g = _parse_xyz(icc, tags[b'gXYZ'][0])
+            b = _parse_xyz(icc, tags[b'bXYZ'][0])
+            m_colorants = np.stack([r, g, b], axis=1)    # columns = primaries (XYZ D50)
+            combined = M_XYZ_D50_2_ADOBE @ m_colorants   # device-linRGB -> linear Adobe RGB
+            luts = [_parse_trc_to_lut(icc, tags[t][0])
+                    for t in (b'rTRC', b'gTRC', b'bTRC')]
+            return cls(combined, luts, cls._read_desc(icc, tags))
+        # LUT-based: an A2B0 (fall back A2B1) device->PCS cLUT in mft1/mft2/mAB.
+        a2b = next((t for t in (b'A2B0', b'A2B1') if t in tags), None)
+        if a2b is not None:
+            pcs = icc[20:24]
+            if pcs not in (b'XYZ ', b'Lab '):
+                raise UnsupportedICCError(f"unsupported PCS {pcs!r:s} (only XYZ/Lab)")
+            is_v4 = icc[8] >= 4                           # major version byte
+            clut = _parse_a2b(icc, tags[a2b][0], pcs, is_v4)
+            return cls._from_clut(clut, cls._read_desc(icc, tags))
+        raise UnsupportedICCError(
+            "only RGB matrix-shaper or A2B cLUT ICC profiles are supported "
+            "(CMYK / B2A-only profiles are not)")
 
     @staticmethod
     def _read_desc(icc: bytes, tags: dict) -> str:
@@ -418,13 +470,349 @@ class InputProfile:
         return ""
 
     def apply(self, rgb_u16: np.ndarray) -> np.ndarray:
-        """Convert HxWx3 uint16 device RGB into uint16 sRGB-encoded working RGB."""
+        """Convert HxWx3 uint16 device RGB into uint16 **linear Adobe RGB** — the
+        exact working space the no-ICC negative decode produces, so the
+        density-based inversion downstream (-log10(value/full)) reads consistent
+        LINEAR data. Emitting sRGB-gamma-encoded data here mis-feeds that optical
+        density and casts the converted image (severe green/blue shift)."""
         if rgb_u16.ndim != 3 or rgb_u16.shape[2] != 3 or rgb_u16.dtype != np.uint16:
             return rgb_u16
+        if self._kind == "clut":
+            return self._apply_clut(rgb_u16)
         # LUTs are length 65536, so a uint16 value indexes them directly.
         lin = np.empty(rgb_u16.shape, dtype=np.float32)
         for c in range(3):
             lin[..., c] = self._luts[c][rgb_u16[..., c]]
-        srgb_lin = lin @ self._matrix.T
-        out = srgb_encode(np.clip(srgb_lin, 0.0, 1.0))
+        adobe_lin = lin @ self._matrix.T                 # device -> linear Adobe RGB
+        out = np.clip(adobe_lin, 0.0, 1.0)               # stay linear (no sRGB OETF)
         return np.rint(out * 65535.0).astype(np.uint16)
+
+    def _apply_clut(self, rgb_u16: np.ndarray) -> np.ndarray:
+        """cLUT apply: device input curves -> tetrahedral CLUT interpolation ->
+        XYZ(D50) -> linear Adobe RGB. Same uint16 linear-Adobe output as the
+        matrix path, so the downstream density inversion is untouched."""
+        clut = self._clut
+        lin = np.empty(rgb_u16.shape, dtype=np.float32)
+        for c in range(3):                               # input curves (65536 LUTs)
+            lin[..., c] = clut.in_luts[c][rgb_u16[..., c]]
+        xyz = _clut_interp_tetra(lin, clut)              # (...,3) XYZ D50 (Y=1)
+        adobe_lin = xyz @ M_XYZ_D50_2_ADOBE.T            # -> linear Adobe RGB
+        out = np.clip(adobe_lin, 0.0, 1.0)               # stay linear (no sRGB OETF)
+        return np.rint(out * 65535.0).astype(np.uint16)
+
+
+# --------------------------------------------------------------------------- #
+# LUT-based (cLUT / A2B) ICC support — parse + interpolate. See
+# spec/clut-icc-support.md. Device->PCS only (A2B), PCS decoded to XYZ(D50, Y=1)
+# at parse time so apply() is a uniform gather+interpolate+matmul.
+# --------------------------------------------------------------------------- #
+
+_XYZ_ENC = 1.0 + 32767.0 / 32768.0          # ICC lut8/lut16 XYZ-number max (~1.99997)
+
+
+@dataclass
+class _CLUT:
+    grid: Tuple[int, ...]                    # per-axis grid points (len = n_in, == 3)
+    table: np.ndarray                        # (g0,g1,g2,3) XYZ D50 (Y=1), float32
+    in_luts: List[np.ndarray]                # 3 device->[0,1] LUTs, len 65536 (uint16 index)
+
+
+def _pcs_decode(v01: np.ndarray, pcs: bytes, is_v4: bool, eight_bit: bool) -> np.ndarray:
+    """Decode normalised [0,1] PCS grid values to XYZ(D50, Y=1)."""
+    v01 = np.asarray(v01, dtype=np.float64)
+    if pcs == b'XYZ ':
+        return v01 * _XYZ_ENC
+    # PCS Lab. v4 and 8-bit legacy use the plain scale; v2 16-bit legacy maps
+    # L*=100 to 0xFF00 (not 0xFFFF), hence the 65535/65280 correction.
+    scale = 1.0 if (is_v4 or eight_bit) else (65535.0 / 65280.0)
+    L = v01[..., 0] * 100.0 * scale
+    a = v01[..., 1] * 255.0 * scale - 128.0
+    b = v01[..., 2] * 255.0 * scale - 128.0
+    lab = np.stack([L, a, b], axis=-1)
+    from core.it8_profile import lab_to_xyz       # lazy: it8_profile imports us
+    return lab_to_xyz(lab) / 100.0                # D50 white, Y=1
+
+
+def _clut_interp_trilinear(d01: np.ndarray, clut: "_CLUT") -> np.ndarray:
+    """Trilinear interpolation over the 3-D CLUT grid (reference / fallback)."""
+    table = clut.table
+    dims = np.array(table.shape[:3])
+    shape = d01.shape[:-1]
+    pts = np.asarray(d01, dtype=np.float32).reshape(-1, 3)
+    t = pts * (dims - 1)
+    i0 = np.clip(np.floor(t).astype(np.intp), 0, dims - 2)
+    f = (t - i0).astype(np.float32)
+    ir, ig, ib = i0[:, 0], i0[:, 1], i0[:, 2]
+    out = np.zeros((pts.shape[0], 3), dtype=np.float32)
+    for cx in (0, 1):
+        for cy in (0, 1):
+            for cz in (0, 1):
+                w = ((f[:, 0] if cx else 1 - f[:, 0])
+                     * (f[:, 1] if cy else 1 - f[:, 1])
+                     * (f[:, 2] if cz else 1 - f[:, 2]))
+                out += w[:, None] * table[ir + cx, ig + cy, ib + cz]
+    return out.reshape(*shape, 3)
+
+
+def _tetra_chunk(pts: np.ndarray, table: np.ndarray, dims: np.ndarray) -> np.ndarray:
+    """Tetrahedral interpolation for one flat chunk of (N,3) device points."""
+    t = pts * (dims - 1).astype(np.float32)
+    i0 = np.clip(np.floor(t).astype(np.intp), 0, dims - 2)
+    f = (t - i0).astype(np.float32)
+    fr, fg, fb = f[:, 0], f[:, 1], f[:, 2]
+    ir, ig, ib = i0[:, 0], i0[:, 1], i0[:, 2]
+
+    def C(dx, dy, dz):
+        return table[ir + dx, ig + dy, ib + dz]
+    c000 = C(0, 0, 0); c100 = C(1, 0, 0); c010 = C(0, 1, 0); c001 = C(0, 0, 1)
+    c110 = C(1, 1, 0); c101 = C(1, 0, 1); c011 = C(0, 1, 1); c111 = C(1, 1, 1)
+    R, G, B = fr[:, None], fg[:, None], fb[:, None]
+    # The six tetrahedra of the unit cube, by the ordering of (fr,fg,fb).
+    v1 = c000 + R * (c100 - c000) + G * (c110 - c100) + B * (c111 - c110)  # r>=g>=b
+    v2 = c000 + R * (c100 - c000) + B * (c101 - c100) + G * (c111 - c101)  # r>=b>=g
+    v3 = c000 + B * (c001 - c000) + R * (c101 - c001) + G * (c111 - c101)  # b>=r>=g
+    v4 = c000 + B * (c001 - c000) + G * (c011 - c001) + R * (c111 - c011)  # b>=g>=r
+    v5 = c000 + G * (c010 - c000) + B * (c011 - c010) + R * (c111 - c011)  # g>=b>=r
+    v6 = c000 + G * (c010 - c000) + R * (c110 - c010) + B * (c111 - c110)  # g>=r>=b
+    conds = [(fr >= fg) & (fg >= fb), (fr >= fb) & (fb >= fg),
+             (fb >= fr) & (fr >= fg), (fb >= fg) & (fg >= fr),
+             (fg >= fb) & (fb >= fr), (fg >= fr) & (fr >= fb)]
+    return np.select([c[:, None] for c in conds], [v1, v2, v3, v4, v5, v6],
+                     default=c000)
+
+
+def _clut_interp_tetra(d01: np.ndarray, clut: "_CLUT") -> np.ndarray:
+    """Tetrahedral interpolation (ICC-standard; affine-exact, no neutral-axis
+    desaturation). Chunked to bound memory at full-resolution export."""
+    table = clut.table
+    dims = np.array(table.shape[:3])
+    if np.any(dims < 2):
+        return _clut_interp_trilinear(d01, clut)
+    shape = d01.shape[:-1]
+    pts = np.ascontiguousarray(np.asarray(d01, dtype=np.float32).reshape(-1, 3))
+    n = pts.shape[0]
+    out = np.empty((n, 3), dtype=np.float32)
+    for s in range(0, n, _TETRA_CHUNK):
+        out[s:s + _TETRA_CHUNK] = _tetra_chunk(pts[s:s + _TETRA_CHUNK], table, dims)
+    return out.reshape(*shape, 3)
+
+
+_TETRA_CHUNK = 1 << 22                                    # rows per pass (bounds memory)
+
+
+# --- A2B element parsers --------------------------------------------------- #
+
+def _assemble_clut(in_tab: np.ndarray, clut_grid: np.ndarray, out_tab: np.ndarray,
+                   grid: Tuple[int, ...], pcs: bytes, is_v4: bool,
+                   eight_bit: bool) -> "_CLUT":
+    """Common tail for mft1/mft2: input curves -> 65536 LUTs; output curves +
+    PCS decode folded into the table."""
+    xs = np.linspace(0.0, 1.0, 65536)
+    in_luts = []
+    for c in range(in_tab.shape[0]):
+        src = np.linspace(0.0, 1.0, in_tab.shape[1])
+        in_luts.append(np.interp(xs, src, in_tab[c]).astype(np.float32))
+    tbl = np.array(clut_grid, dtype=np.float64)
+    for j in range(out_tab.shape[0]):
+        src = np.linspace(0.0, 1.0, out_tab.shape[1])
+        tbl[..., j] = np.interp(tbl[..., j], src, out_tab[j])
+    table = _pcs_decode(tbl, pcs, is_v4, eight_bit).astype(np.float32)
+    return _CLUT(grid=grid, table=table, in_luts=in_luts)
+
+
+def _parse_lut8(icc: bytes, off: int, pcs: bytes, is_v4: bool) -> "_CLUT":
+    i, o, g = icc[off + 8], icc[off + 9], icc[off + 10]
+    if i != 3 or o != 3:
+        raise UnsupportedICCError("only 3->3 cLUT input profiles are supported")
+    if g < 2:
+        raise UnsupportedICCError("degenerate CLUT grid")
+    p = off + 48                                          # after 'mft1'+rsv+i/o/g/pad+3x3 matrix
+    in_tab = (np.frombuffer(icc[p:p + i * 256], dtype=np.uint8)
+              .astype(np.float64).reshape(i, 256) / 255.0)
+    p += i * 256
+    n = g ** i * o
+    clut = np.frombuffer(icc[p:p + n], dtype=np.uint8).astype(np.float64) / 255.0
+    p += n
+    out_tab = (np.frombuffer(icc[p:p + o * 256], dtype=np.uint8)
+               .astype(np.float64).reshape(o, 256) / 255.0)
+    return _assemble_clut(in_tab, clut.reshape(g, g, g, o), out_tab,
+                          (g, g, g), pcs, is_v4, eight_bit=True)
+
+
+def _parse_lut16(icc: bytes, off: int, pcs: bytes, is_v4: bool) -> "_CLUT":
+    i, o, g = icc[off + 8], icc[off + 9], icc[off + 10]
+    if i != 3 or o != 3:
+        raise UnsupportedICCError("only 3->3 cLUT input profiles are supported")
+    if g < 2:
+        raise UnsupportedICCError("degenerate CLUT grid")
+    n = struct.unpack('>H', icc[off + 48:off + 50])[0]    # input table entries
+    m = struct.unpack('>H', icc[off + 50:off + 52])[0]    # output table entries
+    p = off + 52
+    in_tab = (np.frombuffer(icc[p:p + i * n * 2], dtype='>u2')
+              .astype(np.float64).reshape(i, n) / 65535.0)
+    p += i * n * 2
+    cn = g ** i * o
+    clut = np.frombuffer(icc[p:p + cn * 2], dtype='>u2').astype(np.float64) / 65535.0
+    p += cn * 2
+    out_tab = (np.frombuffer(icc[p:p + o * m * 2], dtype='>u2')
+               .astype(np.float64).reshape(o, m) / 65535.0)
+    return _assemble_clut(in_tab, clut.reshape(g, g, g, o), out_tab,
+                          (g, g, g), pcs, is_v4, eight_bit=False)
+
+
+def _curve_len(icc: bytes, off: int) -> int:
+    """Byte length (padded to 4) of a standalone 'curv'/'para' element."""
+    sig = icc[off:off + 4]
+    if sig == b'curv':
+        count = struct.unpack('>I', icc[off + 8:off + 12])[0]
+        ln = 12 + 2 * count
+    elif sig == b'para':
+        func = struct.unpack('>H', icc[off + 8:off + 10])[0]
+        nparams = {0: 1, 1: 3, 2: 4, 3: 5, 4: 7}.get(func)
+        if nparams is None:
+            raise UnsupportedICCError(f"unsupported parametric curve type {func}")
+        ln = 12 + 4 * nparams
+    else:
+        raise UnsupportedICCError(f"unsupported curve element {sig!r:s}")
+    return ln + (-ln % 4)
+
+
+def _read_curve_set(icc: bytes, off: int, count: int) -> List[np.ndarray]:
+    """`count` consecutive curve elements -> list of 65536-entry [0,1]->[0,1] LUTs."""
+    luts, p = [], off
+    for _ in range(count):
+        luts.append(_parse_trc_to_lut(icc, p))
+        p += _curve_len(icc, p)
+    return luts
+
+
+def _parse_lutAToB(icc: bytes, off: int, pcs: bytes, is_v4: bool) -> "_CLUT":
+    i, o = icc[off + 8], icc[off + 9]
+    if i != 3 or o != 3:
+        raise UnsupportedICCError("only 3->3 cLUT input profiles are supported")
+    off_B, off_mat, off_M, off_clut, off_A = struct.unpack(
+        '>5I', icc[off + 12:off + 32])
+    xs = np.linspace(0.0, 1.0, 65536)
+    in_luts = (_read_curve_set(icc, off + off_A, i) if off_A
+               else [xs.astype(np.float32) for _ in range(i)])
+    in_luts = [np.asarray(l, dtype=np.float32) for l in in_luts]
+    if not off_clut:
+        raise UnsupportedICCError("lutAToB without a CLUT is not supported")
+    grid, clut_grid = _read_clut_element(icc, off + off_clut, i, o)
+    tbl = np.array(clut_grid, dtype=np.float64)
+    if off_M:
+        for j, lut in enumerate(_read_curve_set(icc, off + off_M, o)):
+            tbl[..., j] = np.interp(tbl[..., j], xs, lut)
+    if off_mat:
+        vals = np.array(struct.unpack('>12i', icc[off + off_mat:off + off_mat + 48]),
+                        dtype=np.float64) / 65536.0
+        tbl = tbl @ vals[:9].reshape(3, 3).T + vals[9:12]
+    if off_B:
+        for j, lut in enumerate(_read_curve_set(icc, off + off_B, o)):
+            tbl[..., j] = np.interp(tbl[..., j], xs, lut)
+    table = _pcs_decode(tbl, pcs, is_v4, eight_bit=False).astype(np.float32)
+    return _CLUT(grid=grid, table=table, in_luts=in_luts)
+
+
+def _read_clut_element(icc: bytes, off: int, i: int, o: int):
+    """Parse an mAB CLUT element -> (grid dims, (g0,..,o) [0,1] float grid)."""
+    gp = [icc[off + k] for k in range(i)]                 # gridPoints[16], first i used
+    if any(x < 2 for x in gp):
+        raise UnsupportedICCError("degenerate CLUT grid")
+    prec = icc[off + 16]                                  # 1=u8, 2=u16
+    p = off + 20
+    count = o
+    for x in gp:
+        count *= x
+    if prec == 1:
+        raw = np.frombuffer(icc[p:p + count], dtype=np.uint8).astype(np.float64) / 255.0
+    elif prec == 2:
+        raw = np.frombuffer(icc[p:p + count * 2], dtype='>u2').astype(np.float64) / 65535.0
+    else:
+        raise UnsupportedICCError(f"unsupported CLUT precision {prec}")
+    return tuple(gp), raw.reshape(*gp, o)
+
+
+def _parse_a2b(icc: bytes, off: int, pcs: bytes, is_v4: bool) -> "_CLUT":
+    sig = icc[off:off + 4]
+    if sig == b'mft1':
+        return _parse_lut8(icc, off, pcs, is_v4)
+    if sig == b'mft2':
+        return _parse_lut16(icc, off, pcs, is_v4)
+    if sig == b'mAB ':
+        return _parse_lutAToB(icc, off, pcs, is_v4)
+    raise UnsupportedICCError(f"unsupported A2B element type {sig!r:s}")
+
+
+# --------------------------------------------------------------------------- #
+# cLUT ICC synthesis (lut16 / 'mft2', RGB device -> XYZ PCS). Round-trips through
+# _parse_lut16 above. See spec/clut-icc-support.md §5.8.
+# --------------------------------------------------------------------------- #
+
+def _lut16_type(clut_xyz: np.ndarray, grid: int) -> bytes:
+    """lut16Type ('mft2') element: identity 3x3 + identity 2-entry input/output
+    tables; the 3-D CLUT carries the whole RGB->XYZ(D50) transform. `clut_xyz` is
+    (grid,grid,grid,3) XYZ D50 (Y=1), indexed [R][G][B][channel]."""
+    body = struct.pack('>4sI', b'mft2', 0)
+    body += struct.pack('>BBBx', 3, 3, grid)              # i=3, o=3, g=grid, pad
+    for v in (1, 0, 0, 0, 1, 0, 0, 0, 1):                 # identity 3x3 (s15Fixed16)
+        body += struct.pack('>i', _s15f16(v))
+    body += struct.pack('>HH', 2, 2)                      # n=2 in, m=2 out table entries
+    for _ in range(3):                                    # identity input tables
+        body += struct.pack('>HH', 0, 65535)
+    enc = np.clip(np.asarray(clut_xyz, dtype=np.float64) / _XYZ_ENC, 0.0, 1.0)
+    body += np.rint(enc * 65535.0).astype('>u2').tobytes()  # R slowest, B fastest, ch fastest
+    for _ in range(3):                                    # identity output tables
+        body += struct.pack('>HH', 0, 65535)
+    return body
+
+
+def build_clut_icc(desc: str, clut_xyz: np.ndarray, grid: int,
+                   wtpt: Tuple[float, float, float] = D50_XYZ,
+                   copyright_text: str = "Public Domain. No rights reserved.") -> bytes:
+    """Build a valid ICC v2.4 RGB->XYZ cLUT (lut16) profile. `clut_xyz` is a
+    (grid,grid,grid,3) XYZ D50 (Y=1) table indexed [R][G][B]. Parses back via
+    InputProfile.from_bytes (cLUT path)."""
+    desc = str(desc).encode('ascii', 'replace').decode('ascii')
+    copyright_text = str(copyright_text).encode('ascii', 'replace').decode('ascii')
+    tags = {
+        'desc': _desc_type(desc),
+        'wtpt': _xyz_type(*wtpt),
+        'A2B0': _lut16_type(clut_xyz, grid),
+        'cprt': _text_type(copyright_text),
+    }
+    order = ['desc', 'A2B0', 'wtpt', 'cprt']
+    n = len(order)
+    base = 128 + 4 + n * 12
+    data = b''
+    entries = []
+    seen: dict = {}
+    for name in order:
+        payload = tags[name]
+        key = bytes(payload)
+        if key in seen:
+            off, ln = seen[key]
+        else:
+            if len(data) % 4:
+                data += b'\x00' * (4 - len(data) % 4)
+            off = base + len(data)
+            ln = len(payload)
+            data += payload
+            seen[key] = (off, ln)
+        entries.append((name.encode('ascii'), off, ln))
+    table = struct.pack('>I', n)
+    for tag, off, ln in entries:
+        table += struct.pack('>4sII', tag, off, ln)
+    total = 128 + len(table) + len(data)
+    header = bytearray(128)
+    struct.pack_into('>I', header, 0, total)
+    struct.pack_into('>4s', header, 4, b'lcms')
+    struct.pack_into('>I', header, 8, 0x02400000)         # v2.4.0
+    struct.pack_into('>4s', header, 12, b'mntr')
+    struct.pack_into('>4s', header, 16, b'RGB ')
+    struct.pack_into('>4s', header, 20, b'XYZ ')
+    struct.pack_into('>4s', header, 36, b'acsp')
+    struct.pack_into('>i', header, 68, _s15f16(wtpt[0]))
+    struct.pack_into('>i', header, 72, _s15f16(wtpt[1]))
+    struct.pack_into('>i', header, 76, _s15f16(wtpt[2]))
+    return bytes(header) + table + data

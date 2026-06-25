@@ -490,3 +490,129 @@ scales to the grid density (`ncols`/`nrows`).
 The full path (CxF parse → un-mirror → 12×24 block A49–L72 → auto-neutral fit)
 on the user's LaserSoft shot yields **avg ΔE2000 ≈ 1.8** (232 of 288 patches;
 dark patches clipped at the low end were rejected).
+
+## 12. Refinement (v3) — usability: bigger window, invalid-patch feedback, multi-card targets
+
+Driven by three field-usability gaps: the wizard was too cramped to place corners
+accurately, the "valid patches: N/M" read-out never said *which* patches were
+bad, and large IT8 targets that ship as **several physical cards** (the patch grid
+split across panels, e.g. columns 1–24 / 25–48 / 49–72) could only contribute one
+card's worth of patches to a fit.
+
+### 12.1 Larger window
+`IT8ProfileDialog` minimum size → **1024×700** (initial 1120×780) and
+`IT8PatchLocator` minimum → **820×480**, so the locate page — the only page whose
+accuracy depends on screen real estate — gives the patch overlay enough room to
+place corners precisely. No layout restructuring; the locator already expands with
+a stretch factor.
+
+### 12.2 Invalid-patch feedback
+**Validity criterion fix.** The old test flagged a patch invalid when >2 % of its
+window pixels were ≤0.5 % of full scale **or** ≥99.5 %. On raw-linear device data
+the low-end half was wrong: a **saturated hue legitimately reads near-zero in its
+complementary channels** (a vivid red → green/blue ≈ 0, a vivid blue → red ≈ 0)
+and **dense film patches read low**, so the most informative patches for the
+matrix fit were all being dropped (a real ISO 12641-2 Provia shot showed only
+217/288 valid, with every saturated red/blue/dark patch reddened). A low linear
+value is *real signal*, not lost information. `sample_patches` now flags a patch
+only when its colour truly can't be trusted:
+- **highlight-clipped** — any channel has >2 % of pixels at the ceiling
+  (`clip_hi`), judged **per channel** so a single blown channel is caught (and
+  doesn't corrupt that primary's fit) rather than diluted across three;
+- **black-crushed** — even the brightest channel's trimmed mean is ≤ `black_floor`
+  (~0.08 % of full), i.e. no signal at all;
+- **out of frame**.
+
+The locate page now **surfaces which ones**:
+- `IT8PatchLocator.set_invalid_ids(ids)` stores the dialog-computed invalid id set;
+  `paintEvent` draws those dots (and any off-frame dot) **red and enlarged** (the
+  prior code only reddened off-frame dots, never clipped-but-in-frame ones).
+- `_update_locate_status` lists the invalid ids inline (first 10 + "(+N more)")
+  with the **full list in the label's tooltip**, instead of only a count. The set is
+  recomputed on every `changed` (i.e. on drag-release / layout change), keeping the
+  red overlay in sync with the live "N/M valid" read-out.
+
+### 12.3 Multi-card targets (accumulate samples across up to 3 images)
+A target whose grid is split across cards is mapped one card per image, the
+**samples accumulating** into a single fit:
+- After locating a **block-mode** card, the wizard **asks (at most twice → up to 3
+  cards total)** "Map another image?". On *yes* it browses + decodes the next card,
+  loads it into the locator, and **auto-advances the block id range by the block's
+  own width** (`it8.next_block_ids`, e.g. `A1–L24` → `A25–L48` → `A49–L72`, clamped
+  to the reference's max column). On *no* it fits.
+- `it8.merge_samples([...])` (new, pure) unions the per-card sample dicts; on the
+  rare overlapping-id collision a **valid** sample wins over an invalid one.
+- The fit consumes the merged set (`_all_samples`); Step 4 notes "combined from N
+  images" when N>1. A "Card N of up to 3" banner shows on the locate page.
+- **Classic** (single 12×22 + GS strip) targets are one physical card, so the
+  prompt is **gated to block mode** — classic users never see it.
+- New pure-logic helpers live in `core.it8_profile` (`merge_samples`,
+  `next_block_ids`) and are unit-tested; the dialog stays thin UI.
+
+### 12.4 Multi-card session robustness (from adversarial review)
+The accumulation state (`_mapped_cards` / `_all_samples` / `_n_images` / `_fit`)
+belongs to the **(target shot, reference)** pair the cards were sampled against,
+so:
+- **`_reset_card_accum()` is called from `_set_target` and `_browse_ref`** —
+  picking a different target or a different batch reference (incl. via *Back*)
+  discards any cards mapped against the abandoned inputs and re-seeds the block id
+  range from the new reference's extent. Without this, stale cards from an
+  abandoned session would silently contaminate the fit (and falsely report
+  "combined from N images").
+- **`_should_ask_more()` is additionally gated on `self._fit is None`** so that
+  *Back-from-build → Next* simply re-runs the fit rather than re-popping the "Map
+  another?" prompt. A genuine new card is added during the forward mapping flow,
+  before any fit exists.
+- **`_advance_block_ids` refuses a degenerate shift** — if the previous card
+  already reached the chart's edge, the auto-advance would collapse to a single
+  column or overlap, so it leaves the ids for the user to set by hand (with an
+  explanatory note) instead of silently mis-mapping the next card.
+- **The window floor is clamped to the screen** (`availableGeometry`) so the
+  1024×700 minimum can never push the Back/Next row off a small display.
+
+### 12.5 Canonical camera-profiling decode (researched)
+
+The standard device space for **all** camera colour-characterization profiles —
+matrix ICC, cLUT ICC, and Adobe DCP — is **camera-native, demosaiced, linear,
+16-bit, no auto-brightness, no clipping in the patches**. The reference is Anders
+Torger's DCamProf recipe `dcraw -v -r 1 1 1 1 -o 0 -H 0 -T -6 -W -g 1 1`
+("16-bit linear TIFF without white balancing"). Sources: torger.se/DCamProf, the
+dcraw(1) manpage, the Adobe DNG spec, rawpy/LibRaw docs, ninedegreesbelow (Elle
+Stone), RawPedia.
+
+rawpy mapping (FreeCCR's `_raw_color_postprocess_kwargs(no_icc_default=False)`):
+
+| dcraw | meaning | rawpy |
+|-------|---------|-------|
+| `-o 0` | camera-native (no camera matrix / working space) | `output_color=ColorSpace.raw` |
+| `-g 1 1` | linear gamma 1.0 | `gamma=(1, 1)` |
+| `-6` | 16-bit | `output_bps=16` |
+| `-W` | fixed white level (no auto-bright) | `no_auto_bright=True` + `no_auto_scale=True` + manual `×65535/white_level` |
+| `-r 1 1 1 1` | unbalanced (unity WB) | `use_camera_wb=False`, `use_auto_wb=False` |
+| `-H 0` | no highlight recovery | (clip rejection drops blown patches in the fit) |
+
+**Why camera-native:** `-o 0` outputs sensor RGB *before* `convert_to_rgb()` (the
+camera→XYZ/working-space matrix stage). Fitting on Adobe RGB would make the matrix
+characterize Adobe, not the sensor, and — critically — a **DCP's
+ColorMatrix/ForwardMatrix operate on camera-native raw**, so a working-space decode
+makes DCP application impossible. This is why the decode is camera-native, not the
+v0.5/early-v0.6 Adobe-RGB-for-ICC decode.
+
+**White balance — the one divergence (researched):**
+- **DCP must be UNBALANCED**: it carries WB derivation (the `ColorMatrix` relates
+  raw RGB balance ↔ illuminant CCT) and applies the as-shot WB at render time via
+  the `ForwardMatrix`(+LUT) on the white-balanced image.
+- **Matrix/cLUT ICC is normally white-balanced at decode** (no render-time WB
+  stage) — *but may be fit unbalanced with WB baked into the matrix coefficients.*
+  **FreeCCR does the latter**: the decode is unbalanced (no WB) and
+  `fit_camera_matrix` folds the per-channel `gains` into the stored matrix
+  (§5.4 step 5). So FreeCCR's single unbalanced camera-native decode is the correct
+  shared base for both the matrix ICC **and** a future DCP.
+
+**Implementation:** `read_image` selects the camera-native path
+(`no_icc_default=False`) whenever an input ICC is active *or* the bare-device
+profiling decode is requested (`apply_input_icc=False`), and the Adobe RGB +
+auto-scale default only for a plain unprofiled negative. `decode_target` (the IT8
+fit) and the runtime ICC-apply decode therefore hit the **same** kwargs —
+`test_fit_and_apply_decode_spaces_are_identical` pins this so the two paths can't
+silently diverge.

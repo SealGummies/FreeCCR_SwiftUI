@@ -93,11 +93,13 @@ class TestRawPostprocessKwargs:
 
 # --------------------------------------------------------------------------- #
 # read_image decode WIRING (RAW branch). The pure kwargs builder is tested above;
-# these pin read_image's behaviour: the negative decode is ALWAYS the Adobe RGB +
-# rawpy auto-scale (thr=0) working space, and an active input ICC is applied ON
-# TOP (skipped for the IT8 profiling decode, apply_input_icc=False), so fit-space
-# == apply-space. Verified by stubbing the heavy rawpy decode. (DNG is not
-# special-cased: it applies the input ICC like any RAW.)
+# these pin read_image's behaviour: a plain unprofiled negative decodes to Adobe
+# RGB + rawpy auto-scale (thr=0), while ANY ICC path — an active input ICC, or the
+# bare-device decode used to FIT one (apply_input_icc=False) — uses the canonical
+# camera-profiling space: raw camera-native primaries + no_auto_scale + manual
+# white-level scaling. So fit-space == apply-space EXACTLY. Verified by stubbing
+# the heavy rawpy decode. (DNG is not special-cased: it applies the input ICC
+# like any RAW.)
 # --------------------------------------------------------------------------- #
 from core import color_management as cm  # noqa: E402
 
@@ -129,6 +131,7 @@ class _FakeRaw:
         self.num_colors = 3
         self.color_desc = b'RGGB'
         self.raw_pattern = np.array([[0, 1], [1, 2]])
+        self.camera_whitebalance = [2.0, 1.0, 1.5, 0.0]   # as-shot WB (for DCP)
 
     def __enter__(self):
         return self
@@ -187,12 +190,77 @@ class TestInputIccWillApply:
         finally:
             cm.set_active_input_profile(None)
 
+    def test_true_when_dcp_active(self):
+        # A DCP (no ICC) also flips the decode to camera-native.
+        from core import dcp_profile
+
+        class _F:
+            matrix = np.array([[0.46, 0.31, 0.17], [0.23, 0.70, 0.07], [0.02, 0.12, 0.93]])
+        cm.set_active_input_profile(None)
+        cm.set_active_dcp_profile(dcp_profile.parse_dcp_bytes(
+            dcp_profile.build_camera_dcp(_F(), "c")))
+        try:
+            assert self._img("x.arw")._input_icc_will_apply() is True
+        finally:
+            cm.set_active_dcp_profile(None)
+
+
+def _camera_dcp_bytes():
+    from core import dcp_profile
+
+    class _F:
+        matrix = np.array([[0.46, 0.31, 0.17], [0.23, 0.70, 0.07], [0.02, 0.12, 0.93]])
+    return dcp_profile.build_camera_dcp(_F(), "c")
+
+
+class _FakeRawMono(_FakeRaw):
+    def __init__(self, rec):
+        super().__init__(rec)
+        self.num_colors = 1
+
+    def postprocess(self, **kw):
+        self._rec['kwargs'] = kw
+        return np.full((32, 48), 12000, dtype=np.uint16)     # single channel
+
+
+class TestDcpDecodeWiring:
+    def _decode(self, monkeypatch, fake_cls=_FakeRaw, dcp_active=True, apply_icc=True):
+        from core import dcp_profile
+        rec = {}
+        monkeypatch.setattr(rawpy, "imread", lambda p: fake_cls(rec))
+        cm.set_active_input_profile(None)
+        cm.set_active_dcp_profile(dcp_profile.parse_dcp_bytes(_camera_dcp_bytes())
+                                  if dcp_active else None)
+        try:
+            img = CCRImage.__new__(CCRImage)
+            img.source_ops = []
+            img.file_path = "scan.arw"
+            out = img.read_image("scan.arw", preview=True, positive_override=False,
+                                 apply_input_icc=apply_icc)
+        finally:
+            cm.set_active_dcp_profile(None)
+        return rec.get("kwargs"), out
+
+    def test_dcp_uses_camera_native_and_applies(self, monkeypatch):
+        kw, out = self._decode(monkeypatch, dcp_active=True, apply_icc=True)
+        assert kw["output_color"] == rawpy.ColorSpace.raw     # camera-native for DCP
+        assert kw["no_auto_scale"] is True
+        _, bare = self._decode(monkeypatch, dcp_active=True, apply_icc=False)  # bare device
+        assert not np.array_equal(out, bare)                  # DCP was applied
+
+    def test_dcp_skipped_for_monochrome(self, monkeypatch):
+        _, with_dcp = self._decode(monkeypatch, fake_cls=_FakeRawMono, dcp_active=True)
+        _, without = self._decode(monkeypatch, fake_cls=_FakeRawMono, dcp_active=False)
+        assert np.array_equal(with_dcp, without)              # no profile burned into mono
+
 
 class TestRawDecodeSpaceWiring:
-    # The negative decode is ALWAYS the Adobe RGB + auto-scale (thr=0) working
-    # space — independent of input-ICC / bare-device state. An active ICC is
-    # applied ON TOP; IT8 profiling samples this same space with the ICC step
-    # skipped, so fit-space == apply-space. _FakeRaw returns a flat 10000 decode.
+    # No profile + normal decode → Adobe RGB + auto-scale (the camera-independent
+    # default). ANY ICC path — active ICC, or the bare-device decode used to FIT
+    # one (apply_input_icc=False) — → canonical camera-native raw + no_auto_scale +
+    # manual white-level scaling, so the profile is fitted in and applied to the
+    # SAME device space. _FakeRaw returns a flat 10000 decode, white_level=16383
+    # (manual scaling ×65535/16383 ≈ 4 when it applies).
     def test_no_profile_is_adobe_autoscaled(self, monkeypatch):
         kw, out = _decode_raw(monkeypatch, "scan.arw", profile=None)
         assert kw["output_color"] == rawpy.ColorSpace.Adobe
@@ -200,31 +268,44 @@ class TestRawDecodeSpaceWiring:
         assert kw["adjust_maximum_thr"] == 0.0
         assert int(out.max()) == 10000          # manual white-level scaling skipped
 
-    def test_profile_active_same_space_icc_on_top(self, monkeypatch):
-        # Same Adobe+autoscale decode as no-profile, but the ICC is applied on top.
+    def test_profile_active_is_camera_native(self, monkeypatch):
+        # Active ICC → camera-native raw + no_auto_scale device space, ICC on top.
         kw, out = _decode_raw(monkeypatch, "scan.arw",
                               profile=_matrix_shaper_profile())
-        assert kw["output_color"] == rawpy.ColorSpace.Adobe
-        assert kw["no_auto_scale"] is False
+        assert kw["output_color"] == rawpy.ColorSpace.raw
+        assert kw["no_auto_scale"] is True
         _, bare = _decode_raw(monkeypatch, "scan.arw", profile=None)
-        assert not np.array_equal(out, bare)    # ICC changed the pixels
+        assert not np.array_equal(out, bare)    # different space + ICC applied
 
     def test_dng_matches_other_raws(self, monkeypatch):
         kw, _ = _decode_raw(monkeypatch, "scan.dng",
                             profile=_matrix_shaper_profile())
-        assert kw["output_color"] == rawpy.ColorSpace.Adobe
-        assert kw["no_auto_scale"] is False
+        assert kw["output_color"] == rawpy.ColorSpace.raw
+        assert kw["no_auto_scale"] is True
 
-    def test_profiling_decode_is_same_space_without_icc(self, monkeypatch):
-        # IT8 profiling: apply_input_icc=False samples the SAME Adobe+autoscale
-        # working space, but the ICC is NOT applied (bare RGB to fit on), and the
-        # manual white-level scaling stays skipped.
+    def test_profiling_decode_is_camera_native_without_icc(self, monkeypatch):
+        # IT8 profiling: apply_input_icc=False decodes the bare camera-native raw
+        # device RGB (no ICC), WITH the manual white-level scaling applied so the
+        # values are absolute — the exact space the ICC is later applied in.
         kw, out = _decode_raw(monkeypatch, "scan.arw",
                               profile=_matrix_shaper_profile(),
                               apply_input_icc=False)
-        assert kw["output_color"] == rawpy.ColorSpace.Adobe
-        assert kw["no_auto_scale"] is False
-        assert int(out.max()) == 10000          # no ICC + no manual scaling
+        assert kw["output_color"] == rawpy.ColorSpace.raw
+        assert kw["no_auto_scale"] is True
+        # 10000 × 65535/16383 ≈ 40009 — manual white-level scaling applied.
+        assert 39000 < int(out.max()) < 41000
+
+    def test_fit_and_apply_decode_spaces_are_identical(self, monkeypatch):
+        # The crux of a correct camera profile: the kwargs used to FIT the profile
+        # (apply_input_icc=False) must equal those used to APPLY it (active ICC).
+        fit_kw, _ = _decode_raw(monkeypatch, "scan.arw",
+                                profile=_matrix_shaper_profile(),
+                                apply_input_icc=False)
+        apply_kw, _ = _decode_raw(monkeypatch, "scan.arw",
+                                  profile=_matrix_shaper_profile())
+        for key in ("output_color", "no_auto_scale", "gamma", "no_auto_bright",
+                    "use_camera_wb", "use_auto_wb", "output_bps"):
+            assert fit_kw[key] == apply_kw[key], f"fit/apply diverge on {key}"
 
 
 # --------------------------------------------------------------------------- #

@@ -165,12 +165,29 @@ def test_input_profile_applies_and_preserves_shape():
     assert not np.array_equal(out, img)
 
 
-def test_input_profile_srgb_is_near_identity():
+def test_input_profile_adobe_linear_is_near_identity():
+    # The input-profile working space is LINEAR Adobe RGB (so the density-based
+    # negative inversion sees consistent linear data). An Adobe-primary profile
+    # with a LINEAR TRC therefore round-trips to (near) the input.
+    adobe_d50 = cm.M_BRADFORD_D65_D50 @ cm.M_ADOBE2XYZ_D65
+    icc = cm.build_matrix_shaper_icc(
+        "Adobe-linear", tuple(adobe_d50[:, 0]), tuple(adobe_d50[:, 1]),
+        tuple(adobe_d50[:, 2]), (1.0, 1.0, 0.0, 1.0, 0.0))   # linear (identity) TRC
+    ip = cm.InputProfile.from_bytes(icc)
+    img = _rand_u16(seed=9)
+    out = ip.apply(img)
+    # Identity up to ICC s15Fixed16 colorant precision.
+    assert int(np.abs(out.astype(int) - img.astype(int)).max()) < 64
+
+
+def test_input_profile_srgb_relinearizes_to_adobe():
+    # An sRGB profile is NO LONGER identity: it linearises the sRGB-encoded input
+    # and re-expresses it in linear Adobe primaries (the working space), so the
+    # output must differ substantially from the input.
     ip = cm.InputProfile.from_bytes(cm.SRGB_ICC_BYTES)
     img = _rand_u16(seed=9)
     out = ip.apply(img)
-    # sRGB-in -> sRGB-working is identity up to ICC s15Fixed16 colorant precision.
-    assert int(np.abs(out.astype(int) - img.astype(int)).max()) < 64
+    assert int(np.abs(out.astype(int) - img.astype(int)).max()) > 64
 
 
 def test_input_profile_passthrough_non_rgb():
@@ -287,6 +304,58 @@ def test_backend_set_and_clear_input_icc(tmp_path, monkeypatch):
         cm.set_active_input_profile(None)
         ccr_backend.input_icc_path = None
         ccr_backend.input_icc_name = None
+
+
+def _camera_dcp():
+    from core import dcp_profile
+
+    class _F:
+        matrix = np.array([[0.46, 0.31, 0.17], [0.23, 0.70, 0.07], [0.02, 0.12, 0.93]])
+    return dcp_profile.build_camera_dcp(_F(), "Cam")
+
+
+def test_read_image_applies_active_dcp(tmp_path):
+    _make_qapp()
+    from core.ccr_image import CCRImage
+    from core import dcp_profile
+    p = str(tmp_path / "neg.png")
+    _write_negative_png(p)
+    cm.set_active_dcp_profile(None)
+    try:
+        a = CCRImage(p).resized_raw.copy()             # no profile
+        cm.set_active_dcp_profile(dcp_profile.parse_dcp_bytes(_camera_dcp()))
+        b = CCRImage(p).resized_raw.copy()             # DCP burned in at decode
+        assert a.shape == b.shape and not np.array_equal(a, b)
+    finally:
+        cm.set_active_dcp_profile(None)
+
+
+def test_backend_dcp_exclusivity_and_storage(tmp_path, monkeypatch):
+    _make_qapp()
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    from core.ccr_backend import ccr_backend
+    dsrc = tmp_path / "c.dcp"; dsrc.write_bytes(_camera_dcp())
+    isrc = tmp_path / "p.icc"; isrc.write_bytes(_adobe_like_icc())
+    icc_store = str(tmp_path / "FreeCCR" / "input_profile.icc")
+    dcp_store = str(tmp_path / "FreeCCR" / "input_profile.dcp")
+    try:
+        ccr_backend.set_input_icc(str(isrc))
+        ccr_backend.set_input_dcp(str(dsrc))           # DCP set -> ICC must clear
+        assert cm.get_active_dcp_profile() is not None
+        assert cm.get_active_input_profile() is None
+        assert os.path.exists(dcp_store) and not os.path.exists(icc_store)
+        ccr_backend.set_input_icc(str(isrc))           # ICC set -> DCP must clear
+        assert cm.get_active_input_profile() is not None
+        assert cm.get_active_dcp_profile() is None
+        assert not os.path.exists(dcp_store)
+        ccr_backend.clear_input_icc()
+        ccr_backend.clear_input_dcp()
+        assert cm.get_active_dcp_profile() is None and cm.get_active_input_profile() is None
+    finally:
+        cm.set_active_input_profile(None)
+        cm.set_active_dcp_profile(None)
+        ccr_backend.input_icc_path = ccr_backend.input_icc_name = None
+        ccr_backend.input_dcp_path = ccr_backend.input_dcp_name = None
 
 
 def test_backend_rejects_lut_profile_unchanged(tmp_path, monkeypatch):

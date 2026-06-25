@@ -45,6 +45,9 @@ class CCRBackend:
         # color_management's module-level holder; these mirror it for the UI.
         self.input_icc_path: Optional[str] = None
         self.input_icc_name: Optional[str] = None
+        # Active DCP (DNG camera profile) — mutually exclusive with the input ICC.
+        self.input_dcp_path: Optional[str] = None
+        self.input_dcp_name: Optional[str] = None
         # Catalog entries of ACTUAL images removed from the list this
         # session: {file_path: {"signature": sig, "entries": {name: state}}}.
         # Removal must not lose their stored edits, so saves merge these
@@ -603,6 +606,7 @@ class CCRBackend:
                 != os.path.normcase(os.path.abspath(storage))):
             shutil.copyfile(src_path, storage)
         color_management.set_active_input_profile(profile)
+        self.clear_input_dcp()                       # ICC and DCP are exclusive
         self.input_icc_path = storage
         self.input_icc_name = profile.description or os.path.basename(src_path)
         return self.input_icc_name
@@ -629,6 +633,53 @@ class CCRBackend:
         self.input_icc_name = None
         try:
             storage = self._input_icc_storage_path()
+            if os.path.exists(storage):
+                os.remove(storage)
+        except OSError:
+            pass
+
+    # --- DCP (DNG camera profile) — mirrors the input-ICC trio, exclusive ----
+    def _input_dcp_storage_path(self) -> str:
+        from core.catalog import default_catalog_path
+        return os.path.join(os.path.dirname(default_catalog_path()), "input_profile.dcp")
+
+    def set_input_dcp(self, src_path: str) -> str:
+        """Assign a global DCP from src_path (parsed first, raising DcpError on
+        failure). Clears any active ICC (exclusive slot), copies to the working
+        copy, activates it. Returns the profile name."""
+        from core import color_management, dcp_profile
+        import shutil
+        profile = dcp_profile.parse_dcp(src_path)    # parse before mutating
+        storage = self._input_dcp_storage_path()
+        if (os.path.normcase(os.path.abspath(src_path))
+                != os.path.normcase(os.path.abspath(storage))):
+            shutil.copyfile(src_path, storage)
+        color_management.set_active_dcp_profile(profile)
+        self.clear_input_icc()                       # DCP and ICC are exclusive
+        self.input_dcp_path = storage
+        self.input_dcp_name = profile.name or os.path.basename(src_path)
+        return self.input_dcp_name
+
+    def load_input_dcp_from_storage(self, storage_path: str) -> Optional[str]:
+        from core import color_management, dcp_profile
+        try:
+            profile = dcp_profile.parse_dcp(storage_path)
+        except Exception as e:
+            print(f"Could not load saved DCP {storage_path}: {e}")
+            return None
+        color_management.set_active_dcp_profile(profile)
+        self.input_dcp_path = storage_path
+        self.input_dcp_name = profile.name or os.path.basename(storage_path)
+        return self.input_dcp_name
+
+    def clear_input_dcp(self) -> None:
+        """Remove the global DCP and its working copy."""
+        from core import color_management
+        color_management.set_active_dcp_profile(None)
+        self.input_dcp_path = None
+        self.input_dcp_name = None
+        try:
+            storage = self._input_dcp_storage_path()
             if os.path.exists(storage):
                 os.remove(storage)
         except OSError:

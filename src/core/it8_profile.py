@@ -493,6 +493,26 @@ def parse_block(tl_id: str, br_id: str):
     return rows, cols
 
 
+def next_block_ids(tl_id: str, br_id: str, max_col: Optional[int] = None
+                   ) -> Tuple[str, str]:
+    """Advance a block's column range by its own width for the next card of a
+    multi-card target (e.g. ('A1','L24') -> ('A25','L48') -> ('A49','L72')).
+
+    Rows are preserved; only the columns shift. If `max_col` is given the new
+    range is clamped so the right column never exceeds it (the last card of a
+    target that doesn't divide evenly). Raises ValueError on an unparseable id.
+    """
+    rows, cols = parse_block(tl_id, br_id)
+    r0, r1 = rows[0], rows[-1]
+    c0, c1 = cols[0], cols[-1]
+    width = c1 - c0 + 1
+    nc0, nc1 = c0 + width, c1 + width
+    if max_col is not None and nc1 > max_col:
+        nc1 = max_col
+        nc0 = min(nc0, nc1)
+    return f"{r0}{nc0}", f"{r1}{nc1}"
+
+
 def block_sample_points(quad, rows, cols) -> Dict[str, Tuple[float, float]]:
     """Sample centres (array coords) for a regular len(rows)×len(cols) grid laid
     on the 4-corner quad (TL,TR,BR,BL). IDs are '<row><col>' (e.g. 'A49')."""
@@ -531,15 +551,30 @@ def _quad_cell_halfsize(quad: np.ndarray, frac: float,
 
 
 def sample_patches(img_u16: np.ndarray, points: Dict[str, Tuple[float, float]],
-                   quad, frac: float = 0.5, clip_lo: float = 0.005,
-                   clip_hi: float = 0.995, ncols: int = 22,
+                   quad, frac: float = 0.5, clip_hi: float = 0.995,
+                   black_floor: float = 0.0008, ncols: int = 22,
                    nrows: int = 12) -> Dict[str, PatchSample]:
     """Sample each patch's device RGB from a central window via a per-channel
-    trimmed mean; flag patches with >2% clipped pixels or out of frame. ncols/
-    nrows set the grid density so the sampling window scales to the cell size."""
+    trimmed mean and flag only the genuinely unusable ones. ncols/nrows set the
+    grid density so the sampling window scales to the cell size.
+
+    A patch is invalid only when its colour can't be trusted:
+      * **highlight-clipped** — any channel has >2% of pixels pinned at the
+        sensor ceiling (`clip_hi`), so information above it is lost; or
+      * **black-crushed** — even its brightest channel sits at/below the black
+        floor (`black_floor`), i.e. no signal at all; or
+      * partly **out of frame**.
+
+    A merely *low* channel is NOT a defect on raw-linear device data: a saturated
+    hue legitimately reads near-zero in one or two complementary channels while
+    carrying full signal in the rest (a vivid red has green/blue ≈ 0), and dense
+    film patches read low — yet these saturated/dark patches are the most
+    informative for the matrix fit. The previous "any pixel below 0.5 % of full
+    scale counts as clipped" test wrongly rejected all of them."""
     h, w = img_u16.shape[:2]
     full = 65535.0
-    lo, hi = clip_lo * full, clip_hi * full
+    hi = clip_hi * full
+    floor = black_floor * full
     half_w, half_h = _quad_cell_halfsize(quad, frac, ncols, nrows)
     out: Dict[str, PatchSample] = {}
     for sid, (cx, cy) in points.items():
@@ -558,11 +593,33 @@ def sample_patches(img_u16: np.ndarray, points: Dict[str, Tuple[float, float]],
             p10, p90 = np.percentile(col, [10, 90])
             keep = col[(col >= p10) & (col <= p90)]
             rgb[ch] = keep.mean() if keep.size else col.mean()
-        clipped_frac = np.mean((win <= lo) | (win >= hi))
-        # Also invalid if the patch fell partly outside the frame.
+        # Highlight clipping is judged per-channel (a blown channel loses info);
+        # black-crush on the brightest channel so saturated hues survive.
+        hi_frac = np.mean(win >= hi, axis=0)
+        highlight_clipped = bool(np.any(hi_frac >= 0.02))
+        black_crushed = bool(rgb.max() <= floor)
         in_frame = (x0 >= 0 and y0 >= 0 and x1 <= w and y1 <= h)
-        out[sid] = PatchSample(rgb, bool(clipped_frac < 0.02 and in_frame), win.shape[0])
+        valid = (not highlight_clipped) and (not black_crushed) and in_frame
+        out[sid] = PatchSample(rgb, bool(valid), win.shape[0])
     return out
+
+
+def merge_samples(cards: List[Dict[str, PatchSample]]) -> Dict[str, PatchSample]:
+    """Combine the per-card sample dicts of a multi-card target into one set.
+
+    Each card photographs a different block of patch ids, so the union covers
+    the whole chart. On the rare id collision (overlapping blocks) a *valid*
+    sample always wins over an invalid one; on equal validity the first (earlier)
+    card in the list is kept. The merged dict feeds straight into
+    `fit_camera_matrix`.
+    """
+    merged: Dict[str, PatchSample] = {}
+    for samples in cards:
+        for sid, ps in samples.items():
+            old = merged.get(sid)
+            if old is None or (ps.valid and not old.valid):
+                merged[sid] = ps
+    return merged
 
 
 # --------------------------------------------------------------------------- #
@@ -794,20 +851,118 @@ def fit_camera_matrix(samples: Dict[str, PatchSample], ref: IT8Reference, *,
 _IDENTITY_TRC = (1.0, 1.0, 0.0, 1.0, 0.0)
 
 
-def build_camera_icc(fit: CameraFit, desc: str,
+def build_camera_icc(fit: CameraFit, desc: str, *,
+                     mode: str = "matrix", grid: int = 17,
+                     samples: Optional[Dict[str, "PatchSample"]] = None,
+                     ref: Optional[IT8Reference] = None,
                      copyright_text: str = "Public Domain. No rights reserved."
                      ) -> bytes:
-    """Synthesise ICC v2.4 matrix-shaper bytes from the fitted camera matrix.
-    Colorant columns are M's columns (already XYZ D50); TRC is identity (the
-    device space is raw-linear). Round-trips through InputProfile.from_bytes."""
-    M = np.asarray(fit.matrix, dtype=np.float64)
-    # The ICC desc/text tag writers only emit ASCII (textType/textDescription),
-    # so coerce user-supplied names + illuminant notes to ASCII to avoid a crash.
+    """Synthesise camera-profile ICC bytes from the fit. Round-trips through
+    InputProfile.from_bytes.
+
+    mode='matrix' (default) writes a 3x3 matrix-shaper (M's columns are the XYZ
+    D50 colorants, identity TRC). mode='clut' writes a higher-accuracy lut16 cLUT
+    (the 3x3 base + a smooth RBF residual; needs `samples`+`ref`)."""
     desc = str(desc).encode("ascii", "replace").decode("ascii")
     copyright_text = str(copyright_text).encode("ascii", "replace").decode("ascii")
+    if mode == "clut":
+        if samples is None or ref is None:
+            raise ValueError("cLUT mode requires the sampled patches and reference")
+        clut_xyz = build_residual_clut(fit, samples, ref, grid=grid)
+        return color_management.build_clut_icc(
+            desc, clut_xyz, grid, copyright_text=copyright_text)
+    M = np.asarray(fit.matrix, dtype=np.float64)
     return color_management.build_matrix_shaper_icc(
         desc,
         tuple(M[:, 0]), tuple(M[:, 1]), tuple(M[:, 2]),
         _IDENTITY_TRC,
         copyright_text=copyright_text,
     )
+
+
+def build_residual_clut(fit: CameraFit, samples: Dict[str, "PatchSample"],
+                        ref: IT8Reference, grid: int = 17) -> np.ndarray:
+    """A (grid,grid,grid,3) XYZ D50 (Y=1) cLUT = the 3x3 matrix base + a smooth
+    scattered-data residual that bends the saturated corners the 3x3 can't reach.
+
+    The residual is a broad Gaussian-RBF-with-polynomial fit of the per-patch
+    errors `X_i - M·d_i` over the device-RGB sample points, regularised and faded
+    to zero outside the patch hull so the LUT degrades to the safe 3x3 in unsampled
+    regions. Gross per-axis reversals (the chroma-noise/ringing failure mode) are
+    bounded to ≤ RINGING_TOL by shrinking the correction toward the base if needed;
+    the LUT is NOT guaranteed strictly monotone — small reversals are the cost of
+    the bias correction, and the 3x3 matrix mode remains the strictly-safe default.
+    Indexed [R][G][B]."""
+    M = np.asarray(fit.matrix, dtype=np.float64)
+    d_list, r_list = [], []
+    for sid in fit.used_ids:
+        ps = samples.get(sid)
+        xyz = ref.xyz(sid)
+        if ps is None or xyz is None:
+            continue
+        di = ps.rgb / 65535.0
+        d_list.append(di)
+        r_list.append(xyz / 100.0 - M @ di)              # residual in XYZ (Y=1)
+    d = np.asarray(d_list, dtype=np.float64)             # (N,3) device
+    r = np.asarray(r_list, dtype=np.float64)             # (N,3) XYZ residual
+    n = len(d)
+
+    ax = np.linspace(0.0, 1.0, grid)
+    Rg, Gg, Bg = np.meshgrid(ax, ax, ax, indexing="ij")
+    nodes = np.stack([Rg, Gg, Bg], axis=-1).reshape(-1, 3)
+    base = nodes @ M.T                                    # (G,3) pure-matrix prediction
+
+    if n < 5:                                             # too few patches to bend safely
+        return np.clip(base, 0.0, 2.0).reshape(grid, grid, grid, 3)
+
+    # Gaussian RBF. A BROAD kernel (≈3× the mean nearest-neighbour device spacing)
+    # plus a firm smoothness regularisation captures the systematic saturated-corner
+    # bias without the high-frequency overshoot that a tight kernel rings with — it
+    # gives both lower ΔE and far less non-monotonicity than a narrow fit.
+    dd = np.sqrt(np.maximum(((d[:, None, :] - d[None, :, :]) ** 2).sum(-1), 0.0))
+    nn = dd + np.eye(n) * 1e9
+    sigma = max(float(nn.min(1).mean()) * 3.0, 1e-3)
+    Phi = np.exp(-(dd / sigma) ** 2)
+    Phi = Phi + (1e-2 * np.trace(Phi) / n) * np.eye(n)   # smoothness regularisation
+    P = np.concatenate([np.ones((n, 1)), d], axis=1)     # affine polynomial term
+    A = np.zeros((n + 4, n + 4))
+    A[:n, :n] = Phi; A[:n, n:] = P; A[n:, :n] = P.T
+    rhs = np.zeros((n + 4, 3)); rhs[:n] = r
+    sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+
+    dn = np.sqrt(np.maximum(((nodes[:, None, :] - d[None, :, :]) ** 2).sum(-1), 0.0))
+    resid = np.exp(-(dn / sigma) ** 2) @ sol[:n] + np.concatenate(
+        [np.ones((len(nodes), 1)), nodes], axis=1) @ sol[n:]
+    # Fade the residual to zero beyond ~one kernel width from the patch hull, so
+    # unsampled corners fall back to the pure matrix instead of ringing.
+    fade = np.exp(-(np.maximum(dn.min(1) - sigma, 0.0) / (2.0 * sigma)) ** 2)
+    corr = (resid * fade[:, None])
+
+    # Ringing safeguard: the correction must not introduce a *gross* per-axis
+    # reversal the linear base lacks (the parked density experiment's failure
+    # mode). If it does, shrink the whole correction toward the base and recheck —
+    # strength 0 is the pure 3×3 (always safe), so this terminates. Small reversals
+    # are tolerated: they are the cost of the bias correction (see RINGING_TOL).
+    base_grid = base.reshape(grid, grid, grid, 3)
+    table = base_grid
+    for strength in (1.0, 0.7, 0.5, 0.35, 0.2, 0.1, 0.0):
+        table = np.clip(base + corr * strength, 0.0, 2.0).reshape(grid, grid, grid, 3)
+        if _residual_monotone(base_grid, table):
+            break
+    return table
+
+
+RINGING_TOL = 0.12   # max per-axis reversal (fraction of white) the cLUT may add
+
+
+def _residual_monotone(base_grid: np.ndarray, table: np.ndarray,
+                       tol: float = RINGING_TOL) -> bool:
+    """True if `table` introduces no per-axis reversal larger than `tol` where the
+    linear `base_grid` is non-decreasing. NOT strict monotonicity — small reversals
+    are allowed (the bias correction's cost); only gross ringing is rejected."""
+    for axis in range(3):
+        db = np.diff(base_grid, axis=axis)
+        dt = np.diff(table, axis=axis)
+        if np.any((db >= 0) & (dt < -tol)):
+            return False
+    return True

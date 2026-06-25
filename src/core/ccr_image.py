@@ -270,10 +270,11 @@ class CCRImage:
 
     def _apply_input_icc(self, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
         """Convert a freshly-decoded scan from the globally-assigned input ICC
-        profile into the working sRGB encoding, before any conversion or
-        adjustment. No-op when no input profile is set. Applied inside
-        read_image so preview, hi-res zoom, and export all inherit it
-        identically (resolution-independent point operation)."""
+        profile into the working LINEAR Adobe RGB space (the same space the
+        no-ICC decode produces, so the density-based inversion sees consistent
+        linear data), before any conversion or adjustment. No-op when no input
+        profile is set. Applied inside read_image so preview, hi-res zoom, and
+        export all inherit it identically (resolution-independent point op)."""
         if arr is None:
             return arr
         profile = color_management.get_active_input_profile()
@@ -286,13 +287,29 @@ class CCRImage:
             return arr
 
     def _input_icc_will_apply(self) -> bool:
-        """Whether read_image will burn an external input ICC into this scan —
-        i.e. a matrix-shaper input profile is active (mirrors _apply_input_icc's
-        guard). Drives the negative RAW decode: an ICC-corrected decode is raw
-        camera primaries with absolute sensor values (no_auto_scale=True + manual
-        white-level scaling); the no-ICC default decode is Adobe RGB,
-        rawpy-auto-scaled."""
-        return color_management.get_active_input_profile() is not None
+        """Whether read_image will burn an external camera profile into this scan
+        — an input ICC **or** a DCP is active (mirrors the apply guard). Drives the
+        negative RAW decode: a profiled decode is camera-native raw with absolute
+        sensor values (no_auto_scale=True + manual white-level scaling); the
+        unprofiled default decode is Adobe RGB, rawpy-auto-scaled."""
+        return (color_management.get_active_input_profile() is not None
+                or color_management.get_active_dcp_profile() is not None)
+
+    def _apply_input_dcp(self, arr, as_shot_wb) -> Optional[np.ndarray]:
+        """Burn the globally-active DCP into a freshly-decoded camera-native scan
+        (-> linear Adobe RGB), threading the as-shot WB. No-op when no DCP is set.
+        Mirrors _apply_input_icc; failures log and pass the input through."""
+        if arr is None:
+            return arr
+        profile = color_management.get_active_dcp_profile()
+        if profile is None:
+            return arr
+        try:
+            from core import dcp_profile
+            return dcp_profile.apply_dcp(profile, arr, as_shot_wb=as_shot_wb)
+        except Exception as e:
+            logging.warning(f"DCP profile could not be applied: {e}")
+            return arr
 
     @staticmethod
     def _positive_mode_active() -> bool:
@@ -402,6 +419,12 @@ class CCRImage:
                 with rawpy.imread(file_path) as raw:
                     # Capture sensor ceiling before postprocess (e.g. 16383 for 14-bit)
                     white_level = raw.white_level
+                    # As-shot white-balance multipliers (for the DCP apply path,
+                    # which renders WB at apply time). RGB channels only.
+                    try:
+                        as_shot_wb = np.asarray(raw.camera_whitebalance[:3], dtype=float)
+                    except Exception:
+                        as_shot_wb = None
 
                     # Full processed output size, valid even when half_size=True.
                     # Kept LOCAL until after the (slow) postprocess: with a
@@ -456,14 +479,25 @@ class CCRImage:
                         elif rgb.shape[2] == 1:
                             rgb = np.repeat(rgb, 3, axis=2)
                     else:
-                        # Positive mode: decode as a normal sRGB photo. Negative
-                        # mode: ALWAYS the Adobe RGB + rawpy auto-scale (thr=0)
-                        # working decode. An active input ICC (incl. the IT8
-                        # camera profile) is applied on top afterwards, and IT8
-                        # profiling samples this same space with the ICC step
-                        # skipped (apply_input_icc=False) — so fit-space ==
-                        # apply-space.
-                        no_icc_default = True
+                        # Device space for the negative decode. Whenever an input
+                        # ICC is in play —
+                        #   • it is active and will be burned in now
+                        #     (_input_icc_will_apply), or
+                        #   • the caller wants the bare device RGB to FIT one on
+                        #     (IT8 profiling, apply_input_icc=False)
+                        # — decode in the CANONICAL camera-profiling space: raw
+                        # camera-native primaries (output_color=raw, no camera
+                        # matrix / no working-space conversion), linear gamma,
+                        # no_auto_bright, no white balance, no_auto_scale + manual
+                        # white-level scaling for fixed absolute sensor values.
+                        # This is the standard input for matrix/cLUT ICC and DCP
+                        # (`dcraw -o 0 -g 1 1 -W -r 1 1 1 1`, see
+                        # spec/it8-camera-profile.md §12.5), and makes fit-space ==
+                        # apply-space EXACTLY. A plain unprofiled negative keeps the
+                        # Adobe RGB + rawpy auto-scale camera-independent default.
+                        icc_device_space = (not apply_input_icc
+                                            or self._input_icc_will_apply())
+                        no_icc_default = not icc_device_space
                         rgb = raw.postprocess(
                             **self._raw_color_postprocess_kwargs(
                                 positive_decode, preview, no_icc_default))
@@ -493,13 +527,18 @@ class CCRImage:
                 
                 elapsed_time = time.time() - start_time
                 print(f"RAW processing completed in {elapsed_time:.3f} seconds")
-                # Burn in the global input ICC (if any) on the decoded scan,
-                # before negative conversion / adjustments. Skipped in positive
-                # mode (the decode is already a ready sRGB positive — the input
-                # ICC is a negative-scanning tool) and when the caller opted out
-                # (apply_input_icc=False, e.g. IT8 profiling wants bare device RGB).
-                if positive_decode or not apply_input_icc:
+                # Burn in the global camera profile (ICC or DCP, if any) on the
+                # decoded camera-native scan, before negative conversion. Skipped
+                # in positive mode (the decode is already a ready sRGB positive)
+                # and when the caller opted out (apply_input_icc=False, e.g. IT8
+                # profiling wants bare device RGB). A monochrome sensor has no
+                # colour to profile and is NOT decoded camera-native, so skip it
+                # too. A DCP (mutually exclusive with the ICC) renders the as-shot
+                # WB at apply time.
+                if positive_decode or not apply_input_icc or is_monochrome:
                     return rgb
+                if color_management.get_active_dcp_profile() is not None:
+                    return self._apply_input_dcp(rgb, as_shot_wb)
                 return self._apply_input_icc(rgb)
             except Exception as e:
                 logging.exception(f"Failed to read RAW image: {file_path}")
@@ -586,11 +625,13 @@ class CCRImage:
             self.original_full_size = (img.shape[0], img.shape[1])
             if max_long_side:
                 img = self.resize_image_to_max_pixel(img, max_long_side)
-            # Burn in the global input ICC (if any) before conversion/adjustments.
-            # Skipped in positive mode (treat the file as a ready sRGB positive)
-            # and when the caller opted out (apply_input_icc=False).
+            # Burn in the global camera profile (ICC or DCP) before conversion.
+            # Skipped in positive mode and when the caller opted out. A non-RAW
+            # file has no as-shot WB, so a DCP applies unbalanced (warned in the UI).
             if positive_mode or not apply_input_icc:
                 return img
+            if color_management.get_active_dcp_profile() is not None:
+                return self._apply_input_dcp(img, None)
             return self._apply_input_icc(img)
         
     def update_thumbnail_and_preview(self, thumbnail_size: int = 156, preview_size: int = 1080) -> None:
