@@ -200,10 +200,11 @@ def _initialize_opencl():
                 }
             }
 
-            // Gain — IDENTICAL to Channel Levels "Master Gain" (ch_master_gain):
-            // uniform linear gain out = in / (1 - v/300), hard-clipped to [0,1].
+            // Gain — shares Channel Levels "Master Gain"'s /300 curve (uniform
+            // linear gain out = in / (1 - v/300), hard-clipped to [0,1]), but the
+            // Gain slider spans +-200 (3x .. 0.6x) while Master Gain stays +-100.
             if (exposure != 0.0f) {
-                float gm = clamp(exposure, -100.0f, 100.0f) / 300.0f;
+                float gm = clamp(exposure, -200.0f, 200.0f) / 300.0f;
                 float wv = 1.0f - gm;
                 r = clamp((r / 65535.0f) / wv, 0.0f, 1.0f) * 65535.0f;
                 g = clamp((g / 65535.0f) / wv, 0.0f, 1.0f) * 65535.0f;
@@ -2246,11 +2247,12 @@ def adjust_image(
             img[..., 0] *= r_scale  # R  
             img[..., 2] *= b_scale  # B
 
-    # Gain — IDENTICAL to Channel Levels "Master Gain" (ch_master_gain): a uniform
-    # linear gain out = in / (1 - v/300), hard-clipped to [0,1]. Same /300 mapping
-    # so moving "Gain" tracks Master Gain 1:1 (v=100 -> 1.5x, v=-100 -> 0.75x).
+    # Gain — shares Channel Levels "Master Gain"'s /300 curve: a uniform linear
+    # gain out = in / (1 - v/300), hard-clipped to [0,1] (v=200 -> 3x, v=100 ->
+    # 1.5x, v=-200 -> 0.6x). The Gain slider spans +-200 while Master Gain stays
+    # +-100.
     if exposure != 0.0:
-        gm = np.clip(exposure, -100.0, 100.0) / 300.0   # match ch_master_gain
+        gm = np.clip(exposure, -200.0, 200.0) / 300.0   # /300 like ch_master_gain
         white_val = 1.0 - gm                            # black_val is 0
         img = np.clip(img / 65535.0 / white_val, 0.0, 1.0) * 65535.0
     

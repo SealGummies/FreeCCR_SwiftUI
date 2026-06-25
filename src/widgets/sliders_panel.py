@@ -472,7 +472,7 @@ class SlidersPanel(QWidget):
             "Temperature", gradient=theme.TEMP_GRADIENT)
         self.tint_slider_layout = self.create_slider(
             "Tint", gradient=theme.TINT_GRADIENT)
-        self.exposure_slider_layout = self.create_slider("Gain")
+        self.exposure_slider_layout = self.create_slider("Gain", min_value=-200, max_value=200)
         self.brightness_slider_layout = self.create_slider("Brightness")
         self.highlights_slider_layout = self.create_slider("Highlights")
         self.white_point_slider_layout = self.create_slider("White Point")

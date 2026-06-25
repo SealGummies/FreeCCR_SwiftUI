@@ -266,11 +266,6 @@ class CCRImage:
         identically (resolution-independent point operation)."""
         if arr is None:
             return arr
-        # DNG carries its own embedded camera profile (rawpy honours it on
-        # decode), so burning in an external input ICC on top would
-        # double-correct the colour — skip it for .dng sources only.
-        if os.path.splitext(self.file_path)[1].lower() == ".dng":
-            return arr
         profile = color_management.get_active_input_profile()
         if profile is None:
             return arr
@@ -279,6 +274,15 @@ class CCRImage:
         except Exception as e:
             logging.warning(f"Input ICC profile could not be applied: {e}")
             return arr
+
+    def _input_icc_will_apply(self) -> bool:
+        """Whether read_image will burn an external input ICC into this scan —
+        i.e. a matrix-shaper input profile is active (mirrors _apply_input_icc's
+        guard). Drives the negative RAW decode: an ICC-corrected decode is raw
+        camera primaries with absolute sensor values (no_auto_scale=True + manual
+        white-level scaling); the no-ICC default decode is Adobe RGB,
+        rawpy-auto-scaled."""
+        return color_management.get_active_input_profile() is not None
 
     @staticmethod
     def _positive_mode_active() -> bool:
@@ -293,16 +297,22 @@ class CCRImage:
             return False
 
     @staticmethod
-    def _raw_color_postprocess_kwargs(positive: bool, preview: bool) -> dict:
+    def _raw_color_postprocess_kwargs(positive: bool, preview: bool,
+                                      no_icc_default: bool = False) -> dict:
         """rawpy.postprocess kwargs for a (non-monochrome) RAW decode.
 
-        Negative (positive=False) is the original raw-sensor readout: raw color
-        space, linear gamma, no white balance, no auto-scale — the greenish,
-        dark scan the negative pipeline inverts. Positive (positive=True)
-        decodes a normal photo: sRGB color space + gamma, camera white balance,
-        AHD demosaic, and rawpy auto-brightness, so it no longer looks green.
-        Kept pure so the choice is unit-testable and the negative path is
-        provably unchanged."""
+        Negative (positive=False) is the scan the negative pipeline inverts:
+        linear gamma, no explicit white balance. no_icc_default picks the output
+        space and scaling. When False (an input ICC will correct the decode, or a
+        caller wants bare device RGB): raw camera primaries with no_auto_scale=True
+        — absolute sensor values (read_image's manual *65535/white_level then
+        brings them to full range, so the ICC + inversion see consistent values).
+        When True (unprofiled scan): Adobe RGB (camera-independent working space)
+        with no_auto_scale=False — rawpy auto-scales the decode to full range
+        (read_image then skips its manual white-level scaling for this path).
+        Positive (positive=True) decodes a normal photo: sRGB color space + gamma,
+        camera white balance, AHD demosaic, rawpy auto-brightness (no_icc_default
+        is ignored on this path). Kept pure so the choice is unit-testable."""
         if positive:
             return dict(
                 output_bps=16,
@@ -330,8 +340,15 @@ class CCRImage:
             half_size=preview,        # Process at half resolution - much faster!
             use_camera_wb=False,      # No camera white balance
             use_auto_wb=False,        # No auto white balance
-            output_color=rawpy.ColorSpace.raw,  # Raw color space (no color correction)
-            no_auto_scale=True,       # No automatic scaling
+            # No-ICC default decode: Adobe RGB (camera-independent working space)
+            # + rawpy auto-scale to full range (read_image skips the manual
+            # white-level scaling for it). ICC / bare-device decode: raw camera
+            # primaries with scaling OFF, so absolute sensor values stay
+            # consistent for the ICC + inversion.
+            output_color=(rawpy.ColorSpace.Adobe if no_icc_default
+                          else rawpy.ColorSpace.raw),
+            no_auto_scale=(not no_icc_default),
+            adjust_maximum_thr=0.0,   # Don't auto-lower maximum from frame data
             four_color_rgb=False,     # Standard 3-color processing
         )
 
@@ -407,6 +424,10 @@ class CCRImage:
                     # photos (monochrome sensors are left on their own path).
                     positive_decode = positive_mode and not is_monochrome
 
+                    # Set in the colour branch below; pre-seeded so the
+                    # white-level-scaling guard is valid on the monochrome path.
+                    no_icc_default = False
+
                     if is_monochrome:
                         print(f"Detected monochrome sensor for: {os.path.basename(file_path)}")
                         # For monochrome sensors, use different processing
@@ -426,9 +447,16 @@ class CCRImage:
                             rgb = np.repeat(rgb, 3, axis=2)
                     else:
                         # Positive mode: decode as a normal sRGB photo. Negative
-                        # mode: pure/raw sensor readout (greenish) for inversion.
+                        # mode: ALWAYS the Adobe RGB + rawpy auto-scale (thr=0)
+                        # working decode. An active input ICC (incl. the IT8
+                        # camera profile) is applied on top afterwards, and IT8
+                        # profiling samples this same space with the ICC step
+                        # skipped (apply_input_icc=False) — so fit-space ==
+                        # apply-space.
+                        no_icc_default = True
                         rgb = raw.postprocess(
-                            **self._raw_color_postprocess_kwargs(positive_decode, preview))
+                            **self._raw_color_postprocess_kwargs(
+                                positive_decode, preview, no_icc_default))
 
                     # Sliced images read only their region of the source.
                     # Single atomic assignment of the final size (see above).
@@ -442,9 +470,11 @@ class CCRImage:
 
                     # Scale native bit depth to full 16-bit range so images display at
                     # correct brightness (e.g. 14-bit data sits in [0,16383] without this).
-                    # Skipped in positive mode: that decode is already auto-scaled and
-                    # full-range, so re-scaling would blow out the highlights.
-                    if not positive_decode and white_level > 0 and white_level < 65535:
+                    # Skipped in positive mode AND on the no-ICC default decode:
+                    # both are already rawpy-auto-scaled to full range, so re-scaling
+                    # here would blow out the highlights.
+                    if (not positive_decode and not no_icc_default
+                            and white_level > 0 and white_level < 65535):
                         print(f"Scaling RAW from {white_level}-ceiling to 16-bit (factor {65535.0/white_level:.4f})")
                         rgb = np.clip(
                             rgb.astype(np.float32) * (65535.0 / white_level),

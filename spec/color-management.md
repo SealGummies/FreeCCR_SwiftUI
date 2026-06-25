@@ -26,10 +26,25 @@ Two related color-management features:
 ### 1.1 Working-space framing (important honesty note)
 
 FreeCCR's internal pipeline is **not** a characterized color space. RAW is
-decoded `output_color=ColorSpace.raw`, `gamma=(1,1)`, no white balance
-(`ccr_image.py:314-326`); non-RAW files are read as-is with no profile
-interpretation; the v0.2.3 negative inversion + look then runs on those values.
-There is no ICC that describes this space.
+decoded `gamma=(1,1)`, no white balance; non-RAW files are read as-is with no
+profile interpretation; the v0.2.3 negative inversion + look then runs on those
+values. There is no ICC that describes this space.
+
+The negative RAW decode is chosen at decode time (`_raw_color_postprocess_kwargs`
+/ `read_image`). When an external input ICC will be burned in afterwards
+(`_input_icc_will_apply()` — an input matrix profile is active), or a caller
+asked for bare device RGB (IT8 profiling, `apply_input_icc=False`):
+`output_color=ColorSpace.raw` with `no_auto_scale=True` keeps absolute sensor
+values, and `read_image`'s uniform `*65535/white_level` scaling brings them to
+full range, so the ICC + inversion see consistent values. Otherwise (the no-ICC
+default decode of an unprofiled scan): `output_color=ColorSpace.Adobe` (Adobe RGB
+— a defined, camera-independent working space) with `no_auto_scale=False` lets
+rawpy auto-scale the decode to full range, and `read_image` skips its manual
+white-level scaling for this path (re-scaling would blow highlights). Note rawpy
+auto-scale also applies the camera's default (daylight) WB multipliers, so the
+no-ICC default decode carries a per-channel cast the absolute-value path does
+not. DNG is treated like any other RAW here — the input ICC applies to it as
+well (no special-casing).
 
 Consequence for both features: we treat the **on-screen / exported result** as
 **sRGB-encoded display RGB** — which is exactly how every viewer already

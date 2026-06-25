@@ -186,27 +186,19 @@ class GraphicsImageView(QGraphicsView):
                 self.scene().removeItem(self._bw_rect_item)
                 self._bw_rect_item = None
             self.viewport().update()
-        elif (event.button() == Qt.LeftButton
+        elif (event.button() == Qt.RightButton
               and self.parent_widget.pixmap_item is not None
-              and not ccr_backend.positive_mode):
-            # Reference frames belong to the negative-conversion workflow only.
+              and not ccr_backend.positive_mode
+              and not self.bwpoint_mode and not self.wb_pick_mode):
+            # Right-DRAG draws the reference frame (negative-conversion workflow
+            # only); a right-CLICK with no real drag clears it (finalised on
+            # release). The existing frame is removed now so the drag redraws.
             self.drawing_reference = True
             self._drag_start = self.mapToScene(event.pos())
             self._drag_end = self._drag_start
             if self.reference_rect_item:
                 self.scene().removeItem(self.reference_rect_item)
                 self.reference_rect_item = None
-            self.viewport().update()
-        elif event.button() == Qt.RightButton:
-            # Remove reference frame on right click
-            if self.reference_rect_item:
-                self.scene().removeItem(self.reference_rect_item)
-                self.reference_rect_item = None
-            # Also clear in parent widget
-            self.parent_widget.reference_rect_item = None
-            # Clear in backend
-            ccr_backend.set_reference_frame_by_index(self.parent_widget.current_idx, None)
-            self.drawing_reference = False
             self.viewport().update()
         else:
             super().mousePressEvent(event)
@@ -427,7 +419,7 @@ class GraphicsImageView(QGraphicsView):
                                 pass
             return
 
-        if self.drawing_reference and event.button() == Qt.LeftButton:
+        if self.drawing_reference and event.button() == Qt.RightButton:
             self._drag_end = self.mapToScene(event.pos())
             self.drawing_reference = False
 
@@ -456,12 +448,13 @@ class GraphicsImageView(QGraphicsView):
             x, y = min(x1, x2), min(y1, y2)
             x2, y2 = max(x1, x2), max(y1, y2)
             w, h = x2 - x, y2 - y
+            pw = self.parent_widget
+            frame_set = False
             if w > 20 and h > 20:
                 # Map from displayed (possibly cropped/rotated) coords to
                 # full-image coords. All FOUR corners must be mapped — under
                 # a rotated crop the two-diagonal AABB degenerates — and the
                 # minimum size re-checked in full-image space.
-                pw = self.parent_widget
                 pts = [pw.map_displayed_to_full(px, py)
                        for px, py in ((x, y), (x2, y), (x, y2), (x2, y2))]
                 fx1 = int(min(p[0] for p in pts))
@@ -476,6 +469,14 @@ class GraphicsImageView(QGraphicsView):
                         duration=5000
                     )
                     print("Set reference frame:", (fx1, fy1, fx2, fy2))
+                    frame_set = True
+            if not frame_set:
+                # Right-click without a real drag → clear the reference frame.
+                if self.reference_rect_item:
+                    self.scene().removeItem(self.reference_rect_item)
+                    self.reference_rect_item = None
+                pw.reference_rect_item = None
+                ccr_backend.set_reference_frame_by_index(pw.current_idx, None)
         self.parent_widget.update_preview(self.parent_widget.current_idx)
 
     def resizeEvent(self, event):
@@ -623,14 +624,6 @@ class ImagePreview(QWidget):
             spacer.setFixedWidth(width)
             spacer.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
             self.toolbar.addWidget(spacer)
-
-        auto_icon = theme.load_tinted_icon(resource_path("icons/auto.png"))
-        if auto_icon.isNull():
-            auto_icon = QIcon.fromTheme("view-refresh")
-        self.auto_frame_action = QAction(auto_icon, "Auto Frame", self)
-        self.auto_frame_action.triggered.connect(self.auto_frame)
-        self.toolbar.addAction(self.auto_frame_action)
-        add_spacer()
 
         rotate_left_icon = theme.load_tinted_icon(resource_path("icons/rotate-left-icon-size_512.png"))
         if rotate_left_icon.isNull():
@@ -926,8 +919,8 @@ class ImagePreview(QWidget):
             self.confirm_crop()
         elif self.slice_mode:
             self.confirm_slices()
-        else:
-            self.convert_ccr()
+        # Enter no longer triggers a (re-)convert — conversion is explicit, via
+        # the Convert button only.
 
     def _on_escape_key(self):
         if self.crop_mode:
@@ -1113,7 +1106,7 @@ class ImagePreview(QWidget):
                 # positive mode has no reference frame / conversion step).
                 self.parent().parent().sliders_panel.set_hint(
                     "<b>Hint:</b><br>Draw a frame around the image + some film base (orange/brown). "
-                    "Avoid white backlight or black film holder areas. Left-drag to draw, right-click to remove."
+                    "Avoid white backlight or black film holder areas. Right-drag to draw, right-click to clear."
                 )
 
 
@@ -1361,7 +1354,6 @@ class ImagePreview(QWidget):
                      and 0 <= self.current_idx < len(ccr_backend.images))
         # Negative-only toolbar actions are greyed in positive mode.
         self.convert_action.setEnabled(not positive)
-        self.auto_frame_action.setEnabled(not positive)
         self.unconvert_action.setEnabled(self.current_converted and not positive)
         # Positive mode: every loaded image is exportable (no conversion needed).
         self.export_action.setEnabled(

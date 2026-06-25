@@ -16,7 +16,14 @@ import time
 import copy
 import uuid
 
-CATALOG_VERSION = 1
+# Bump whenever stored fields change meaning so legacy catalogs are discarded
+# (load_catalog returns a fresh one on a version mismatch) rather than replayed
+# with stale semantics. v2: the unprofiled negative RAW decode changed (the
+# no-ICC default is now Adobe RGB + rawpy auto-scale instead of raw sensor
+# primaries + uniform white-level scaling), so v1 conversion anchors (ref_params
+# p_lo/p_hi/od and bw black/white points) were computed against a different
+# decode and would recolour slices / B&W-point conversions if replayed.
+CATALOG_VERSION = 2
 MAX_CATALOG_ENTRIES = 2000  # bounds growth; oldest records pruned beyond this
 
 
