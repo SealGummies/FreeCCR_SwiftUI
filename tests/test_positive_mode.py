@@ -56,6 +56,8 @@ class TestRawPostprocessKwargs:
     def test_negative_is_the_original_raw_readout(self):
         kw = CCRImage._raw_color_postprocess_kwargs(positive=False, preview=False)
         # Regression guard: the greenish raw-sensor decode the inverter expects.
+        # Default (no_icc_default=False) = the ICC / bare-device decode that keeps
+        # absolute sensor values (no_auto_scale=True + manual white-level scaling).
         assert kw["output_color"] == rawpy.ColorSpace.raw
         assert kw["gamma"] == (1, 1)
         assert kw["no_auto_bright"] is True
@@ -63,10 +65,166 @@ class TestRawPostprocessKwargs:
         assert kw["use_auto_wb"] is False
         assert kw["no_auto_scale"] is True
 
+    def test_negative_no_icc_decode_is_adobe_autoscaled(self):
+        # no_icc_default=True (no input ICC will correct the decode): Adobe RGB
+        # with rawpy auto-scale (no_auto_scale=False); gamma/WB/auto-bright stay
+        # as the negative readout.
+        kw = CCRImage._raw_color_postprocess_kwargs(
+            positive=False, preview=False, no_icc_default=True)
+        assert kw["output_color"] == rawpy.ColorSpace.Adobe
+        assert kw["gamma"] == (1, 1)
+        assert kw["no_auto_bright"] is True
+        assert kw["use_camera_wb"] is False
+        assert kw["use_auto_wb"] is False
+        assert kw["no_auto_scale"] is False
+
+    def test_positive_ignores_no_icc_default_flag(self):
+        # The positive path always decodes as an sRGB photo; no_icc_default is a
+        # negative-only knob and must not leak into it.
+        assert (CCRImage._raw_color_postprocess_kwargs(
+            positive=True, preview=True, no_icc_default=True)["output_color"]
+            == rawpy.ColorSpace.sRGB)
+
     def test_preview_flag_threads_to_half_size(self):
         assert CCRImage._raw_color_postprocess_kwargs(True, True)["half_size"] is True
         assert CCRImage._raw_color_postprocess_kwargs(True, False)["half_size"] is False
         assert CCRImage._raw_color_postprocess_kwargs(False, True)["half_size"] is True
+
+
+# --------------------------------------------------------------------------- #
+# read_image decode WIRING (RAW branch). The pure kwargs builder is tested above;
+# these pin read_image's behaviour: the negative decode is ALWAYS the Adobe RGB +
+# rawpy auto-scale (thr=0) working space, and an active input ICC is applied ON
+# TOP (skipped for the IT8 profiling decode, apply_input_icc=False), so fit-space
+# == apply-space. Verified by stubbing the heavy rawpy decode. (DNG is not
+# special-cased: it applies the input ICC like any RAW.)
+# --------------------------------------------------------------------------- #
+from core import color_management as cm  # noqa: E402
+
+
+def _matrix_shaper_profile():
+    """A synthetic Adobe-RGB-like matrix-shaper InputProfile (any non-None
+    profile flips the decode to the raw+ICC path)."""
+    m = np.array([[0.5767309, 0.1855540, 0.1881852],
+                  [0.2973769, 0.6273491, 0.0752741],
+                  [0.0270343, 0.0706872, 0.9911085]])
+    adapted = cm.M_BRADFORD_D65_D50 @ m
+    icc = cm.build_matrix_shaper_icc(
+        "Adobe-like", tuple(adapted[:, 0]), tuple(adapted[:, 1]),
+        tuple(adapted[:, 2]), (2.19921875, 1.0, 0.0, 0.0, 0.0))
+    return cm.InputProfile.from_bytes(icc)
+
+
+class _FakeSizes:
+    height, width = 64, 96
+
+
+class _FakeRaw:
+    """Minimal rawpy RawPy context-manager stand-in: records the postprocess
+    kwargs and returns a small non-monochrome 16-bit RGB array."""
+    def __init__(self, rec):
+        self._rec = rec
+        self.white_level = 16383
+        self.sizes = _FakeSizes()
+        self.num_colors = 3
+        self.color_desc = b'RGGB'
+        self.raw_pattern = np.array([[0, 1], [1, 2]])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def postprocess(self, **kw):
+        self._rec['kwargs'] = kw
+        return np.full((32, 48, 3), 10000, dtype=np.uint16)
+
+
+def _decode_raw(monkeypatch, path, *, profile, apply_input_icc=True):
+    """Run read_image's RAW branch with rawpy stubbed; return
+    (postprocess kwargs, decoded array). positive_override=False pins negative
+    mode (no backend dependency); the path need not exist on disk. _FakeRaw
+    reports white_level=16383 and a flat 10000-valued decode, so the manual
+    white-level scaling (when applied) multiplies by 65535/16383 ≈ 4."""
+    rec = {}
+    monkeypatch.setattr(rawpy, "imread", lambda p: _FakeRaw(rec))
+    cm.set_active_input_profile(profile)
+    try:
+        img = CCRImage.__new__(CCRImage)
+        img.source_ops = []
+        img.file_path = path
+        out = img.read_image(path, preview=True, positive_override=False,
+                             apply_input_icc=apply_input_icc)
+    finally:
+        cm.set_active_input_profile(None)
+    return rec["kwargs"], out
+
+
+class TestInputIccWillApply:
+    def _img(self, name):
+        img = CCRImage.__new__(CCRImage)
+        img.file_path = name
+        return img
+
+    def test_true_when_profile_active(self):
+        cm.set_active_input_profile(_matrix_shaper_profile())
+        try:
+            assert self._img("x.ARW")._input_icc_will_apply() is True
+        finally:
+            cm.set_active_input_profile(None)
+
+    def test_false_when_no_profile(self):
+        cm.set_active_input_profile(None)
+        assert self._img("x.ARW")._input_icc_will_apply() is False
+
+    def test_dng_is_no_longer_carved_out(self):
+        # Regression: DNG used to return False unconditionally; it now applies
+        # the input ICC like any other RAW.
+        cm.set_active_input_profile(_matrix_shaper_profile())
+        try:
+            assert self._img("x.dng")._input_icc_will_apply() is True
+        finally:
+            cm.set_active_input_profile(None)
+
+
+class TestRawDecodeSpaceWiring:
+    # The negative decode is ALWAYS the Adobe RGB + auto-scale (thr=0) working
+    # space — independent of input-ICC / bare-device state. An active ICC is
+    # applied ON TOP; IT8 profiling samples this same space with the ICC step
+    # skipped, so fit-space == apply-space. _FakeRaw returns a flat 10000 decode.
+    def test_no_profile_is_adobe_autoscaled(self, monkeypatch):
+        kw, out = _decode_raw(monkeypatch, "scan.arw", profile=None)
+        assert kw["output_color"] == rawpy.ColorSpace.Adobe
+        assert kw["no_auto_scale"] is False
+        assert kw["adjust_maximum_thr"] == 0.0
+        assert int(out.max()) == 10000          # manual white-level scaling skipped
+
+    def test_profile_active_same_space_icc_on_top(self, monkeypatch):
+        # Same Adobe+autoscale decode as no-profile, but the ICC is applied on top.
+        kw, out = _decode_raw(monkeypatch, "scan.arw",
+                              profile=_matrix_shaper_profile())
+        assert kw["output_color"] == rawpy.ColorSpace.Adobe
+        assert kw["no_auto_scale"] is False
+        _, bare = _decode_raw(monkeypatch, "scan.arw", profile=None)
+        assert not np.array_equal(out, bare)    # ICC changed the pixels
+
+    def test_dng_matches_other_raws(self, monkeypatch):
+        kw, _ = _decode_raw(monkeypatch, "scan.dng",
+                            profile=_matrix_shaper_profile())
+        assert kw["output_color"] == rawpy.ColorSpace.Adobe
+        assert kw["no_auto_scale"] is False
+
+    def test_profiling_decode_is_same_space_without_icc(self, monkeypatch):
+        # IT8 profiling: apply_input_icc=False samples the SAME Adobe+autoscale
+        # working space, but the ICC is NOT applied (bare RGB to fit on), and the
+        # manual white-level scaling stays skipped.
+        kw, out = _decode_raw(monkeypatch, "scan.arw",
+                              profile=_matrix_shaper_profile(),
+                              apply_input_icc=False)
+        assert kw["output_color"] == rawpy.ColorSpace.Adobe
+        assert kw["no_auto_scale"] is False
+        assert int(out.max()) == 10000          # no ICC + no manual scaling
 
 
 # --------------------------------------------------------------------------- #

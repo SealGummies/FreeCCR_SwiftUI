@@ -22,10 +22,16 @@ that already exist — **no ArgyllCMS, lcms, Pillow, scipy, or colour-science**
 dependency is added.
 
 ### Why this fits FreeCCR exactly
-- The default (negative) decode path produces **raw-linear sensor RGB**
-  (`rawpy` `output_color=raw`, `gamma=(1,1)`, no white balance, white-level
-  scaled to 16-bit) — see `ccr_image.py:307`/`read_image`. That is precisely the
-  *device RGB* an input ICC profile maps from.
+- The IT8 profiling decode explicitly requests **raw-linear sensor RGB** by
+  passing `apply_input_icc=False` to `read_image` (forces `rawpy`
+  `output_color=raw`, `gamma=(1,1)`, no white balance, `no_auto_scale=True` with
+  white-level scaled to 16-bit) — see `_raw_color_postprocess_kwargs`/
+  `read_image`. That is precisely the *device RGB* an input ICC profile maps
+  from. (Note: under a separate change the *default* unprofiled negative decode
+  is Adobe RGB + rawpy auto-scale — `no_auto_scale=False`, which also applies a
+  daylight WB — whereas the ICC-corrected and the IT8 bare-device decode are raw
+  primaries with absolute sensor values, so IT8 sampling still gets the unscaled
+  device RGB it fits on.)
 - A camera profile fit as a **3×3 matrix (linear device RGB → XYZ D50) + identity
   tone curve** is exactly a **matrix-shaper** ICC profile — the only kind the app
   builds (`build_matrix_shaper_icc`) and the only kind `InputProfile` accepts.

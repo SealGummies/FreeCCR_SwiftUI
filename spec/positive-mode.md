@@ -27,9 +27,13 @@
 ### Non-goals
 - No per-image positive/negative switch. The mode is global, matching the
   framing "block the parts that serve film negatives."
-- No change to the negative pipeline when the mode is **off** — the negative
-  decode, conversion, and export paths must be byte-for-byte unchanged
-  (regression-guarded).
+- No change to the negative pipeline when the mode is **off** beyond what
+  positive mode itself introduced — the conversion and export paths stay
+  byte-for-byte unchanged. (The negative *decode* later became conditional under
+  a separate change: the no-ICC default decode is Adobe RGB + rawpy auto-scale,
+  while the ICC / bare-device decode is raw primaries + absolute values + manual
+  white-level scaling — see spec/color-management.md §1.1. Not a positive-mode
+  concern.)
 - No new export format/colorspace work; positive export reuses the existing
   `write_export_image` (colorspace + ICC + format) tail.
 - Monochrome-sensor RAW decoding is left as-is (already not green; an edge case).
@@ -81,9 +85,14 @@
 A small pure helper returns the rawpy `postprocess` kwargs for the active mode so
 the choice is unit-testable and the negative path is provably unchanged:
 
-- **Negative (mode off) — unchanged:** `output_color=raw`, `gamma=(1,1)`,
-  `no_auto_bright=True`, `use_camera_wb=False`, `use_auto_wb=False`,
-  `no_auto_scale=True`, AHD, `half_size=preview`.
+- **Negative (mode off):** `gamma=(1,1)`, `no_auto_bright=True`,
+  `use_camera_wb=False`, `use_auto_wb=False`, AHD, `half_size=preview`. Output
+  space + scaling are conditional (separate change, see
+  spec/color-management.md §1.1): `output_color=raw` + `no_auto_scale=True`
+  (absolute sensor values + manual white-level scaling) when an input ICC will be
+  burned in afterwards or a caller wants bare device RGB (`apply_input_icc=False`,
+  IT8 profiling); otherwise the no-ICC default decode is `output_color=Adobe`
+  (Adobe RGB) + `no_auto_scale=False` (rawpy auto-scales to full range).
 - **Positive (mode on):** `output_color=sRGB`, `gamma=(2.222, 4.5)`,
   `use_camera_wb=True`, AHD, `half_size=preview`, **`no_auto_bright=True`**.
   Auto-brightness is OFF on purpose: rawpy's auto-bright scales until ~1% of the
@@ -93,9 +102,10 @@ the choice is unit-testable and the negative path is provably unchanged:
   highlight headroom (the user raises Exposure to taste). (No `no_auto_scale`.)
 
 Two follow-on steps are gated on the mode:
-- **White-level scaling** (`rgb *= 65535/white_level`) is applied only in the
-  **negative** path. The positive decode is already auto-scaled/full-range;
-  re-scaling would blow out highlights — so it is skipped in positive mode.
+- **White-level scaling** (`rgb *= 65535/white_level`) is applied on the
+  absolute-value negative decode (ICC / bare-device). The positive decode **and**
+  the no-ICC default negative decode are already rawpy-auto-scaled to full range;
+  re-scaling would blow out highlights — so it is skipped for both.
 - **Input ICC** (`_apply_input_icc`) is skipped in positive mode (RAW and
   non-RAW). In negative mode it is applied exactly as today.
 
@@ -191,8 +201,8 @@ restores the user's frame.
 - `positive_mode` field, `reprocess_all_for_positive_mode_change`, export routing.
 
 `src/core/ccr_image.py`:
-- `_raw_color_postprocess_kwargs(positive, preview)`, decode/ICC/white-level
-  gating, display-brightness gating.
+- `_raw_color_postprocess_kwargs(positive, preview, no_icc_default=False)`,
+  decode/ICC/white-level gating, display-brightness gating.
 
 `src/core/ccr_processor.py`:
 - `ccr_export_positive`.
@@ -201,7 +211,11 @@ restores the user's frame.
 - `_raw_color_postprocess_kwargs(positive=True)` uses `output_color=sRGB`,
   `gamma=(2.222,4.5)`, `use_camera_wb=True`, `no_auto_bright=False`, and has **no**
   `no_auto_scale`; `positive=False` is the exact negative kwargs (regression
-  guard, incl. `output_color=raw`, `gamma=(1,1)`, `no_auto_scale=True`).
+  guard, incl. `output_color=raw`, `gamma=(1,1)`). The `no_icc_default` flag
+  picks the negative decode: default (`no_icc_default=False`) = `output_color=raw`
+  + `no_auto_scale=True`; `no_icc_default=True` = `output_color=Adobe` +
+  `no_auto_scale=False` (covered in the decode-wiring tests under a separate
+  change).
 - `ccr_export_positive(stub, output_path=None)` with identity adjustments
   **returns the input unchanged** (proves no inversion) and applies adjustments
   (e.g. B&W profile → neutral grayscale; a real adjustment changes pixels).

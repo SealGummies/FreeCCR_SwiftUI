@@ -407,7 +407,11 @@ def decode_target(path: str, sample_max: int = SAMPLE_MAX) -> Optional[np.ndarra
     heavyweight __init__ (a redundant 1080px decode + lens correction +
     thumbnail) is skipped; read_image only needs `source_ops` on the instance.
     A half-size (preview) decode capped at sample_max gives ample pixels per
-    patch and matches the runtime preview's device space."""
+    patch. apply_input_icc=False also pins no_auto_scale=True, so this matches
+    the device space the profiled/ICC preview decode uses (raw + absolute sensor
+    values); the default unprofiled preview is Adobe RGB + rawpy auto-scale, but
+    that is irrelevant to fitting — the fit and its later application both operate
+    in raw device RGB."""
     from core.ccr_image import CCRImage
     img = CCRImage.__new__(CCRImage)
     img.source_ops = []
