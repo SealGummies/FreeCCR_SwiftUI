@@ -493,6 +493,26 @@ def parse_block(tl_id: str, br_id: str):
     return rows, cols
 
 
+def next_block_ids(tl_id: str, br_id: str, max_col: Optional[int] = None
+                   ) -> Tuple[str, str]:
+    """Advance a block's column range by its own width for the next card of a
+    multi-card target (e.g. ('A1','L24') -> ('A25','L48') -> ('A49','L72')).
+
+    Rows are preserved; only the columns shift. If `max_col` is given the new
+    range is clamped so the right column never exceeds it (the last card of a
+    target that doesn't divide evenly). Raises ValueError on an unparseable id.
+    """
+    rows, cols = parse_block(tl_id, br_id)
+    r0, r1 = rows[0], rows[-1]
+    c0, c1 = cols[0], cols[-1]
+    width = c1 - c0 + 1
+    nc0, nc1 = c0 + width, c1 + width
+    if max_col is not None and nc1 > max_col:
+        nc1 = max_col
+        nc0 = min(nc0, nc1)
+    return f"{r0}{nc0}", f"{r1}{nc1}"
+
+
 def block_sample_points(quad, rows, cols) -> Dict[str, Tuple[float, float]]:
     """Sample centres (array coords) for a regular len(rows)×len(cols) grid laid
     on the 4-corner quad (TL,TR,BR,BL). IDs are '<row><col>' (e.g. 'A49')."""
@@ -531,15 +551,30 @@ def _quad_cell_halfsize(quad: np.ndarray, frac: float,
 
 
 def sample_patches(img_u16: np.ndarray, points: Dict[str, Tuple[float, float]],
-                   quad, frac: float = 0.5, clip_lo: float = 0.005,
-                   clip_hi: float = 0.995, ncols: int = 22,
+                   quad, frac: float = 0.5, clip_hi: float = 0.995,
+                   black_floor: float = 0.0008, ncols: int = 22,
                    nrows: int = 12) -> Dict[str, PatchSample]:
     """Sample each patch's device RGB from a central window via a per-channel
-    trimmed mean; flag patches with >2% clipped pixels or out of frame. ncols/
-    nrows set the grid density so the sampling window scales to the cell size."""
+    trimmed mean and flag only the genuinely unusable ones. ncols/nrows set the
+    grid density so the sampling window scales to the cell size.
+
+    A patch is invalid only when its colour can't be trusted:
+      * **highlight-clipped** — any channel has >2% of pixels pinned at the
+        sensor ceiling (`clip_hi`), so information above it is lost; or
+      * **black-crushed** — even its brightest channel sits at/below the black
+        floor (`black_floor`), i.e. no signal at all; or
+      * partly **out of frame**.
+
+    A merely *low* channel is NOT a defect on raw-linear device data: a saturated
+    hue legitimately reads near-zero in one or two complementary channels while
+    carrying full signal in the rest (a vivid red has green/blue ≈ 0), and dense
+    film patches read low — yet these saturated/dark patches are the most
+    informative for the matrix fit. The previous "any pixel below 0.5 % of full
+    scale counts as clipped" test wrongly rejected all of them."""
     h, w = img_u16.shape[:2]
     full = 65535.0
-    lo, hi = clip_lo * full, clip_hi * full
+    hi = clip_hi * full
+    floor = black_floor * full
     half_w, half_h = _quad_cell_halfsize(quad, frac, ncols, nrows)
     out: Dict[str, PatchSample] = {}
     for sid, (cx, cy) in points.items():
@@ -558,11 +593,33 @@ def sample_patches(img_u16: np.ndarray, points: Dict[str, Tuple[float, float]],
             p10, p90 = np.percentile(col, [10, 90])
             keep = col[(col >= p10) & (col <= p90)]
             rgb[ch] = keep.mean() if keep.size else col.mean()
-        clipped_frac = np.mean((win <= lo) | (win >= hi))
-        # Also invalid if the patch fell partly outside the frame.
+        # Highlight clipping is judged per-channel (a blown channel loses info);
+        # black-crush on the brightest channel so saturated hues survive.
+        hi_frac = np.mean(win >= hi, axis=0)
+        highlight_clipped = bool(np.any(hi_frac >= 0.02))
+        black_crushed = bool(rgb.max() <= floor)
         in_frame = (x0 >= 0 and y0 >= 0 and x1 <= w and y1 <= h)
-        out[sid] = PatchSample(rgb, bool(clipped_frac < 0.02 and in_frame), win.shape[0])
+        valid = (not highlight_clipped) and (not black_crushed) and in_frame
+        out[sid] = PatchSample(rgb, bool(valid), win.shape[0])
     return out
+
+
+def merge_samples(cards: List[Dict[str, PatchSample]]) -> Dict[str, PatchSample]:
+    """Combine the per-card sample dicts of a multi-card target into one set.
+
+    Each card photographs a different block of patch ids, so the union covers
+    the whole chart. On the rare id collision (overlapping blocks) a *valid*
+    sample always wins over an invalid one; on equal validity the first (earlier)
+    card in the list is kept. The merged dict feeds straight into
+    `fit_camera_matrix`.
+    """
+    merged: Dict[str, PatchSample] = {}
+    for samples in cards:
+        for sid, ps in samples.items():
+            old = merged.get(sid)
+            if old is None or (ps.valid and not old.valid):
+                merged[sid] = ps
+    return merged
 
 
 # --------------------------------------------------------------------------- #

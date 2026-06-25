@@ -267,6 +267,43 @@ def test_parse_block():
     assert it8.parse_block("L72", "A49") == (rows, cols)
 
 
+def test_next_block_ids_advances_columns():
+    # The classic 3-card split: each card shifts by its own column width.
+    assert it8.next_block_ids("A1", "L24") == ("A25", "L48")
+    assert it8.next_block_ids("A25", "L48") == ("A49", "L72")
+    # Rows are preserved; order of the input ids doesn't matter (parse_block sorts).
+    assert it8.next_block_ids("L48", "A25") == ("A49", "L72")
+    # Clamp the right column to the reference's extent on an uneven last card.
+    assert it8.next_block_ids("A49", "L72", max_col=72) == ("A72", "L72")
+    assert it8.next_block_ids("A40", "L60", max_col=72) == ("A61", "L72")
+    with pytest.raises(ValueError):
+        it8.next_block_ids("nope", "L24")
+
+
+def test_merge_samples_prefers_valid():
+    def ps(v, valid):
+        return it8.PatchSample(rgb=np.array([float(v)] * 3), valid=valid, n_pix=9)
+    card_a = {"A1": ps(1, True), "A2": ps(2, False)}
+    card_b = {"A2": ps(3, True), "A3": ps(4, True)}
+    merged = it8.merge_samples([card_a, card_b])
+    assert set(merged) == {"A1", "A2", "A3"}
+    # The valid A2 from card_b overrides the invalid A2 from card_a...
+    assert merged["A2"].valid and merged["A2"].rgb[0] == 3.0
+    # ...and a later *invalid* sample must not clobber an existing valid one.
+    merged2 = it8.merge_samples([card_b, card_a])
+    assert merged2["A2"].valid and merged2["A2"].rgb[0] == 3.0
+
+
+def test_merge_samples_union_covers_all_cards():
+    def ps(v):
+        return it8.PatchSample(rgb=np.array([float(v)] * 3), valid=True, n_pix=9)
+    c1 = {f"A{c}": ps(c) for c in range(1, 25)}      # columns 1-24
+    c2 = {f"A{c}": ps(c) for c in range(25, 49)}     # columns 25-48
+    c3 = {f"A{c}": ps(c) for c in range(49, 73)}     # columns 49-72
+    merged = it8.merge_samples([c1, c2, c3])
+    assert len(merged) == 72 and merged["A50"].rgb[0] == 50.0
+
+
 def test_block_sample_points_unit_quad():
     quad = [(0, 0), (240, 0), (240, 120), (0, 120)]   # TL,TR,BR,BL
     rows, cols = it8.parse_block("A49", "L72")          # 12 rows x 24 cols
@@ -361,6 +398,30 @@ def test_sample_clip_rejection():
     pts = it8.grid_sample_points(quad)
     samples = it8.sample_patches(img, pts, quad)
     assert not samples["A1"].valid                          # clipped -> invalid
+
+
+def test_sample_keeps_saturated_and_dark():
+    # Raw-linear: a saturated hue reads near-zero in its complementary channels;
+    # that is real signal, not clipping, so the patch must stay VALID. Only a
+    # blown highlight or a truly-black patch is dropped.
+    quad = [(0, 0), (220, 0), (220, 120), (0, 120)]
+    img = np.zeros((130, 230, 3), dtype=np.uint16)
+
+    def fill(sid, val):
+        i = it8.COLOR_IDS.index(sid)
+        r, c = divmod(i, 22)
+        img[r * 10:(r + 1) * 10, c * 10:(c + 1) * 10] = val
+
+    fill("A1", [60000, 180, 120])      # saturated red (G/B ~ 0) -> still valid
+    fill("A2", [120, 150, 58000])      # saturated blue (R ~ 0) -> still valid
+    fill("A3", [4200, 3900, 3600])     # ordinary mid-tone -> valid
+    fill("A4", [65535, 65535, 65535])  # blown highlight -> invalid
+    fill("A5", [9, 7, 5])              # essentially black -> invalid
+    pts = it8.grid_sample_points(quad)
+    samples = it8.sample_patches(img, pts, quad, frac=0.5)
+    assert samples["A1"].valid and samples["A2"].valid and samples["A3"].valid
+    assert not samples["A4"].valid     # highlight-clipped dropped
+    assert not samples["A5"].valid     # black-crush dropped
 
 
 # --------------------------------------------------------------------------- #
