@@ -851,20 +851,118 @@ def fit_camera_matrix(samples: Dict[str, PatchSample], ref: IT8Reference, *,
 _IDENTITY_TRC = (1.0, 1.0, 0.0, 1.0, 0.0)
 
 
-def build_camera_icc(fit: CameraFit, desc: str,
+def build_camera_icc(fit: CameraFit, desc: str, *,
+                     mode: str = "matrix", grid: int = 17,
+                     samples: Optional[Dict[str, "PatchSample"]] = None,
+                     ref: Optional[IT8Reference] = None,
                      copyright_text: str = "Public Domain. No rights reserved."
                      ) -> bytes:
-    """Synthesise ICC v2.4 matrix-shaper bytes from the fitted camera matrix.
-    Colorant columns are M's columns (already XYZ D50); TRC is identity (the
-    device space is raw-linear). Round-trips through InputProfile.from_bytes."""
-    M = np.asarray(fit.matrix, dtype=np.float64)
-    # The ICC desc/text tag writers only emit ASCII (textType/textDescription),
-    # so coerce user-supplied names + illuminant notes to ASCII to avoid a crash.
+    """Synthesise camera-profile ICC bytes from the fit. Round-trips through
+    InputProfile.from_bytes.
+
+    mode='matrix' (default) writes a 3x3 matrix-shaper (M's columns are the XYZ
+    D50 colorants, identity TRC). mode='clut' writes a higher-accuracy lut16 cLUT
+    (the 3x3 base + a smooth RBF residual; needs `samples`+`ref`)."""
     desc = str(desc).encode("ascii", "replace").decode("ascii")
     copyright_text = str(copyright_text).encode("ascii", "replace").decode("ascii")
+    if mode == "clut":
+        if samples is None or ref is None:
+            raise ValueError("cLUT mode requires the sampled patches and reference")
+        clut_xyz = build_residual_clut(fit, samples, ref, grid=grid)
+        return color_management.build_clut_icc(
+            desc, clut_xyz, grid, copyright_text=copyright_text)
+    M = np.asarray(fit.matrix, dtype=np.float64)
     return color_management.build_matrix_shaper_icc(
         desc,
         tuple(M[:, 0]), tuple(M[:, 1]), tuple(M[:, 2]),
         _IDENTITY_TRC,
         copyright_text=copyright_text,
     )
+
+
+def build_residual_clut(fit: CameraFit, samples: Dict[str, "PatchSample"],
+                        ref: IT8Reference, grid: int = 17) -> np.ndarray:
+    """A (grid,grid,grid,3) XYZ D50 (Y=1) cLUT = the 3x3 matrix base + a smooth
+    scattered-data residual that bends the saturated corners the 3x3 can't reach.
+
+    The residual is a broad Gaussian-RBF-with-polynomial fit of the per-patch
+    errors `X_i - M·d_i` over the device-RGB sample points, regularised and faded
+    to zero outside the patch hull so the LUT degrades to the safe 3x3 in unsampled
+    regions. Gross per-axis reversals (the chroma-noise/ringing failure mode) are
+    bounded to ≤ RINGING_TOL by shrinking the correction toward the base if needed;
+    the LUT is NOT guaranteed strictly monotone — small reversals are the cost of
+    the bias correction, and the 3x3 matrix mode remains the strictly-safe default.
+    Indexed [R][G][B]."""
+    M = np.asarray(fit.matrix, dtype=np.float64)
+    d_list, r_list = [], []
+    for sid in fit.used_ids:
+        ps = samples.get(sid)
+        xyz = ref.xyz(sid)
+        if ps is None or xyz is None:
+            continue
+        di = ps.rgb / 65535.0
+        d_list.append(di)
+        r_list.append(xyz / 100.0 - M @ di)              # residual in XYZ (Y=1)
+    d = np.asarray(d_list, dtype=np.float64)             # (N,3) device
+    r = np.asarray(r_list, dtype=np.float64)             # (N,3) XYZ residual
+    n = len(d)
+
+    ax = np.linspace(0.0, 1.0, grid)
+    Rg, Gg, Bg = np.meshgrid(ax, ax, ax, indexing="ij")
+    nodes = np.stack([Rg, Gg, Bg], axis=-1).reshape(-1, 3)
+    base = nodes @ M.T                                    # (G,3) pure-matrix prediction
+
+    if n < 5:                                             # too few patches to bend safely
+        return np.clip(base, 0.0, 2.0).reshape(grid, grid, grid, 3)
+
+    # Gaussian RBF. A BROAD kernel (≈3× the mean nearest-neighbour device spacing)
+    # plus a firm smoothness regularisation captures the systematic saturated-corner
+    # bias without the high-frequency overshoot that a tight kernel rings with — it
+    # gives both lower ΔE and far less non-monotonicity than a narrow fit.
+    dd = np.sqrt(np.maximum(((d[:, None, :] - d[None, :, :]) ** 2).sum(-1), 0.0))
+    nn = dd + np.eye(n) * 1e9
+    sigma = max(float(nn.min(1).mean()) * 3.0, 1e-3)
+    Phi = np.exp(-(dd / sigma) ** 2)
+    Phi = Phi + (1e-2 * np.trace(Phi) / n) * np.eye(n)   # smoothness regularisation
+    P = np.concatenate([np.ones((n, 1)), d], axis=1)     # affine polynomial term
+    A = np.zeros((n + 4, n + 4))
+    A[:n, :n] = Phi; A[:n, n:] = P; A[n:, :n] = P.T
+    rhs = np.zeros((n + 4, 3)); rhs[:n] = r
+    sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+
+    dn = np.sqrt(np.maximum(((nodes[:, None, :] - d[None, :, :]) ** 2).sum(-1), 0.0))
+    resid = np.exp(-(dn / sigma) ** 2) @ sol[:n] + np.concatenate(
+        [np.ones((len(nodes), 1)), nodes], axis=1) @ sol[n:]
+    # Fade the residual to zero beyond ~one kernel width from the patch hull, so
+    # unsampled corners fall back to the pure matrix instead of ringing.
+    fade = np.exp(-(np.maximum(dn.min(1) - sigma, 0.0) / (2.0 * sigma)) ** 2)
+    corr = (resid * fade[:, None])
+
+    # Ringing safeguard: the correction must not introduce a *gross* per-axis
+    # reversal the linear base lacks (the parked density experiment's failure
+    # mode). If it does, shrink the whole correction toward the base and recheck —
+    # strength 0 is the pure 3×3 (always safe), so this terminates. Small reversals
+    # are tolerated: they are the cost of the bias correction (see RINGING_TOL).
+    base_grid = base.reshape(grid, grid, grid, 3)
+    table = base_grid
+    for strength in (1.0, 0.7, 0.5, 0.35, 0.2, 0.1, 0.0):
+        table = np.clip(base + corr * strength, 0.0, 2.0).reshape(grid, grid, grid, 3)
+        if _residual_monotone(base_grid, table):
+            break
+    return table
+
+
+RINGING_TOL = 0.12   # max per-axis reversal (fraction of white) the cLUT may add
+
+
+def _residual_monotone(base_grid: np.ndarray, table: np.ndarray,
+                       tol: float = RINGING_TOL) -> bool:
+    """True if `table` introduces no per-axis reversal larger than `tol` where the
+    linear `base_grid` is non-decreasing. NOT strict monotonicity — small reversals
+    are allowed (the bias correction's cost); only gross ringing is rejected."""
+    for axis in range(3):
+        db = np.diff(base_grid, axis=axis)
+        dt = np.diff(table, axis=axis)
+        if np.any((db >= 0) & (dt < -tol)):
+            return False
+    return True

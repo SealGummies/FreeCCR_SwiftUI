@@ -569,3 +569,50 @@ so:
   explanatory note) instead of silently mis-mapping the next card.
 - **The window floor is clamped to the screen** (`availableGeometry`) so the
   1024×700 minimum can never push the Back/Next row off a small display.
+
+### 12.5 Canonical camera-profiling decode (researched)
+
+The standard device space for **all** camera colour-characterization profiles —
+matrix ICC, cLUT ICC, and Adobe DCP — is **camera-native, demosaiced, linear,
+16-bit, no auto-brightness, no clipping in the patches**. The reference is Anders
+Torger's DCamProf recipe `dcraw -v -r 1 1 1 1 -o 0 -H 0 -T -6 -W -g 1 1`
+("16-bit linear TIFF without white balancing"). Sources: torger.se/DCamProf, the
+dcraw(1) manpage, the Adobe DNG spec, rawpy/LibRaw docs, ninedegreesbelow (Elle
+Stone), RawPedia.
+
+rawpy mapping (FreeCCR's `_raw_color_postprocess_kwargs(no_icc_default=False)`):
+
+| dcraw | meaning | rawpy |
+|-------|---------|-------|
+| `-o 0` | camera-native (no camera matrix / working space) | `output_color=ColorSpace.raw` |
+| `-g 1 1` | linear gamma 1.0 | `gamma=(1, 1)` |
+| `-6` | 16-bit | `output_bps=16` |
+| `-W` | fixed white level (no auto-bright) | `no_auto_bright=True` + `no_auto_scale=True` + manual `×65535/white_level` |
+| `-r 1 1 1 1` | unbalanced (unity WB) | `use_camera_wb=False`, `use_auto_wb=False` |
+| `-H 0` | no highlight recovery | (clip rejection drops blown patches in the fit) |
+
+**Why camera-native:** `-o 0` outputs sensor RGB *before* `convert_to_rgb()` (the
+camera→XYZ/working-space matrix stage). Fitting on Adobe RGB would make the matrix
+characterize Adobe, not the sensor, and — critically — a **DCP's
+ColorMatrix/ForwardMatrix operate on camera-native raw**, so a working-space decode
+makes DCP application impossible. This is why the decode is camera-native, not the
+v0.5/early-v0.6 Adobe-RGB-for-ICC decode.
+
+**White balance — the one divergence (researched):**
+- **DCP must be UNBALANCED**: it carries WB derivation (the `ColorMatrix` relates
+  raw RGB balance ↔ illuminant CCT) and applies the as-shot WB at render time via
+  the `ForwardMatrix`(+LUT) on the white-balanced image.
+- **Matrix/cLUT ICC is normally white-balanced at decode** (no render-time WB
+  stage) — *but may be fit unbalanced with WB baked into the matrix coefficients.*
+  **FreeCCR does the latter**: the decode is unbalanced (no WB) and
+  `fit_camera_matrix` folds the per-channel `gains` into the stored matrix
+  (§5.4 step 5). So FreeCCR's single unbalanced camera-native decode is the correct
+  shared base for both the matrix ICC **and** a future DCP.
+
+**Implementation:** `read_image` selects the camera-native path
+(`no_icc_default=False`) whenever an input ICC is active *or* the bare-device
+profiling decode is requested (`apply_input_icc=False`), and the Adobe RGB +
+auto-scale default only for a plain unprofiled negative. `decode_target` (the IT8
+fit) and the runtime ICC-apply decode therefore hit the **same** kwargs —
+`test_fit_and_apply_decode_spaces_are_identical` pins this so the two paths can't
+silently diverge.

@@ -191,9 +191,14 @@ class MainWindow(QMainWindow):
         # Restore a previously-chosen global input ICC profile (applied to every
         # decode). Done before any images load so the first batch picks it up.
         saved_icc = self._settings.value("import/input_icc_path", "", type=str)
+        saved_dcp = self._settings.value("import/input_dcp_path", "", type=str)
         if saved_icc and os.path.exists(saved_icc):
             if ccr_backend.load_input_icc_from_storage(saved_icc) is None:
                 self._settings.remove("import/input_icc_path")
+            self._refresh_input_icc_menu()
+        elif saved_dcp and os.path.exists(saved_dcp):
+            if ccr_backend.load_input_dcp_from_storage(saved_dcp) is None:
+                self._settings.remove("import/input_dcp_path")
             self._refresh_input_icc_menu()
 
         # Ctrl+Z (Cmd+Z on macOS): undo the last action on the current image;
@@ -352,6 +357,11 @@ class MainWindow(QMainWindow):
         self.input_icc_action.triggered.connect(self.set_input_icc_profile)
         self.clear_input_icc_action = file_menu.addAction("Clear Input ICC Profile")
         self.clear_input_icc_action.triggered.connect(self.clear_input_icc_profile)
+        # DCP (DNG camera profile) — exclusive alternative to the input ICC.
+        self.input_dcp_action = file_menu.addAction("Load DCP Profile…")
+        self.input_dcp_action.triggered.connect(self.set_input_dcp_profile)
+        self.clear_input_dcp_action = file_menu.addAction("Clear DCP Profile")
+        self.clear_input_dcp_action.triggered.connect(self.clear_input_dcp_profile)
         self._refresh_input_icc_menu()
 
         # Build a camera input profile from a photographed IT8 target.
@@ -371,7 +381,7 @@ class MainWindow(QMainWindow):
 
     # --- Input ICC profile (global, persistent) ---------------------------
     def _refresh_input_icc_menu(self):
-        """Reflect the active input profile in the File-menu actions."""
+        """Reflect the active input profile (ICC or DCP) in the File-menu actions."""
         name = getattr(ccr_backend, "input_icc_name", None)
         if name:
             self.input_icc_action.setText(f"Input ICC: {name}…")
@@ -379,6 +389,14 @@ class MainWindow(QMainWindow):
         else:
             self.input_icc_action.setText("Set Input ICC Profile…")
             self.clear_input_icc_action.setEnabled(False)
+        if hasattr(self, "input_dcp_action"):
+            dcp_name = getattr(ccr_backend, "input_dcp_name", None)
+            if dcp_name:
+                self.input_dcp_action.setText(f"DCP: {dcp_name}…")
+                self.clear_input_dcp_action.setEnabled(True)
+            else:
+                self.input_dcp_action.setText("Load DCP Profile…")
+                self.clear_input_dcp_action.setEnabled(False)
 
     def set_input_icc_profile(self):
         start_dir = self._settings.value("import/last_icc_dir", "", type=str)
@@ -401,19 +419,64 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "Unsupported ICC Profile",
                 f"This profile can't be used as an input profile:\n\n{e}\n\n"
-                "Only RGB matrix-shaper profiles are supported "
-                "(LUT-based, cLUT, or CMYK profiles are not).")
+                "Only RGB matrix-shaper and cLUT (A2B) profiles are supported "
+                "(CMYK and output/B2A-only profiles are not).")
             return False
         except Exception as e:
             QMessageBox.warning(self, "Input ICC Profile Error",
                                 f"Could not load the ICC profile:\n\n{e}")
             return False
         self._settings.setValue("import/input_icc_path", ccr_backend.input_icc_path)
+        self._settings.remove("import/input_dcp_path")   # ICC cleared the DCP
         self._refresh_input_icc_menu()
         self._reprocess_after_input_icc_change()
         self.sliders_panel.set_temporary_hint(
             f"Input ICC profile set: {name}", duration=3000)
         return True
+
+    def set_input_dcp_profile(self):
+        start_dir = self._settings.value("import/last_dcp_dir", "", type=str)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select DCP Profile", start_dir,
+            "DNG Camera Profiles (*.dcp);;All Files (*)")
+        if not path:
+            return
+        self._settings.setValue("import/last_dcp_dir", os.path.dirname(path))
+        self._apply_input_dcp_path(path)
+
+    def _apply_input_dcp_path(self, path: str) -> bool:
+        """Activate `path` as the global DCP (parse, persist, reprocess). Clears
+        any active ICC. Shared by the picker and the IT8 wizard's 'apply now'."""
+        from core.dcp_profile import DcpError
+        try:
+            name = ccr_backend.set_input_dcp(path)
+        except DcpError as e:
+            QMessageBox.warning(self, "DCP Profile",
+                                f"This .dcp can't be used:\n\n{e}")
+            return False
+        except Exception as e:
+            QMessageBox.warning(self, "DCP Profile Error",
+                                f"Could not load the DCP profile:\n\n{e}")
+            return False
+        self._settings.setValue("import/input_dcp_path", ccr_backend.input_dcp_path)
+        self._settings.remove("import/input_icc_path")   # DCP cleared the ICC
+        self._refresh_input_icc_menu()
+        self._reprocess_after_input_icc_change()
+        msg = f"DCP profile set: {name}"
+        _raw = (".cr3", ".cr2", ".nef", ".arw", ".dng", ".rw2", ".orf",
+                ".raf", ".srw", ".pef", ".3fr")
+        if any(not (getattr(im, "file_path", "") or "").lower().endswith(_raw)
+               for im in ccr_backend.images):
+            msg += " — note: a DCP applies to RAW only; non-RAW files will be colour-shifted"
+        self.sliders_panel.set_temporary_hint(msg, duration=5000)
+        return True
+
+    def clear_input_dcp_profile(self):
+        ccr_backend.clear_input_dcp()
+        self._settings.remove("import/input_dcp_path")
+        self._refresh_input_icc_menu()
+        self._reprocess_after_input_icc_change()
+        self.sliders_panel.set_temporary_hint("DCP profile cleared.", duration=3000)
 
     def create_camera_profile_from_it8(self):
         """Open the IT8 wizard; on success optionally activate the new profile."""
@@ -428,7 +491,11 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted or not dlg.saved_path:
             return
         base = os.path.basename(dlg.saved_path)
-        if dlg.apply_now and self._apply_input_icc_path(dlg.saved_path):
+        is_dcp = dlg.saved_path.lower().endswith(".dcp")
+        applied = dlg.apply_now and (
+            self._apply_input_dcp_path(dlg.saved_path) if is_dcp
+            else self._apply_input_icc_path(dlg.saved_path))
+        if applied:
             self.sliders_panel.set_temporary_hint(
                 f"Camera profile saved and applied: {base}", duration=4000)
         else:

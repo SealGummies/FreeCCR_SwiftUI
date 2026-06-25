@@ -306,6 +306,58 @@ def test_backend_set_and_clear_input_icc(tmp_path, monkeypatch):
         ccr_backend.input_icc_name = None
 
 
+def _camera_dcp():
+    from core import dcp_profile
+
+    class _F:
+        matrix = np.array([[0.46, 0.31, 0.17], [0.23, 0.70, 0.07], [0.02, 0.12, 0.93]])
+    return dcp_profile.build_camera_dcp(_F(), "Cam")
+
+
+def test_read_image_applies_active_dcp(tmp_path):
+    _make_qapp()
+    from core.ccr_image import CCRImage
+    from core import dcp_profile
+    p = str(tmp_path / "neg.png")
+    _write_negative_png(p)
+    cm.set_active_dcp_profile(None)
+    try:
+        a = CCRImage(p).resized_raw.copy()             # no profile
+        cm.set_active_dcp_profile(dcp_profile.parse_dcp_bytes(_camera_dcp()))
+        b = CCRImage(p).resized_raw.copy()             # DCP burned in at decode
+        assert a.shape == b.shape and not np.array_equal(a, b)
+    finally:
+        cm.set_active_dcp_profile(None)
+
+
+def test_backend_dcp_exclusivity_and_storage(tmp_path, monkeypatch):
+    _make_qapp()
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    from core.ccr_backend import ccr_backend
+    dsrc = tmp_path / "c.dcp"; dsrc.write_bytes(_camera_dcp())
+    isrc = tmp_path / "p.icc"; isrc.write_bytes(_adobe_like_icc())
+    icc_store = str(tmp_path / "FreeCCR" / "input_profile.icc")
+    dcp_store = str(tmp_path / "FreeCCR" / "input_profile.dcp")
+    try:
+        ccr_backend.set_input_icc(str(isrc))
+        ccr_backend.set_input_dcp(str(dsrc))           # DCP set -> ICC must clear
+        assert cm.get_active_dcp_profile() is not None
+        assert cm.get_active_input_profile() is None
+        assert os.path.exists(dcp_store) and not os.path.exists(icc_store)
+        ccr_backend.set_input_icc(str(isrc))           # ICC set -> DCP must clear
+        assert cm.get_active_input_profile() is not None
+        assert cm.get_active_dcp_profile() is None
+        assert not os.path.exists(dcp_store)
+        ccr_backend.clear_input_icc()
+        ccr_backend.clear_input_dcp()
+        assert cm.get_active_dcp_profile() is None and cm.get_active_input_profile() is None
+    finally:
+        cm.set_active_input_profile(None)
+        cm.set_active_dcp_profile(None)
+        ccr_backend.input_icc_path = ccr_backend.input_icc_name = None
+        ccr_backend.input_dcp_path = ccr_backend.input_dcp_name = None
+
+
 def test_backend_rejects_lut_profile_unchanged(tmp_path, monkeypatch):
     _make_qapp()
     monkeypatch.setenv("APPDATA", str(tmp_path))
