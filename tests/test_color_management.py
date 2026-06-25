@@ -165,12 +165,29 @@ def test_input_profile_applies_and_preserves_shape():
     assert not np.array_equal(out, img)
 
 
-def test_input_profile_srgb_is_near_identity():
+def test_input_profile_adobe_linear_is_near_identity():
+    # The input-profile working space is LINEAR Adobe RGB (so the density-based
+    # negative inversion sees consistent linear data). An Adobe-primary profile
+    # with a LINEAR TRC therefore round-trips to (near) the input.
+    adobe_d50 = cm.M_BRADFORD_D65_D50 @ cm.M_ADOBE2XYZ_D65
+    icc = cm.build_matrix_shaper_icc(
+        "Adobe-linear", tuple(adobe_d50[:, 0]), tuple(adobe_d50[:, 1]),
+        tuple(adobe_d50[:, 2]), (1.0, 1.0, 0.0, 1.0, 0.0))   # linear (identity) TRC
+    ip = cm.InputProfile.from_bytes(icc)
+    img = _rand_u16(seed=9)
+    out = ip.apply(img)
+    # Identity up to ICC s15Fixed16 colorant precision.
+    assert int(np.abs(out.astype(int) - img.astype(int)).max()) < 64
+
+
+def test_input_profile_srgb_relinearizes_to_adobe():
+    # An sRGB profile is NO LONGER identity: it linearises the sRGB-encoded input
+    # and re-expresses it in linear Adobe primaries (the working space), so the
+    # output must differ substantially from the input.
     ip = cm.InputProfile.from_bytes(cm.SRGB_ICC_BYTES)
     img = _rand_u16(seed=9)
     out = ip.apply(img)
-    # sRGB-in -> sRGB-working is identity up to ICC s15Fixed16 colorant precision.
-    assert int(np.abs(out.astype(int) - img.astype(int)).max()) < 64
+    assert int(np.abs(out.astype(int) - img.astype(int)).max()) > 64
 
 
 def test_input_profile_passthrough_non_rgb():

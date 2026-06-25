@@ -270,10 +270,11 @@ class CCRImage:
 
     def _apply_input_icc(self, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
         """Convert a freshly-decoded scan from the globally-assigned input ICC
-        profile into the working sRGB encoding, before any conversion or
-        adjustment. No-op when no input profile is set. Applied inside
-        read_image so preview, hi-res zoom, and export all inherit it
-        identically (resolution-independent point operation)."""
+        profile into the working LINEAR Adobe RGB space (the same space the
+        no-ICC decode produces, so the density-based inversion sees consistent
+        linear data), before any conversion or adjustment. No-op when no input
+        profile is set. Applied inside read_image so preview, hi-res zoom, and
+        export all inherit it identically (resolution-independent point op)."""
         if arr is None:
             return arr
         profile = color_management.get_active_input_profile()

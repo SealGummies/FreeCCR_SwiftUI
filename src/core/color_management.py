@@ -95,6 +95,20 @@ _M_SRGB2PROPHOTO_F32 = M_SRGB2PROPHOTO.astype(np.float32)   # export math runs i
 # Combined XYZ(D50) -> linear sRGB(D65) (used by InputProfile to reach working space).
 M_XYZ_D50_2_SRGB = M_XYZ2SRGB @ M_BRADFORD_D50_D65
 
+# Adobe RGB (1998) primaries -> XYZ (D65); columns are the Adobe primaries.
+M_ADOBE2XYZ_D65 = np.array([
+    [0.5767309, 0.1855540, 0.1881852],
+    [0.2973769, 0.6273491, 0.0752741],
+    [0.0270343, 0.0706872, 0.9911085],
+], dtype=np.float64)
+M_XYZ2ADOBE_D65 = np.linalg.inv(M_ADOBE2XYZ_D65)            # XYZ(D65) -> linear Adobe
+# Combined XYZ(D50) -> LINEAR Adobe RGB. The negative pipeline's no-ICC decode is
+# linear Adobe RGB (output_color=Adobe, gamma=(1,1)) and the density-based
+# inversion reads -log10(value/full) assuming LINEAR input, so an input ICC must
+# land an image in this SAME linear-Adobe space (NOT sRGB-gamma-encoded) — else the
+# optical-density cast balance mis-reads every channel and casts the result.
+M_XYZ_D50_2_ADOBE = M_XYZ2ADOBE_D65 @ M_BRADFORD_D50_D65
+
 # D50 PCS white point (ICC reference illuminant).
 D50_XYZ = (0.9642, 1.0000, 0.8249)
 
@@ -378,7 +392,7 @@ class InputProfile:
     pixels into the working sRGB encoding."""
 
     def __init__(self, combined_matrix: np.ndarray, luts: list, desc: str):
-        self._matrix = combined_matrix.astype(np.float32)   # device-linRGB -> linear sRGB
+        self._matrix = combined_matrix.astype(np.float32)   # device-linRGB -> linear Adobe RGB
         # 3 device->linear LUTs, length 65536 so a uint16 value indexes directly.
         self._luts = [np.ascontiguousarray(l, dtype=np.float32) for l in luts]
         self.description = desc
@@ -398,7 +412,7 @@ class InputProfile:
         g = _parse_xyz(icc, tags[b'gXYZ'][0])
         b = _parse_xyz(icc, tags[b'bXYZ'][0])
         m_colorants = np.stack([r, g, b], axis=1)        # columns = primaries (XYZ D50)
-        combined = M_XYZ_D50_2_SRGB @ m_colorants        # device-linRGB -> linear sRGB
+        combined = M_XYZ_D50_2_ADOBE @ m_colorants       # device-linRGB -> linear Adobe RGB
         luts = [_parse_trc_to_lut(icc, tags[t][0])
                 for t in (b'rTRC', b'gTRC', b'bTRC')]
         desc = cls._read_desc(icc, tags)
@@ -418,13 +432,17 @@ class InputProfile:
         return ""
 
     def apply(self, rgb_u16: np.ndarray) -> np.ndarray:
-        """Convert HxWx3 uint16 device RGB into uint16 sRGB-encoded working RGB."""
+        """Convert HxWx3 uint16 device RGB into uint16 **linear Adobe RGB** — the
+        exact working space the no-ICC negative decode produces, so the
+        density-based inversion downstream (-log10(value/full)) reads consistent
+        LINEAR data. Emitting sRGB-gamma-encoded data here mis-feeds that optical
+        density and casts the converted image (severe green/blue shift)."""
         if rgb_u16.ndim != 3 or rgb_u16.shape[2] != 3 or rgb_u16.dtype != np.uint16:
             return rgb_u16
         # LUTs are length 65536, so a uint16 value indexes them directly.
         lin = np.empty(rgb_u16.shape, dtype=np.float32)
         for c in range(3):
             lin[..., c] = self._luts[c][rgb_u16[..., c]]
-        srgb_lin = lin @ self._matrix.T
-        out = srgb_encode(np.clip(srgb_lin, 0.0, 1.0))
+        adobe_lin = lin @ self._matrix.T                 # device -> linear Adobe RGB
+        out = np.clip(adobe_lin, 0.0, 1.0)               # stay linear (no sRGB OETF)
         return np.rint(out * 65535.0).astype(np.uint16)
