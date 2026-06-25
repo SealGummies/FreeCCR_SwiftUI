@@ -29,6 +29,18 @@ from utils.unicode_path_utils import normalize_unicode_path, validate_unicode_pa
 _REF_URL = "http://www.targets.coloraid.de/"
 
 
+def _illuminant_enum(illum: str) -> int:
+    """Map the wizard's capture-light label to a DNG CalibrationIlluminant
+    (EXIF LightSource) code. The fit is D50-referenced, so this is metadata for a
+    single-illuminant DCP; tungsten/fluorescent are tagged, everything else D50."""
+    s = (illum or "").lower()
+    if "tungsten" in s:
+        return 17                                    # Standard light A
+    if "fluor" in s:
+        return 2                                     # Fluorescent
+    return 23                                        # D50
+
+
 def _gamma_stretch_to_qimage(arr_u16: np.ndarray) -> QImage:
     """8-bit gamma-stretched view of a raw-linear 16-bit RGB array (display
     only — the fit always uses the linear data)."""
@@ -460,8 +472,15 @@ class IT8ProfileDialog(QDialog):
         self.illum_combo.setEditable(True)
         self.illum_combo.addItems(["Daylight", "Strobe/Flash", "Tungsten",
                                    "Fluorescent", "Other"])
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["3×3 matrix", "cLUT (higher accuracy)"])
+        self.type_combo.setToolTip(
+            "3×3 matrix: a compact, well-behaved linear profile. cLUT: a 3-D "
+            "lookup table that also corrects the saturated-corner residuals a "
+            "matrix can't reach (uses the full sampled patch set).")
         form.addRow("Profile name:", self.name_edit)
         form.addRow("Illuminant:", self.illum_combo)
+        form.addRow("Profile type:", self.type_combo)
         lay.addLayout(form)
         lay.addStretch(1)
         return w
@@ -817,12 +836,12 @@ class IT8ProfileDialog(QDialog):
         return os.path.join(folder, f"{safe}.icc")
 
     def _choose_save_path(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save camera ICC profile", self.save_path_edit.text(),
-            "ICC Profiles (*.icc)")
+        path, sel = QFileDialog.getSaveFileName(
+            self, "Save camera profile", self.save_path_edit.text(),
+            "ICC profile (*.icc);;DNG camera profile (*.dcp)")
         if path:
-            if not path.lower().endswith(".icc"):
-                path += ".icc"
+            if not path.lower().endswith((".icc", ".dcp")):
+                path += ".dcp" if "dcp" in sel.lower() else ".icc"
             self.save_path_edit.setText(path)
 
     def _do_save(self) -> bool:
@@ -833,11 +852,27 @@ class IT8ProfileDialog(QDialog):
         illum = self.illum_combo.currentText().strip()
         name = self.name_edit.text().strip() or "Camera Profile"
         desc = f"{name} ({illum})" if illum else name
+        clut = self.type_combo.currentIndex() == 1
+        if path.lower().endswith(".dcp") and clut:
+            QMessageBox.information(
+                self, "DCP is matrix-only",
+                "DCP export writes a 3×3 matrix profile; the cLUT "
+                "(higher-accuracy) correction is not included. Save as .icc to "
+                "keep the cLUT.")
         try:
-            icc = it8.build_camera_icc(self._fit, desc)
+            if path.lower().endswith(".dcp"):
+                from core import dcp_profile
+                blob = dcp_profile.build_camera_dcp(
+                    self._fit, desc, illuminant=_illuminant_enum(illum))
+            elif clut:
+                blob = it8.build_camera_icc(
+                    self._fit, desc, mode="clut", grid=17,
+                    samples=self._all_samples, ref=self._ref)
+            else:
+                blob = it8.build_camera_icc(self._fit, desc)
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "wb") as f:
-                f.write(icc)
+                f.write(blob)
         except Exception as e:
             QMessageBox.critical(self, "Save Error",
                                  f"Could not write the profile:\n\n{e}")
