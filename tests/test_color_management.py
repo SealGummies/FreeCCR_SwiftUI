@@ -312,10 +312,11 @@ def test_backend_rejects_lut_profile_unchanged(tmp_path, monkeypatch):
         ccr_backend.input_icc_name = None
 
 
-def test_reprocess_preserves_inherited_tint_factor(tmp_path):
-    """Regression: a slice/duplicate inherits its parent's tint_balance_factor;
-    reprocessing after an input-ICC change must not let reload recompute it from
-    the image's own region. A plain image is free to re-adapt."""
+def test_reprocess_full_resets_all_images(tmp_path):
+    """Switching the input ICC changes the decode itself, so every image is
+    FULLY reset: conversion + non-destructive edits dropped and the scan
+    re-decoded fresh (replaying a conversion computed against the old decode
+    would mis-colour the result)."""
     _make_qapp()
     from core.ccr_image import CCRImage
     from core.ccr_backend import ccr_backend
@@ -324,17 +325,19 @@ def test_reprocess_preserves_inherited_tint_factor(tmp_path):
     saved_images = ccr_backend.images
     cm.set_active_input_profile(None)
     try:
-        plain = CCRImage(p)
-        dup = CCRImage(p)
-        dup.is_duplicate = True
-        SENT = 0.777
-        dup.tint_balance_factor = SENT             # inherited sentinel
-        plain_before = plain.tint_balance_factor
-        ccr_backend.images = [plain, dup]
+        a, b = CCRImage(p), CCRImage(p)
+        for im in (a, b):
+            im.converted = True
+            im.adjustment_settings = {"exposure": 50}
+            im.reference_frame = (1, 1, 50, 50)
+        ccr_backend.images = [a, b]
         cm.set_active_input_profile(cm.InputProfile.from_bytes(_adobe_like_icc()))
         ccr_backend.reprocess_all_for_input_icc_change()
-        assert dup.tint_balance_factor == SENT     # inherited factor preserved
-        assert plain.tint_balance_factor != plain_before  # plain re-adapts to ICC
+        for im in (a, b):
+            assert im.converted is False
+            assert im.adjustment_settings == {}
+            assert im.reference_frame is None
+            assert im.resized_raw is not None      # re-decoded fresh
     finally:
         ccr_backend.images = saved_images
         cm.set_active_input_profile(None)

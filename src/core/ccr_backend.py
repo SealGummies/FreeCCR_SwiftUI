@@ -470,19 +470,12 @@ class CCRBackend:
             else:
                 print(f"Image at index {idx} is not converted.")
 
-    def reset_image_by_index(self, idx: int) -> bool:
-        """Reset the image at idx to its freshly-loaded state: undo the
-        conversion and clear every non-destructive edit (adjustments,
-        reference frame, crop, orientation, colour profile) so it matches a
-        just-imported image. Slicing (source_ops/lineage) is preserved — a
-        slice resets to its un-edited region, not back to the whole file
-        (use "Reset Slice" for that). Returns False if idx is out of range."""
-        if idx is None or not (0 <= idx < len(self.images)):
-            return False
-        image_obj = self.images[idx]
-        # Clear edit state BEFORE reloading so the rebuilt preview reflects
-        # the pristine settings. reload_image() re-decodes resized_raw and
-        # resets the base offsets + conversion_inputs.
+    @staticmethod
+    def _clear_edit_state(image_obj) -> None:
+        """Clear every non-destructive edit (conversion, adjustments, reference
+        frame, crop, orientation, colour profile, undo history) so the image
+        matches a just-imported one. Slicing (source_ops/lineage) is preserved —
+        a slice resets to its un-edited region, not back to the whole file."""
         image_obj.converted = False
         image_obj.adjustment_settings = {}
         image_obj.reference_frame = None
@@ -496,16 +489,72 @@ class CCRBackend:
         # The conversion is gone, so the undo history (which never captured
         # the conversion anyway) would be inconsistent — drop it.
         image_obj.undo_stack = []
+
+    def reset_image_by_index(self, idx: int) -> bool:
+        """Reset the image at idx to its freshly-loaded state: undo the
+        conversion and clear every non-destructive edit (adjustments,
+        reference frame, crop, orientation, colour profile) so it matches a
+        just-imported image. Slicing (source_ops/lineage) is preserved — a
+        slice resets to its un-edited region, not back to the whole file
+        (use "Reset Slice" for that). Returns False if idx is out of range."""
+        if idx is None or not (0 <= idx < len(self.images)):
+            return False
+        image_obj = self.images[idx]
+        # Clear edit state BEFORE reloading so the rebuilt preview reflects
+        # the pristine settings. reload_image() re-decodes resized_raw and
+        # resets the base offsets + conversion_inputs.
+        self._clear_edit_state(image_obj)
         image_obj.reload_image()
         return True
 
-    def reset_images_by_indices(self, indices) -> bool:
-        """Reset each image in indices to its freshly-loaded state.
-        Returns True if at least one image was reset."""
-        # Materialize the results first: any() over a generator short-circuits
-        # on the first True and would leave the rest of the selection un-reset.
-        results = [self.reset_image_by_index(i) for i in sorted(set(indices))]
-        return any(results)
+    def _reload_decode_parallel(self, imgs, progress_callback=None) -> None:
+        """Re-decode resized_raw for each image concurrently. read_image (RAW
+        decode / file IO) is the slow part and releases the GIL, so a thread
+        pool gives a near-linear speed-up. QPixmap building is deliberately NOT
+        done here — it must run on the GUI thread, so the caller follows up with
+        update_thumbnail_and_preview() per image on the main thread."""
+        if not imgs:
+            return
+        total = len(imgs)
+        max_workers = min(8, os.cpu_count() or 1)
+        done = 0
+        if max_workers <= 1 or total <= 1:
+            for img in imgs:
+                try:
+                    img.reload_image_decode_only()
+                except Exception as e:
+                    print(f"Reset decode failed for {img.file_path}: {e}")
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total)
+            return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(img.reload_image_decode_only): img for img in imgs}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Reset decode failed for {futures[future].file_path}: {e}")
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total)
+
+    def reset_images_by_indices(self, indices, progress_callback=None) -> bool:
+        """Reset each image in indices to its freshly-loaded state. The slow
+        per-image re-decode runs in parallel; previews are then rebuilt on the
+        calling (GUI) thread. Returns True if at least one image was reset."""
+        idxs = [i for i in sorted(set(indices))
+                if i is not None and 0 <= i < len(self.images)]
+        if not idxs:
+            return False
+        imgs = [self.images[i] for i in idxs]
+        for img in imgs:
+            self._clear_edit_state(img)
+        self._reload_decode_parallel(imgs, progress_callback)
+        # QPixmap thumbnails/previews on the caller's thread (GUI-thread safe).
+        for img in imgs:
+            img.update_thumbnail_and_preview()
+        return True
 
     def convert_negative_by_index(self, idx: int):
         """
@@ -586,36 +635,14 @@ class CCRBackend:
             pass
 
     def reprocess_all_for_input_icc_change(self, progress_callback=None) -> None:
-        """Re-decode and re-convert every loaded image so a change to the global
-        input ICC takes effect immediately. Re-decoding runs through read_image,
-        which re-applies the (new) global profile; converted images then replay
-        their stored conversion against the freshly-decoded scan."""
-        from core.catalog import _replay_conversion
-        total = len(self.images)
-        for i, img in enumerate(self.images):
-            ci = img.conversion_inputs
-            was_converted = img.converted
-            cb, tb, bb = img.contrast_base, img.temperature_base, img.brightness_base
-            # Slices/duplicates deliberately INHERIT the parent's tint balance
-            # factor (their own region/converted pixels would give a different
-            # one). reload_image unconditionally recomputes it, so preserve the
-            # inherited value for those images.
-            inherited_tbf = bool(img.source_ops) or bool(getattr(img, "is_duplicate", False))
-            tbf = getattr(img, "tint_balance_factor", 1.0)
-            try:
-                img.reload_image()                 # re-decode (ICC re-applied)
-                if inherited_tbf:
-                    img.tint_balance_factor = tbf
-                if was_converted and ci is not None:
-                    _replay_conversion(img, ci)    # re-convert from the new scan
-                # Preserve the user's non-destructive look offsets across the
-                # re-decode (reload_image / replay reset them to defaults).
-                img.contrast_base, img.temperature_base, img.brightness_base = cb, tb, bb
-                img.update_thumbnail_and_preview()
-            except Exception as e:
-                print(f"Reprocess after input ICC change failed for {img.file_path}: {e}")
-            if progress_callback:
-                progress_callback(i + 1, total)
+        """A change to the global input ICC changes the decode itself, so every
+        loaded image is FULLY reset: the conversion and all non-destructive edits
+        (adjustments, reference frame, crop, orientation, colour profile) are
+        dropped and the scan is re-decoded fresh (in parallel). Replaying a
+        conversion that was computed against the old decode would mis-colour the
+        result, so we start from a clean slate. Slicing/lineage is preserved (a
+        slice resets to its un-edited region)."""
+        self.reset_images_by_indices(range(len(self.images)), progress_callback)
 
     def reprocess_all_for_positive_mode_change(self, progress_callback=None) -> None:
         """Re-decode every loaded image after the global Positive-mode toggle.

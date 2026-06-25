@@ -443,8 +443,9 @@ class MainWindow(QMainWindow):
         self.sliders_panel.set_temporary_hint("Input ICC profile cleared.", duration=3000)
 
     def _reprocess_after_input_icc_change(self):
-        """Re-decode + re-convert loaded images so the profile change shows
-        immediately, then refresh the UI."""
+        """A change to the input ICC fully resets every loaded image (the decode
+        itself changes, so a conversion from the old decode can't be reused),
+        then refreshes the UI."""
         if not ccr_backend.images:
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -452,9 +453,15 @@ class MainWindow(QMainWindow):
             ccr_backend.reprocess_all_for_input_icc_change()
         finally:
             QApplication.restoreOverrideCursor()
+        # Every image was re-decoded and reset, so the zoom hi-res cache is stale.
+        self.image_preview._release_hires(refresh=False)
         self.thumbnail_list.update_all_thumbnails()
-        if self.image_preview.current_idx is not None:
-            self.image_preview.update_preview(self.image_preview.current_idx)
+        cur = self.image_preview.current_idx
+        if cur is not None:
+            self.image_preview.update_preview(cur)
+            self.sliders_panel.set_current_idx(cur)   # reflect the cleared settings
+        else:
+            self.image_preview._update_unconvert_action_state()
         ccr_backend.save_catalog()
 
     # --- Positive mode (global, persistent) -------------------------------
