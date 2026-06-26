@@ -12,8 +12,10 @@ Crop panel** that covers the right-hand sliders panel while in crop mode — the
 exact pattern used by Dust Removal (`DustRemovalPanel`). The panel exposes "all
 the options" for cropping:
 
-- **Aspect-ratio presets** (Free, Original, 1:1, 5:4, 4:3, 7:5, 3:2, 16:9) with a
-  **portrait/landscape** toggle and a **custom W:H** field. A locked ratio
+- **Aspect-ratio presets** (Free, Original, 1:1, 5:4, 4:3, 7:5, 3:2, 16:9, plus a
+  cinematic group — Academy 1.37, 1.85 Flat, 2:1 Univisium, 2.35 CinemaScope,
+  2.39 Scope) with a **portrait/landscape** toggle and a **custom W:H** field.
+  A locked ratio
   constrains every on-canvas drag (draw, corner, edge) so the box can only ever
   be that shape. The selected ratio **persists across images and sessions**
   (QSettings) so a whole catalogue can be cropped to the same dimensions — the
@@ -80,7 +82,8 @@ rotations never stack. Cancelling leaves the original micro-rotation untouched.
   then a stretch and a button row **Reset | ✓ Done** (Done = primary, like dust).
 
 ### 3.2 Aspect ratio
-- **Combo** lists: Free, Original, 1:1, 5:4, 4:3, 7:5, 3:2, 16:9, Custom…
+- **Combo** lists: Free, Original, 1:1, 5:4, 4:3, 7:5, 3:2, 16:9, Academy (1.37:1),
+  1.85:1 (Flat), 2:1 (Univisium), 2.35:1 (CinemaScope), 2.39:1 (Scope), Custom…
 - **Orientation** (Landscape / Portrait) radios; disabled and ignored for Free,
   Original, and 1:1 (orientation is meaningless there). Toggling swaps the active
   ratio `r ↔ 1/r`.
@@ -117,7 +120,8 @@ No new persistent field on `CCRImage`. The committed result is still exactly
 `crop_angle` (deg). The chosen **aspect ratio is panel/session state**, persisted
 in QSettings (not per image) so it is consistent across the catalogue:
 
-- `crop/aspect_key`: one of `free|original|1:1|5:4|4:3|7:5|3:2|16:9|custom`.
+- `crop/aspect_key`: one of
+  `free|original|1:1|5:4|4:3|7:5|3:2|16:9|academy|1.85:1|2:1|2.35:1|2.39:1|custom`.
 - `crop/custom_w`, `crop/custom_h`: ints for the custom ratio.
 - `crop/orientation`: `landscape|portrait`.
 

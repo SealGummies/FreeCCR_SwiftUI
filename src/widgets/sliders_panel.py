@@ -416,6 +416,10 @@ class SlidersPanel(QWidget):
         # Shows which slope source the next conversion will use.
         self.bwp_mode_label = QLabel("")
         self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
+        # Starts empty (no black point yet); an empty label would still reserve a
+        # line of height + spacing, leaving a gap between this and the Convert row,
+        # so keep it hidden until it has something to say (_update_bwp_mode_label).
+        self.bwp_mode_label.setVisible(False)
         scroll_layout.addWidget(self.bwp_mode_label)
         self.convert_current_bwp_btn = QPushButton("Convert Current")
         self.convert_all_bwp_btn = QPushButton("Convert All")
@@ -1447,11 +1451,15 @@ class SlidersPanel(QWidget):
         bp_set = ccr_backend.black_point_bgr is not None
         wp_set = ccr_backend.white_point_bgr is not None
         if not bp_set:
-            self.bwp_mode_label.setText("")
+            text = ""
         elif wp_set:
-            self.bwp_mode_label.setText("Slope source: white point (two-point)")
+            text = "Slope source: white point (two-point)"
         else:
-            self.bwp_mode_label.setText("Slope source: default slope (black point only)")
+            text = "Slope source: default slope (black point only)"
+        self.bwp_mode_label.setText(text)
+        # Hide when empty so it reserves no vertical space — keeps the Set-point
+        # row and the Convert row tight together (no gap) until a point is set.
+        self.bwp_mode_label.setVisible(bool(text))
 
     def on_bwpoint_sampled(self, mode):
         label = "White Point" if mode == "white" else "Black Point"
