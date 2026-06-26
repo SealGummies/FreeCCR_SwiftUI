@@ -10,6 +10,7 @@ from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QP
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
 from core.ccr_processor import apply_dust_removal
+from core import crop_aspect
 from widgets.export_dialog import ExportSettingsDialog
 from ui import theme
 import math
@@ -788,6 +789,9 @@ class ImagePreview(QWidget):
         self._crop_rerender = False          # guards update_preview while entering crop mode
         self._pending_crop_local = None      # QRectF box (un-rotated) in full-pixmap coords
         self._pending_crop_angle = 0.0       # box rotation, degrees (Qt clockwise-positive)
+        self._crop_fold_fine = False         # did entry fold a nonzero fine_rotation in?
+        self._crop_box_is_seed = False       # is the pending box an auto-seed (vs a user crop)?
+        self._crop_panel = None              # set by MainWindow (aspect ratio + straighten sync)
         self._crop_drag = None               # in-progress handle/new-rect drag state
         self._crop_overlay_item = None
         self._crop_handle_items = []
@@ -1077,7 +1081,10 @@ class ImagePreview(QWidget):
             # Fine rotation is suppressed in dust mode (the canvas shows the
             # un-fine-rotated image), so disable its slider to match — otherwise
             # it would show a value the display ignores and could mutate state.
-            self.rotation_slider.setEnabled(not self.dust_mode)
+            # In crop mode the panel's Straighten slider replaces it (and the
+            # image-level micro-rotation is folded into the crop), so keep it
+            # disabled there too.
+            self.rotation_slider.setEnabled(not self.dust_mode and not self.crop_mode)
             self.pixmap_item = QGraphicsPixmapItem(preview_img)
             self.scene.addItem(self.pixmap_item)
 
@@ -2480,16 +2487,113 @@ class ImagePreview(QWidget):
         finally:
             self._crop_rerender = False
         self._sync_zoom_combo()
+        # Fold any image-level micro-rotation into the crop straighten so the two
+        # rotations never stack: the box angle absorbs fine_rotation_angle, and
+        # confirm clears fine_rotation. Cancel never mutates it. See spec §5.4.
+        fine = getattr(img_obj, "fine_rotation_angle", 0) or 0
+        self._crop_fold_fine = (fine != 0)
+        base_angle = getattr(img_obj, "crop_angle", 0.0) or 0.0
+        self._pending_crop_angle = crop_aspect.folded_crop_angle(base_angle, fine)
+        self._crop_box_is_seed = False
         crop = getattr(img_obj, "crop_rect", None)
         if crop is not None and self.current_pixmap is not None:
             w, h = self.current_pixmap.width(), self.current_pixmap.height()
             self._pending_crop_local = QRectF(
                 crop[0] * w, crop[1] * h,
                 (crop[2] - crop[0]) * w, (crop[3] - crop[1]) * h)
-            self._pending_crop_angle = getattr(img_obj, "crop_angle", 0.0) or 0.0
+        elif fine != 0 and self.current_pixmap is not None:
+            # Folding a straighten but no crop yet: seed a full-frame box so the
+            # folded angle has something to live on (drawing a fresh box would
+            # otherwise reset the angle to 0 and discard the leveling). Marked as
+            # a seed so a remembered aspect ratio may reshape it on entry.
+            w, h = self.current_pixmap.width(), self.current_pixmap.height()
+            self._pending_crop_local = QRectF(0.0, 0.0, float(w), float(h))
+            self._crop_box_is_seed = True
         self._draw_crop_overlay()
         self.view.setCursor(Qt.CrossCursor)
+        # The panel straighten slider replaces the canvas micro-rotation slider
+        # while cropping; disable it so it can't set a second, stacking rotation.
+        self.rotation_slider.setEnabled(False)
         return True
+
+    # ---- Crop panel hooks: aspect ratio + straighten --------------------
+    def set_crop_panel(self, panel):
+        """MainWindow wires the CropPanel here so the crop tool can read the
+        active aspect ratio and keep the straighten slider in sync."""
+        self._crop_panel = panel
+
+    def _active_effective_ratio(self):
+        """The aspect ratio (box-frame, un-rotated space) the crop must hold, or
+        None for Free / when there is no panel."""
+        panel = self._crop_panel
+        if panel is None or self.current_pixmap is None:
+            return None
+        return panel.current_effective_ratio(self.current_rotation, self.current_pixmap)
+
+    def _sync_crop_panel(self):
+        panel = self._crop_panel
+        if panel is not None:
+            panel.on_crop_geometry_changed()
+
+    def redraw_crop_overlay(self):
+        """Public wrapper so the panel can request an overlay redraw."""
+        self._draw_crop_overlay()
+
+    def set_pending_straighten(self, degrees):
+        """Panel straighten slider -> crop box angle (no commit)."""
+        if not self.crop_mode:
+            return
+        self._pending_crop_angle = float(degrees)
+        self._draw_crop_overlay()
+
+    def reset_pending_crop(self):
+        """Reset button: clear the pending box + straighten (no commit)."""
+        if not self.crop_mode:
+            return
+        self._pending_crop_local = None
+        self._pending_crop_angle = 0.0
+        self._crop_box_is_seed = False
+        self._draw_crop_overlay()
+        self._sync_crop_panel()
+
+    def reapply_crop_ratio(self, seed_if_empty=True):
+        """Reshape the pending box to the panel's active ratio (preset change /
+        orientation toggle / custom edit). Free leaves the box untouched."""
+        if not self.crop_mode or self.current_pixmap is None:
+            return
+        r = self._active_effective_ratio()
+        if r is None:
+            return
+        w, h = self.current_pixmap.width(), self.current_pixmap.height()
+        sel = self._pending_crop_local
+        if sel is not None and sel.width() >= 2 and sel.height() >= 2:
+            center = (sel.center().x(), sel.center().y())
+            box_wh = (sel.width(), sel.height())
+        else:
+            if not seed_if_empty:
+                return
+            center, box_wh = (w / 2.0, h / 2.0), None
+        res = crop_aspect.reshape_to_ratio(center, box_wh, (w, h), r)
+        if res is None:
+            return
+        cx, cy, bw, bh = res
+        self._pending_crop_local = QRectF(cx - bw / 2.0, cy - bh / 2.0, bw, bh)
+        self._crop_box_is_seed = False
+        self._draw_crop_overlay()
+        self._sync_crop_panel()
+
+    def seed_crop_ratio_on_entry(self):
+        """On entering crop with a remembered ratio: seed a centered ratio box
+        when there is no user crop yet (None, or a fold-seeded full-frame box).
+        Leaves an existing user crop untouched."""
+        if not self.crop_mode:
+            return
+        sel = self._pending_crop_local
+        has_user_box = (sel is not None and sel.width() >= 2 and sel.height() >= 2
+                        and not self._crop_box_is_seed)
+        if has_user_box:
+            return
+        self.reapply_crop_ratio(seed_if_empty=True)
 
     # ---- Crop drag interaction: new rect + 10 control handles -----------
     # 4 corners (resize), 4 edge midpoints (move that edge), a rotate knob
@@ -2598,6 +2702,8 @@ class ImagePreview(QWidget):
             "box0": QRectF(sel) if sel is not None else None,
             "angle0": self._pending_crop_angle,
         }
+        # Any interaction makes the box user-owned (no longer an auto-seed).
+        self._crop_box_is_seed = False
         if mode != "new":
             self.view.setCursor(self._cursor_for_handle(mode))
         self.update_crop_drag(scene_pos)
@@ -2622,6 +2728,7 @@ class ImagePreview(QWidget):
         elif mode.startswith("edge-"):
             self._drag_edge(drag, p, mode[len("edge-"):])
         self._draw_crop_overlay()
+        self._sync_crop_panel()
 
     def end_crop_drag(self, scene_pos):
         if self._crop_drag is None:
@@ -2631,16 +2738,42 @@ class ImagePreview(QWidget):
 
     def _update_new_selection(self, p0, p1):
         w, h = self.current_pixmap.width(), self.current_pixmap.height()
-        x1 = max(0.0, min(float(w), min(p0.x(), p1.x())))
-        y1 = max(0.0, min(float(h), min(p0.y(), p1.y())))
-        x2 = max(0.0, min(float(w), max(p0.x(), p1.x())))
-        y2 = max(0.0, min(float(h), max(p0.y(), p1.y())))
-        if (x2 - x1) < 3 and (y2 - y1) < 3:
-            # Stray click, not a drag — keep the current selection (and its
-            # angle) so the display keeps matching what Enter will confirm.
+        r = self._active_effective_ratio()
+        if r is None:
+            x1 = max(0.0, min(float(w), min(p0.x(), p1.x())))
+            y1 = max(0.0, min(float(h), min(p0.y(), p1.y())))
+            x2 = max(0.0, min(float(w), max(p0.x(), p1.x())))
+            y2 = max(0.0, min(float(h), max(p0.y(), p1.y())))
+            if (x2 - x1) < 3 and (y2 - y1) < 3:
+                # Stray click, not a drag — keep the current selection (and its
+                # angle) so the display keeps matching what Enter will confirm.
+                return
+            # A freshly drawn box starts axis-aligned
+            self._pending_crop_local = QRectF(x1, y1, x2 - x1, y2 - y1)
+            self._pending_crop_angle = 0.0
             return
-        # A freshly drawn box starts axis-aligned
-        self._pending_crop_local = QRectF(x1, y1, x2 - x1, y2 - y1)
+        # Ratio-locked: anchor at p0, grow toward p1 covering the drag while
+        # holding the ratio, then clamp into the image (scaling about the anchor
+        # keeps the ratio). The new box is axis-aligned (straighten resets).
+        ax = min(max(p0.x(), 0.0), float(w))
+        ay = min(max(p0.y(), 0.0), float(h))
+        sx = 1.0 if (p1.x() - p0.x()) >= 0 else -1.0
+        sy = 1.0 if (p1.y() - p0.y()) >= 0 else -1.0
+        bw, bh = crop_aspect.enforce_ratio_size(p1.x() - p0.x(), p1.y() - p0.y(), r)
+        avail_x = (w - ax) if sx > 0 else ax
+        avail_y = (h - ay) if sy > 0 else ay
+        scale = 1.0
+        if bw > avail_x and bw > 0:
+            scale = min(scale, avail_x / bw)
+        if bh > avail_y and bh > 0:
+            scale = min(scale, avail_y / bh)
+        bw *= scale
+        bh *= scale
+        if bw < 3 and bh < 3:
+            return
+        x1 = min(ax, ax + sx * bw)
+        y1 = min(ay, ay + sy * bh)
+        self._pending_crop_local = QRectF(x1, y1, bw, bh)
         self._pending_crop_angle = 0.0
 
     def _drag_move_box(self, drag, p):
@@ -2694,10 +2827,19 @@ class ImagePreview(QWidget):
         anchor = box0.center() + fwd.map(QPointF(-sx * hw0, -sy * hh0))
         d = unrot.map(p - anchor)  # dragged corner in box frame, rel. anchor
         min_sz = 10.0
-        dx = sx * max(sx * d.x(), min_sz)
-        dy = sy * max(sy * d.y(), min_sz)
+        r = self._active_effective_ratio()
+        adx, ady = abs(d.x()), abs(d.y())
+        if r is not None and r > 0:
+            # Hold the ratio (cover the pointer), then re-hold it after the
+            # min-size clamp so a tiny box stays the right shape.
+            adx, ady = crop_aspect.enforce_ratio_size(adx, ady, r)
+            adx, ady = max(adx, min_sz), max(ady, min_sz)
+            adx, ady = crop_aspect.enforce_ratio_size(adx, ady, r)
+        else:
+            adx, ady = max(adx, min_sz), max(ady, min_sz)
+        dx, dy = sx * adx, sy * ady
         c = anchor + fwd.map(QPointF(dx / 2.0, dy / 2.0))
-        bw, bh = abs(dx), abs(dy)
+        bw, bh = adx, ady
         self._pending_crop_local = QRectF(c.x() - bw / 2.0, c.y() - bh / 2.0, bw, bh)
 
     def _drag_edge(self, drag, p, which):
@@ -2722,6 +2864,18 @@ class ImagePreview(QWidget):
             bottom = max(d.y(), top + min_sz)
         elif which == "t":
             top = min(d.y(), bottom - min_sz)
+        r = self._active_effective_ratio()
+        if r is not None and r > 0:
+            # With a locked ratio an edge can't move alone: derive the
+            # perpendicular dimension symmetric about the box center.
+            if which in ("l", "r"):
+                bw = right - left
+                bh = max(bw / r, min_sz)
+                top, bottom = -bh / 2.0, bh / 2.0
+            else:
+                bh = bottom - top
+                bw = max(bh * r, min_sz)
+                left, right = -bw / 2.0, bw / 2.0
         c = c0 + fwd.map(QPointF((left + right) / 2.0, (top + bottom) / 2.0))
         bw, bh = right - left, bottom - top
         self._pending_crop_local = QRectF(c.x() - bw / 2.0, c.y() - bh / 2.0, bw, bh)
@@ -2852,11 +3006,19 @@ class ImagePreview(QWidget):
                         and new_crop[2] >= 0.999 and new_crop[3] >= 0.999):
                     new_crop = None
                 old_angle = getattr(img_obj, "crop_angle", 0.0) or 0.0
+                fold = self._crop_fold_fine and bool(
+                    getattr(img_obj, "fine_rotation_angle", 0))
                 if (not self._crops_equal(new_crop, img_obj.crop_rect, w, h)
-                        or abs(angle - old_angle) >= 0.05):
+                        or abs(angle - old_angle) >= 0.05 or fold):
                     img_obj.push_undo_state()
                     img_obj.crop_rect = new_crop
                     img_obj.crop_angle = 0.0 if new_crop is None else angle
+                    if fold:
+                        # The folded micro-rotation now lives in the crop angle
+                        # (the cropped result already reflects the un-fine-rotated
+                        # display). Clear it in the same undo snapshot so the two
+                        # rotations don't stack; Ctrl+Z restores both.
+                        img_obj.fine_rotation_angle = 0
                     applied = True
                     cleared = new_crop is None
             else:
@@ -2908,9 +3070,16 @@ class ImagePreview(QWidget):
         self.crop_mode = False
         self._pending_crop_local = None
         self._pending_crop_angle = 0.0
+        self._crop_fold_fine = False
+        self._crop_box_is_seed = False
         self._crop_drag = None
         self._remove_crop_overlay_items()
         self.view.setCursor(Qt.ArrowCursor)
+        # Single chokepoint for every crop exit (Done/Enter/Esc/right-click/
+        # image-switch/entering-dust) — restore the right-hand sliders panel.
+        mw = self.window()
+        if hasattr(mw, "on_crop_panel_closed"):
+            mw.on_crop_panel_closed()
 
     # ===== Area editing (local masked adjustment layers) ==================
     # Mirrors the crop tool: a scene-item overlay with constant-size handles,

@@ -441,9 +441,9 @@ class SlidersPanel(QWidget):
         # Crop: non-destructive crop of the preview/export (same gating).
         self.crop_btn = QPushButton("Crop")
         self.crop_btn.setToolTip(
-            "Crop the image. Drag to draw a box; drag the handles to resize, "
-            "the top knob to rotate, the center to move. Enter confirms, "
-            "Esc cancels, right-click clears the crop.")
+            "Crop the image. Opens the Crop panel: pick an aspect ratio "
+            "(or Free), straighten, and drag the box on the image. Enter "
+            "confirms, Esc cancels, right-click clears the crop.")
         # Slice: split one scan containing several photos into separate
         # images. Not conversion-gated — slicing is most useful BEFORE
         # converting, so each frame gets its own reference/conversion.
@@ -1374,16 +1374,17 @@ class SlidersPanel(QWidget):
     def _on_crop_clicked(self):
         if not (hasattr(self, 'image_preview') and self.image_preview):
             return
-        # Toggle: clicking Crop again leaves crop mode (without changing it)
-        if self.image_preview.crop_mode:
-            self.image_preview.cancel_crop_mode()
+        # Opening crop swaps the sliders panel for the dedicated Crop panel
+        # (aspect ratios + straighten); MainWindow owns that swap.
+        mw = self.window()
+        if mw is None or not hasattr(mw, "toggle_crop_panel"):
+            # Fallback (e.g. tests with a stub host): drive crop mode directly.
+            if self.image_preview.crop_mode:
+                self.image_preview.cancel_crop_mode()
+            else:
+                self.image_preview.enter_crop_mode()
             return
-        if self.image_preview.enter_crop_mode():
-            self.set_temporary_hint(
-                "<b>Crop:</b> Drag to draw a box; drag handles to resize, "
-                "top knob to rotate, center to move. <b>Enter</b> = confirm, "
-                "<b>Esc</b> = cancel, right-click = clear crop, "
-                "<b>Crop</b> again = exit.", duration=12000)
+        mw.toggle_crop_panel(not self.image_preview.crop_mode)
 
     def _on_slice_clicked(self):
         if not (hasattr(self, 'image_preview') and self.image_preview):
