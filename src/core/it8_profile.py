@@ -792,6 +792,16 @@ def fit_camera_matrix(samples: Dict[str, PatchSample], ref: IT8Reference, *,
     d = np.asarray(d_list)                  # (N,3) normalised raw device RGB (un-WB)
     X = np.asarray(x_list)                  # (N,3) reference XYZ, Y in [0,~1]
 
+    # Relative-colorimetric: map the chart's white patch to the PCS white (D50) by
+    # normalising the reference so the lightest neutral reads D50 (Y=1) — the
+    # ArgyllCMS "brightest patch -> media white" rule. The matrix already pins
+    # white->D50; scoring it against a <100%-reflectance reference white would
+    # inflate every ΔE by the white patch's reflectance deficit (~10%) and falsely
+    # flag a good fit as "Check placement".
+    white_Y = float(ref.xyz(chosen_wb)[1]) / 100.0
+    if white_Y > 1e-6:
+        X = X / white_Y
+
     # --- White-balance the device on the neutral (standard convention) --------
     # ICC matrix and DNG ForwardMatrix profiles operate on WHITE-BALANCED data,
     # so the fitted matrix consumes balanced device RGB. The multipliers are
@@ -820,10 +830,11 @@ def fit_camera_matrix(samples: Dict[str, PatchSample], ref: IT8Reference, *,
     white = np.where(np.abs(white) < 1e-9, 1e-9, white)
     M = np.diag(D50_XYZ / white) @ M         # M @ (1,1,1) == D50
 
-    # Quality: predicted Lab vs reference Lab for the used patches (balanced).
+    # Quality: predicted Lab vs the white-normalised reference Lab (same relative-
+    # colorimetric space the matrix maps into, so ΔE measures COLOUR error only).
     pred_xyz = (bN @ M.T) * 100.0
     pred_lab = xyz_to_lab(pred_xyz)
-    ref_lab = np.array([ref.lab(s) for s in used], dtype=np.float64)
+    ref_lab = xyz_to_lab(X * 100.0)
     de = delta_e_2000(ref_lab, pred_lab)
     order = np.argsort(-de)
     per_patch = [(used[i], float(de[i])) for i in order]
