@@ -337,12 +337,13 @@ class ThumbnailList(QWidget):
 
     def replace_with_current_profile(self, indices):
         """Re-grade the given image(s) under the current camera profile by
-        re-decoding + resetting them (drops their edits, like Reset). Bulk-safe."""
+        re-decoding them, KEEPING geometry (rotation, fine rotation, crop, slice)
+        and dropping only the stale colour grade — unlike Reset. Bulk-safe."""
         if not indices:
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            changed = ccr_backend.reset_images_by_indices(indices)
+            changed = ccr_backend.regrade_images_by_indices(indices)
         finally:
             QApplication.restoreOverrideCursor()
         if not changed:
@@ -460,6 +461,9 @@ class ThumbnailList(QWidget):
             return
         for idx in indices:
             self.update_thumbnail(idx)
+        # Reset re-decodes under the current profile, so the per-image grading
+        # signature now matches — clear any stale ⚠ mismatch flags.
+        self.refresh_profile_warnings()
         # Refresh the preview, sliders, and convert/unconvert state for the
         # currently selected image (the list itself is unchanged).
         current = self.thumbnail_list.currentItem()

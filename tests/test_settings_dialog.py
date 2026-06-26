@@ -384,3 +384,50 @@ class TestCameraProfileLibrary:
         d._profile_list.setCurrentRow(0)
         d._delete()
         assert d._mw.calls and d._mw.calls[-1][0] == "delete"
+
+
+class TestRegradeVsReset:
+    """Replace (regrade) keeps geometry; Reset drops it. Both re-stamp the
+    profile signature so the ⚠ mismatch clears."""
+
+    def _img(self, tmp_path):
+        from core.ccr_image import CCRImage
+        path = _scan_png(tmp_path)
+        img = CCRImage(path)
+        img.rotation_angle = 90
+        img.fine_rotation_angle = 150
+        img.crop_rect = (0.1, 0.1, 0.9, 0.9)
+        img.crop_angle = 2.0
+        img.horizontal_mirrored = True
+        img.source_ops = [(0, (0.0, 0.0, 0.5, 0.5))]      # a slice region
+        img.adjustment_settings = {"temperature": 12}
+        img.converted = True
+        img.profile_signature = "icc:Stale"               # graded under another profile
+        ccr_backend.images = [img]
+        ccr_backend.file_paths = [path]
+        return img
+
+    def test_regrade_keeps_geometry_drops_grade_and_restamps(self, tmp_path):
+        img = self._img(tmp_path)
+        assert ccr_backend.regrade_images_by_indices([0]) is True
+        # geometry KEPT
+        assert img.rotation_angle == 90
+        assert img.fine_rotation_angle == 150
+        assert img.crop_rect == (0.1, 0.1, 0.9, 0.9)
+        assert img.crop_angle == 2.0
+        assert img.horizontal_mirrored is True
+        assert img.source_ops == [(0, (0.0, 0.0, 0.5, 0.5))]
+        # colour grade DROPPED + signature re-stamped (no active profile -> 'none')
+        assert img.converted is False
+        assert img.adjustment_settings == {}
+        assert img.profile_signature == ccr_backend.active_profile_signature()
+
+    def test_reset_drops_geometry_too(self, tmp_path):
+        img = self._img(tmp_path)
+        assert ccr_backend.reset_images_by_indices([0]) is True
+        assert img.rotation_angle == 0
+        assert img.fine_rotation_angle == 0
+        assert img.crop_rect is None
+        assert img.horizontal_mirrored is False
+        assert img.source_ops == [(0, (0.0, 0.0, 0.5, 0.5))]   # slice still preserved
+        assert img.profile_signature == ccr_backend.active_profile_signature()

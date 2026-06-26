@@ -563,6 +563,35 @@ class CCRBackend:
             img.update_thumbnail_and_preview()
         return True
 
+    @staticmethod
+    def _clear_grade_state(image_obj) -> None:
+        """Clear only the COLOUR-grade state (conversion, adjustments, reference
+        frame, undo) for a re-grade. Geometry — rotation, fine rotation, crop,
+        flips, slice — and the colour profile are PRESERVED. Unlike
+        _clear_edit_state (Reset), the user's framing work survives."""
+        image_obj.converted = False
+        image_obj.adjustment_settings = {}
+        image_obj.reference_frame = None
+        image_obj.undo_stack = []
+
+    def regrade_images_by_indices(self, indices, progress_callback=None) -> bool:
+        """Re-decode each image under the CURRENT camera profile, KEEPING geometry
+        (rotation / fine rotation / crop / flips / slice) but dropping the now-stale
+        colour grade (conversion + adjustments). Backs 'Replace with current camera
+        profile' — distinct from Reset, which also drops the framing. Returns True
+        if at least one image was re-graded."""
+        idxs = [i for i in sorted(set(indices))
+                if i is not None and 0 <= i < len(self.images)]
+        if not idxs:
+            return False
+        imgs = [self.images[i] for i in idxs]
+        for img in imgs:
+            self._clear_grade_state(img)
+        self._reload_decode_parallel(imgs, progress_callback)   # re-decode + re-stamp signature
+        for img in imgs:
+            img.update_thumbnail_and_preview()
+        return True
+
     def convert_negative_by_index(self, idx: int):
         """
         Converts the negative image at the given index using CCR normalization with reference.
