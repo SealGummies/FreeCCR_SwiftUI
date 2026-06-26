@@ -892,16 +892,25 @@ def build_residual_clut(fit: CameraFit, samples: Dict[str, "PatchSample"],
     the LUT is NOT guaranteed strictly monotone — small reversals are the cost of
     the bias correction, and the 3x3 matrix mode remains the strictly-safe default.
     Indexed [R][G][B]."""
-    # The CLUT lives in WHITE-BALANCED device space (raw * as-shot WB), in [0,1],
-    # matching _apply_clut. The fit matrix consumes white-NORMALISED balanced data
-    # (neutral -> 1), so for balanced-[0,1] nodes the equivalent matrix is M / n1
-    # where n1 is the neutral's green level. The linear base stays exposure-robust;
-    # the residual is faded to zero outside the sampled hull, so off-scale inputs
-    # (different exposure) degrade gracefully to the safe linear matrix.
-    M = np.asarray(fit.matrix, dtype=np.float64)
+    # The CLUT lives in the SAME white-balanced device space the matrix path
+    # consumes (raw * as-shot WB, in [0,1]) and uses the SAME matrix M (fit.matrix)
+    # as its linear base, so the cLUT and the 3x3 AGREE (cLUT = matrix + a small
+    # colour residual) — apply must not produce a different brightness than the
+    # matrix. The chart is shot below white, so its balanced device values sit at
+    # ~n1 (the neutral's green level); the reference is scaled by n1 to the matrix's
+    # exposure so the residual is a pure colour correction, NOT a 1/n1 brightness
+    # blow-up. The residual fades to zero outside the sampled hull.
+    M = np.asarray(fit.matrix, dtype=np.float64)         # balanced device -> XYZ (matches apply)
     wb = np.asarray(fit.wb_mult, dtype=np.float64)[:3]
-    n1 = float(samples[fit.wb_id].rgb[1] / 65535.0) if fit.wb_id in samples else 1.0
-    M = M / max(n1, 1e-6)                                 # balanced-[0,1] device -> XYZ D50
+    # Anchor the reference's exposure on the white patch so the white neutral's
+    # residual is zero — the cLUT then matches the 3x3 EXACTLY on the neutral axis
+    # (corrects colour, not brightness); toggling matrix<->cLUT shifts nothing.
+    xw = ref.xyz(fit.wb_id)
+    if fit.wb_id in samples and xw is not None and float(xw[1]) > 1e-6:
+        di_w = np.clip(samples[fit.wb_id].rgb / 65535.0 * wb, 0.0, 1.0)
+        s = float((M @ di_w)[1]) / (float(xw[1]) / 100.0)
+    else:
+        s = 1.0
     d_list, r_list = [], []
     for sid in fit.used_ids:
         ps = samples.get(sid)
@@ -910,7 +919,7 @@ def build_residual_clut(fit: CameraFit, samples: Dict[str, "PatchSample"],
             continue
         di = np.clip(ps.rgb / 65535.0 * wb, 0.0, 1.0)    # white-balanced, clamped to grid
         d_list.append(di)
-        r_list.append(xyz / 100.0 - M @ di)              # residual in XYZ (Y=1)
+        r_list.append(s * xyz / 100.0 - M @ di)          # residual at the matrix's exposure scale
     d = np.asarray(d_list, dtype=np.float64)             # (N,3) balanced device
     r = np.asarray(r_list, dtype=np.float64)             # (N,3) XYZ residual
     n = len(d)
@@ -918,7 +927,7 @@ def build_residual_clut(fit: CameraFit, samples: Dict[str, "PatchSample"],
     ax = np.linspace(0.0, 1.0, grid)
     Rg, Gg, Bg = np.meshgrid(ax, ax, ax, indexing="ij")
     nodes = np.stack([Rg, Gg, Bg], axis=-1).reshape(-1, 3)
-    base = nodes @ M.T                                    # (G,3) pure-matrix prediction
+    base = nodes @ M.T                                    # M_f — same scale as the matrix path
 
     if n < 5:                                             # too few patches to bend safely
         return np.clip(base, 0.0, 2.0).reshape(grid, grid, grid, 3)

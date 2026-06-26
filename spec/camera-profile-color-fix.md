@@ -49,10 +49,15 @@ RawTherapee feeds its own white-balanced data → renders correctly.
 `ColorMatrix1 = inv(M · diag(wb))` (camera neutral `CM·D50 = 1/wb`, green-normalised
 raw neutral). `apply_dcp` green-normalises `as_shot_wb` before the WB diagonal.
 
-**cLUT** — built in balanced device space (`M/neutral_green` base, WB'd sample
-points); `_apply_clut` white-balances + clamps into the `[0,1]` grid. The linear base
-stays exposure-robust; the residual fades to zero outside the sampled hull, so
-off-scale inputs degrade to the safe matrix.
+**cLUT** — built in the SAME balanced device space the matrix path consumes, with the
+SAME base matrix `M` (so cLUT ≡ matrix + a small colour residual, at the SAME
+exposure). The residual reference is anchored on the white patch
+(`s = (M·di_white)_Y / (ref_white_Y)`) so the neutral residual is zero and toggling
+matrix↔cLUT shifts nothing. `_apply_clut` white-balances + clamps into the `[0,1]`
+grid. **Bug fixed:** an earlier base of `M/neutral_green` made the cLUT ~1/n1 (~6.6×)
+brighter than the matrix → blown highlights / lost colour in FreeCCR's own apply (it
+happened to look right in RawTherapee, which white-normalises its input). Regression
+test: `test_clut_brightness_tracks_matrix_not_blown`.
 
 ## 4. Validation
 

@@ -387,6 +387,24 @@ def test_clut_beats_matrix_on_nonaffine_camera():
     assert c_max <= m_max
 
 
+def test_clut_brightness_tracks_matrix_not_blown():
+    """Regression: the cLUT must reproduce at the SAME exposure as the 3x3 (cLUT
+    = matrix + small colour residual). A prior bug scaled the cLUT base by 1/n1
+    (~6.6x) -> blown highlights / lost colour. The neutral patch must come out at
+    matrix brightness, never multiples of it."""
+    samples, ref = _nonaffine_camera()
+    fit = it8.fit_camera_matrix(samples, ref)
+    mp = cm.InputProfile.from_bytes(it8.build_camera_icc(fit, 'm', mode='matrix'))
+    cp = cm.InputProfile.from_bytes(
+        it8.build_camera_icc(fit, 'c', mode='clut', grid=17, samples=samples, ref=ref))
+    # The lightest neutral (the fit's wb_id) — cLUT vs matrix output, balanced.
+    dev = np.clip(samples[fit.wb_id].rgb, 0, 65535).astype(np.uint16).reshape(1, 1, 3)
+    m_out = mp.apply(dev, as_shot_wb=fit.wb_mult)[0, 0].astype(np.float64)
+    c_out = cp.apply(dev, as_shot_wb=fit.wb_mult)[0, 0].astype(np.float64)
+    ratio = c_out / np.maximum(m_out, 1.0)
+    assert np.allclose(ratio, 1.0, atol=0.1), f"cLUT neutral not at matrix brightness: {ratio}"
+
+
 def test_build_camera_icc_clut_requires_samples():
     samples, ref = _nonaffine_camera()
     fit = it8.fit_camera_matrix(samples, ref)
