@@ -7,6 +7,9 @@ toggle that used to live in the File menu / thumbnail panel.
 UI only: it reuses MainWindow's existing colour handlers (file pickers, backend
 apply, re-decode) — settings apply immediately on click. See spec/settings-page.md.
 """
+import os
+
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QDialog, QGroupBox, QHBoxLayout, QLabel,
     QListWidget, QListWidgetItem, QPushButton, QScrollArea, QStackedWidget,
@@ -92,30 +95,32 @@ class SettingsDialog(QDialog):
         lay = QVBoxLayout(page)
         theme.apply_panel_spacing(lay, spacing=theme.GAP_SECTION)
 
-        # --- Input camera profile -------------------------------------- #
-        grp = QGroupBox("Input camera profile")
+        # --- Camera-profile library ------------------------------------ #
+        grp = QGroupBox("Camera profiles")
         g = QVBoxLayout(grp)
         g.setSpacing(theme.GAP_ROW)
         g.addWidget(self._muted(
-            "A single global camera profile applied to every scan at decode time, "
-            "before negative conversion. ICC and DCP are mutually exclusive."))
+            "Your imported and IT8-generated profiles, kept in FreeCCR's workspace "
+            "(they survive updates). Pick the active one from the “Camera profile” "
+            "dropdown above the thumbnails; manage which to keep here."))
 
         self._status = QLabel("Active: None")
         self._status.setStyleSheet(theme.section_header_qss())
         g.addWidget(self._status)
 
+        self._profile_list = QListWidget()
+        self._profile_list.setMinimumHeight(150)
+        g.addWidget(self._profile_list)
+
         row = QHBoxLayout()
         theme.apply_button_row(row)
-        btn_icc = QPushButton("Set ICC profile…")
-        btn_icc.clicked.connect(self._set_icc)
-        btn_dcp = QPushButton("Load DCP profile…")
-        btn_dcp.clicked.connect(self._set_dcp)
-        self._btn_clear = QPushButton("Clear")
-        theme.style_button(self._btn_clear, "danger")
-        self._btn_clear.clicked.connect(self._clear)
-        row.addWidget(btn_icc)
-        row.addWidget(btn_dcp)
-        row.addWidget(self._btn_clear)
+        btn_import = QPushButton("Import profile…")
+        btn_import.clicked.connect(self._import)
+        self._btn_delete = QPushButton("Delete")
+        theme.style_button(self._btn_delete, "danger")
+        self._btn_delete.clicked.connect(self._delete)
+        row.addWidget(btn_import)
+        row.addWidget(self._btn_delete)
         row.addStretch(1)
         g.addLayout(row)
 
@@ -128,15 +133,8 @@ class SettingsDialog(QDialog):
         it8_row.addStretch(1)
         g.addLayout(it8_row)
         g.addWidget(self._muted(
-            "Build a camera ICC or DCP from a photographed IT8 calibration chart."))
-        g.addWidget(theme.section_separator())
-        self._cb_disable = QCheckBox("Disable camera profile (don't apply the ICC/DCP)")
-        self._cb_disable.setToolTip(
-            "Temporarily ignore the active camera profile at decode without "
-            "clearing it. Remembered across sessions. Already-graded images are "
-            "flagged for re-grading rather than re-decoded.")
-        self._cb_disable.toggled.connect(self._on_disable)
-        g.addWidget(self._cb_disable)
+            "Build a camera ICC or DCP from a photographed IT8 calibration chart; "
+            "it is added to the library above."))
         lay.addWidget(grp)
 
         # --- Negative conversion --------------------------------------- #
@@ -159,19 +157,15 @@ class SettingsDialog(QDialog):
     # Actions — delegate to MainWindow (file pickers, backend, re-decode);
     # everything applies immediately, then the page refreshes its status.
     # ------------------------------------------------------------------ #
-    def _set_icc(self):
-        self._mw.set_input_icc_profile()
+    def _import(self):
+        self._mw.import_camera_profile_dialog()
         self.refresh_color_management()
 
-    def _set_dcp(self):
-        self._mw.set_input_dcp_profile()
-        self.refresh_color_management()
-
-    def _clear(self):
-        if color_management.get_active_dcp_profile() is not None:
-            self._mw.clear_input_dcp_profile()
-        elif color_management.get_active_input_profile() is not None:
-            self._mw.clear_input_icc_profile()
+    def _delete(self):
+        item = self._profile_list.currentItem()
+        if item is None:
+            return
+        self._mw.delete_camera_profile(item.data(Qt.UserRole))
         self.refresh_color_management()
 
     def _create_it8(self):
@@ -183,27 +177,29 @@ class SettingsDialog(QDialog):
             return                                   # programmatic sync, not a user toggle
         self._mw.on_positive_mode_toggled(bool(checked))
 
-    def _on_disable(self, checked: bool):
-        if bool(checked) == bool(color_management.input_profile_disabled()):
-            return
-        self._mw.set_camera_profile_disabled(bool(checked))
-        self.refresh_color_management()
-
     def refresh_color_management(self):
-        """Reflect the live active profile + positive-mode state on the page."""
+        """Reflect the live active profile, the library list, and Positive mode."""
         icc = getattr(ccr_backend, "input_icc_name", None)
         dcp = getattr(ccr_backend, "input_dcp_name", None)
         if dcp:
-            self._status.setText(f"Active: DCP — {dcp}")
+            self._status.setText(f"Active: {dcp}  (DCP)")
         elif icc:
-            self._status.setText(f"Active: ICC — {icc}")
+            self._status.setText(f"Active: {icc}  (ICC)")
         else:
             self._status.setText("Active: None")
-        self._btn_clear.setEnabled(bool(icc or dcp))
-        self._cb_disable.blockSignals(True)
-        self._cb_disable.setChecked(color_management.input_profile_disabled())
-        self._cb_disable.setEnabled(bool(icc or dcp))
-        self._cb_disable.blockSignals(False)
+
+        active = getattr(ccr_backend, "active_profile_path", None)
+        active_n = os.path.normcase(os.path.abspath(active)) if active else None
+        self._profile_list.clear()
+        for p in ccr_backend.list_camera_profiles():
+            label = f"{p['name']}  ({p['kind'].upper()})"
+            if active_n and os.path.normcase(os.path.abspath(p["path"])) == active_n:
+                label += "   ● active"
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, p["path"])
+            self._profile_list.addItem(it)
+        self._btn_delete.setEnabled(self._profile_list.count() > 0)
+
         self._cb_positive.blockSignals(True)
         self._cb_positive.setChecked(bool(ccr_backend.positive_mode))
         self._cb_positive.blockSignals(False)

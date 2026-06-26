@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QListWidget, QListWidgetItem, QLabel, QDialog, QApplication, QPushButton, QMenu, QCheckBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QListWidget, QListWidgetItem, QLabel, QDialog, QApplication, QPushButton, QMenu, QCheckBox, QComboBox
 from PySide6.QtGui import QPixmap, QIcon, QTransform, QPainter
 from PySide6.QtCore import Qt, QSize, QTimer
 import os
@@ -89,9 +89,48 @@ class ThumbnailList(QWidget):
         self.positive_mode_checkbox.setChecked(bool(checked))
         self.positive_mode_checkbox.blockSignals(False)
 
+    def refresh_profile_combo(self):
+        """Repopulate the camera-profile picker from the library and reflect the
+        active selection (called on startup and after import/delete/generate)."""
+        if not hasattr(self, "profile_combo"):
+            return
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItem("None", None)
+        active = getattr(ccr_backend, "active_profile_path", None)
+        active_n = os.path.normcase(os.path.abspath(active)) if active else None
+        sel = 0
+        for i, p in enumerate(ccr_backend.list_camera_profiles(), start=1):
+            self.profile_combo.addItem(f"{p['name']}  ({p['kind'].upper()})", p["path"])
+            if active_n and os.path.normcase(os.path.abspath(p["path"])) == active_n:
+                sel = i
+        self.profile_combo.setCurrentIndex(sel)
+        self.profile_combo.blockSignals(False)
+
+    def _on_profile_combo_changed(self, _idx):
+        """User picked a profile (or None) — forward to the MainWindow, which
+        owns activation + persistence + the thumbnail mismatch refresh."""
+        mw = self._main_window()
+        if hasattr(mw, "set_active_profile_path"):
+            mw.set_active_profile_path(self.profile_combo.currentData())
+
     def init_ui(self):
         self.layout = QVBoxLayout()
         theme.apply_panel_spacing(self.layout)
+
+        # Camera-profile picker — choose which imported / IT8-generated profile
+        # (kept in FreeCCR's library) is applied at decode, or None. Manage the
+        # library in Settings ▸ Color Management. See spec/camera-profile-library.md.
+        self.profile_combo = QComboBox()
+        self.profile_combo.setToolTip(
+            "Camera input profile applied at decode, from your imported / "
+            "IT8-generated library. 'None' applies no profile. Add and manage "
+            "profiles in Settings ▸ Color Management.")
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_combo_changed)
+        _plabel = QLabel("Camera profile:")
+        _plabel.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        self.layout.addWidget(_plabel)
+        self.layout.addWidget(self.profile_combo)
 
         # Positive mode toggle — sits above the thumbnails. When checked, RAWs
         # decode as normal sRGB positives and the film-negative tools are

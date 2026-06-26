@@ -261,19 +261,13 @@ class _StubMW(QWidget):
         super().__init__()
         self.calls = []
 
-    def set_input_icc_profile(self): self.calls.append("set_icc")
-    def set_input_dcp_profile(self): self.calls.append("set_dcp")
-    def clear_input_icc_profile(self): self.calls.append("clear_icc")
-    def clear_input_dcp_profile(self): self.calls.append("clear_dcp")
+    def import_camera_profile_dialog(self): self.calls.append("import")
+    def delete_camera_profile(self, path): self.calls.append(("delete", path))
     def create_camera_profile_from_it8(self): self.calls.append("it8")
 
     def on_positive_mode_toggled(self, c):
         self.calls.append(("positive", bool(c)))
         ccr_backend.positive_mode = bool(c)
-
-    def set_camera_profile_disabled(self, d):
-        self.calls.append(("disable", bool(d)))
-        cm.set_input_profile_disabled(bool(d))
 
 
 def _dialog():
@@ -287,16 +281,19 @@ class TestSettingsDialog:
         names = [d._sidebar.item(i).text() for i in range(d._sidebar.count())]
         assert names == ["Color Management"]
 
+    def test_no_disable_checkbox(self):
+        # The disable checkbox is gone — "None" in the picker replaces it.
+        d = _dialog()
+        assert not hasattr(d, "_cb_disable")
+
     def test_status_reflects_active_profile(self):
         ccr_backend.input_icc_name = None
         ccr_backend.input_dcp_name = None
         d = _dialog()
         assert d._status.text() == "Active: None"
-        assert d._btn_clear.isEnabled() is False
         ccr_backend.input_icc_name = "MyCam.icc"
         d.refresh_color_management()
         assert "ICC" in d._status.text() and "MyCam.icc" in d._status.text()
-        assert d._btn_clear.isEnabled() is True
         ccr_backend.input_icc_name = None
         ccr_backend.input_dcp_name = "Nikon.dcp"
         d.refresh_color_management()
@@ -305,21 +302,85 @@ class TestSettingsDialog:
 
     def test_buttons_delegate_to_main_window(self):
         d = _dialog()
-        d._set_icc(); d._set_dcp(); d._create_it8()
-        assert d._mw.calls == ["set_icc", "set_dcp", "it8"]
-
-    def test_disable_checkbox_toggles_backend(self):
-        ccr_backend.input_icc_name = "MyCam.icc"
-        cm.set_active_input_profile(_StubICC())
-        d = _dialog()
-        assert d._cb_disable.isChecked() is False
-        d._cb_disable.setChecked(True)
-        assert ("disable", True) in d._mw.calls
-        assert cm.input_profile_disabled() is True
-        ccr_backend.input_icc_name = None
+        d._import(); d._create_it8()
+        assert d._mw.calls == ["import", "it8"]
 
     def test_positive_checkbox_toggles_backend(self):
         d = _dialog()
         d._cb_positive.setChecked(True)
         assert ("positive", True) in d._mw.calls
-        assert ccr_backend.positive_mode is True
+
+
+class TestCameraProfileLibrary:
+    """The persistent profile library: import / list / activate / delete + the
+    thumbnail picker and the Settings management list."""
+
+    def _make(self, name):
+        return cm.build_matrix_shaper_icc(
+            name, (0.6, 0.3, 0.0), (0.2, 0.7, 0.06), (0.0, 0.06, 0.8),
+            (1.0, 1.0, 0.0, 1.0, 0.0))
+
+    @pytest.fixture
+    def lib(self, tmp_path, monkeypatch):
+        from core import catalog
+        monkeypatch.setattr(catalog, "default_catalog_path",
+                            lambda: str(tmp_path / "catalog.json"))
+        d = ccr_backend.camera_profiles_dir()
+        for nm in ("Alpha", "Beta"):
+            with open(os.path.join(d, nm + ".icc"), "wb") as f:
+                f.write(self._make(nm))
+        yield d
+        ccr_backend.set_active_profile(None)
+
+    def test_list_sorted_with_kind(self, lib):
+        ps = ccr_backend.list_camera_profiles()
+        assert [p["name"] for p in ps] == ["Alpha", "Beta"]
+        assert all(p["kind"] == "icc" for p in ps)
+
+    def test_activate_and_clear_without_copy_or_delete(self, lib):
+        path = os.path.join(lib, "Beta.icc")
+        assert ccr_backend.set_active_profile(path) is not None
+        assert ccr_backend.active_profile_path == path
+        assert os.path.exists(path)                          # not moved/deleted
+        assert ccr_backend.set_active_profile(None) is None
+        assert ccr_backend.active_profile_path is None
+        assert os.path.exists(path)
+
+    def test_import_validates_and_dedupes(self, lib, tmp_path):
+        src = tmp_path / "ext.icc"
+        src.write_bytes(self._make("Ext"))
+        p1 = ccr_backend.import_camera_profile(str(src))
+        p2 = ccr_backend.import_camera_profile(str(src))     # same name -> de-duped
+        assert os.path.exists(p1) and os.path.exists(p2)
+        assert os.path.basename(p1) != os.path.basename(p2)
+        bad = tmp_path / "bad.icc"
+        bad.write_bytes(b"not a profile")
+        with pytest.raises(Exception):
+            ccr_backend.import_camera_profile(str(bad))
+
+    def test_delete_removes_and_deactivates_active(self, lib):
+        path = os.path.join(lib, "Alpha.icc")
+        ccr_backend.set_active_profile(path)
+        assert ccr_backend.delete_camera_profile(path) is True
+        assert not os.path.exists(path)
+        assert ccr_backend.active_profile_path is None        # deactivated
+        assert [p["name"] for p in ccr_backend.list_camera_profiles()] == ["Beta"]
+
+    def test_thumbnail_picker_lists_and_reflects_active(self, lib):
+        from widgets.thumbnail_list import ThumbnailList
+        ccr_backend.set_active_profile(os.path.join(lib, "Beta.icc"))
+        tl = ThumbnailList(lambda i: None)
+        tl.refresh_profile_combo()
+        items = [tl.profile_combo.itemText(i) for i in range(tl.profile_combo.count())]
+        assert items[0] == "None"
+        assert any("Alpha" in t for t in items) and any("Beta" in t for t in items)
+        assert "Beta" in tl.profile_combo.currentText()
+
+    def test_dialog_list_marks_active_and_delete_delegates(self, lib):
+        ccr_backend.set_active_profile(os.path.join(lib, "Beta.icc"))
+        d = _dialog()
+        labels = [d._profile_list.item(i).text() for i in range(d._profile_list.count())]
+        assert any("Beta" in t and "active" in t for t in labels)
+        d._profile_list.setCurrentRow(0)
+        d._delete()
+        assert d._mw.calls and d._mw.calls[-1][0] == "delete"

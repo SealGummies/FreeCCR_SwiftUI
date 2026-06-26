@@ -48,6 +48,10 @@ class CCRBackend:
         # Active DCP (DNG camera profile) — mutually exclusive with the input ICC.
         self.input_dcp_path: Optional[str] = None
         self.input_dcp_name: Optional[str] = None
+        # The active profile's path within the camera-profile library (or None).
+        # The library (camera_profiles/) keeps every imported/generated profile;
+        # the active one is just a selection, not a copy. See spec/camera-profile-library.md.
+        self.active_profile_path: Optional[str] = None
         # Catalog entries of ACTUAL images removed from the list this
         # session: {file_path: {"signature": sig, "entries": {name: state}}}.
         # Removal must not lose their stored edits, so saves merge these
@@ -605,6 +609,97 @@ class CCRBackend:
                 return hashlib.md5(f.read()).hexdigest()[:12]
         except OSError:
             return None
+
+    # --- Camera-profile library (persistent in the app-data workspace) --------
+    def camera_profiles_dir(self) -> str:
+        """The library folder under %APPDATA%/FreeCCR that keeps every imported
+        and IT8-generated camera profile (survives app updates/reinstalls — it is
+        outside the install dir)."""
+        from core.catalog import default_catalog_path
+        d = os.path.join(os.path.dirname(default_catalog_path()), "camera_profiles")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def list_camera_profiles(self) -> list:
+        """All profiles in the library: [{name, path, kind('icc'|'dcp')}], by name."""
+        import glob
+        out = []
+        for ext, kind in ((".icc", "icc"), (".icm", "icc"), (".dcp", "dcp")):
+            for p in glob.glob(os.path.join(self.camera_profiles_dir(), "*" + ext)):
+                out.append({"name": os.path.splitext(os.path.basename(p))[0],
+                            "path": p, "kind": kind})
+        return sorted(out, key=lambda x: x["name"].lower())
+
+    def import_camera_profile(self, src_path: str) -> str:
+        """Validate then copy an external .icc/.icm/.dcp into the library, keeping
+        it for re-selection. Returns the new library path. Raises (UnsupportedICCError
+        / DcpError / ValueError) on an unparseable or unsupported file."""
+        import shutil
+        ext = os.path.splitext(src_path)[1].lower()
+        if ext == ".dcp":
+            from core import dcp_profile
+            dcp_profile.parse_dcp(src_path)                  # validate
+        elif ext in (".icc", ".icm"):
+            from core import color_management
+            color_management.load_input_profile(src_path)    # validate
+        else:
+            raise ValueError(f"Unsupported profile type: {ext}")
+        base, e = os.path.splitext(os.path.basename(src_path))
+        dst = os.path.join(self.camera_profiles_dir(), base + e)
+        n = 1
+        srcn = os.path.normcase(os.path.abspath(src_path))
+        while os.path.exists(dst) and os.path.normcase(os.path.abspath(dst)) != srcn:
+            dst = os.path.join(self.camera_profiles_dir(), f"{base} ({n}){e}")
+            n += 1
+        if os.path.normcase(os.path.abspath(dst)) != srcn:
+            shutil.copyfile(src_path, dst)
+        return dst
+
+    def set_active_profile(self, path: Optional[str]) -> Optional[str]:
+        """Activate the library profile at `path` (.icc/.icm/.dcp), or None to use
+        no profile. Never copies or deletes — the library file is the source.
+        Returns the profile's display name, or None. Raises on a bad file."""
+        from core import color_management
+        if not path:
+            color_management.set_active_input_profile(None)
+            color_management.set_active_dcp_profile(None)
+            self.input_icc_path = self.input_icc_name = None
+            self.input_dcp_path = self.input_dcp_name = None
+            self.active_profile_path = None
+            return None
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".dcp":
+            from core import dcp_profile
+            prof = dcp_profile.parse_dcp(path)
+            prof.content_id = self._profile_content_id(path)
+            color_management.set_active_dcp_profile(prof)
+            color_management.set_active_input_profile(None)
+            self.input_dcp_path = path
+            self.input_dcp_name = prof.name or os.path.basename(path)
+            self.input_icc_path = self.input_icc_name = None
+            name = self.input_dcp_name
+        else:
+            prof = color_management.load_input_profile(path)
+            prof.content_id = self._profile_content_id(path)
+            color_management.set_active_input_profile(prof)
+            color_management.set_active_dcp_profile(None)
+            self.input_icc_path = path
+            self.input_icc_name = prof.description or os.path.basename(path)
+            self.input_dcp_path = self.input_dcp_name = None
+            name = self.input_icc_name
+        self.active_profile_path = path
+        return name
+
+    def delete_camera_profile(self, path: str) -> bool:
+        """Remove a profile file from the library. Deactivates it first if active."""
+        if (self.active_profile_path and os.path.normcase(os.path.abspath(path))
+                == os.path.normcase(os.path.abspath(self.active_profile_path))):
+            self.set_active_profile(None)
+        try:
+            os.remove(path)
+            return True
+        except OSError:
+            return False
 
     # --- Global input ICC profile -----------------------------------------
     def _input_icc_storage_path(self) -> str:

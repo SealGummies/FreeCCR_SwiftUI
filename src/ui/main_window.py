@@ -188,22 +188,22 @@ class MainWindow(QMainWindow):
         self.installEventFilter(self)
         self.create_menu()
 
-        # Restore a previously-chosen global input ICC profile (applied to every
+        # Restore the active camera profile from the library (applied to every
         # decode). Done before any images load so the first batch picks it up.
-        saved_icc = self._settings.value("import/input_icc_path", "", type=str)
-        saved_dcp = self._settings.value("import/input_dcp_path", "", type=str)
-        if saved_icc and os.path.exists(saved_icc):
-            if ccr_backend.load_input_icc_from_storage(saved_icc) is None:
-                self._settings.remove("import/input_icc_path")
-            self._refresh_profile_ui()
-        elif saved_dcp and os.path.exists(saved_dcp):
-            if ccr_backend.load_input_dcp_from_storage(saved_dcp) is None:
-                self._settings.remove("import/input_dcp_path")
-            self._refresh_profile_ui()
-        # Restore the persistent "disable camera profile" toggle.
-        from core import color_management as _cm
-        _cm.set_input_profile_disabled(
-            self._settings.value("import/input_profile_disabled", False, type=bool))
+        # Falls back to the legacy single-copy keys for users upgrading.
+        saved = self._settings.value("import/active_profile_path", "", type=str)
+        if not (saved and os.path.exists(saved)):
+            legacy = (self._settings.value("import/input_icc_path", "", type=str)
+                      or self._settings.value("import/input_dcp_path", "", type=str))
+            saved = legacy if (legacy and os.path.exists(legacy)) else ""
+        if saved:
+            try:
+                ccr_backend.set_active_profile(saved)
+                self._settings.setValue("import/active_profile_path", saved)
+            except Exception:
+                self._settings.remove("import/active_profile_path")
+        self.thumbnail_list.refresh_profile_combo()
+        self._refresh_profile_ui()
 
         # Ctrl+Z (Cmd+Z on macOS): undo the last action on the current image;
         # repeated presses walk further back through the undo stack.
@@ -397,98 +397,73 @@ class MainWindow(QMainWindow):
         under a different profile, so the user can re-grade them on demand."""
         self.thumbnail_list.refresh_profile_warnings()
 
-    def set_camera_profile_disabled(self, disabled: bool):
-        """Temporarily disable applying the active camera profile (persisted).
-        Like a profile change, it re-flags mismatches rather than re-decoding."""
-        from core import color_management
-        color_management.set_input_profile_disabled(bool(disabled))
-        self._settings.setValue("import/input_profile_disabled", bool(disabled))
+    def _refresh_profile_combo(self):
+        """Repopulate the thumbnail-panel picker (after import / delete / generate /
+        select) so it reflects the library and the active selection."""
+        self.thumbnail_list.refresh_profile_combo()
+
+    def set_active_profile_path(self, path):
+        """Select the active camera profile from the library (a library path), or
+        None for no profile. Persisted; re-flags thumbnail mismatches (no re-decode)
+        and refreshes the picker + dialog. Replaces the old set/disable handlers."""
+        from core.color_management import UnsupportedICCError
+        try:
+            name = ccr_backend.set_active_profile(path)
+        except (UnsupportedICCError, Exception) as e:
+            QMessageBox.warning(self, "Camera profile",
+                                f"Could not activate the profile:\n\n{e}")
+            self._refresh_profile_combo()
+            return False
+        if path:
+            self._settings.setValue("import/active_profile_path", path)
+        else:
+            self._settings.remove("import/active_profile_path")
+        self._refresh_profile_combo()
         self._refresh_profile_mismatch()
         self._refresh_profile_ui()
+        self.sliders_panel.set_temporary_hint(
+            f"Camera profile: {name}" if name else "Camera profile: None",
+            duration=3000)
+        return True
 
-    def set_input_icc_profile(self):
+    def import_camera_profile_dialog(self):
+        """Pick an external .icc/.icm/.dcp, copy it into FreeCCR's library (so it is
+        kept for re-selection), and activate it."""
         start_dir = self._settings.value("import/last_icc_dir", "", type=str)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Input ICC Profile", start_dir,
-            "ICC Profiles (*.icc *.icm);;All Files (*)")
+            self, "Import camera profile", start_dir,
+            "Camera profiles (*.icc *.icm *.dcp);;All Files (*)")
         if not path:
             return
         self._settings.setValue("import/last_icc_dir", os.path.dirname(path))
-        self._apply_input_icc_path(path)
-
-    def _apply_input_icc_path(self, path: str) -> bool:
-        """Activate `path` as the global input ICC profile (parse, persist,
-        reprocess). Returns True on success. Shared by the file picker and the
-        IT8 camera-profile wizard's 'apply now'."""
-        from core.color_management import UnsupportedICCError
         try:
-            name = ccr_backend.set_input_icc(path)
-        except UnsupportedICCError as e:
-            QMessageBox.warning(
-                self, "Unsupported ICC Profile",
-                f"This profile can't be used as an input profile:\n\n{e}\n\n"
-                "Only RGB matrix-shaper and cLUT (A2B) profiles are supported "
-                "(CMYK and output/B2A-only profiles are not).")
-            return False
+            lib = ccr_backend.import_camera_profile(path)
         except Exception as e:
-            QMessageBox.warning(self, "Input ICC Profile Error",
-                                f"Could not load the ICC profile:\n\n{e}")
-            return False
-        self._settings.setValue("import/input_icc_path", ccr_backend.input_icc_path)
-        self._settings.remove("import/input_dcp_path")   # ICC cleared the DCP
-        self._refresh_profile_ui()
-        self._refresh_profile_mismatch()
-        self.sliders_panel.set_temporary_hint(
-            f"Input ICC profile set: {name}", duration=3000)
-        return True
-
-    def set_input_dcp_profile(self):
-        start_dir = self._settings.value("import/last_dcp_dir", "", type=str)
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select DCP Profile", start_dir,
-            "DNG Camera Profiles (*.dcp);;All Files (*)")
-        if not path:
+            QMessageBox.warning(self, "Import camera profile",
+                                f"This file can't be used as a camera profile:\n\n{e}")
             return
-        self._settings.setValue("import/last_dcp_dir", os.path.dirname(path))
-        self._apply_input_dcp_path(path)
+        self.set_active_profile_path(lib)
 
-    def _apply_input_dcp_path(self, path: str) -> bool:
-        """Activate `path` as the global DCP (parse, persist, reprocess). Clears
-        any active ICC. Shared by the picker and the IT8 wizard's 'apply now'."""
-        from core.dcp_profile import DcpError
-        try:
-            name = ccr_backend.set_input_dcp(path)
-        except DcpError as e:
-            QMessageBox.warning(self, "DCP Profile",
-                                f"This .dcp can't be used:\n\n{e}")
-            return False
-        except Exception as e:
-            QMessageBox.warning(self, "DCP Profile Error",
-                                f"Could not load the DCP profile:\n\n{e}")
-            return False
-        self._settings.setValue("import/input_dcp_path", ccr_backend.input_dcp_path)
-        self._settings.remove("import/input_icc_path")   # DCP cleared the ICC
-        self._refresh_profile_ui()
+    def delete_camera_profile(self, path):
+        """Remove a profile from the library (with confirmation). Deactivates it
+        first if it is the active one."""
+        name = os.path.splitext(os.path.basename(path))[0]
+        if QMessageBox.question(
+                self, "Delete camera profile",
+                f"Remove “{name}” from your camera-profile library?\n"
+                "The file is deleted from FreeCCR's workspace.") != QMessageBox.Yes:
+            return
+        was_active = (path == self._settings.value("import/active_profile_path", "", type=str))
+        ccr_backend.delete_camera_profile(path)
+        if was_active:
+            self._settings.remove("import/active_profile_path")
+        self._refresh_profile_combo()
         self._refresh_profile_mismatch()
-        msg = f"DCP profile set: {name}"
-        _raw = (".cr3", ".cr2", ".nef", ".arw", ".dng", ".rw2", ".orf",
-                ".raf", ".srw", ".pef", ".3fr")
-        if any(not (getattr(im, "file_path", "") or "").lower().endswith(_raw)
-               for im in ccr_backend.images):
-            msg += " — note: a DCP applies to RAW only; non-RAW files will be colour-shifted"
-        self.sliders_panel.set_temporary_hint(msg, duration=5000)
-        return True
-
-    def clear_input_dcp_profile(self):
-        ccr_backend.clear_input_dcp()
-        self._settings.remove("import/input_dcp_path")
-        self._clear_profile_disabled()
         self._refresh_profile_ui()
-        self._refresh_profile_mismatch()
-        self.sliders_panel.set_temporary_hint("DCP profile cleared.", duration=3000)
 
     def create_camera_profile_from_it8(self):
-        """Open the IT8 wizard; on success optionally activate the new profile."""
+        """Open the IT8 wizard; on success add the new profile to the library and
+        optionally make it the active profile."""
         from widgets.it8_profile_dialog import IT8ProfileDialog
         current_path = None
         idx = self.image_preview.current_idx
@@ -500,32 +475,21 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted or not dlg.saved_path:
             return
         base = os.path.basename(dlg.saved_path)
-        is_dcp = dlg.saved_path.lower().endswith(".dcp")
-        applied = dlg.apply_now and (
-            self._apply_input_dcp_path(dlg.saved_path) if is_dcp
-            else self._apply_input_icc_path(dlg.saved_path))
-        if applied:
+        # Ensure the freshly-saved profile is in the library (the wizard saves there
+        # by default; a custom save location is copied in), then refresh the picker.
+        lib = dlg.saved_path
+        try:
+            lib = ccr_backend.import_camera_profile(dlg.saved_path)
+        except Exception:
+            pass
+        self._refresh_profile_combo()
+        self._refresh_profile_ui()
+        if dlg.apply_now and self.set_active_profile_path(lib):
             self.sliders_panel.set_temporary_hint(
                 f"Camera profile saved and applied: {base}", duration=4000)
         else:
             self.sliders_panel.set_temporary_hint(
                 f"Camera profile saved: {base}", duration=4000)
-
-    def clear_input_icc_profile(self):
-        ccr_backend.clear_input_icc()
-        self._settings.remove("import/input_icc_path")
-        self._clear_profile_disabled()
-        self._refresh_profile_ui()
-        self._refresh_profile_mismatch()
-        self.sliders_panel.set_temporary_hint("Input ICC profile cleared.", duration=3000)
-
-    def _clear_profile_disabled(self):
-        """Reset the persistent 'disable camera profile' flag — there is no
-        profile left to disable, so it must not silently re-arm when a future
-        profile is set."""
-        from core import color_management
-        color_management.set_input_profile_disabled(False)
-        self._settings.setValue("import/input_profile_disabled", False)
 
     # --- Positive mode (global, persistent) -------------------------------
     def on_positive_mode_toggled(self, checked: bool):
