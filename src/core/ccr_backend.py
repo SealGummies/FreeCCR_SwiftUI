@@ -563,32 +563,50 @@ class CCRBackend:
             img.update_thumbnail_and_preview()
         return True
 
-    @staticmethod
-    def _clear_grade_state(image_obj) -> None:
-        """Clear only the COLOUR-grade state (conversion, adjustments, reference
-        frame, undo) for a re-grade. Geometry — rotation, fine rotation, crop,
-        flips, slice — and the colour profile are PRESERVED. Unlike
-        _clear_edit_state (Reset), the user's framing work survives."""
-        image_obj.converted = False
-        image_obj.adjustment_settings = {}
-        image_obj.reference_frame = None
-        image_obj.undo_stack = []
+    def _reconvert_in_place(self, image_obj) -> None:
+        """Replay the stored negative conversion (bwpoint / reference / ref_params)
+        on the freshly re-decoded resized_raw, in place — so a profile re-grade
+        keeps the conversion. No-op if there is no recipe to replay."""
+        ci = getattr(image_obj, "conversion_inputs", None)
+        wm = not self.software_activated
+        try:
+            if ci is not None and ci.get("mode") == "bw":
+                black_point, white_point = ci["bw"]
+                processed = ccr_normalize_with_bwpoint(
+                    image_obj, black_point, white_point, water_mark=wm)
+            elif ci is not None and ci.get("mode") == "ref_params":
+                processed = ccr_normalize_with_refparams(
+                    image_obj, ci["p_lo"], ci["p_hi"], ci["od"], water_mark=wm)
+            elif image_obj.reference_frame is not None:
+                processed = ccr_normalize_with_reference(image_obj, water_mark=wm)
+            else:
+                return
+            if processed is not None:
+                image_obj.resized_raw = processed
+                image_obj.converted = True
+        except Exception as e:
+            print(f"Re-convert failed for {getattr(image_obj, 'file_path', '?')}: {e}")
 
     def regrade_images_by_indices(self, indices, progress_callback=None) -> bool:
-        """Re-decode each image under the CURRENT camera profile, KEEPING geometry
-        (rotation / fine rotation / crop / flips / slice) but dropping the now-stale
-        colour grade (conversion + adjustments). Backs 'Replace with current camera
-        profile' — distinct from Reset, which also drops the framing. Returns True
-        if at least one image was re-graded."""
+        """Re-decode each image under the CURRENT camera profile, KEEPING all of the
+        user's work — the negative conversion (bwpoint / reference), colour
+        adjustments, crop, flips, rotation and slice. Only the camera-profile decode
+        changes; the conversion is replayed on the new decode. Backs 'Replace with
+        current camera profile' (distinct from Reset, which drops everything).
+        Returns True if at least one image was re-graded."""
         idxs = [i for i in sorted(set(indices))
                 if i is not None and 0 <= i < len(self.images)]
         if not idxs:
             return False
         imgs = [self.images[i] for i in idxs]
-        for img in imgs:
-            self._clear_grade_state(img)
-        self._reload_decode_parallel(imgs, progress_callback)   # re-decode + re-stamp signature
-        for img in imgs:
+        # The re-decode clears conversion_inputs + base offsets — snapshot the
+        # recipe + converted flag so they can be restored and replayed after.
+        saved = [(img.conversion_inputs, img.converted) for img in imgs]
+        self._reload_decode_parallel(imgs, progress_callback)   # re-decode base + re-stamp signature
+        for img, (ci, was_converted) in zip(imgs, saved):
+            img.conversion_inputs = ci
+            if was_converted:
+                self._reconvert_in_place(img)
             img.update_thumbnail_and_preview()
         return True
 

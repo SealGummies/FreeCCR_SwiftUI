@@ -342,8 +342,9 @@ class ThumbnailList(QWidget):
 
     def replace_with_current_profile(self, indices):
         """Re-grade the given image(s) under the current camera profile by
-        re-decoding them, KEEPING geometry (rotation, fine rotation, crop, slice)
-        and dropping only the stale colour grade — unlike Reset. Bulk-safe."""
+        re-decoding them and replaying the conversion — KEEPING everything (the
+        negative conversion / bwpoint, adjustments, crop, flips, rotation, slice).
+        Only the camera-profile decode changes, unlike Reset. Bulk-safe."""
         if not indices:
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)

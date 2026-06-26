@@ -391,8 +391,9 @@ class TestCameraProfileLibrary:
 
 
 class TestRegradeVsReset:
-    """Replace (regrade) keeps geometry; Reset drops it. Both re-stamp the
-    profile signature so the ⚠ mismatch clears."""
+    """Replace (regrade) keeps EVERYTHING — conversion (bwpoint/reference),
+    adjustments, crop, flips, rotation, slice — and replays the conversion on the
+    new decode. Reset drops it all. Both re-stamp the signature (clearing the ⚠)."""
 
     def _img(self, tmp_path):
         from core.ccr_image import CCRImage
@@ -411,19 +412,47 @@ class TestRegradeVsReset:
         ccr_backend.file_paths = [path]
         return img
 
-    def test_regrade_keeps_geometry_drops_grade_and_restamps(self, tmp_path):
+    def test_regrade_keeps_everything_and_replays_reference(self, tmp_path, monkeypatch):
+        import core.ccr_backend as B
         img = self._img(tmp_path)
+        img.reference_frame = (10, 10, 200, 150)
+        img.conversion_inputs = {"mode": "ref", "ref": (10, 10, 200, 150), "fine_rot": 0}
+        called = {}
+        def fake_ref(im, **kw):
+            called["ref"] = True
+            return im.resized_raw
+        monkeypatch.setattr(B, "ccr_normalize_with_reference", fake_ref)
         assert ccr_backend.regrade_images_by_indices([0]) is True
-        # geometry KEPT
+        # conversion REPLAYED on the new decode
+        assert called.get("ref") is True
+        assert img.converted is True
+        assert img.conversion_inputs == {"mode": "ref", "ref": (10, 10, 200, 150), "fine_rot": 0}
+        # adjustments + geometry KEPT
+        assert img.adjustment_settings == {"temperature": 12}
         assert img.rotation_angle == 90
         assert img.fine_rotation_angle == 150
         assert img.crop_rect == (0.1, 0.1, 0.9, 0.9)
         assert img.crop_angle == 2.0
         assert img.horizontal_mirrored is True
         assert img.source_ops == [(0, (0.0, 0.0, 0.5, 0.5))]
-        # colour grade DROPPED + signature re-stamped (no active profile -> 'none')
-        assert img.converted is False
-        assert img.adjustment_settings == {}
+        # signature re-stamped under the current profile
+        assert img.profile_signature == ccr_backend.active_profile_signature()
+
+    def test_regrade_replays_bwpoint(self, tmp_path, monkeypatch):
+        import core.ccr_backend as B
+        img = self._img(tmp_path)
+        img.reference_frame = None
+        bw = ((100, 90, 80), (2000, 1900, 1800))
+        img.conversion_inputs = {"mode": "bw", "bw": bw, "fine_rot": 0}
+        called = {}
+        def fake_bw(im, b, w, **kw):
+            called["bw"] = (b, w)
+            return im.resized_raw
+        monkeypatch.setattr(B, "ccr_normalize_with_bwpoint", fake_bw)
+        assert ccr_backend.regrade_images_by_indices([0]) is True
+        assert called.get("bw") == bw                          # bwpoint replayed with baked anchors
+        assert img.converted is True
+        assert img.adjustment_settings == {"temperature": 12}
         assert img.profile_signature == ccr_backend.active_profile_signature()
 
     def test_reset_drops_geometry_too(self, tmp_path):
