@@ -196,6 +196,7 @@ class TestInputIccWillApply:
 
         class _F:
             matrix = np.array([[0.46, 0.31, 0.17], [0.23, 0.70, 0.07], [0.02, 0.12, 0.93]])
+            wb_mult = np.ones(3)
         cm.set_active_input_profile(None)
         cm.set_active_dcp_profile(dcp_profile.parse_dcp_bytes(
             dcp_profile.build_camera_dcp(_F(), "c")))
@@ -210,6 +211,7 @@ def _camera_dcp_bytes():
 
     class _F:
         matrix = np.array([[0.46, 0.31, 0.17], [0.23, 0.70, 0.07], [0.02, 0.12, 0.93]])
+        wb_mult = np.ones(3)
     return dcp_profile.build_camera_dcp(_F(), "c")
 
 

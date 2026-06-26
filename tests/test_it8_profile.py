@@ -318,9 +318,10 @@ def test_block_sample_points_unit_quad():
 def test_fit_block_generic_autoneutral():
     # A 12x24 block with in-grid neutrals (no GS strip): auto-neutral WB must
     # find a gray and the fit recover the generator.
-    M0 = np.array([[0.46, 0.31, 0.17],
-                   [0.23, 0.70, 0.07],
-                   [0.02, 0.12, 0.93]])
+    M0 = _pin(np.array([[0.46, 0.31, 0.17],
+                        [0.23, 0.70, 0.07],
+                        [0.02, 0.12, 0.93]]))
+    wb = np.array([2.1, 1.0, 1.5])
     rng = np.random.default_rng(11)
     patches = {}
     rows, cols = it8.parse_block("A49", "L72")
@@ -333,12 +334,14 @@ def test_fit_block_generic_autoneutral():
                 Y = rng.uniform(5, 85)
                 patches[f"{r}{c}"] = np.array([Y * rng.uniform(0.7, 1.3), Y,
                                                Y * rng.uniform(0.4, 1.2)])
-    samples = _consistent_samples(M0, patches)
+    samples = _balanced_samples(M0, patches, wb)
     ref = _ref_from_patches(patches)
     fit = it8.fit_camera_matrix(samples, ref)
     assert fit.wb_id[0] in "GHIJ"           # auto-picked an in-grid neutral
+    # Recovers the balanced->XYZ matrix (white-relative) and the wb multipliers.
     np.testing.assert_allclose(fit.matrix, M0, atol=1e-6)
-    assert fit.avg_de < 1e-3
+    np.testing.assert_allclose(fit.matrix @ np.ones(3), D50, atol=1e-9)
+    np.testing.assert_allclose(fit.wb_mult, wb, atol=1e-6)
 
 
 # --------------------------------------------------------------------------- #
@@ -439,6 +442,28 @@ def _consistent_samples(M0, patches):
     return samples
 
 
+def _pin(M0):
+    """Pin a matrix so its balanced white (1,1,1) maps EXACTLY to D50 — the
+    white-relative anchor the fit produces (M @ (1,1,1) == D50)."""
+    return np.diag(D50 / (np.asarray(M0, float) @ np.ones(3))) @ np.asarray(M0, float)
+
+
+def _balanced_samples(M0, patches, wb):
+    """Device samples for the NEW (standards-compliant) convention: M0 maps
+    WHITE-BALANCED device RGB -> XYZ D50, and the raw device is the balanced
+    value divided by the green-normalised WB multipliers (raw = balanced / wb,
+    wb[1] == 1). The fit must recover (pinned M0, wb) exactly. Returns the
+    samples; pass `_pin(M0)` as M0 so balanced white -> D50."""
+    Minv = np.linalg.inv(np.asarray(M0, float))
+    wb = np.asarray(wb, float)
+    samples = {}
+    for sid, xyz in patches.items():
+        balanced = Minv @ (xyz / 100.0)         # balanced device RGB in [0,1]
+        raw = np.clip(balanced / wb, 0, None)   # un-balance: raw -> *wb -> balanced
+        samples[sid] = it8.PatchSample(rgb=raw * 65535.0, valid=True, n_pix=900)
+    return samples
+
+
 def _ref_from_patches(patches):
     ref = it8.IT8Reference(chart_type="IT8.7/1", batch="TEST")
     for sid, xyz in patches.items():
@@ -449,33 +474,48 @@ def _ref_from_patches(patches):
 
 
 def test_fit_synthetic_roundtrip():
-    M0 = np.array([[0.46, 0.31, 0.17],
-                   [0.23, 0.70, 0.07],
-                   [0.02, 0.12, 0.93]])
+    # NEW convention: M0 maps WHITE-BALANCED device -> XYZ D50 (pinned so
+    # M0 @ (1,1,1) == D50); the raw device carries an explicit green-normalised
+    # white balance. The fit must recover BOTH the balanced matrix and the wb
+    # multipliers exactly.
+    M0 = _pin(np.array([[0.46, 0.31, 0.17],
+                        [0.23, 0.70, 0.07],
+                        [0.02, 0.12, 0.93]]))
+    wb = np.array([2.1, 1.0, 1.5])             # raw -> balanced (green == 1)
     patches = _synthetic_patches()
-    samples = _consistent_samples(M0, patches)
+    samples = _balanced_samples(M0, patches, wb)
     ref = _ref_from_patches(patches)
     fit = it8.fit_camera_matrix(samples, ref)
-    # Recovered matrix matches the generator (pin + exposure cancel exactly when
-    # the neutral reference is D50 chromaticity).
+    # Balanced->XYZ matrix recovered, white-relative (M @ (1,1,1) == D50)...
     np.testing.assert_allclose(fit.matrix, M0, atol=1e-6)
-    assert fit.avg_de < 1e-3 and fit.max_de < 1e-2
+    np.testing.assert_allclose(fit.matrix @ np.ones(3), D50, atol=1e-9)
+    # ...and the green-normalised WB multipliers recovered (wb[1] == 1).
+    np.testing.assert_allclose(fit.wb_mult, wb, atol=1e-6)
+    assert abs(fit.wb_mult[1] - 1.0) < 1e-9
     assert len(fit.used_ids) == 288 and not fit.dropped_ids
 
 
 def test_fit_neutral_axis_is_neutral():
-    M0 = np.array([[0.50, 0.30, 0.18],
-                   [0.25, 0.68, 0.07],
-                   [0.03, 0.10, 0.90]])
+    M0 = _pin(np.array([[0.50, 0.30, 0.18],
+                        [0.25, 0.68, 0.07],
+                        [0.03, 0.10, 0.90]]))
+    wb = np.array([1.8, 1.0, 1.4])
     patches = _synthetic_patches()
-    samples = _consistent_samples(M0, patches)
+    samples = _balanced_samples(M0, patches, wb)
     ref = _ref_from_patches(patches)
     fit = it8.fit_camera_matrix(samples, ref)
-    # Each grayscale patch's predicted Lab is neutral (a*,b* ~ 0).
+    # fit.matrix now consumes WHITE-BALANCED device, so balance each grey by the
+    # recovered wb first; the balanced neutral must map to D50 chromaticity
+    # (predicted Lab a*,b* ~ 0).
     for k in it8.GRAY_IDS:
-        d = samples[k].rgb / 65535.0
-        lab = it8.xyz_to_lab((fit.matrix @ d) * 100.0)
+        balanced = (samples[k].rgb / 65535.0) * fit.wb_mult
+        lab = it8.xyz_to_lab((fit.matrix @ balanced) * 100.0)
         assert abs(lab[1]) < 0.3 and abs(lab[2]) < 0.3
+    # The camera's own raw neutral is 1/wb: balancing it (raw * wb) gives (1,1,1),
+    # which the white-relative matrix maps EXACTLY to D50.
+    cam_neutral = 1.0 / fit.wb_mult
+    white_xyz = fit.matrix @ (cam_neutral * fit.wb_mult)
+    np.testing.assert_allclose(white_xyz, D50, atol=1e-9)
 
 
 def test_fit_drops_invalid_and_missing():
@@ -491,16 +531,21 @@ def test_fit_drops_invalid_and_missing():
 
 
 def test_fit_wb_fallback_when_gs0_invalid():
-    M0 = np.array([[0.46, 0.31, 0.17],
-                   [0.23, 0.70, 0.07],
-                   [0.02, 0.12, 0.93]])
+    M0 = _pin(np.array([[0.46, 0.31, 0.17],
+                        [0.23, 0.70, 0.07],
+                        [0.02, 0.12, 0.93]]))
+    wb = np.array([2.1, 1.0, 1.5])
     patches = _synthetic_patches()
-    samples = _consistent_samples(M0, patches)
+    samples = _balanced_samples(M0, patches, wb)
     samples["GS0"] = it8.PatchSample(samples["GS0"].rgb, valid=False, n_pix=1)
     ref = _ref_from_patches(patches)
     fit = it8.fit_camera_matrix(samples, ref)
+    # Falls back to another neutral GS patch; the green-normalised wb is the same
+    # regardless of which neutral is chosen (all GS are D50-chromatic), so the
+    # matrix + wb still come out white-relative and correct.
     assert fit.wb_id != "GS0" and fit.wb_id.startswith("GS")
-    assert fit.avg_de < 1e-2
+    np.testing.assert_allclose(fit.matrix @ np.ones(3), D50, atol=1e-9)
+    np.testing.assert_allclose(fit.wb_mult, wb, atol=1e-6)
 
 
 # --------------------------------------------------------------------------- #
@@ -534,34 +579,37 @@ def test_delta_e_2000_sharma_pairs():
 # --------------------------------------------------------------------------- #
 
 def test_build_icc_reparses_as_input_profile():
-    M0 = np.array([[0.46, 0.31, 0.17],
-                   [0.23, 0.70, 0.07],
-                   [0.02, 0.12, 0.93]])
+    M0 = _pin(np.array([[0.46, 0.31, 0.17],
+                        [0.23, 0.70, 0.07],
+                        [0.02, 0.12, 0.93]]))
+    wb = np.array([2.1, 1.0, 1.5])
     patches = _synthetic_patches()
-    fit = it8.fit_camera_matrix(_consistent_samples(M0, patches),
-                                _ref_from_patches(patches))
+    samples = _balanced_samples(M0, patches, wb)
+    fit = it8.fit_camera_matrix(samples, _ref_from_patches(patches))
     icc = it8.build_camera_icc(fit, "FreeCCR Camera — Test")
     # Valid ICC header, RGB matrix-shaper, parses without UnsupportedICCError.
     assert icc[36:40] == b"acsp" and icc[16:20] == b"RGB "
     prof = cm.InputProfile.from_bytes(icc)
     assert "Test" in prof.description
-    # Applying to a near-neutral mid-gray device patch yields a near-neutral
-    # sRGB result (R~=G~=B).
-    gs = fit  # use a grayscale patch's device value
-    d_gray = _consistent_samples(M0, patches)["GS8"].rgb.astype(np.uint16)
-    out = prof.apply(np.tile(d_gray, (2, 2, 1)).astype(np.uint16))
+    # Applying to a RAW mid-gray device patch WITH its as-shot WB yields a
+    # near-neutral linear-Adobe result (R~=G~=B). The ICC white-balances the raw
+    # (green-normalised wb) before the matrix — without as_shot_wb the un-balanced
+    # raw would NOT come out neutral.
+    d_gray = samples["GS8"].rgb.astype(np.uint16)
+    out = prof.apply(np.tile(d_gray, (2, 2, 1)).astype(np.uint16), as_shot_wb=wb)
     px = out[0, 0].astype(float)
     assert px.max() - px.min() < 0.04 * 65535      # near-neutral output
 
 
 def test_end_to_end_render_sample_fit():
-    # Render a synthetic chart from a known matrix, then locate -> sample ->
-    # fit and recover it (exercises geometry + sampling + fit composed).
-    M0 = np.array([[0.46, 0.31, 0.17],
-                   [0.23, 0.70, 0.07],
-                   [0.02, 0.12, 0.93]])
+    # Render a synthetic chart from a known (balanced) matrix + WB, then locate ->
+    # sample -> fit and recover both (exercises geometry + sampling + fit composed).
+    M0 = _pin(np.array([[0.46, 0.31, 0.17],
+                        [0.23, 0.70, 0.07],
+                        [0.02, 0.12, 0.93]]))
+    wb = np.array([2.1, 1.0, 1.5])
     patches = _synthetic_patches()
-    devs = _consistent_samples(M0, patches)        # id -> PatchSample(rgb)
+    devs = _balanced_samples(M0, patches, wb)      # id -> PatchSample(raw rgb)
     S = 14
     ox = oy = 30
     quad = [(ox, oy), (ox + 22 * S, oy),
@@ -577,8 +625,11 @@ def test_end_to_end_render_sample_fit():
         img[max(0, y - half):y + half, max(0, x - half):x + half] = rgb
     samples = it8.sample_patches(img, pts, quad, frac=0.5)
     fit = it8.fit_camera_matrix(samples, _ref_from_patches(patches))
-    assert fit.avg_de < 0.5 and fit.max_de < 2.0
+    # The balanced->XYZ matrix and the WB multipliers are both recovered through
+    # the full render/sample pipeline (residual is u16-quantisation only).
     np.testing.assert_allclose(fit.matrix, M0, atol=2e-3)
+    np.testing.assert_allclose(fit.wb_mult, wb, atol=2e-3)
+    np.testing.assert_allclose(fit.matrix @ np.ones(3), D50, atol=1e-9)
 
 
 def test_identity_trc_is_identity():
