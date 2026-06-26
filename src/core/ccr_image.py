@@ -82,6 +82,10 @@ class CCRImage:
         self.slice_parent: Optional[Dict[str, Any]] = slice_parent
         self.thumbnail = thumbnail
         self.resized_raw = resized_raw
+        # Camera profile (ICC/DCP/none) this image's decode was graded under;
+        # stamped on every working decode so the thumbnail can flag a mismatch
+        # when the active profile changes. Not persisted (a reload re-stamps).
+        self.profile_signature = None
         self.reference_frame = reference_frame
         self.resized_preview = None  # Placeholder for resized preview, if needed later
         self.adjustment_settings = adjustment_settings if adjustment_settings is not None else {}
@@ -162,7 +166,8 @@ class CCRImage:
             
             # Calculate tint balance factor once during loading
             self.tint_balance_factor = self._calculate_tint_balance_factor()
-            
+            self._stamp_profile_signature()
+
             # Populate thumbnail and preview
             self.update_thumbnail_and_preview()
         else:
@@ -207,6 +212,7 @@ class CCRImage:
         self.resized_raw = img
         # Recalculate tint balance factor for the new image
         self.tint_balance_factor = self._calculate_tint_balance_factor()
+        self._stamp_profile_signature()
         return True
 
     def reload_image(self) -> None:
@@ -268,20 +274,24 @@ class CCRImage:
             new_h = int(h * max_long_side / w)
         return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    def _apply_input_icc(self, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    def _apply_input_icc(self, arr: Optional[np.ndarray],
+                         as_shot_wb=None) -> Optional[np.ndarray]:
         """Convert a freshly-decoded scan from the globally-assigned input ICC
         profile into the working LINEAR Adobe RGB space (the same space the
         no-ICC decode produces, so the density-based inversion sees consistent
         linear data), before any conversion or adjustment. No-op when no input
         profile is set. Applied inside read_image so preview, hi-res zoom, and
-        export all inherit it identically (resolution-independent point op)."""
+        export all inherit it identically (resolution-independent point op).
+
+        The camera matrix consumes WHITE-BALANCED data, so the frame's as-shot
+        neutral is threaded through (mirrors _apply_input_dcp)."""
         if arr is None:
             return arr
         profile = color_management.get_active_input_profile()
-        if profile is None:
+        if profile is None or color_management.input_profile_disabled():
             return arr
         try:
-            return profile.apply(arr)
+            return profile.apply(arr, as_shot_wb=as_shot_wb)
         except Exception as e:
             logging.warning(f"Input ICC profile could not be applied: {e}")
             return arr
@@ -291,9 +301,9 @@ class CCRImage:
         — an input ICC **or** a DCP is active (mirrors the apply guard). Drives the
         negative RAW decode: a profiled decode is camera-native raw with absolute
         sensor values (no_auto_scale=True + manual white-level scaling); the
-        unprofiled default decode is Adobe RGB, rawpy-auto-scaled."""
-        return (color_management.get_active_input_profile() is not None
-                or color_management.get_active_dcp_profile() is not None)
+        unprofiled default decode is Adobe RGB, rawpy-auto-scaled. False when the
+        profile is temporarily disabled."""
+        return color_management.camera_profile_active()
 
     def _apply_input_dcp(self, arr, as_shot_wb) -> Optional[np.ndarray]:
         """Burn the globally-active DCP into a freshly-decoded camera-native scan
@@ -302,7 +312,7 @@ class CCRImage:
         if arr is None:
             return arr
         profile = color_management.get_active_dcp_profile()
-        if profile is None:
+        if profile is None or color_management.input_profile_disabled():
             return arr
         try:
             from core import dcp_profile
@@ -310,6 +320,16 @@ class CCRImage:
         except Exception as e:
             logging.warning(f"DCP profile could not be applied: {e}")
             return arr
+
+    def _stamp_profile_signature(self):
+        """Record which camera profile this image's working decode was graded
+        under, so the thumbnail can flag a mismatch when the active profile (or
+        the disable toggle / Positive mode) later changes."""
+        try:
+            from core.ccr_backend import ccr_backend
+            self.profile_signature = ccr_backend.active_profile_signature()
+        except Exception:
+            self.profile_signature = None
 
     @staticmethod
     def _positive_mode_active() -> bool:
@@ -493,10 +513,16 @@ class CCRImage:
                         # This is the standard input for matrix/cLUT ICC and DCP
                         # (`dcraw -o 0 -g 1 1 -W -r 1 1 1 1`, see
                         # spec/it8-camera-profile.md §12.5), and makes fit-space ==
-                        # apply-space EXACTLY. A plain unprofiled negative keeps the
-                        # Adobe RGB + rawpy auto-scale camera-independent default.
+                        # apply-space EXACTLY.
+                        #
+                        # No-profile decode space is the picker's choice: "Camera
+                        # Matrix" -> Adobe RGB + rawpy auto-scale (the camera's
+                        # built-in matrix); "None" -> bare camera-native RAW (same
+                        # space a profile is applied on, just no matrix). A profile
+                        # always decodes camera-native. The IT8 profiling decode
+                        # (apply_input_icc=False) is forced camera-native too.
                         icc_device_space = (not apply_input_icc
-                                            or self._input_icc_will_apply())
+                                            or not color_management.camera_matrix_mode())
                         no_icc_default = not icc_device_space
                         rgb = raw.postprocess(
                             **self._raw_color_postprocess_kwargs(
@@ -539,7 +565,7 @@ class CCRImage:
                     return rgb
                 if color_management.get_active_dcp_profile() is not None:
                     return self._apply_input_dcp(rgb, as_shot_wb)
-                return self._apply_input_icc(rgb)
+                return self._apply_input_icc(rgb, as_shot_wb)
             except Exception as e:
                 logging.exception(f"Failed to read RAW image: {file_path}")
                 return None
@@ -632,7 +658,7 @@ class CCRImage:
                 return img
             if color_management.get_active_dcp_profile() is not None:
                 return self._apply_input_dcp(img, None)
-            return self._apply_input_icc(img)
+            return self._apply_input_icc(img, None)
         
     def update_thumbnail_and_preview(self, thumbnail_size: int = 156, preview_size: int = 1080) -> None:
         """

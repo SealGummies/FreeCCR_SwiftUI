@@ -144,15 +144,18 @@ class _FakeRaw:
         return np.full((32, 48, 3), 10000, dtype=np.uint16)
 
 
-def _decode_raw(monkeypatch, path, *, profile, apply_input_icc=True):
+def _decode_raw(monkeypatch, path, *, profile, apply_input_icc=True,
+                camera_matrix=False):
     """Run read_image's RAW branch with rawpy stubbed; return
     (postprocess kwargs, decoded array). positive_override=False pins negative
     mode (no backend dependency); the path need not exist on disk. _FakeRaw
     reports white_level=16383 and a flat 10000-valued decode, so the manual
-    white-level scaling (when applied) multiplies by 65535/16383 ≈ 4."""
+    white-level scaling (when applied) multiplies by 65535/16383 ≈ 4.
+    camera_matrix=True selects the Camera-Matrix decode (Adobe + auto-scale)."""
     rec = {}
     monkeypatch.setattr(rawpy, "imread", lambda p: _FakeRaw(rec))
     cm.set_active_input_profile(profile)
+    cm.set_camera_matrix_mode(camera_matrix)
     try:
         img = CCRImage.__new__(CCRImage)
         img.source_ops = []
@@ -161,6 +164,7 @@ def _decode_raw(monkeypatch, path, *, profile, apply_input_icc=True):
                              apply_input_icc=apply_input_icc)
     finally:
         cm.set_active_input_profile(None)
+        cm.set_camera_matrix_mode(False)
     return rec["kwargs"], out
 
 
@@ -196,6 +200,7 @@ class TestInputIccWillApply:
 
         class _F:
             matrix = np.array([[0.46, 0.31, 0.17], [0.23, 0.70, 0.07], [0.02, 0.12, 0.93]])
+            wb_mult = np.ones(3)
         cm.set_active_input_profile(None)
         cm.set_active_dcp_profile(dcp_profile.parse_dcp_bytes(
             dcp_profile.build_camera_dcp(_F(), "c")))
@@ -210,6 +215,7 @@ def _camera_dcp_bytes():
 
     class _F:
         matrix = np.array([[0.46, 0.31, 0.17], [0.23, 0.70, 0.07], [0.02, 0.12, 0.93]])
+        wb_mult = np.ones(3)
     return dcp_profile.build_camera_dcp(_F(), "c")
 
 
@@ -261,11 +267,19 @@ class TestRawDecodeSpaceWiring:
     # manual white-level scaling, so the profile is fitted in and applied to the
     # SAME device space. _FakeRaw returns a flat 10000 decode, white_level=16383
     # (manual scaling ×65535/16383 ≈ 4 when it applies).
-    def test_no_profile_is_adobe_autoscaled(self, monkeypatch):
+    def test_none_is_camera_native_raw(self, monkeypatch):
+        # "None" now decodes bare camera-native RAW (linear, no auto-scale, manual
+        # white-level scaling) — NOT Adobe.
         kw, out = _decode_raw(monkeypatch, "scan.arw", profile=None)
+        assert kw["output_color"] == rawpy.ColorSpace.raw
+        assert kw["no_auto_scale"] is True
+        assert 39000 < int(out.max()) < 41000   # manual white-level scaling applied
+
+    def test_camera_matrix_is_adobe_autoscaled(self, monkeypatch):
+        # "Camera Matrix" reproduces the prior default: Adobe RGB + rawpy auto-scale.
+        kw, out = _decode_raw(monkeypatch, "scan.arw", profile=None, camera_matrix=True)
         assert kw["output_color"] == rawpy.ColorSpace.Adobe
         assert kw["no_auto_scale"] is False
-        assert kw["adjust_maximum_thr"] == 0.0
         assert int(out.max()) == 10000          # manual white-level scaling skipped
 
     def test_profile_active_is_camera_native(self, monkeypatch):

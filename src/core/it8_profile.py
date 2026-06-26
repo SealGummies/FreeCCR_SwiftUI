@@ -709,7 +709,10 @@ D50_XYZ = np.array(color_management.D50_XYZ, dtype=np.float64)   # [0,1] scale, 
 
 @dataclass
 class CameraFit:
-    matrix: np.ndarray                     # (3,3) device-norm RGB[0,1] -> XYZ D50 (Y~1)
+    matrix: np.ndarray                     # (3,3) WHITE-BALANCED device RGB -> XYZ D50;
+                                           #       matrix @ (1,1,1) == D50 (white-relative)
+    wb_mult: np.ndarray                    # (3,) green-normalised WB multipliers used to
+                                           #      balance the raw device before the matrix
     avg_de: float
     med_de: float
     p95_de: float
@@ -786,52 +789,59 @@ def fit_camera_matrix(samples: Dict[str, PatchSample], ref: IT8Reference, *,
             "Re-check corner placement, exposure (clipping), and the reference "
             "file.")
 
-    d = np.asarray(d_list)                  # (N,3) normalised device RGB
+    d = np.asarray(d_list)                  # (N,3) normalised raw device RGB (un-WB)
     X = np.asarray(x_list)                  # (N,3) reference XYZ, Y in [0,~1]
 
-    # White balance on the chosen neutral so it becomes equal-RGB.
-    d_wb_ref = samples[chosen_wb].rgb / 65535.0
-    d_wb_ref = np.clip(d_wb_ref, 1e-6, None)
-    gains = d_wb_ref.mean() / d_wb_ref
-    d_wb = d * gains
+    # Relative-colorimetric: map the chart's white patch to the PCS white (D50) by
+    # normalising the reference so the lightest neutral reads D50 (Y=1) — the
+    # ArgyllCMS "brightest patch -> media white" rule. The matrix already pins
+    # white->D50; scoring it against a <100%-reflectance reference white would
+    # inflate every ΔE by the white patch's reflectance deficit (~10%) and falsely
+    # flag a good fit as "Check placement".
+    white_Y = float(ref.xyz(chosen_wb)[1]) / 100.0
+    if white_Y > 1e-6:
+        X = X / white_Y
 
-    # (Weighted) least squares  X ~= d_wb @ A ;  M_wb = A.T  => XYZ = M_wb @ rgb.
+    # --- White-balance the device on the neutral (standard convention) --------
+    # ICC matrix and DNG ForwardMatrix profiles operate on WHITE-BALANCED data,
+    # so the fitted matrix consumes balanced device RGB. The multipliers are
+    # green-normalised (green channel == 1), matching the DNG AsShotNeutral
+    # convention; the same balance is rebuilt per-image at apply time from the
+    # frame's own as-shot neutral.
+    n_raw = np.clip(samples[chosen_wb].rgb / 65535.0, 1e-6, None)
+    wb = n_raw[1] / n_raw                    # neutral -> equal RGB; wb[1] == 1
+    # Balanced device, normalised so the white/neutral patch reads ~ (1,1,1):
+    # makes the matrix WHITE-RELATIVE so the chart's absolute exposure drops OUT
+    # of the gain (ArgyllCMS / colprof default), not baked into it.
+    bN = (d * wb) / float(n_raw[1])
+
+    # --- (Weighted) least squares  X ~= bN @ A ;  M = A.T  => XYZ = M @ balanced
     if weight == "1/Y":
-        w = 1.0 / np.clip(X[:, 1], 0.02, None)
-        sw = np.sqrt(w)[:, None]
-        A, *_ = np.linalg.lstsq(d_wb * sw, X * sw, rcond=None)
+        sw = np.sqrt(1.0 / np.clip(X[:, 1], 0.02, None))[:, None]
+        A, *_ = np.linalg.lstsq(bN * sw, X * sw, rcond=None)
     else:
-        A, *_ = np.linalg.lstsq(d_wb, X, rcond=None)
-    M_wb = A.T
+        A, *_ = np.linalg.lstsq(bN, X, rcond=None)
+    M = A.T                                  # balanced device RGB -> XYZ D50
 
-    # Pin so equal-RGB (post-WB) maps exactly to D50 chromaticity (well-behaved
-    # neutral axis). This per-column scale fixes chromaticity but leaves an
-    # overall brightness gain, removed by the exposure step below.
-    white = M_wb @ np.ones(3)
+    # Pin balanced white (1,1,1) EXACTLY to D50 (Y=1). A row (output) scale fixes
+    # both the neutral chromaticity and the residual exposure; for a good fit it
+    # is ~uniform. This is the white-relative anchor every standard CMM expects.
+    white = M @ np.ones(3)
     white = np.where(np.abs(white) < 1e-9, 1e-9, white)
-    M_pin = M_wb @ np.diag(D50_XYZ / white)
+    M = np.diag(D50_XYZ / white) @ M         # M @ (1,1,1) == D50
 
-    # Fold WB back so the stored matrix consumes un-white-balanced device RGB.
-    M = M_pin @ np.diag(gains)
-
-    # Normalise overall exposure so the chosen neutral reproduces its reference
-    # Y exactly. This keeps the reported deltaE about colour (not a benign
-    # brightness scale) and makes the fit reproduce the chart when consistent.
-    pred_wb_Y = float((M @ (samples[chosen_wb].rgb / 65535.0))[1])
-    ref_wb_Y = float(ref.xyz(chosen_wb)[1] / 100.0)
-    if pred_wb_Y > 1e-9:
-        M = M * (ref_wb_Y / pred_wb_Y)
-
-    # Quality: predicted Lab vs reference Lab for the used patches.
-    pred_xyz = (d @ M.T) * 100.0
+    # Quality: predicted Lab vs the white-normalised reference Lab (same relative-
+    # colorimetric space the matrix maps into, so ΔE measures COLOUR error only).
+    pred_xyz = (bN @ M.T) * 100.0
     pred_lab = xyz_to_lab(pred_xyz)
-    ref_lab = np.array([ref.lab(s) for s in used], dtype=np.float64)
+    ref_lab = xyz_to_lab(X * 100.0)
     de = delta_e_2000(ref_lab, pred_lab)
     order = np.argsort(-de)
     per_patch = [(used[i], float(de[i])) for i in order]
 
     return CameraFit(
         matrix=M,
+        wb_mult=wb,
         avg_de=float(de.mean()),
         med_de=float(np.median(de)),
         p95_de=float(np.percentile(de, 95)),
@@ -893,24 +903,42 @@ def build_residual_clut(fit: CameraFit, samples: Dict[str, "PatchSample"],
     the LUT is NOT guaranteed strictly monotone — small reversals are the cost of
     the bias correction, and the 3x3 matrix mode remains the strictly-safe default.
     Indexed [R][G][B]."""
-    M = np.asarray(fit.matrix, dtype=np.float64)
+    # The CLUT lives in the SAME white-balanced device space the matrix path
+    # consumes (raw * as-shot WB, in [0,1]) and uses the SAME matrix M (fit.matrix)
+    # as its linear base, so the cLUT and the 3x3 AGREE (cLUT = matrix + a small
+    # colour residual) — apply must not produce a different brightness than the
+    # matrix. The chart is shot below white, so its balanced device values sit at
+    # ~n1 (the neutral's green level); the reference is scaled by n1 to the matrix's
+    # exposure so the residual is a pure colour correction, NOT a 1/n1 brightness
+    # blow-up. The residual fades to zero outside the sampled hull.
+    M = np.asarray(fit.matrix, dtype=np.float64)         # balanced device -> XYZ (matches apply)
+    wb = np.asarray(fit.wb_mult, dtype=np.float64)[:3]
+    # Anchor the reference's exposure on the white patch so the white neutral's
+    # residual is zero — the cLUT then matches the 3x3 EXACTLY on the neutral axis
+    # (corrects colour, not brightness); toggling matrix<->cLUT shifts nothing.
+    xw = ref.xyz(fit.wb_id)
+    if fit.wb_id in samples and xw is not None and float(xw[1]) > 1e-6:
+        di_w = np.clip(samples[fit.wb_id].rgb / 65535.0 * wb, 0.0, 1.0)
+        s = float((M @ di_w)[1]) / (float(xw[1]) / 100.0)
+    else:
+        s = 1.0
     d_list, r_list = [], []
     for sid in fit.used_ids:
         ps = samples.get(sid)
         xyz = ref.xyz(sid)
         if ps is None or xyz is None:
             continue
-        di = ps.rgb / 65535.0
+        di = np.clip(ps.rgb / 65535.0 * wb, 0.0, 1.0)    # white-balanced, clamped to grid
         d_list.append(di)
-        r_list.append(xyz / 100.0 - M @ di)              # residual in XYZ (Y=1)
-    d = np.asarray(d_list, dtype=np.float64)             # (N,3) device
+        r_list.append(s * xyz / 100.0 - M @ di)          # residual at the matrix's exposure scale
+    d = np.asarray(d_list, dtype=np.float64)             # (N,3) balanced device
     r = np.asarray(r_list, dtype=np.float64)             # (N,3) XYZ residual
     n = len(d)
 
     ax = np.linspace(0.0, 1.0, grid)
     Rg, Gg, Bg = np.meshgrid(ax, ax, ax, indexing="ij")
     nodes = np.stack([Rg, Gg, Bg], axis=-1).reshape(-1, 3)
-    base = nodes @ M.T                                    # (G,3) pure-matrix prediction
+    base = nodes @ M.T                                    # M_f — same scale as the matrix path
 
     if n < 5:                                             # too few patches to bend safely
         return np.clip(base, 0.0, 2.0).reshape(grid, grid, grid, 3)

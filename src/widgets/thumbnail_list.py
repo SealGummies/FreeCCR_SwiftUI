@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QListWidget, QListWidgetItem, QLabel, QDialog, QApplication, QPushButton, QMenu, QCheckBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QListWidget, QListWidgetItem, QLabel, QDialog, QApplication, QPushButton, QMenu, QComboBox
 from PySide6.QtGui import QPixmap, QIcon, QTransform, QPainter
 from PySide6.QtCore import Qt, QSize, QTimer
 import os
@@ -76,35 +76,54 @@ class ThumbnailList(QWidget):
         """Return the MainWindow that owns this widget."""
         return self.parent().parent()
 
-    def _on_positive_mode_toggled(self, checked):
-        """Forward to the MainWindow, which owns the re-decode + persistence."""
-        mw = self._main_window()
-        if hasattr(mw, "on_positive_mode_toggled"):
-            mw.on_positive_mode_toggled(checked)
+    def refresh_profile_combo(self):
+        """Repopulate the camera-profile picker from the library and reflect the
+        active selection (called on startup and after import/delete/generate)."""
+        if not hasattr(self, "profile_combo"):
+            return
+        CM = ccr_backend.CAMERA_MATRIX
+        active = getattr(ccr_backend, "active_profile_path", None)
+        active_n = (os.path.normcase(os.path.abspath(active))
+                    if (active and active != CM) else None)
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        # Two non-removable entries first: None (bare RAW) and Camera Matrix
+        # (Adobe RGB + auto-scale, the camera's built-in matrix).
+        self.profile_combo.addItem("None", None)
+        self.profile_combo.addItem("Camera Matrix", CM)
+        sel = 1 if active == CM else 0
+        for p in ccr_backend.list_camera_profiles():
+            self.profile_combo.addItem(f"{p['name']}  ({p['kind'].upper()})", p["path"])
+            if active_n and os.path.normcase(os.path.abspath(p["path"])) == active_n:
+                sel = self.profile_combo.count() - 1
+        self.profile_combo.setCurrentIndex(sel)
+        self.profile_combo.blockSignals(False)
 
-    def set_positive_checkbox(self, checked: bool):
-        """Reflect the restored/global Positive-mode state without firing the
-        toggle handler (used on startup)."""
-        self.positive_mode_checkbox.blockSignals(True)
-        self.positive_mode_checkbox.setChecked(bool(checked))
-        self.positive_mode_checkbox.blockSignals(False)
+    def _on_profile_combo_changed(self, _idx):
+        """User picked a profile (or None) — forward to the MainWindow, which
+        owns activation + persistence + the thumbnail mismatch refresh."""
+        mw = self._main_window()
+        if hasattr(mw, "set_active_profile_path"):
+            mw.set_active_profile_path(self.profile_combo.currentData())
 
     def init_ui(self):
         self.layout = QVBoxLayout()
         theme.apply_panel_spacing(self.layout)
 
-        # Positive mode toggle — sits above the thumbnails. When checked, RAWs
-        # decode as normal sRGB positives and the film-negative tools are
-        # disabled; every image becomes directly editable/exportable. The
-        # MainWindow owns the heavy re-decode + persistence. See
-        # spec/positive-mode.md.
-        self.positive_mode_checkbox = QCheckBox("Positive mode")
-        self.positive_mode_checkbox.setToolTip(
-            "Treat images as normal positives (not film negatives): RAWs decode "
-            "in sRGB, conversion is skipped, and adjustments are available on "
-            "every image. Toggling re-decodes the loaded images.")
-        self.positive_mode_checkbox.toggled.connect(self._on_positive_mode_toggled)
-        self.layout.addWidget(self.positive_mode_checkbox)
+        # Camera-profile picker — choose which imported / IT8-generated profile
+        # (kept in FreeCCR's library) is applied at decode, or None. Manage the
+        # library in Settings ▸ Color Management. See spec/camera-profile-library.md.
+        self.profile_combo = QComboBox()
+        self.profile_combo.setToolTip(
+            "Camera input profile applied at decode, from your imported / "
+            "IT8-generated library. 'None' applies no profile. Add and manage "
+            "profiles in Settings ▸ Color Management.")
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_combo_changed)
+        _plabel = QLabel("Camera profile:")
+        _plabel.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        self.layout.addWidget(_plabel)
+        self.layout.addWidget(self.profile_combo)
+        # Positive mode now lives only in Settings ▸ Color Management.
 
         self.thumbnail_list = QListWidget()
         self.thumbnail_list.setViewMode(QListWidget.IconMode)
@@ -196,7 +215,8 @@ class ThumbnailList(QWidget):
                 QApplication.processEvents()
         self.thumbnail_list.setIconSize(QSize(156, 156))
         self.count_label.setText(f"Total: {image_count} image(s)")
-        
+        self.refresh_profile_warnings()
+
         # Set current index to 0 if there are items
         if image_count > 0:
             self.thumbnail_list.setCurrentRow(0)
@@ -254,6 +274,7 @@ class ThumbnailList(QWidget):
         self.thumbnail_list.addItem(item)
         self.count_label.setText(
             f"Total: {ccr_backend.get_image_count()} image(s)")
+        self.refresh_profile_warnings()
         if select:
             self.thumbnail_list.setCurrentRow(self.thumbnail_list.count() - 1)
         return True
@@ -284,6 +305,66 @@ class ThumbnailList(QWidget):
         """Backend indices of the selected thumbnails, ascending."""
         return sorted({item.data(Qt.UserRole)
                        for item in self.thumbnail_list.selectedItems()})
+
+    # --- Camera-profile mismatch flagging ---------------------------------
+    def _profile_mismatch(self, idx) -> bool:
+        """True if the image was graded under a different camera profile than the
+        one active now (so it should be re-graded / flagged)."""
+        img = ccr_backend.get_image_by_index(idx)
+        if img is None:
+            return False
+        sig = getattr(img, "profile_signature", None)
+        return sig is not None and sig != ccr_backend.active_profile_signature()
+
+    def refresh_profile_warnings(self):
+        """Flag every thumbnail whose image was graded under a different camera
+        profile than the active one — ⚠ prefix + amber text + tooltip. Called on
+        load/append and whenever the active profile (or disable / Positive mode)
+        changes."""
+        active = ccr_backend.active_profile_signature()
+        warn = theme.qcolor(theme.WARN_TEXT)
+        normal = theme.qcolor(theme.TEXT)
+        for row in range(self.thumbnail_list.count()):
+            item = self.thumbnail_list.item(row)
+            idx = item.data(Qt.UserRole)
+            img = ccr_backend.get_image_by_index(idx)
+            if img is None:
+                continue
+            filename = (getattr(img, "display_name", None)
+                        or os.path.basename(img.file_path))
+            sig = getattr(img, "profile_signature", None)
+            mism = sig is not None and sig != active
+            item.setText(("⚠ " + filename) if mism else filename)
+            item.setForeground(warn if mism else normal)
+            item.setToolTip(
+                "Graded under a different camera profile.\nRight-click ▸ "
+                "Replace with current camera profile." if mism else "")
+
+    def replace_with_current_profile(self, indices):
+        """Re-grade the given image(s) under the current camera profile by
+        re-decoding them and replaying the conversion — KEEPING everything (the
+        negative conversion / bwpoint, adjustments, crop, flips, rotation, slice).
+        Only the camera-profile decode changes, unlike Reset. Bulk-safe."""
+        if not indices:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            changed = ccr_backend.regrade_images_by_indices(indices)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not changed:
+            return
+        for idx in indices:
+            self.update_thumbnail(idx)
+        self.refresh_profile_warnings()
+        current = self.thumbnail_list.currentItem()
+        if current is not None:
+            cur_idx = current.data(Qt.UserRole)
+            mw = self._main_window()
+            mw.image_preview.update_preview(cur_idx)
+            mw.sliders_panel.set_current_idx(cur_idx)
+            mw.image_preview._update_unconvert_action_state()
+        ccr_backend.save_catalog()
 
     def show_context_menu(self, pos):
         if getattr(self, "_rebuilding", False):
@@ -318,6 +399,15 @@ class ThumbnailList(QWidget):
         if slice_count:
             slice_suffix = f" ({slice_count})" if slice_count > 1 else ""
             reset_slice_action = menu.addAction(f"Reset Slice{slice_suffix}")
+        # "Replace with current camera profile" — only for images in the selection
+        # graded under a different profile (re-decodes them, like Reset).
+        mismatched = [i for i in indices if self._profile_mismatch(i)]
+        replace_action = None
+        if mismatched:
+            menu.addSeparator()
+            rsuffix = f" ({len(mismatched)})" if len(mismatched) > 1 else ""
+            replace_action = menu.addAction(
+                f"Replace with current camera profile{rsuffix}")
         action = menu.exec_(self.thumbnail_list.mapToGlobal(pos))
         if action == duplicate_action:
             self.duplicate_images(indices)
@@ -330,6 +420,8 @@ class ThumbnailList(QWidget):
             self.reset_images(indices)
         elif reset_slice_action is not None and action == reset_slice_action:
             self.reset_slices(indices)
+        elif replace_action is not None and action == replace_action:
+            self.replace_with_current_profile(mismatched)
 
     def duplicate_images(self, indices):
         created = ccr_backend.duplicate_images_by_indices(indices)
@@ -375,6 +467,9 @@ class ThumbnailList(QWidget):
             return
         for idx in indices:
             self.update_thumbnail(idx)
+        # Reset re-decodes under the current profile, so the per-image grading
+        # signature now matches — clear any stale ⚠ mismatch flags.
+        self.refresh_profile_warnings()
         # Refresh the preview, sliders, and convert/unconvert state for the
         # currently selected image (the list itself is unchanged).
         current = self.thumbnail_list.currentItem()

@@ -66,6 +66,60 @@ def get_active_dcp_profile():
     return _active_dcp_profile
 
 
+# Temporary "disable camera profile" toggle (persisted by the UI). When set, the
+# active ICC/DCP is NOT applied at decode (the decode reverts to the unprofiled
+# path) without clearing the profile.
+_input_profile_disabled = False
+
+
+def set_input_profile_disabled(disabled: bool) -> None:
+    global _input_profile_disabled
+    _input_profile_disabled = bool(disabled)
+
+
+def input_profile_disabled() -> bool:
+    return _input_profile_disabled
+
+
+def camera_profile_active() -> bool:
+    """Whether a camera profile (ICC or DCP) will actually be applied: one is set
+    AND the disable toggle is off."""
+    return (not _input_profile_disabled
+            and (_active_input_profile is not None or _active_dcp_profile is not None))
+
+
+# "Camera Matrix" decode mode (a non-removable picker entry, no profile): decode
+# in Adobe RGB with rawpy auto-scale (linear) — the camera's built-in matrix. When
+# OFF and no profile is set ("None"), the decode is bare camera-native RAW (linear,
+# no auto-scale). Mutually exclusive with an active ICC/DCP. Read by ccr_image to
+# pick the no-profile decode space. See spec/camera-profile-library.md.
+_camera_matrix_mode = False
+
+
+def set_camera_matrix_mode(on: bool) -> None:
+    global _camera_matrix_mode
+    _camera_matrix_mode = bool(on)
+
+
+def camera_matrix_mode() -> bool:
+    return _camera_matrix_mode
+
+
+def active_profile_signature() -> str:
+    """Stable id of the profile that would be applied now — what an image's decode
+    is 'graded under'. 'none' when disabled or unset. (Positive mode is folded in
+    by ccr_backend.active_profile_signature, which this does not know about.)"""
+    if _input_profile_disabled:
+        return "none"
+    if _active_dcp_profile is not None:
+        cid = getattr(_active_dcp_profile, "content_id", None)
+        return "dcp:" + (cid or getattr(_active_dcp_profile, "name", "") or "?")
+    if _active_input_profile is not None:
+        cid = getattr(_active_input_profile, "content_id", None)
+        return "icc:" + (cid or getattr(_active_input_profile, "description", "") or "?")
+    return "none"
+
+
 def load_input_profile(path: str) -> "InputProfile":
     """Read and parse a matrix-shaper ICC file. Raises UnsupportedICCError for
     LUT/CMYK/unparseable profiles, or OSError if the file can't be read."""
@@ -469,32 +523,55 @@ class InputProfile:
             pass
         return ""
 
-    def apply(self, rgb_u16: np.ndarray) -> np.ndarray:
-        """Convert HxWx3 uint16 device RGB into uint16 **linear Adobe RGB** — the
-        exact working space the no-ICC negative decode produces, so the
+    @staticmethod
+    def _wb_gains(as_shot_wb):
+        """Green-normalised white-balance multipliers from the frame's as-shot
+        neutral (raw.camera_whitebalance), or None to skip balancing."""
+        if as_shot_wb is None:
+            return None
+        m = np.asarray(as_shot_wb, dtype=np.float32)[:3].copy()
+        m[m <= 0] = 1.0
+        if m[1] > 0:
+            m = m / m[1]
+        return m
+
+    def apply(self, rgb_u16: np.ndarray, as_shot_wb=None) -> np.ndarray:
+        """Convert HxWx3 uint16 camera device RGB into uint16 **linear Adobe RGB**
+        — the exact working space the no-ICC negative decode produces, so the
         density-based inversion downstream (-log10(value/full)) reads consistent
-        LINEAR data. Emitting sRGB-gamma-encoded data here mis-feeds that optical
-        density and casts the converted image (severe green/blue shift)."""
+        LINEAR data.
+
+        The matrix is a standard camera-profile matrix, so it consumes
+        WHITE-BALANCED data: the raw is balanced with the frame's as-shot neutral
+        (as_shot_wb, green-normalised) before the matrix — exactly what a DNG
+        ForwardMatrix or a RawTherapee input ICC expects. as_shot_wb=None (e.g. a
+        non-RAW input) skips balancing (degraded path)."""
         if rgb_u16.ndim != 3 or rgb_u16.shape[2] != 3 or rgb_u16.dtype != np.uint16:
             return rgb_u16
+        m = self._wb_gains(as_shot_wb)
         if self._kind == "clut":
-            return self._apply_clut(rgb_u16)
+            return self._apply_clut(rgb_u16, m)
         # LUTs are length 65536, so a uint16 value indexes them directly.
         lin = np.empty(rgb_u16.shape, dtype=np.float32)
         for c in range(3):
             lin[..., c] = self._luts[c][rgb_u16[..., c]]
-        adobe_lin = lin @ self._matrix.T                 # device -> linear Adobe RGB
+        if m is not None:
+            lin = lin * m                                # white balance (raw -> balanced)
+        adobe_lin = lin @ self._matrix.T                 # balanced -> linear Adobe RGB
         out = np.clip(adobe_lin, 0.0, 1.0)               # stay linear (no sRGB OETF)
         return np.rint(out * 65535.0).astype(np.uint16)
 
-    def _apply_clut(self, rgb_u16: np.ndarray) -> np.ndarray:
-        """cLUT apply: device input curves -> tetrahedral CLUT interpolation ->
-        XYZ(D50) -> linear Adobe RGB. Same uint16 linear-Adobe output as the
-        matrix path, so the downstream density inversion is untouched."""
+    def _apply_clut(self, rgb_u16: np.ndarray, m=None) -> np.ndarray:
+        """cLUT apply: white-balance -> tetrahedral CLUT interpolation -> XYZ(D50)
+        -> linear Adobe RGB. The CLUT is built in balanced device space, so the
+        raw is balanced (and clamped into the [0,1] node grid) before the lookup
+        — same uint16 linear-Adobe output as the matrix path."""
         clut = self._clut
         lin = np.empty(rgb_u16.shape, dtype=np.float32)
         for c in range(3):                               # input curves (65536 LUTs)
             lin[..., c] = clut.in_luts[c][rgb_u16[..., c]]
+        if m is not None:
+            lin = np.clip(lin * m, 0.0, 1.0)             # balance into the [0,1] grid
         xyz = _clut_interp_tetra(lin, clut)              # (...,3) XYZ D50 (Y=1)
         adobe_lin = xyz @ M_XYZ_D50_2_ADOBE.T            # -> linear Adobe RGB
         out = np.clip(adobe_lin, 0.0, 1.0)               # stay linear (no sRGB OETF)

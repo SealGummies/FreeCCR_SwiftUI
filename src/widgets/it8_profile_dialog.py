@@ -472,14 +472,23 @@ class IT8ProfileDialog(QDialog):
         self.illum_combo.setEditable(True)
         self.illum_combo.addItems(["Daylight", "Strobe/Flash", "Tungsten",
                                    "Fluorescent", "Other"])
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["ICC profile", "DCP — DNG camera profile"])
+        self.format_combo.setToolTip(
+            "ICC: FreeCCR's native input profile (3×3 matrix or cLUT). "
+            "DCP: a DNG camera profile (3×3 matrix only) for interchange with "
+            "Lightroom / Camera Raw and other DNG tools.")
+        self.format_combo.currentIndexChanged.connect(self._on_format_changed)
         self.type_combo = QComboBox()
         self.type_combo.addItems(["3×3 matrix", "cLUT (higher accuracy)"])
         self.type_combo.setToolTip(
             "3×3 matrix: a compact, well-behaved linear profile. cLUT: a 3-D "
             "lookup table that also corrects the saturated-corner residuals a "
-            "matrix can't reach (uses the full sampled patch set).")
+            "matrix can't reach (uses the full sampled patch set). cLUT is "
+            "ICC-only — DCP is always a 3×3 matrix.")
         form.addRow("Profile name:", self.name_edit)
         form.addRow("Illuminant:", self.illum_combo)
+        form.addRow("Output format:", self.format_combo)
         form.addRow("Profile type:", self.type_combo)
         lay.addLayout(form)
         lay.addStretch(1)
@@ -826,6 +835,21 @@ class IT8ProfileDialog(QDialog):
     # ------------------------------------------------------------------ #
     # Page 5 — save
     # ------------------------------------------------------------------ #
+    def _is_dcp(self) -> bool:
+        """The Output-format selector is the single source of truth for ICC vs DCP."""
+        return self.format_combo.currentIndex() == 1
+
+    def _on_format_changed(self):
+        """ICC ↔ DCP: cLUT is ICC-only (DCP is matrix-only), and the suggested
+        filename's extension follows the format."""
+        is_dcp = self._is_dcp()
+        if is_dcp:
+            self.type_combo.setCurrentIndex(0)        # force 3×3 matrix
+        self.type_combo.setEnabled(not is_dcp)
+        cur = self.save_path_edit.text().strip()
+        if cur.lower().endswith((".icc", ".dcp")):
+            self.save_path_edit.setText(cur[:-4] + (".dcp" if is_dcp else ".icc"))
+
     def _default_save_path(self) -> str:
         from core.catalog import default_catalog_path
         folder = os.path.join(os.path.dirname(default_catalog_path()),
@@ -833,34 +857,45 @@ class IT8ProfileDialog(QDialog):
         os.makedirs(folder, exist_ok=True)
         name = self.name_edit.text().strip() or "Camera Profile"
         safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in name)
-        return os.path.join(folder, f"{safe}.icc")
+        return os.path.join(folder, f"{safe}{'.dcp' if self._is_dcp() else '.icc'}")
 
     def _choose_save_path(self):
+        sel0 = ("DNG camera profile (*.dcp)" if self._is_dcp()
+                else "ICC profile (*.icc)")
         path, sel = QFileDialog.getSaveFileName(
-            self, "Save camera profile", self.save_path_edit.text(),
-            "ICC profile (*.icc);;DNG camera profile (*.dcp)")
-        if path:
-            if not path.lower().endswith((".icc", ".dcp")):
-                path += ".dcp" if "dcp" in sel.lower() else ".icc"
-            self.save_path_edit.setText(path)
+            self, "Save camera profile",
+            self.save_path_edit.text() or self._default_save_path(),
+            "ICC profile (*.icc);;DNG camera profile (*.dcp)", sel0)
+        if not path:
+            return
+        # Picking a file type in the dialog keeps the Output-format selector in
+        # step (so the combo and the path never disagree).
+        if path.lower().endswith(".dcp"):
+            chosen_dcp = True
+        elif path.lower().endswith(".icc"):
+            chosen_dcp = False
+        else:
+            chosen_dcp = "dcp" in sel.lower()
+            path += ".dcp" if chosen_dcp else ".icc"
+        self.format_combo.setCurrentIndex(1 if chosen_dcp else 0)
+        self.save_path_edit.setText(path)
 
     def _do_save(self) -> bool:
         path = self.save_path_edit.text().strip()
         if not path:
             QMessageBox.warning(self, "Save", "Choose a destination file.")
             return False
+        is_dcp = self._is_dcp()
+        # The Output-format selector wins: normalise the path extension to match.
+        base = path[:-4] if path.lower().endswith((".icc", ".dcp")) else path
+        path = base + (".dcp" if is_dcp else ".icc")
+        self.save_path_edit.setText(path)
         illum = self.illum_combo.currentText().strip()
         name = self.name_edit.text().strip() or "Camera Profile"
         desc = f"{name} ({illum})" if illum else name
-        clut = self.type_combo.currentIndex() == 1
-        if path.lower().endswith(".dcp") and clut:
-            QMessageBox.information(
-                self, "DCP is matrix-only",
-                "DCP export writes a 3×3 matrix profile; the cLUT "
-                "(higher-accuracy) correction is not included. Save as .icc to "
-                "keep the cLUT.")
+        clut = (not is_dcp) and self.type_combo.currentIndex() == 1
         try:
-            if path.lower().endswith(".dcp"):
+            if is_dcp:
                 from core import dcp_profile
                 blob = dcp_profile.build_camera_dcp(
                     self._fit, desc, illuminant=_illuminant_enum(illum))

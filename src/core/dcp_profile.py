@@ -276,6 +276,11 @@ def apply_dcp(profile: DcpProfile, rgb_u16: np.ndarray, *,
     m = (np.asarray(as_shot_wb, dtype=np.float64)[:3].copy()
          if as_shot_wb is not None else np.ones(3))
     m[m <= 0] = 1.0
+    # Normalise the as-shot multipliers to green=1 — they are raw WB *gains*
+    # (e.g. [2366,1024,1640]); using them un-normalised multiplies the image by
+    # ~1000x and blows it to white. This is the DNG reference-neutral diagonal.
+    if m[1] > 0:
+        m = m / m[1]
 
     w = _interp_weight(profile, m)
     FM = _blend(profile.forward_matrix_1, profile.forward_matrix_2, w)
@@ -444,14 +449,17 @@ def _write_ifd(tags: Dict[int, Tuple[str, object]]) -> bytes:
 def build_camera_dcp(fit, name: str, *, illuminant: int = 23) -> bytes:
     """Synthesise a minimal single-illuminant matrix DCP from the IT8 fit.
 
-    M (camera-native device[0,1] -> XYZ D50, Y~1) is re-expressed as a
-    ForwardMatrix on white-balanced camera RGB plus the required ColorMatrix.
-    Parses back via parse_dcp_bytes."""
+    The fit's matrix M maps WHITE-BALANCED camera RGB -> XYZ D50 with M@(1,1,1)=D50,
+    which is exactly the DNG ForwardMatrix. The ColorMatrix (XYZ D50 -> un-balanced
+    reference camera RGB) is inv(M @ diag(wb)) — NOT inv(ForwardMatrix); the two
+    differ by the white-balance diagonal (DNG spec 1.6, ch.6). Parses back via
+    parse_dcp_bytes."""
     M = np.asarray(fit.matrix, dtype=np.float64)
-    N = np.linalg.inv(M) @ _D50                       # camera RGB that maps to D50 grey
-    N = N / np.max(np.abs(N))                          # DNG-style neutral, max 1
-    FM = M @ np.diag(N)                                # wb-camera -> XYZ D50 (FM @ 1 = D50)
-    CM = np.linalg.inv(FM)                             # XYZ D50 -> camera (single-illuminant)
+    wb = np.asarray(fit.wb_mult, dtype=np.float64)[:3]  # raw -> balanced (green=1)
+    FM = M                                             # ForwardMatrix: balanced cam -> XYZ D50
+    # Un-balanced raw -> XYZ is M @ diag(wb) (balanced = raw*wb), so XYZ -> raw is
+    # its inverse. CameraNeutral = CM @ D50 = 1/wb (the green-normalised raw neutral).
+    CM = np.linalg.inv(M @ np.diag(wb))                # XYZ D50 -> un-balanced camera
     name = str(name).encode('ascii', 'replace').decode('ascii')
     tags = {
         _T_PROFILENAME: ('ascii', name),

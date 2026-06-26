@@ -48,6 +48,10 @@ class CCRBackend:
         # Active DCP (DNG camera profile) — mutually exclusive with the input ICC.
         self.input_dcp_path: Optional[str] = None
         self.input_dcp_name: Optional[str] = None
+        # The active profile's path within the camera-profile library (or None).
+        # The library (camera_profiles/) keeps every imported/generated profile;
+        # the active one is just a selection, not a copy. See spec/camera-profile-library.md.
+        self.active_profile_path: Optional[str] = None
         # Catalog entries of ACTUAL images removed from the list this
         # session: {file_path: {"signature": sig, "entries": {name: state}}}.
         # Removal must not lose their stored edits, so saves merge these
@@ -559,6 +563,53 @@ class CCRBackend:
             img.update_thumbnail_and_preview()
         return True
 
+    def _reconvert_in_place(self, image_obj) -> None:
+        """Replay the stored negative conversion (bwpoint / reference / ref_params)
+        on the freshly re-decoded resized_raw, in place — so a profile re-grade
+        keeps the conversion. No-op if there is no recipe to replay."""
+        ci = getattr(image_obj, "conversion_inputs", None)
+        wm = not self.software_activated
+        try:
+            if ci is not None and ci.get("mode") == "bw":
+                black_point, white_point = ci["bw"]
+                processed = ccr_normalize_with_bwpoint(
+                    image_obj, black_point, white_point, water_mark=wm)
+            elif ci is not None and ci.get("mode") == "ref_params":
+                processed = ccr_normalize_with_refparams(
+                    image_obj, ci["p_lo"], ci["p_hi"], ci["od"], water_mark=wm)
+            elif image_obj.reference_frame is not None:
+                processed = ccr_normalize_with_reference(image_obj, water_mark=wm)
+            else:
+                return
+            if processed is not None:
+                image_obj.resized_raw = processed
+                image_obj.converted = True
+        except Exception as e:
+            print(f"Re-convert failed for {getattr(image_obj, 'file_path', '?')}: {e}")
+
+    def regrade_images_by_indices(self, indices, progress_callback=None) -> bool:
+        """Re-decode each image under the CURRENT camera profile, KEEPING all of the
+        user's work — the negative conversion (bwpoint / reference), colour
+        adjustments, crop, flips, rotation and slice. Only the camera-profile decode
+        changes; the conversion is replayed on the new decode. Backs 'Replace with
+        current camera profile' (distinct from Reset, which drops everything).
+        Returns True if at least one image was re-graded."""
+        idxs = [i for i in sorted(set(indices))
+                if i is not None and 0 <= i < len(self.images)]
+        if not idxs:
+            return False
+        imgs = [self.images[i] for i in idxs]
+        # The re-decode clears conversion_inputs + base offsets — snapshot the
+        # recipe + converted flag so they can be restored and replayed after.
+        saved = [(img.conversion_inputs, img.converted) for img in imgs]
+        self._reload_decode_parallel(imgs, progress_callback)   # re-decode base + re-stamp signature
+        for img, (ci, was_converted) in zip(imgs, saved):
+            img.conversion_inputs = ci
+            if was_converted:
+                self._reconvert_in_place(img)
+            img.update_thumbnail_and_preview()
+        return True
+
     def convert_negative_by_index(self, idx: int):
         """
         Converts the negative image at the given index using CCR normalization with reference.
@@ -584,6 +635,135 @@ class CCRBackend:
             except Exception as e:
                 print(f"Failed to convert image at index {idx}: {e}")
 
+    def active_profile_signature(self) -> str:
+        """The camera-profile signature an image decoded NOW would be graded
+        under: 'none' in Positive mode (the profile isn't applied) or when the
+        profile is disabled/unset, else 'icc:<desc>' / 'dcp:<name>'. Drives the
+        per-image thumbnail mismatch warning."""
+        from core import color_management
+        if self.positive_mode:
+            return "none"
+        if color_management.camera_matrix_mode():
+            return "camera_matrix"          # Adobe+autoscale decode, distinct from RAW "none"
+        return color_management.active_profile_signature()
+
+    @staticmethod
+    def _profile_content_id(path):
+        """A short content hash of a profile file, attached to the active profile
+        so the per-image grading signature distinguishes two different profiles
+        that happen to share a description/name (or both lack one)."""
+        import hashlib
+        try:
+            with open(path, "rb") as f:
+                return hashlib.md5(f.read()).hexdigest()[:12]
+        except OSError:
+            return None
+
+    # --- Camera-profile library (persistent in the app-data workspace) --------
+    def camera_profiles_dir(self) -> str:
+        """The library folder under %APPDATA%/FreeCCR that keeps every imported
+        and IT8-generated camera profile (survives app updates/reinstalls — it is
+        outside the install dir)."""
+        from core.catalog import default_catalog_path
+        d = os.path.join(os.path.dirname(default_catalog_path()), "camera_profiles")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def list_camera_profiles(self) -> list:
+        """All profiles in the library: [{name, path, kind('icc'|'dcp')}], by name."""
+        import glob
+        out = []
+        for ext, kind in ((".icc", "icc"), (".icm", "icc"), (".dcp", "dcp")):
+            for p in glob.glob(os.path.join(self.camera_profiles_dir(), "*" + ext)):
+                out.append({"name": os.path.splitext(os.path.basename(p))[0],
+                            "path": p, "kind": kind})
+        return sorted(out, key=lambda x: x["name"].lower())
+
+    def import_camera_profile(self, src_path: str) -> str:
+        """Validate then copy an external .icc/.icm/.dcp into the library, keeping
+        it for re-selection. Returns the new library path. Raises (UnsupportedICCError
+        / DcpError / ValueError) on an unparseable or unsupported file."""
+        import shutil
+        ext = os.path.splitext(src_path)[1].lower()
+        if ext == ".dcp":
+            from core import dcp_profile
+            dcp_profile.parse_dcp(src_path)                  # validate
+        elif ext in (".icc", ".icm"):
+            from core import color_management
+            color_management.load_input_profile(src_path)    # validate
+        else:
+            raise ValueError(f"Unsupported profile type: {ext}")
+        base, e = os.path.splitext(os.path.basename(src_path))
+        dst = os.path.join(self.camera_profiles_dir(), base + e)
+        n = 1
+        srcn = os.path.normcase(os.path.abspath(src_path))
+        while os.path.exists(dst) and os.path.normcase(os.path.abspath(dst)) != srcn:
+            dst = os.path.join(self.camera_profiles_dir(), f"{base} ({n}){e}")
+            n += 1
+        if os.path.normcase(os.path.abspath(dst)) != srcn:
+            shutil.copyfile(src_path, dst)
+        return dst
+
+    # Non-removable picker sentinel: no profile, decode in Adobe RGB + auto-scale
+    # (the camera's built-in matrix) instead of bare camera-native RAW ("None").
+    CAMERA_MATRIX = "__camera_matrix__"
+
+    def set_active_profile(self, path: Optional[str]) -> Optional[str]:
+        """Activate the library profile at `path` (.icc/.icm/.dcp), the special
+        CAMERA_MATRIX mode, or None (bare RAW). Never copies or deletes — the
+        library file is the source. Returns the display name, or None. Raises on a
+        bad file."""
+        from core import color_management
+        if path == self.CAMERA_MATRIX:
+            color_management.set_active_input_profile(None)
+            color_management.set_active_dcp_profile(None)
+            color_management.set_camera_matrix_mode(True)
+            self.input_icc_path = self.input_icc_name = None
+            self.input_dcp_path = self.input_dcp_name = None
+            self.active_profile_path = self.CAMERA_MATRIX
+            return "Camera Matrix"
+        color_management.set_camera_matrix_mode(False)   # any real selection clears it
+        if not path:
+            color_management.set_active_input_profile(None)
+            color_management.set_active_dcp_profile(None)
+            self.input_icc_path = self.input_icc_name = None
+            self.input_dcp_path = self.input_dcp_name = None
+            self.active_profile_path = None
+            return None
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".dcp":
+            from core import dcp_profile
+            prof = dcp_profile.parse_dcp(path)
+            prof.content_id = self._profile_content_id(path)
+            color_management.set_active_dcp_profile(prof)
+            color_management.set_active_input_profile(None)
+            self.input_dcp_path = path
+            self.input_dcp_name = prof.name or os.path.basename(path)
+            self.input_icc_path = self.input_icc_name = None
+            name = self.input_dcp_name
+        else:
+            prof = color_management.load_input_profile(path)
+            prof.content_id = self._profile_content_id(path)
+            color_management.set_active_input_profile(prof)
+            color_management.set_active_dcp_profile(None)
+            self.input_icc_path = path
+            self.input_icc_name = prof.description or os.path.basename(path)
+            self.input_dcp_path = self.input_dcp_name = None
+            name = self.input_icc_name
+        self.active_profile_path = path
+        return name
+
+    def delete_camera_profile(self, path: str) -> bool:
+        """Remove a profile file from the library. Deactivates it first if active."""
+        if (self.active_profile_path and os.path.normcase(os.path.abspath(path))
+                == os.path.normcase(os.path.abspath(self.active_profile_path))):
+            self.set_active_profile(None)
+        try:
+            os.remove(path)
+            return True
+        except OSError:
+            return False
+
     # --- Global input ICC profile -----------------------------------------
     def _input_icc_storage_path(self) -> str:
         """Persistent working-copy path inside the app-data folder (next to the
@@ -605,6 +785,7 @@ class CCRBackend:
         if (os.path.normcase(os.path.abspath(src_path))
                 != os.path.normcase(os.path.abspath(storage))):
             shutil.copyfile(src_path, storage)
+        profile.content_id = self._profile_content_id(src_path)
         color_management.set_active_input_profile(profile)
         self.clear_input_dcp()                       # ICC and DCP are exclusive
         self.input_icc_path = storage
@@ -620,6 +801,7 @@ class CCRBackend:
         except Exception as e:
             print(f"Could not load saved input ICC {storage_path}: {e}")
             return None
+        profile.content_id = self._profile_content_id(storage_path)
         color_management.set_active_input_profile(profile)
         self.input_icc_path = storage_path
         self.input_icc_name = profile.description or os.path.basename(storage_path)
@@ -654,6 +836,7 @@ class CCRBackend:
         if (os.path.normcase(os.path.abspath(src_path))
                 != os.path.normcase(os.path.abspath(storage))):
             shutil.copyfile(src_path, storage)
+        profile.content_id = self._profile_content_id(src_path)
         color_management.set_active_dcp_profile(profile)
         self.clear_input_icc()                       # DCP and ICC are exclusive
         self.input_dcp_path = storage
@@ -667,6 +850,7 @@ class CCRBackend:
         except Exception as e:
             print(f"Could not load saved DCP {storage_path}: {e}")
             return None
+        profile.content_id = self._profile_content_id(storage_path)
         color_management.set_active_dcp_profile(profile)
         self.input_dcp_path = storage_path
         self.input_dcp_name = profile.name or os.path.basename(storage_path)
