@@ -625,6 +625,8 @@ class CCRBackend:
         from core import color_management
         if self.positive_mode:
             return "none"
+        if color_management.camera_matrix_mode():
+            return "camera_matrix"          # Adobe+autoscale decode, distinct from RAW "none"
         return color_management.active_profile_signature()
 
     @staticmethod
@@ -684,11 +686,25 @@ class CCRBackend:
             shutil.copyfile(src_path, dst)
         return dst
 
+    # Non-removable picker sentinel: no profile, decode in Adobe RGB + auto-scale
+    # (the camera's built-in matrix) instead of bare camera-native RAW ("None").
+    CAMERA_MATRIX = "__camera_matrix__"
+
     def set_active_profile(self, path: Optional[str]) -> Optional[str]:
-        """Activate the library profile at `path` (.icc/.icm/.dcp), or None to use
-        no profile. Never copies or deletes — the library file is the source.
-        Returns the profile's display name, or None. Raises on a bad file."""
+        """Activate the library profile at `path` (.icc/.icm/.dcp), the special
+        CAMERA_MATRIX mode, or None (bare RAW). Never copies or deletes — the
+        library file is the source. Returns the display name, or None. Raises on a
+        bad file."""
         from core import color_management
+        if path == self.CAMERA_MATRIX:
+            color_management.set_active_input_profile(None)
+            color_management.set_active_dcp_profile(None)
+            color_management.set_camera_matrix_mode(True)
+            self.input_icc_path = self.input_icc_name = None
+            self.input_dcp_path = self.input_dcp_name = None
+            self.active_profile_path = self.CAMERA_MATRIX
+            return "Camera Matrix"
+        color_management.set_camera_matrix_mode(False)   # any real selection clears it
         if not path:
             color_management.set_active_input_profile(None)
             color_management.set_active_dcp_profile(None)

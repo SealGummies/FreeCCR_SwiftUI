@@ -81,16 +81,21 @@ class ThumbnailList(QWidget):
         active selection (called on startup and after import/delete/generate)."""
         if not hasattr(self, "profile_combo"):
             return
+        CM = ccr_backend.CAMERA_MATRIX
+        active = getattr(ccr_backend, "active_profile_path", None)
+        active_n = (os.path.normcase(os.path.abspath(active))
+                    if (active and active != CM) else None)
         self.profile_combo.blockSignals(True)
         self.profile_combo.clear()
+        # Two non-removable entries first: None (bare RAW) and Camera Matrix
+        # (Adobe RGB + auto-scale, the camera's built-in matrix).
         self.profile_combo.addItem("None", None)
-        active = getattr(ccr_backend, "active_profile_path", None)
-        active_n = os.path.normcase(os.path.abspath(active)) if active else None
-        sel = 0
-        for i, p in enumerate(ccr_backend.list_camera_profiles(), start=1):
+        self.profile_combo.addItem("Camera Matrix", CM)
+        sel = 1 if active == CM else 0
+        for p in ccr_backend.list_camera_profiles():
             self.profile_combo.addItem(f"{p['name']}  ({p['kind'].upper()})", p["path"])
             if active_n and os.path.normcase(os.path.abspath(p["path"])) == active_n:
-                sel = i
+                sel = self.profile_combo.count() - 1
         self.profile_combo.setCurrentIndex(sel)
         self.profile_combo.blockSignals(False)
 

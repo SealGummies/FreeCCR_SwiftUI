@@ -88,6 +88,23 @@ def camera_profile_active() -> bool:
             and (_active_input_profile is not None or _active_dcp_profile is not None))
 
 
+# "Camera Matrix" decode mode (a non-removable picker entry, no profile): decode
+# in Adobe RGB with rawpy auto-scale (linear) — the camera's built-in matrix. When
+# OFF and no profile is set ("None"), the decode is bare camera-native RAW (linear,
+# no auto-scale). Mutually exclusive with an active ICC/DCP. Read by ccr_image to
+# pick the no-profile decode space. See spec/camera-profile-library.md.
+_camera_matrix_mode = False
+
+
+def set_camera_matrix_mode(on: bool) -> None:
+    global _camera_matrix_mode
+    _camera_matrix_mode = bool(on)
+
+
+def camera_matrix_mode() -> bool:
+    return _camera_matrix_mode
+
+
 def active_profile_signature() -> str:
     """Stable id of the profile that would be applied now — what an image's decode
     is 'graded under'. 'none' when disabled or unset. (Positive mode is folded in

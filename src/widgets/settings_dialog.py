@@ -181,12 +181,14 @@ class SettingsDialog(QDialog):
         """Reflect the live active profile, the library list, and Positive mode."""
         icc = getattr(ccr_backend, "input_icc_name", None)
         dcp = getattr(ccr_backend, "input_dcp_name", None)
-        if dcp:
+        if getattr(ccr_backend, "active_profile_path", None) == ccr_backend.CAMERA_MATRIX:
+            self._status.setText("Active: Camera Matrix  (Adobe RGB)")
+        elif dcp:
             self._status.setText(f"Active: {dcp}  (DCP)")
         elif icc:
             self._status.setText(f"Active: {icc}  (ICC)")
         else:
-            self._status.setText("Active: None")
+            self._status.setText("Active: None  (raw)")
 
         active = getattr(ccr_backend, "active_profile_path", None)
         active_n = os.path.normcase(os.path.abspath(active)) if active else None

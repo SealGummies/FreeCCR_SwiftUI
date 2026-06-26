@@ -187,20 +187,32 @@ class MainWindow(QMainWindow):
         self.installEventFilter(self)
         self.create_menu()
 
-        # Restore the active camera profile from the library (applied to every
-        # decode). Done before any images load so the first batch picks it up.
-        # Falls back to the legacy single-copy keys for users upgrading.
+        # Restore the active camera-profile selection (applied to every decode).
+        # Done before any images load so the first batch picks it up. A fresh
+        # install / a vanished profile file defaults to Camera Matrix (the prior
+        # Adobe RGB + auto-scale out-of-box look). "none" = explicit bare-RAW.
+        CM = ccr_backend.CAMERA_MATRIX
         saved = self._settings.value("import/active_profile_path", "", type=str)
-        if not (saved and os.path.exists(saved)):
+
+        def _restore(sel):
+            try:
+                ccr_backend.set_active_profile(sel)
+                self._settings.setValue("import/active_profile_path",
+                                        sel if sel else "none")
+            except Exception:
+                ccr_backend.set_active_profile(CM)
+                self._settings.setValue("import/active_profile_path", CM)
+
+        if saved == "none":
+            ccr_backend.set_active_profile(None)
+        elif saved == CM:
+            ccr_backend.set_active_profile(CM)
+        elif saved and os.path.exists(saved):
+            _restore(saved)
+        else:
             legacy = (self._settings.value("import/input_icc_path", "", type=str)
                       or self._settings.value("import/input_dcp_path", "", type=str))
-            saved = legacy if (legacy and os.path.exists(legacy)) else ""
-        if saved:
-            try:
-                ccr_backend.set_active_profile(saved)
-                self._settings.setValue("import/active_profile_path", saved)
-            except Exception:
-                self._settings.remove("import/active_profile_path")
+            _restore(legacy if (legacy and os.path.exists(legacy)) else CM)
         self.thumbnail_list.refresh_profile_combo()
         self._refresh_profile_ui()
 
@@ -413,10 +425,9 @@ class MainWindow(QMainWindow):
                                 f"Could not activate the profile:\n\n{e}")
             self._refresh_profile_combo()
             return False
-        if path:
-            self._settings.setValue("import/active_profile_path", path)
-        else:
-            self._settings.remove("import/active_profile_path")
+        # Persist the literal selection ("none" so it's distinct from a fresh
+        # install, which defaults to Camera Matrix at startup).
+        self._settings.setValue("import/active_profile_path", path if path else "none")
         self._refresh_profile_combo()
         self._refresh_profile_mismatch()
         self._refresh_profile_ui()

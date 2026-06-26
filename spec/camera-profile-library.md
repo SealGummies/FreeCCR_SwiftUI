@@ -25,6 +25,26 @@ the library **survives app updates / reinstalls**.
    which Windows never removes on update/uninstall. Verify the installer does not
    delete it.
 
+## 2b. Picker entries & decode space (refinement)
+
+The picker has two non-removable entries before the library:
+
+| Selection | Decode | Signature |
+|-----------|--------|-----------|
+| **None** | bare camera-native **RAW** (`output_color=raw`, linear, **no_auto_scale** + manual white-level scaling) — no matrix | `none` |
+| **Camera Matrix** | **Adobe RGB** + rawpy **auto-scale** (linear) — the camera's built-in matrix | `camera_matrix` |
+| *a profile* | camera-native RAW + the profile's matrix → linear Adobe | `icc:…`/`dcp:…` |
+
+Implementation: `color_management.camera_matrix_mode()` (set by
+`ccr_backend.set_active_profile(CAMERA_MATRIX)`, cleared by any other selection) is
+read in `ccr_image.read_image` — `icc_device_space = (not apply_input_icc) or not
+camera_matrix_mode()`, so only Camera Matrix takes the Adobe+auto-scale path; None
+and profiles decode camera-native. `ccr_backend.active_profile_signature()` returns
+`camera_matrix` so switching None↔Camera Matrix↔profile flags the per-image ⚠ as
+usual. Persistence: `active_profile_path` is `"none"` / `"__camera_matrix__"` / a
+path; **a fresh install (or a vanished profile file) defaults to Camera Matrix** so
+the prior out-of-box Adobe look does not regress.
+
 ## 3. Data model
 
 The library dir already exists (the IT8 wizard saves there). The active profile is

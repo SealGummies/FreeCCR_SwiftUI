@@ -40,18 +40,19 @@ class _StubDCP:
 
 @pytest.fixture(autouse=True)
 def _reset_profile_state():
-    """Each test starts with no profile, not disabled, negative mode."""
-    cm.set_active_input_profile(None)
-    cm.set_active_dcp_profile(None)
-    cm.set_input_profile_disabled(False)
-    ccr_backend.positive_mode = False
-    ccr_backend.images = []
+    """Each test starts with no profile, not disabled, negative mode, no Camera
+    Matrix, no active selection."""
+    def _reset():
+        cm.set_active_input_profile(None)
+        cm.set_active_dcp_profile(None)
+        cm.set_input_profile_disabled(False)
+        cm.set_camera_matrix_mode(False)
+        ccr_backend.positive_mode = False
+        ccr_backend.active_profile_path = None
+        ccr_backend.images = []
+    _reset()
     yield
-    cm.set_active_input_profile(None)
-    cm.set_active_dcp_profile(None)
-    cm.set_input_profile_disabled(False)
-    ccr_backend.positive_mode = False
-    ccr_backend.images = []
+    _reset()
 
 
 def _scan_png(tmp_path, name="negative.png", w=320, h=240, seed=7):
@@ -290,7 +291,7 @@ class TestSettingsDialog:
         ccr_backend.input_icc_name = None
         ccr_backend.input_dcp_name = None
         d = _dialog()
-        assert d._status.text() == "Active: None"
+        assert "None" in d._status.text()
         ccr_backend.input_icc_name = "MyCam.icc"
         d.refresh_color_management()
         assert "ICC" in d._status.text() and "MyCam.icc" in d._status.text()
@@ -299,6 +300,9 @@ class TestSettingsDialog:
         d.refresh_color_management()
         assert "DCP" in d._status.text() and "Nikon.dcp" in d._status.text()
         ccr_backend.input_dcp_name = None
+        ccr_backend.active_profile_path = ccr_backend.CAMERA_MATRIX
+        d.refresh_color_management()
+        assert "Camera Matrix" in d._status.text()
 
     def test_buttons_delegate_to_main_window(self):
         d = _dialog()
@@ -431,3 +435,37 @@ class TestRegradeVsReset:
         assert img.horizontal_mirrored is False
         assert img.source_ops == [(0, (0.0, 0.0, 0.5, 0.5))]   # slice still preserved
         assert img.profile_signature == ccr_backend.active_profile_signature()
+
+
+class TestCameraMatrixMode:
+    """The non-removable 'Camera Matrix' picker entry (Adobe RGB + auto-scale),
+    distinct from 'None' (bare RAW)."""
+
+    def test_backend_activates_signature_and_clears(self):
+        assert ccr_backend.set_active_profile(ccr_backend.CAMERA_MATRIX) == "Camera Matrix"
+        assert cm.camera_matrix_mode() is True
+        assert ccr_backend.active_profile_path == ccr_backend.CAMERA_MATRIX
+        assert ccr_backend.active_profile_signature() == "camera_matrix"
+        assert ccr_backend.set_active_profile(None) is None     # None -> bare RAW
+        assert cm.camera_matrix_mode() is False
+        assert ccr_backend.active_profile_signature() == "none"
+
+    def test_profile_clears_camera_matrix(self, tmp_path):
+        ccr_backend.set_active_profile(ccr_backend.CAMERA_MATRIX)
+        blob = cm.build_matrix_shaper_icc(
+            "P", (0.6, 0.3, 0.0), (0.2, 0.7, 0.06), (0.0, 0.06, 0.8),
+            (1.0, 1.0, 0.0, 1.0, 0.0))
+        p = tmp_path / "p.icc"; p.write_bytes(blob)
+        ccr_backend.set_active_profile(str(p))
+        assert cm.camera_matrix_mode() is False
+        assert ccr_backend.active_profile_signature().startswith("icc:")
+        ccr_backend.set_active_profile(None)
+
+    def test_picker_lists_none_then_camera_matrix(self):
+        from widgets.thumbnail_list import ThumbnailList
+        ccr_backend.set_active_profile(ccr_backend.CAMERA_MATRIX)
+        tl = ThumbnailList(lambda i: None)
+        tl.refresh_profile_combo()
+        assert [tl.profile_combo.itemText(i) for i in range(2)] == ["None", "Camera Matrix"]
+        assert "Camera Matrix" in tl.profile_combo.currentText()
+        ccr_backend.set_active_profile(None)

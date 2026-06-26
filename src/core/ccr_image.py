@@ -513,10 +513,16 @@ class CCRImage:
                         # This is the standard input for matrix/cLUT ICC and DCP
                         # (`dcraw -o 0 -g 1 1 -W -r 1 1 1 1`, see
                         # spec/it8-camera-profile.md §12.5), and makes fit-space ==
-                        # apply-space EXACTLY. A plain unprofiled negative keeps the
-                        # Adobe RGB + rawpy auto-scale camera-independent default.
+                        # apply-space EXACTLY.
+                        #
+                        # No-profile decode space is the picker's choice: "Camera
+                        # Matrix" -> Adobe RGB + rawpy auto-scale (the camera's
+                        # built-in matrix); "None" -> bare camera-native RAW (same
+                        # space a profile is applied on, just no matrix). A profile
+                        # always decodes camera-native. The IT8 profiling decode
+                        # (apply_input_icc=False) is forced camera-native too.
                         icc_device_space = (not apply_input_icc
-                                            or self._input_icc_will_apply())
+                                            or not color_management.camera_matrix_mode())
                         no_icc_default = not icc_device_space
                         rgb = raw.postprocess(
                             **self._raw_color_postprocess_kwargs(
