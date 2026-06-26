@@ -6,6 +6,7 @@ from widgets.thumbnail_list import ThumbnailList
 from widgets.image_preview import ImagePreview
 from widgets.sliders_panel import SlidersPanel
 from widgets.dust_panel import DustRemovalPanel
+from widgets.crop_panel import CropPanel
 from widgets.tether_banner import TetherBanner
 from core.ccr_backend import ccr_backend
 from core.tether_watcher import (TetherWatchWorker, FolderScanner, is_supported,
@@ -144,6 +145,14 @@ class MainWindow(QMainWindow):
         self.dust_panel.setVisible(False)
         self.image_preview.set_dust_panel(self.dust_panel)
 
+        # Crop panel — covers the sliders panel while in crop mode, same sibling
+        # pattern as dust_panel (keeps SlidersPanel's parent chain valid). See
+        # spec/crop-panel.md.
+        self.crop_panel = CropPanel(self, self.image_preview)
+        self.crop_panel.setFixedWidth(300)
+        self.crop_panel.setVisible(False)
+        self.image_preview.set_crop_panel(self.crop_panel)
+
         # Tethering (watch-folder capture) state + status banner. The banner is
         # installed INTO image_preview's own layout (not wrapped around it) so
         # ImagePreview's parent().parent() chains stay valid — see
@@ -168,6 +177,7 @@ class MainWindow(QMainWindow):
         self.layout.addWidget(self.image_preview, 3)
         self.layout.addWidget(self.sliders_panel, 0)
         self.layout.addWidget(self.dust_panel, 0)
+        self.layout.addWidget(self.crop_panel, 0)
 
         # Persisted UI preferences (last-open location etc.)
         self._settings = QSettings("FreeCCR", "FreeCCR")
@@ -308,6 +318,42 @@ class MainWindow(QMainWindow):
         self.dust_panel.setVisible(False)
         self.sliders_panel.setVisible(True)
         self._sync_dust_action(False)
+
+    # --- Crop (panel cover + canvas crop mode) ---------------------------
+    def toggle_crop_panel(self, on=None):
+        """Show/hide the Crop panel (covering the sliders) and enter/exit the
+        canvas crop mode. `on=None` flips the current state. Mirrors
+        toggle_dust_removal. Exit is also driven by the canvas chokepoint
+        (_exit_crop_mode -> on_crop_panel_closed) for Enter/Esc/right-click."""
+        if on is None:
+            on = not self.image_preview.crop_mode
+        if on:
+            if self.image_preview.current_idx is None:
+                return
+            if self.image_preview.crop_mode:
+                return
+            if not self.image_preview.enter_crop_mode():
+                return
+            self.sliders_panel.setVisible(False)
+            self.dust_panel.setVisible(False)
+            self.crop_panel.bind_image()
+            self.crop_panel.setVisible(True)
+        else:
+            # Done button: commit the pending crop. confirm_crop -> _exit_crop_mode
+            # -> on_crop_panel_closed restores the panel; if already out of crop
+            # mode, restore directly.
+            if self.image_preview.crop_mode:
+                self.image_preview.confirm_crop()
+            else:
+                self.on_crop_panel_closed()
+
+    def on_crop_panel_closed(self):
+        """Restore the sliders panel after crop mode ends by any path. Guarded
+        so entering dust mode from crop (which also exits crop) doesn't fight the
+        dust panel."""
+        self.crop_panel.setVisible(False)
+        if not self.dust_panel.isVisible():
+            self.sliders_panel.setVisible(True)
 
     def _sync_dust_action(self, checked: bool):
         action = getattr(self.image_preview, "dust_action", None)
