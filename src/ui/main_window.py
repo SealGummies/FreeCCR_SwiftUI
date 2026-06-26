@@ -176,7 +176,6 @@ class MainWindow(QMainWindow):
         # first batch decodes in the right mode (see spec/positive-mode.md).
         positive_mode = self._settings.value("import/positive_mode", False, type=bool)
         ccr_backend.positive_mode = positive_mode
-        self.thumbnail_list.set_positive_checkbox(positive_mode)
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
@@ -498,9 +497,6 @@ class MainWindow(QMainWindow):
         Mirrors the input-ICC reprocess. See spec/positive-mode.md."""
         ccr_backend.positive_mode = bool(checked)
         self._settings.setValue("import/positive_mode", bool(checked))
-        # Keep the thumbnail-panel checkbox in step when the toggle comes from the
-        # Settings dialog (set_positive_checkbox blocks its own signal).
-        self.thumbnail_list.set_positive_checkbox(bool(checked))
         if ccr_backend.images:
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:

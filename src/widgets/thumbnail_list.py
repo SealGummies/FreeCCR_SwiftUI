@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QListWidget, QListWidgetItem, QLabel, QDialog, QApplication, QPushButton, QMenu, QCheckBox, QComboBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QListWidget, QListWidgetItem, QLabel, QDialog, QApplication, QPushButton, QMenu, QComboBox
 from PySide6.QtGui import QPixmap, QIcon, QTransform, QPainter
 from PySide6.QtCore import Qt, QSize, QTimer
 import os
@@ -76,19 +76,6 @@ class ThumbnailList(QWidget):
         """Return the MainWindow that owns this widget."""
         return self.parent().parent()
 
-    def _on_positive_mode_toggled(self, checked):
-        """Forward to the MainWindow, which owns the re-decode + persistence."""
-        mw = self._main_window()
-        if hasattr(mw, "on_positive_mode_toggled"):
-            mw.on_positive_mode_toggled(checked)
-
-    def set_positive_checkbox(self, checked: bool):
-        """Reflect the restored/global Positive-mode state without firing the
-        toggle handler (used on startup)."""
-        self.positive_mode_checkbox.blockSignals(True)
-        self.positive_mode_checkbox.setChecked(bool(checked))
-        self.positive_mode_checkbox.blockSignals(False)
-
     def refresh_profile_combo(self):
         """Repopulate the camera-profile picker from the library and reflect the
         active selection (called on startup and after import/delete/generate)."""
@@ -131,19 +118,7 @@ class ThumbnailList(QWidget):
         _plabel.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         self.layout.addWidget(_plabel)
         self.layout.addWidget(self.profile_combo)
-
-        # Positive mode toggle — sits above the thumbnails. When checked, RAWs
-        # decode as normal sRGB positives and the film-negative tools are
-        # disabled; every image becomes directly editable/exportable. The
-        # MainWindow owns the heavy re-decode + persistence. See
-        # spec/positive-mode.md.
-        self.positive_mode_checkbox = QCheckBox("Positive mode")
-        self.positive_mode_checkbox.setToolTip(
-            "Treat images as normal positives (not film negatives): RAWs decode "
-            "in sRGB, conversion is skipped, and adjustments are available on "
-            "every image. Toggling re-decodes the loaded images.")
-        self.positive_mode_checkbox.toggled.connect(self._on_positive_mode_toggled)
-        self.layout.addWidget(self.positive_mode_checkbox)
+        # Positive mode now lives only in Settings ▸ Color Management.
 
         self.thumbnail_list = QListWidget()
         self.thumbnail_list.setViewMode(QListWidget.IconMode)
