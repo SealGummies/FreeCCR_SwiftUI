@@ -50,9 +50,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: win_installer/FreeCCR_Install_*.exe
-          # Install instructions shown on every release page.
+          # Release notes shown on every release page.
           # KEEP IN SYNC with the macOS job's upload step below.
+          # The body is static, so refresh "## What's New" for each release.
           body: |
+            ## What's New
+
+            **v0.7.1**
+            - **Crop:** added cinematic aspect-ratio presets — Academy (1.37:1), 1.85:1 (Flat), 2:1 (Univisium), 2.35:1 (CinemaScope), and 2.39:1 (Scope).
+            - **Film B/W Point:** closed the empty gap between the Set Black/White Point row and the Convert Current / Convert All row — the slope-source label now stays hidden until a point is sampled.
+
             ## Install
 
             ### Windows
@@ -141,9 +148,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: FreeCCR_macOS_*.zip
-          # Install instructions shown on every release page.
+          # Release notes shown on every release page.
           # KEEP IN SYNC with the Windows job's upload step above.
+          # The body is static, so refresh "## What's New" for each release.
           body: |
+            ## What's New
+
+            **v0.7.1**
+            - **Crop:** added cinematic aspect-ratio presets — Academy (1.37:1), 1.85:1 (Flat), 2:1 (Univisium), 2.35:1 (CinemaScope), and 2.39:1 (Scope).
+            - **Film B/W Point:** closed the empty gap between the Set Black/White Point row and the Convert Current / Convert All row — the slope-source label now stays hidden until a point is sampled.
+
             ## Install
 
             ### Windows

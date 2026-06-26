@@ -20,6 +20,14 @@ ASPECT_PRESETS = [
     ("7:5", "7:5", 7.0 / 5.0),
     ("3:2", "3:2", 3.0 / 2.0),
     ("16:9", "16:9", 16.0 / 9.0),
+    # Cinematic ratios (width/height in Landscape). Academy 1.375 is the classic
+    # 35 mm sound-film frame; the rest are the modern wide theatrical/streaming
+    # standards — DCI Flat 1.85, Univisium 2.0, CinemaScope 2.35, DCI Scope 2.39.
+    ("Academy (1.37:1)", "academy", 1.375),
+    ("1.85:1 (Flat)", "1.85:1", 1.85),
+    ("2:1 (Univisium)", "2:1", 2.0),
+    ("2.35:1 (CinemaScope)", "2.35:1", 2.35),
+    ("2.39:1 (Scope)", "2.39:1", 2.39),
     ("Custom…", "custom", None),
 ]
 

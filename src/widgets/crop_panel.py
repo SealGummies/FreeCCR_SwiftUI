@@ -3,7 +3,8 @@ Crop panel — covers the right-hand sliders panel while in crop mode (the same
 cover/restore pattern as DustRemovalPanel). Exposes "all the crop options":
 
   - Aspect ratio: presets (Free / Original / 1:1 / 5:4 / 4:3 / 7:5 / 3:2 / 16:9 /
-    Custom…) with a Landscape/Portrait toggle. A locked ratio constrains every
+    cinematic Academy / 1.85 / 2:1 / 2.35 / 2.39 / Custom…) with a
+    Landscape/Portrait toggle. A locked ratio constrains every
     on-canvas drag and reshapes the current box; the choice persists across
     images and sessions (QSettings) for catalogue consistency (issue #39).
   - Straighten: a ±45° slider that drives the crop box's rotation, two-way synced
