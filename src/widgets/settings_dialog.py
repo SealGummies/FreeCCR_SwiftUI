@@ -163,7 +163,8 @@ class SettingsDialog(QDialog):
             "blue light. On your NEXT import, every 3 RAWs (sorted by filename) "
             "are merged into one colour image — each frame contributes only its "
             "own channel, with no demosaicing — then converted as a negative. "
-            "RAW (Bayer) only; the selected count must be a multiple of 3. "
+            "RAW only (Bayer or monochrome); the selected count must be a "
+            "multiple of 3. "
             "Applies to the next import only; merged-image edits are not saved "
             "between sessions."))
         lay.addWidget(grp3)

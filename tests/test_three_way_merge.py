@@ -110,6 +110,31 @@ def test_bayer_indices_rejects_monochrome_and_non_rgb():
 
 
 # --------------------------------------------------------------------------- #
+# is_monochrome_sensor
+# --------------------------------------------------------------------------- #
+def test_monochrome_detected_by_num_colors():
+    assert ccr_merge.is_monochrome_sensor(1, b"RGBG") is True
+    assert ccr_merge.is_monochrome_sensor(1, b"G") is True
+
+
+def test_monochrome_detected_by_grey_desc():
+    for desc in (b"G", b"GRAY", b"GREY"):
+        assert ccr_merge.is_monochrome_sensor(3, desc) is True, desc
+
+
+def test_monochrome_detected_by_flat_rgbg_pattern():
+    flat = np.zeros((2, 2), dtype=np.int32)            # all one colour index
+    assert ccr_merge.is_monochrome_sensor(3, b"RGBG", flat) is True
+
+
+def test_bayer_is_not_monochrome():
+    normal = np.array([[0, 1], [3, 2]], dtype=np.int32)  # real RGGB pattern
+    assert ccr_merge.is_monochrome_sensor(3, b"RGBG", normal) is False
+    assert ccr_merge.is_monochrome_sensor(3, b"RGBG") is False   # no pattern given
+    assert ccr_merge.is_monochrome_sensor(4, b"RGBE") is False   # 4-colour, not mono
+
+
+# --------------------------------------------------------------------------- #
 # combine_channels (the pure merge core)
 # --------------------------------------------------------------------------- #
 def _const_plane(h, w, value):

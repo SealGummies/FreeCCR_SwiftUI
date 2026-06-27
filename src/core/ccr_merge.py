@@ -6,12 +6,22 @@ red, then green, then blue — and every consecutive triplet of source RAWs is
 merged into one full-colour image by taking each frame's OWN colour channel and
 discarding the other two, WITHOUT demosaicing.
 
-"No demosaic" means: collapse each 2x2 Bayer (RGGB) tile to one output pixel
-(R = R-site, G = mean of the two G-sites, B = B-site) — a pure bin, no
-interpolation. That is exactly what libraw/rawpy `half_size=True` does, so the
-merged frame is half-sensor resolution (which IS its full resolution). Decoding
-in camera-native colour (`output_color=raw`, no white balance) keeps each output
-channel an unmixed sensor colour, so picking a single channel is faithful.
+Two sensor kinds are supported:
+
+* **Bayer (RGGB)** — "no demosaic" means collapse each 2x2 CFA tile to one
+  output pixel (R = R-site, G = mean of the two G-sites, B = B-site): a pure bin,
+  no interpolation. That is exactly what libraw/rawpy `half_size=True` does, so a
+  Bayer merge is half-sensor resolution (which IS its full resolution). Decoding
+  camera-native (`output_color=raw`, no white balance) keeps each output channel
+  an unmixed sensor colour, so picking a single channel is faithful.
+
+* **Monochrome** — no CFA at all, so there is nothing to demosaic: every
+  photosite measured the (single) light's intensity. The whole grayscale frame
+  IS that frame's channel, at FULL sensor resolution. A monochrome sensor is in
+  fact the ideal trichrome sensor (no wasted photosites, full resolution).
+
+Either way each frame contributes exactly one channel (R from the red-light
+frame, G from green, B from blue), scaled to 16-bit by 65535/white_level.
 
 This module is split so everything except `merge_raw_channels` is pure and
 unit-testable without rawpy/Qt. See spec/three-way-rgb-merge.md.
@@ -61,8 +71,8 @@ def validate_merge_inputs(paths: Sequence[str]) -> Tuple[bool, Optional[str]]:
     """Pre-decode validation for a merge import. Returns (ok, error_message).
 
     Checks, in order: non-empty, every file is a supported RAW, count is a
-    multiple of 3. The Bayer-CFA check can only happen at decode time (see
-    merge_raw_channels), so it is NOT done here."""
+    multiple of 3. The sensor check (Bayer vs monochrome vs unsupported) can only
+    happen at decode time (see merge_raw_channels), so it is NOT done here."""
     if not paths:
         return False, "No files selected for 3-way RGB merge."
     non_raw = [p for p in paths if not is_raw_path(p)]
@@ -70,7 +80,7 @@ def validate_merge_inputs(paths: Sequence[str]) -> Tuple[bool, Optional[str]]:
         shown = "\n".join(os.path.basename(p) for p in non_raw[:8])
         if len(non_raw) > 8:
             shown += f"\n… and {len(non_raw) - 8} more"
-        return False, ("3-way RGB merge requires RAW (Bayer) files. "
+        return False, ("3-way RGB merge requires RAW files. "
                        f"These are not supported RAW:\n\n{shown}")
     if len(paths) % MERGE_GROUP_SIZE != 0:
         return False, ("3-way RGB merge needs a multiple of 3 images "
@@ -119,30 +129,84 @@ def combine_channels(plane_r: np.ndarray, plane_g: np.ndarray, plane_b: np.ndarr
     return out
 
 
-def _decode_native_halfsize(path: str):
-    """Decode one RAW to a camera-native, half-size (2x2-binned, no-demosaic)
-    array. Returns (rgb, color_desc, white_level). rgb is (H, W, num_colors)
-    with unmixed sensor channels; libraw subtracts the black level during
-    postprocess. Raises on a non-Bayer-RGB sensor."""
+def _desc_bytes(color_desc) -> bytes:
+    if isinstance(color_desc, (bytes, bytearray)):
+        return bytes(color_desc)
+    return str(color_desc).encode("ascii", "ignore")
+
+
+def is_monochrome_sensor(num_colors, color_desc, raw_pattern=None) -> bool:
+    """Whether a RAW comes from a monochrome (no-CFA) sensor. Mirrors
+    read_image's detection (ccr_image.py): num_colors == 1, a grey color_desc,
+    or an RGBG desc whose CFA pattern is all one colour index. Pure (takes the
+    rawpy primitives, not a raw object), so it is unit-testable."""
+    if num_colors == 1:
+        return True
+    cd = _desc_bytes(color_desc)
+    if cd in (b"G", b"GRAY", b"GREY"):
+        return True
+    if cd == b"RGBG" and raw_pattern is not None:
+        try:
+            if int(np.asarray(raw_pattern).max()) == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False):
+    """Decode one source RAW and return (plane_2d, white_level, is_mono,
+    sensor_full) for the single colour this frame contributes (frame_pos
+    0=R/1=G/2=B). libraw subtracts the black level during postprocess.
+
+    * Monochrome: no CFA — the whole grayscale frame IS the channel, at FULL
+      sensor resolution (nothing to demosaic). `preview` may decode at half size
+      for a fast preview/zoom tile, but the canonical full resolution reported is
+      always the full sensor.
+    * Bayer (RGGB): half-size 2x2 bin (the no-demosaic extraction), camera-native
+      (no matrix), then pick the frame's colour channel via color_desc. The
+      binned size IS the Bayer merge's full resolution (`preview` is irrelevant).
+
+    Raises ValueError on an unsupported sensor (X-Trans, 4-colour)."""
     import rawpy
 
     with rawpy.imread(path) as raw:
         white_level = float(raw.white_level)
+        sensor_full = (int(raw.sizes.height), int(raw.sizes.width))
         num_colors = int(getattr(raw, "num_colors", 0) or 0)
         color_desc = getattr(raw, "color_desc", b"")
         pattern = getattr(raw, "raw_pattern", None)
 
+        if is_monochrome_sensor(num_colors, color_desc, pattern):
+            rgb = raw.postprocess(
+                output_bps=16,
+                no_auto_bright=True,
+                gamma=(1, 1),                                  # linear
+                user_flip=0,
+                demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR,
+                half_size=preview,         # full res unless a fast preview decode
+                use_camera_wb=False,
+                use_auto_wb=False,
+                output_color=rawpy.ColorSpace.raw,
+                no_auto_scale=True,        # absolute sensor values; scale manually
+                adjust_maximum_thr=0.0,
+                four_color_rgb=False,
+            )
+            plane = rgb if rgb.ndim == 2 else rgb[..., 0]   # channels are equal
+            return np.ascontiguousarray(plane), white_level, True, sensor_full
+
+        # Bayer (RGGB): require a 3-colour 2x2 R/G/B mosaic.
         if num_colors != 3:
             raise ValueError(
-                f"3-way merge requires a 3-colour Bayer sensor; "
+                f"3-way merge requires a Bayer (RGGB) or monochrome sensor; "
                 f"{os.path.basename(path)} reports {num_colors} colours "
-                f"(monochrome or 4-colour).")
+                f"(e.g. 4-colour CYGM/RGBE).")
         if pattern is not None and tuple(np.asarray(pattern).shape) != (2, 2):
             raise ValueError(
-                f"3-way merge requires a 2x2 Bayer mosaic; "
-                f"{os.path.basename(path)} is non-Bayer (e.g. X-Trans).")
-        # Raises if color_desc is not an R/G/B permutation.
-        bayer_channel_indices(color_desc)
+                f"3-way merge requires a 2x2 Bayer mosaic or a monochrome "
+                f"sensor; {os.path.basename(path)} is non-Bayer (e.g. X-Trans).")
+        r_idx, g_idx, b_idx = bayer_channel_indices(color_desc)  # raises if not RGB
+        channel_idx = (r_idx, g_idx, b_idx)[frame_pos]
 
         rgb = raw.postprocess(
             output_bps=16,
@@ -158,15 +222,23 @@ def _decode_native_halfsize(path: str):
             adjust_maximum_thr=0.0,
             four_color_rgb=False,
         )
-    return rgb, color_desc, white_level
+        if rgb.ndim != 3 or channel_idx >= rgb.shape[2]:
+            raise ValueError(
+                f"unexpected decode shape {getattr(rgb, 'shape', None)} for "
+                f"{os.path.basename(path)}")
+        return np.ascontiguousarray(rgb[..., channel_idx]), white_level, False, sensor_full
 
 
-def merge_raw_channels(sources: Sequence[str]) -> Tuple[np.ndarray, Tuple[int, int]]:
+def merge_raw_channels(sources: Sequence[str],
+                       preview: bool = False) -> Tuple[np.ndarray, Tuple[int, int]]:
     """Merge a (red, green, blue) triplet of RAW files into one (H, W, 3) uint16
-    linear-RGB image at half-sensor resolution, taking only each frame's own
-    colour channel with no demosaicing.
+    linear-RGB image, taking only each frame's own colour channel with no
+    demosaicing. Bayer → half-sensor resolution (2x2 bin); monochrome → full
+    sensor resolution (no CFA). `preview` lets a monochrome decode run at half
+    size for fast preview/zoom (Bayer ignores it).
 
-    Returns (merged_rgb, full_size=(H, W)). Raises ValueError on a non-Bayer
+    Returns (merged_rgb, full_size=(H, W)) where full_size is the merged image's
+    canonical FULL (export) resolution. Raises ValueError on an unsupported
     sensor or a decode failure (the caller surfaces it)."""
     if len(sources) != MERGE_GROUP_SIZE:
         raise ValueError(f"merge_raw_channels needs exactly {MERGE_GROUP_SIZE} "
@@ -177,16 +249,27 @@ def merge_raw_channels(sources: Sequence[str]) -> Tuple[np.ndarray, Tuple[int, i
 
     planes: List[np.ndarray] = []
     white_levels: List[float] = []
+    monos: List[bool] = []
+    sensor_full: Optional[Tuple[int, int]] = None
     for frame_pos, path in enumerate(sources):       # 0=red, 1=green, 2=blue
-        rgb, color_desc, white_level = _decode_native_halfsize(path)
-        r_idx, g_idx, b_idx = bayer_channel_indices(color_desc)
-        channel_idx = (r_idx, g_idx, b_idx)[frame_pos]
-        if rgb.ndim != 3 or channel_idx >= rgb.shape[2]:
-            raise ValueError(
-                f"unexpected decode shape {getattr(rgb, 'shape', None)} for "
-                f"{os.path.basename(path)}")
-        planes.append(rgb[..., channel_idx])
+        plane, white_level, mono, sfull = _decode_frame_plane(path, frame_pos, preview)
+        planes.append(plane)
         white_levels.append(white_level)
+        monos.append(mono)
+        if sensor_full is None:
+            sensor_full = sfull
+
+    # All three frames must be the same sensor type — mixing a monochrome
+    # (full-res) frame with Bayer (half-res) ones would silently min-crop into a
+    # misaligned merge. A real trichrome set is always one body, so reject.
+    any_mono = any(monos)
+    if any_mono and not all(monos):
+        raise ValueError("3-way merge sources must all be the same sensor type "
+                         "(all Bayer, or all monochrome).")
 
     merged = combine_channels(planes[0], planes[1], planes[2], white_levels)
-    return merged, (merged.shape[0], merged.shape[1])
+    # Canonical FULL (export) resolution: full sensor for monochrome (the merge
+    # is full-res; a preview decode may have produced a smaller `merged`), the
+    # 2x2-binned size for Bayer (its only resolution).
+    full_size = sensor_full if any_mono else (merged.shape[0], merged.shape[1])
+    return merged, full_size

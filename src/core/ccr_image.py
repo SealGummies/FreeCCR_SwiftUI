@@ -417,11 +417,14 @@ class CCRImage:
                      max_long_side: Optional[int] = None) -> Optional[np.ndarray]:
         """Decode a 3-way RGB-merged image from its source RAWs. Mirrors the tail
         of read_image's RAW branch (slice ops, full-size capture, optional
-        downsize) so export / zoom / slice all compose. `preview` is accepted but
-        ignored: the merge's native resolution IS half-sensor (the 2x2 bin is the
-        no-demosaic step); size is controlled purely by max_long_side."""
+        downsize) so export / zoom / slice all compose. The merge's native
+        resolution is sensor-native: half-sensor for Bayer (the 2x2 bin is the
+        no-demosaic step), full-sensor for monochrome (no CFA). `preview` only
+        speeds up a monochrome decode (half size); full_decode_size always
+        reports the canonical full resolution, and max_long_side does the rest."""
         from core import ccr_merge
-        rgb, full_decode_size = ccr_merge.merge_raw_channels(self.merge_sources)
+        rgb, full_decode_size = ccr_merge.merge_raw_channels(self.merge_sources,
+                                                             preview=preview)
         # Sliced merged children read only their region of the source.
         rgb = self._apply_source_ops(rgb)
         self.original_full_size = self._ops_full_size(full_decode_size)

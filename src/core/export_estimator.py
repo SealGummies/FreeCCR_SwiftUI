@@ -29,8 +29,10 @@ def get_original_dims(ccr_img):
         return dims
 
     # Merged (trichrome) images have no single backing file — file_path is one
-    # full-sensor source RAW, ~2x the half-size merged dims. Never probe it;
-    # fall back to the in-memory preview size. See spec/three-way-rgb-merge.md.
+    # source RAW whose dimensions don't match the merged image (a Bayer merge is
+    # half-sensor; a monochrome merge is full-sensor but still derived from 3
+    # files). Never probe it; fall back to the in-memory preview size.
+    # See spec/three-way-rgb-merge.md.
     if getattr(ccr_img, "is_merged", False):
         if ccr_img.resized_raw is not None:
             dims = (ccr_img.resized_raw.shape[0], ccr_img.resized_raw.shape[1])
