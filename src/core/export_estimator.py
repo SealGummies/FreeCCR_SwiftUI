@@ -28,6 +28,15 @@ def get_original_dims(ccr_img):
     if dims:
         return dims
 
+    # Merged (trichrome) images have no single backing file — file_path is one
+    # full-sensor source RAW, ~2x the half-size merged dims. Never probe it;
+    # fall back to the in-memory preview size. See spec/three-way-rgb-merge.md.
+    if getattr(ccr_img, "is_merged", False):
+        if ccr_img.resized_raw is not None:
+            dims = (ccr_img.resized_raw.shape[0], ccr_img.resized_raw.shape[1])
+            ccr_img.original_full_size = dims
+        return dims
+
     file_path = ccr_img.file_path
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".fff":

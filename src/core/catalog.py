@@ -210,6 +210,10 @@ def update_for_images(images, path: str = None, preserved: dict = None) -> None:
     catalog = load_catalog(path)
     grouped = {}
     for img in images:
+        # Merged (trichrome) images are session-only — never persist their edits
+        # under a source RAW's per-file key. See spec/three-way-rgb-merge.md.
+        if getattr(img, "is_merged", False):
+            continue
         grouped.setdefault(_file_key(img.file_path), []).append(img)
     preserved_by_key = {}
     for file_path, record in (preserved or {}).items():

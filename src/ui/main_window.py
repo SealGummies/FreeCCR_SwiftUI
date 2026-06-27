@@ -186,6 +186,9 @@ class MainWindow(QMainWindow):
         # first batch decodes in the right mode (see spec/positive-mode.md).
         positive_mode = self._settings.value("import/positive_mode", False, type=bool)
         ccr_backend.positive_mode = positive_mode
+        # Restore the global 3-way RGB merge toggle too (affects the next import).
+        ccr_backend.rgb_merge_mode = self._settings.value(
+            "import/rgb_merge_mode", False, type=bool)
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
@@ -585,6 +588,24 @@ class MainWindow(QMainWindow):
             if checked else "Positive mode off — film-negative tools restored.",
             duration=4000)
 
+    # --- 3-way RGB merge mode (global, persistent) ------------------------
+    def on_rgb_merge_mode_toggled(self, checked: bool):
+        """Flip the global 3-way RGB merge flag and persist it. Unlike Positive
+        mode this does NOT re-process loaded images — it only affects the NEXT
+        import (every 3 RAWs, sorted by filename, merged into one).
+        See spec/three-way-rgb-merge.md."""
+        ccr_backend.rgb_merge_mode = bool(checked)
+        self._settings.setValue("import/rgb_merge_mode", bool(checked))
+        if checked:
+            msg = ("3-way RGB merge on — your next import merges every 3 RAWs "
+                   "(R,G,B by filename).")
+            if ccr_backend.positive_mode:
+                msg += (" Positive mode is on; merged frames are negatives — "
+                        "turn Positive off to invert them.")
+        else:
+            msg = "3-way RGB merge off."
+        self.sliders_panel.set_temporary_hint(msg, duration=5000)
+
     def show_activation_dialog(self):
         QMessageBox.information(
             self,
@@ -653,6 +674,13 @@ class MainWindow(QMainWindow):
         """Called when the loader thread finishes. Nulls the references so isRunning() is never called on a deleted C++ object."""
         self._loader_thread = None
         self._loader_worker = None
+        # Surface a 3-way merge rejection recorded by the backend loader (covers
+        # the Open Folder path and decode-time non-Bayer rejections). Read once,
+        # then clear so it can't reappear on a later, unrelated load.
+        err = getattr(ccr_backend, "last_merge_error", None)
+        if err:
+            ccr_backend.last_merge_error = None
+            QMessageBox.warning(self, "3-way RGB merge", err)
 
     def _stop_loader_if_running(self):
         """Cancel and join any in-progress loader thread."""
@@ -703,6 +731,15 @@ class MainWindow(QMainWindow):
                 )
             
             if valid_files:
+                # 3-way RGB merge: validate the selection up front (multiple of
+                # 3, all RAW) so the user gets immediate feedback before any load.
+                if ccr_backend.rgb_merge_mode:
+                    from core import ccr_merge
+                    ok, err = ccr_merge.validate_merge_inputs(
+                        ccr_merge.sort_for_merge(valid_files))
+                    if not ok:
+                        QMessageBox.warning(self, "3-way RGB merge", err)
+                        return
                 self._stop_loader_if_running()
                 self.thumbnail_list.show_loading_dialog()
                 self._loader_thread = QThread()

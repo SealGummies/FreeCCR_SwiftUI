@@ -38,6 +38,15 @@ class CCRBackend:
         # bypassed — every image is editable/exportable directly. App-wide, like
         # the input ICC profile; persisted by MainWindow. See spec/positive-mode.md.
         self.positive_mode: bool = False
+        # 3-way RGB-light merge (trichrome): when True, an import sorts files by
+        # name, requires a multiple of 3, and merges every (red, green, blue)
+        # triplet into one camera-native image (no demosaicing). Global, like
+        # positive_mode; persisted by MainWindow. See spec/three-way-rgb-merge.md.
+        self.rgb_merge_mode: bool = False
+        # Last merge-import rejection (bad count / non-RAW / non-Bayer / decode
+        # failure), set by the loader and surfaced by the UI after load, then
+        # cleared. Reset at the top of every load so it never goes stale.
+        self.last_merge_error: Optional[str] = None
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Global input ICC profile (one app-wide setting; applied to every
@@ -69,9 +78,17 @@ class CCRBackend:
         # QSettings copy is intact and still restores at next app start.
         self.black_point_bgr = None
         self.white_point_bgr = None
+        # Per-load merge error: reset up front so a prior load's message can't
+        # carry over and be shown after this (possibly successful) one.
+        self.last_merge_error = None
         # Preserved removal states belong to the previous batch (the open
         # flows save the catalog before loading a new one)
         self._catalog_preserved = {}
+
+        # 3-way RGB merge: handle the whole batch on a dedicated path (sort,
+        # validate multiple-of-3 + RAW, group into triplets, merge each).
+        if self.rgb_merge_mode:
+            return self._load_merged_triplets(file_paths, cancel_flag)
 
         # Read the catalog ONCE for the whole batch — per-file reads would
         # re-parse the entire JSON N times across the loader threads.
@@ -132,6 +149,94 @@ class CCRBackend:
         # Keep file_paths derived from actually-loaded images so the two lists stay in sync
         self.file_paths = [img.file_path for img in self.images]
         return loaded_file_count
+
+    def _load_merged_triplets(self, file_paths: List[str], cancel_flag=None) -> int:
+        """3-way RGB merge load: sort by filename, validate (multiple of 3, all
+        RAW), group into (red, green, blue) triplets, and merge each into one
+        CCRImage (in parallel). Returns the number of merged images produced. A
+        validation failure records last_merge_error and loads nothing; a per-
+        triplet decode failure (e.g. non-Bayer sensor) is recorded and skipped.
+        See spec/three-way-rgb-merge.md."""
+        from core import ccr_merge
+
+        ordered = ccr_merge.sort_for_merge(file_paths)
+        ok, err = ccr_merge.validate_merge_inputs(ordered)
+        if not ok:
+            self.last_merge_error = err
+            self.images = []
+            self.file_paths = []
+            return 0
+
+        triplets = ccr_merge.group_into_triplets(ordered)
+        # Progress bar in merged units: total = number of triplets (not 3N files).
+        self.file_paths = [t[0] for t in triplets]
+
+        def load_triplet(order, triplet):
+            if cancel_flag and cancel_flag():
+                return None
+            red = triplet[0]
+            try:
+                img = CCRImage(red, is_merged=True, merge_sources=list(triplet))
+            except Exception as e:
+                print(f"3-way merge failed for {os.path.basename(red)}: {e}")
+                self.last_merge_error = (
+                    "3-way RGB merge could not process some frames:\n\n"
+                    f"{e}")
+                return None
+            img._catalog_order = order
+            return img
+
+        max_workers = min(8, os.cpu_count() or 1)
+        results = []
+        if max_workers == 1:
+            for order, triplet in enumerate(triplets):
+                if cancel_flag and cancel_flag():
+                    break
+                img = load_triplet(order, triplet)
+                if img is not None:
+                    results.append(img)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(load_triplet, order, triplet): order
+                           for order, triplet in enumerate(triplets)}
+                for future in concurrent.futures.as_completed(futures):
+                    if cancel_flag and cancel_flag():
+                        break
+                    img = future.result()
+                    if img is not None:
+                        results.append(img)
+
+        # User cancelled mid-load: suppress any decode error a worker recorded
+        # for the aborted import (the pool above has joined, so every write has
+        # landed before this check) — don't pop an error dialog for a load the
+        # user deliberately stopped.
+        if cancel_flag and cancel_flag():
+            self.last_merge_error = None
+
+        # Stable order: unique red basenames, with catalog_order as a tiebreak.
+        results.sort(key=lambda im: (os.path.basename(im.file_path),
+                                     getattr(im, "_catalog_order", 0)))
+        self._dedupe_display_names(results)
+        self.images = results
+        self.file_paths = [im.file_path for im in self.images]
+        return len(results)
+
+    @staticmethod
+    def _dedupe_display_names(images) -> None:
+        """Ensure each image's display_name is unique within the batch (append
+        _2, _3 …), so export filenames and name-keyed lookups can't collide —
+        mirrors the duplicate/slice naming guards."""
+        seen = set()
+        for im in images:
+            name = im.display_name or os.path.basename(im.file_path)
+            if name in seen:
+                stem, ext = os.path.splitext(name)
+                n = 2
+                while f"{stem}_{n}{ext}" in seen:
+                    n += 1
+                name = f"{stem}_{n}{ext}"
+                im.display_name = name
+            seen.add(name)
 
     def clear(self):
         """
@@ -210,9 +315,12 @@ class CCRBackend:
         print(f"Found {len(file_paths)} files total: {file_paths[:5]}...")  # Show first 5 files
         
         # Load images and track success/failure (counted in FILES — a sliced
-        # file restores as several images)
+        # file restores as several images). In 3-way merge mode the loader
+        # returns MERGED images (one per triplet), so the diagnostic baseline is
+        # the triplet count, not the raw file count.
         loaded_files = self.load_images_from_files(sorted(file_paths), cancel_flag=cancel_flag) or 0
-        failed_count = len(file_paths) - loaded_files
+        expected = (len(file_paths) // 3) if self.rgb_merge_mode else len(file_paths)
+        failed_count = max(0, expected - loaded_files)
 
         print(f"Loading complete: {loaded_files} files loaded successfully "
               f"({len(self.images)} images), {failed_count} failed")
@@ -1175,6 +1283,12 @@ class CCRBackend:
             from core.catalog import serialize_image, remove_duplicate_entries
             duplicate_removals = {}
             for img in removed_images:
+                # Merged (trichrome) images are session-only: never serialize
+                # their edits into a source RAW's per-file record (the red
+                # exposure's key), which would corrupt that file on a later
+                # plain open. See spec/three-way-rgb-merge.md.
+                if getattr(img, "is_merged", False):
+                    continue
                 if getattr(img, "is_duplicate", False):
                     if img.display_name:
                         duplicate_removals.setdefault(img.file_path,
@@ -1222,6 +1336,10 @@ class CCRBackend:
                 preloaded_full_size=img.original_full_size,
                 display_name=f"{stem}_copy{n}{ext}",
                 color_profile=img.color_profile,
+                # A copy of a merged image must itself re-merge on any re-read
+                # (zoom/export), not decode the red RAW alone.
+                is_merged=getattr(img, "is_merged", False),
+                merge_sources=getattr(img, "merge_sources", None),
             )
             dup.reference_frame = img.reference_frame
             dup.conversion_inputs = (dict(img.conversion_inputs)
@@ -1404,6 +1522,11 @@ class CCRBackend:
                     slice_group=slice_group,
                     slice_parent=dict(slice_parent),
                     color_profile=img_obj.color_profile,
+                    # A slice of a merged image re-merges (then crops via
+                    # source_ops) on hi-res zoom / export, so the detail layer
+                    # and exported file match the merged preview.
+                    is_merged=getattr(img_obj, "is_merged", False),
+                    merge_sources=getattr(img_obj, "merge_sources", None),
                 )
                 child.conversion_inputs = child_ci
                 # Slices descend from the parent's loaded content — carry its

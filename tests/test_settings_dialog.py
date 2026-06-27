@@ -270,6 +270,10 @@ class _StubMW(QWidget):
         self.calls.append(("positive", bool(c)))
         ccr_backend.positive_mode = bool(c)
 
+    def on_rgb_merge_mode_toggled(self, c):
+        self.calls.append(("rgb_merge", bool(c)))
+        ccr_backend.rgb_merge_mode = bool(c)
+
 
 def _dialog():
     from widgets.settings_dialog import SettingsDialog
@@ -313,6 +317,21 @@ class TestSettingsDialog:
         d = _dialog()
         d._cb_positive.setChecked(True)
         assert ("positive", True) in d._mw.calls
+
+    def test_rgb_merge_checkbox_toggles_backend(self):
+        ccr_backend.rgb_merge_mode = False
+        d = _dialog()
+        d._cb_rgb_merge.setChecked(True)
+        assert ("rgb_merge", True) in d._mw.calls
+        assert ccr_backend.rgb_merge_mode is True
+
+    def test_rgb_merge_checkbox_reflects_backend_on_refresh(self):
+        ccr_backend.rgb_merge_mode = True
+        d = _dialog()                       # refresh runs in __init__
+        assert d._cb_rgb_merge.isChecked() is True
+        ccr_backend.rgb_merge_mode = False
+        d.refresh_color_management()
+        assert d._cb_rgb_merge.isChecked() is False
 
 
 class TestCameraProfileLibrary:
