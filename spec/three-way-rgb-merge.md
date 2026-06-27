@@ -210,21 +210,22 @@ Merged images must never enter the per-file catalog. Guard **every** path:
 **Bayer.** A Bayer sensor records one colour per photosite in a 2×2 tile (RGGB).
 A normal decode *demosaics* — interpolates the two missing colours at every site.
 The requirement is the opposite: take **only** the photosites that natively
-measured the wanted colour, with **no inter-channel crosstalk at all**. We read
-the RAW Bayer mosaic directly (`raw.raw_image_visible` + `raw.raw_colors_visible`)
-and phase-slice out a single colour's sites — `mosaic[dy::2, dx::2]`, where
-`(dy, dx)` is that colour's position in the 2×2 tile (read from the actual
-`colors` at the visible origin, so it is offset-safe). One site per quad, **no
-averaging, no quad-merge, no demosaic, and no libraw colour pipeline whatsoever.**
-The black pedestal is subtracted manually (`raw_image` carries it). This yields a
-half-width × half-height plane (one site per quad = the Bayer merge's full
-resolution).
+measured the wanted colour, **never mixing in the other colours** (zero
+inter-channel crosstalk). We read the RAW Bayer mosaic directly
+(`raw.raw_image_visible` + `raw.raw_colors_visible`) and phase-slice out a single
+colour's sites — `mosaic[dy::2, dx::2]`, where `(dy, dx)` is that colour's
+position in the 2×2 tile (read from the actual `colors` at the visible origin, so
+it is offset-safe). **No demosaic and no libraw colour pipeline whatsoever.** R
+and B have one site per quad → that bare site; **green has two sites per quad,
+which are averaged** (both are green, so this is not crosstalk, and it preserves
+the green SNR). The black pedestal is subtracted per site manually (`raw_image`
+carries it). This yields a half-width × half-height plane (one site per quad = the
+Bayer merge's full resolution).
 
-> `half_size=True` is the quick, lower-rigor alternative: it bins each quad to
-> `R = R-site, G = mean(two G-sites), B = B-site`. It is interpolation-free, but
-> it *mixes the quad* (averages the two greens, and runs the libraw postprocess),
-> so it is **deliberately not used**. For the green channel we take only **one**
-> of the two green sites (taking both would be an average == a merge).
+> `half_size=True` gives a numerically similar result (it bins each quad to
+> `R = R-site, G = mean(two G-sites), B = B-site`), but it goes through libraw's
+> postprocess pipeline. Reading the mosaic directly keeps full control and
+> guarantees no hidden colour operation, which is why it is used instead.
 
 **Monochrome.** A monochrome sensor has no CFA, so there is nothing to demosaic:
 every photosite measured the (single) light's intensity. The whole grayscale
@@ -233,10 +234,13 @@ the ideal trichrome sensor — no wasted photosites, no resolution loss.
 
 ### Per-frame extraction
 
-- **Bayer:** read the raw mosaic, pick the frame's CFA colour index from
-  `color_desc` (`bayer_channel_indices`), and `extract_cfa_plane(mosaic, colors,
-  target)` returns just that colour's sites. Subtract `black_level_per_channel[
-  target]`. No `raw.postprocess` at all.
+- **Bayer:** read the raw mosaic; `extract_cfa_channel(mosaic, colors,
+  color_desc, letter, black_levels)` returns that colour's plane — the single
+  site for R/B, the per-site-black-subtracted **average of the two sites for
+  green** — matching contributing sites by CFA letter (so it works whether the
+  two greens share one colour index or use indices 1 and 3). No `raw.postprocess`
+  at all. (`bayer_channel_indices` is still the guard that rejects a non-R/G/B
+  `color_desc`.)
 - **Monochrome:** `raw.postprocess(half_size=preview, output_color=raw,
   gamma=(1,1), no_auto_bright=True, no_auto_scale=True, use_camera_wb=False)`;
   the channel **is** the grayscale plane (`rgb` if 2-D, else `rgb[..., 0]` — the
@@ -246,13 +250,14 @@ the ideal trichrome sensor — no wasted photosites, no resolution loss.
 Either way the plane is scaled by `65535/white_level` in `combine_channels`
 (matching `read_image`'s black-subtracted negative decode).
 
-Verified on `example_raw/DSC07096.ARW` (Bayer): the direct-mosaic R and B planes
-are **byte-identical** (max abs diff 0) to libraw's own `half_size`+`output_color=
-raw` single-site read — proving the phase + black-level handling is correct — while
-the green plane differs (one site vs libraw's two-green average), which is exactly
-the merge being eliminated. (Monochrome cannot be CI-verified here — the repo
-ships no monochrome RAW — so its decode mirrors `read_image`'s existing monochrome
-path.)
+Verified on `example_raw/DSC07096.ARW` (Bayer) against libraw's own
+`half_size`+`output_color=raw` read: R and B are **byte-identical** (max abs diff
+0), and green matches the two-green average to within float-vs-integer **rounding**
+(max abs diff 6 / 65535 ≈ 0.01% of pixels) — confirming the phase, black-level,
+and green-average handling. The direct read reaches the same values as `half_size`
+without going through libraw's postprocess. (Monochrome cannot be CI-verified
+here — the repo ships no monochrome RAW — so its decode mirrors `read_image`'s
+existing monochrome path.)
 
 ### Sensor-type guard (decode-time)
 
@@ -324,8 +329,9 @@ def validate_merge_inputs(paths) -> tuple[bool, Optional[str]]
         # (ok, error). Checks: non-empty, len % 3 == 0, all is_raw_path.
 def bayer_channel_indices(color_desc) -> tuple[int, int, int]   # pure
 def is_monochrome_sensor(num_colors, color_desc, raw_pattern=None) -> bool  # pure
-def extract_cfa_plane(mosaic, colors, target_index) -> np.ndarray  # pure
-        # phase-slice one CFA colour's sites from the raw mosaic; no merge
+def extract_cfa_channel(mosaic, colors, color_desc, letter, black_levels=None) -> np.ndarray
+        # pure: one CFA colour's plane from the raw mosaic — single site for R/B,
+        # per-site-black-subtracted average of the two sites for green
 def combine_channels(plane_r, plane_g, plane_b, white_levels) -> np.ndarray  # pure
         # crop to common (min H, min W); scale each by 65535/wl; clip; stack -> uint16
 def merge_raw_channels(sources, preview=False) -> tuple[np.ndarray, tuple[int, int]]
@@ -336,7 +342,7 @@ def merge_raw_channels(sources, preview=False) -> tuple[np.ndarray, tuple[int, i
 
 `merge_raw_channels` is the only rawpy-touching function; everything else
 (`is_raw_path`, `sort_for_merge`, `group_into_triplets`, `validate_merge_inputs`,
-`bayer_channel_indices`, `is_monochrome_sensor`, `extract_cfa_plane`,
+`bayer_channel_indices`, `is_monochrome_sensor`, `extract_cfa_channel`,
 `combine_channels`) is pure and unit-tested.
 
 ## Integration Points
@@ -475,10 +481,16 @@ itself is not CI-verifiable here (no monochrome RAW in the repo); it mirrors
 `read_image`'s existing monochrome path plus the Bayer absolute-value scaling.
 
 Round 5 (crosstalk-free Bayer): replaced the Bayer `half_size=True` decode with a
-direct raw-mosaic read (`extract_cfa_plane`) that pulls only the wanted colour's
-photosites — one site per quad, no green averaging, no quad-merge, no libraw
-colour pipeline — eliminating inter-channel crosstalk. Validated on the example
-ARW: R and B planes are byte-identical to libraw's single-site read, green now
-uses one site (the eliminated average). `half_size` is documented as the
-lower-rigor alternative and no longer used for Bayer; monochrome still uses
-`postprocess` (no CFA, so no crosstalk to remove).
+direct raw-mosaic read (`extract_cfa_channel`) that pulls only the wanted colour's
+photosites — no demosaic, no libraw colour pipeline, never mixing the other
+colours — eliminating inter-channel crosstalk. R/B use their single site; green
+**averages its two same-colour sites** (not crosstalk — both green — and it keeps
+the green SNR). Per-site black subtraction. Validated on the example ARW: R and B
+are byte-identical to libraw's single-site read and green matches the two-green
+average within rounding. `half_size` (numerically similar, but via libraw's
+postprocess) is no longer used for Bayer; monochrome still uses `postprocess` (no
+CFA, so no crosstalk to remove).
+
+(During review the green channel was first implemented as a single site — strict
+"no merge" — then changed per request to the two-green average, since averaging
+two same-colour sites is not crosstalk and preserves green resolution/SNR.)

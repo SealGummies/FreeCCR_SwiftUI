@@ -9,14 +9,14 @@ discarding the other two, WITHOUT demosaicing.
 Two sensor kinds are supported:
 
 * **Bayer (RGGB)** — read the RAW Bayer mosaic directly and take ONLY the
-  wanted colour's photosites: one site per 2x2 quad, with NO averaging, NO
-  quad-merge, NO demosaic, and NO libraw colour pipeline. This eliminates
-  inter-channel crosstalk entirely (we never touch the other three sites of the
-  quad — not even to average the two greens, of which only one is used). A Bayer
-  merge is therefore half-sensor resolution (one site per quad = its full
-  resolution). NB: `half_size=True` would be the quick, lower-rigor alternative
-  (it bins the quad, averaging the greens), but it mixes the four sites, so it is
-  deliberately NOT used here.
+  wanted colour's photosites, with NO demosaic and NO libraw colour pipeline, and
+  never mixing in the OTHER colours — so there is zero inter-channel crosstalk.
+  R and B use their single site per quad; green averages its two same-colour sites
+  (not crosstalk — both are green — and it preserves the green SNR). A Bayer merge
+  is half-sensor resolution (one site per quad = its full resolution). NB: libraw
+  `half_size=True` gives a numerically similar result, but it goes through the
+  postprocess pipeline; reading the mosaic directly keeps full control and
+  guarantees no hidden colour operation.
 
 * **Monochrome** — no CFA at all, so there is nothing to demosaic: every
   photosite measured the (single) light's intensity. The whole grayscale frame
@@ -157,25 +157,42 @@ def is_monochrome_sensor(num_colors, color_desc, raw_pattern=None) -> bool:
     return False
 
 
-def extract_cfa_plane(mosaic: np.ndarray, colors: np.ndarray,
-                      target_index: int) -> np.ndarray:
+def extract_cfa_channel(mosaic: np.ndarray, colors: np.ndarray, color_desc,
+                        letter: str, black_levels=None) -> np.ndarray:
     """From a raw Bayer mosaic (2-D sensor read-out) and its per-pixel CFA colour
-    indices, return the half-resolution plane of ONLY the photosites whose colour
-    == target_index — by phase-slicing the 2x2 lattice, NOT by binning/averaging.
+    indices, return the half-resolution plane for ONE colour `letter` (R/G/B) by
+    phase-slicing the 2x2 lattice — NO demosaic, NO colour matrix, and NO mixing
+    with the OTHER colours, so there is zero inter-channel crosstalk.
 
-    This is the crosstalk-free extraction: no quad merge, no green averaging, no
-    demosaic, no colour matrix — just the bare sites of one colour, exactly as the
-    sensor measured them. The colour's phase within the tile is read from the
-    actual `colors` at the visible origin (offset-safe), and the CFA is periodic
-    with period 2, so `mosaic[dy::2, dx::2]` is precisely that colour's sites.
-    Pure (numpy in/out), so it is unit-testable without rawpy."""
+    R and B have a single site per quad → that bare site. Green has two sites per
+    quad (same colour, not crosstalk) → their per-site-black-subtracted AVERAGE,
+    which keeps the green SNR. Each contributing site is matched by its CFA letter
+    via `color_desc` (so it works whether the two greens share one colour index or
+    use indices 1 and 3), located by its phase in the tile read from the actual
+    `colors` at the visible origin (offset-safe; the CFA is period-2 so
+    `mosaic[dy::2, dx::2]` is exactly that phase's sites), and black-subtracted by
+    its own colour index when `black_levels` is given. Pure — unit-testable
+    without rawpy."""
     eff = np.asarray(colors)[:2, :2]
-    pos = np.argwhere(eff == target_index)
-    if pos.size == 0:
-        raise ValueError(f"CFA colour index {target_index} not present in the "
-                         f"2x2 tile {eff.tolist()}")
-    dy, dx = int(pos[0][0]), int(pos[0][1])
-    return np.asarray(mosaic)[dy::2, dx::2]
+    desc = _desc_bytes(color_desc).decode("ascii", "ignore").upper()
+    letter = letter.upper()
+    phases = [(dy, dx, int(eff[dy, dx]))
+              for dy in range(eff.shape[0]) for dx in range(eff.shape[1])
+              if 0 <= int(eff[dy, dx]) < len(desc) and desc[int(eff[dy, dx])] == letter]
+    if not phases:
+        raise ValueError(f"CFA colour {letter!r} not present in the 2x2 tile "
+                         f"{eff.tolist()} (color_desc {desc!r})")
+    m = np.asarray(mosaic)
+    subs = [m[dy::2, dx::2].astype(np.float32) for dy, dx, _ in phases]
+    h = min(s.shape[0] for s in subs)
+    w = min(s.shape[1] for s in subs)
+    acc = np.zeros((h, w), dtype=np.float32)
+    for (dy, dx, idx), s in zip(phases, subs):
+        black = 0.0
+        if black_levels is not None and idx < len(black_levels):
+            black = float(black_levels[idx])
+        acc += s[:h, :w] - black
+    return acc / len(phases)            # 1 site for R/B; average of 2 for green
 
 
 def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False):
@@ -184,13 +201,13 @@ def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False):
     0=R/1=G/2=B).
 
     * Bayer (RGGB): read the RAW Bayer mosaic directly (`raw.raw_image_visible`)
-      and take ONLY this frame's colour photosites — one site per 2x2 quad, no
-      averaging, no quad-merge, no demosaic, no libraw colour pipeline — so there
-      is zero inter-channel crosstalk. The black pedestal is subtracted manually
-      (raw_image carries it). Half-sensor resolution (one site per quad) is the
-      Bayer merge's full resolution; `preview` is irrelevant (the read is already
-      cheap). For the green channel only one of the two green sites is used
-      (taking both would average == merge, which we avoid).
+      and take ONLY this frame's colour photosites — no demosaic, no libraw
+      colour pipeline, and never mixing in the OTHER colours, so there is zero
+      inter-channel crosstalk. R/B use their single site per quad; green averages
+      its two same-colour sites (not crosstalk — both are green — and it keeps the
+      green SNR). The black pedestal is subtracted per site manually (raw_image
+      carries it). Half-sensor resolution (one site per quad) is the Bayer merge's
+      full resolution; `preview` is irrelevant (the read is already cheap).
     * Monochrome: no CFA — the whole grayscale frame IS the channel, at FULL
       sensor resolution (nothing to demosaic, no quad to mix). `preview` may
       decode at half size for a fast preview/zoom tile, but the canonical full
@@ -234,20 +251,21 @@ def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False):
             raise ValueError(
                 f"3-way merge requires a 2x2 Bayer mosaic or a monochrome "
                 f"sensor; {os.path.basename(path)} is non-Bayer (e.g. X-Trans).")
-        r_idx, g_idx, b_idx = bayer_channel_indices(color_desc)  # raises if not RGB
-        target = (r_idx, g_idx, b_idx)[frame_pos]               # CFA colour index
+        bayer_channel_indices(color_desc)        # guard: raises if not R/G/B
+        letter = "RGB"[frame_pos]                 # this frame's colour
 
-        # Read the RAW mosaic and pull only this colour's sites — no merge.
+        # Read the RAW mosaic and pull only this colour's sites (R/B single,
+        # green = average of its two sites) with per-site black subtraction;
+        # combine then scales 65535/white_level, matching read_image's decode.
         mosaic = np.asarray(raw.raw_image_visible)
         colors = np.asarray(raw.raw_colors_visible)
-        plane = extract_cfa_plane(mosaic, colors, target).astype(np.float32)
-        # Subtract this colour's black pedestal (raw_image carries it); combine
-        # then scales by 65535/white_level, matching read_image's negative decode.
         try:
-            black = float(raw.black_level_per_channel[target])
+            black_levels = list(raw.black_level_per_channel)
         except Exception:
-            black = 0.0
-        plane = np.clip(plane - black, 0, None)
+            black_levels = None
+        plane = extract_cfa_channel(mosaic, colors, color_desc, letter,
+                                    black_levels=black_levels)
+        plane = np.clip(plane, 0, None)
         return (np.ascontiguousarray(plane), white_level, False,
                 (plane.shape[0], plane.shape[1]))
 

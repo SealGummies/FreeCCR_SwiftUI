@@ -135,55 +135,69 @@ def test_bayer_is_not_monochrome():
 
 
 # --------------------------------------------------------------------------- #
-# extract_cfa_plane (crosstalk-free single-channel extraction from the mosaic)
+# extract_cfa_channel (crosstalk-free per-colour extraction from the mosaic)
 # --------------------------------------------------------------------------- #
 def _ramp(n=4):
     # value = row*10 + col, so each site's origin is identifiable
-    return np.array([[i * 10 + j for j in range(n)] for i in range(n)])
+    return np.array([[i * 10 + j for j in range(n)] for i in range(n)], dtype=np.float32)
 
 
-def test_extract_cfa_plane_rggb_each_colour_is_its_own_site():
-    # RGGB tile: index 0=R@(0,0), 1=G@(0,1), 3=G2@(1,0), 2=B@(1,1)
+# RGGB tile: index 0=R@(0,0), 1=G@(0,1), 3=G2@(1,0), 2=B@(1,1); desc 'RGBG'.
+_RGGB_COLORS = np.array([[0, 1, 0, 1],
+                         [3, 2, 3, 2],
+                         [0, 1, 0, 1],
+                         [3, 2, 3, 2]])
+
+
+def test_extract_channel_red_and_blue_are_single_site():
+    m = _ramp(4)
+    r = ccr_merge.extract_cfa_channel(m, _RGGB_COLORS, b"RGBG", "R")
+    b = ccr_merge.extract_cfa_channel(m, _RGGB_COLORS, b"RGBG", "B")
+    assert r.tolist() == [[0, 2], [20, 22]]      # R@(0,0)
+    assert b.tolist() == [[11, 13], [31, 33]]    # B@(1,1)
+
+
+def test_extract_channel_green_averages_the_two_green_sites():
+    m = _ramp(4)
+    g = ccr_merge.extract_cfa_channel(m, _RGGB_COLORS, b"RGBG", "G")
+    # green sites: (0,1)->[[1,3],[21,23]] and (1,0)->[[10,12],[30,32]]; averaged
+    assert np.allclose(g, [[5.5, 7.5], [25.5, 27.5]])
+
+
+def test_extract_channel_green_average_when_both_greens_share_one_index():
+    # Some cameras map both greens to index 1 (color_desc 'RGB', 3 colours).
     colors = np.array([[0, 1, 0, 1],
-                       [3, 2, 3, 2],
+                       [1, 2, 1, 2],
                        [0, 1, 0, 1],
-                       [3, 2, 3, 2]])
-    mosaic = _ramp(4)
-    assert ccr_merge.extract_cfa_plane(mosaic, colors, 0).tolist() == [[0, 2], [20, 22]]   # R
-    assert ccr_merge.extract_cfa_plane(mosaic, colors, 2).tolist() == [[11, 13], [31, 33]]  # B
-    assert ccr_merge.extract_cfa_plane(mosaic, colors, 1).tolist() == [[1, 3], [21, 23]]    # G
+                       [1, 2, 1, 2]])
+    m = _ramp(4)
+    g = ccr_merge.extract_cfa_channel(m, colors, b"RGB", "G")
+    # green index-1 phases (0,1) and (1,0) averaged — same result as RGGB above
+    assert np.allclose(g, [[5.5, 7.5], [25.5, 27.5]])
 
 
-def test_extract_cfa_plane_does_not_merge_the_two_greens():
-    # The two green sub-lattices (index 1 and 3) are DISTINCT — proves we take
-    # one green site, never an average/merge of both.
-    colors = np.array([[0, 1, 0, 1],
-                       [3, 2, 3, 2],
-                       [0, 1, 0, 1],
-                       [3, 2, 3, 2]])
-    mosaic = _ramp(4)
-    g1 = ccr_merge.extract_cfa_plane(mosaic, colors, 1)
-    g2 = ccr_merge.extract_cfa_plane(mosaic, colors, 3)
-    assert g1.tolist() == [[1, 3], [21, 23]]
-    assert g2.tolist() == [[10, 12], [30, 32]]
-    assert g1.tolist() != g2.tolist()
+def test_extract_channel_subtracts_black_per_index():
+    m = _ramp(4)
+    r = ccr_merge.extract_cfa_channel(m, _RGGB_COLORS, b"RGBG", "R",
+                                      black_levels=[100, 200, 300, 200])
+    assert r.tolist() == [[0 - 100, 2 - 100], [20 - 100, 22 - 100]]
 
 
-def test_extract_cfa_plane_follows_actual_phase_not_assumed_origin():
-    # A shifted CFA phase (R no longer at (0,0)): extraction must use the real
-    # per-pixel colours, not a hardcoded origin.
+def test_extract_channel_follows_actual_phase():
+    # Shifted CFA phase: R no longer at (0,0).
     colors = np.array([[1, 0, 1, 0],
                        [2, 3, 2, 3],
                        [1, 0, 1, 0],
                        [2, 3, 2, 3]])
-    mosaic = _ramp(4)
-    assert ccr_merge.extract_cfa_plane(mosaic, colors, 0).tolist() == [[1, 3], [21, 23]]  # R@(0,1)
+    m = _ramp(4)
+    r = ccr_merge.extract_cfa_channel(m, colors, b"RGBG", "R")
+    assert r.tolist() == [[1, 3], [21, 23]]      # R@(0,1)
 
 
-def test_extract_cfa_plane_missing_colour_raises():
-    colors = np.array([[0, 1], [1, 0]])   # no index 2 in the tile
+def test_extract_channel_missing_colour_raises():
+    colors = np.array([[0, 1], [1, 0]])          # only R/G in the tile, no B
     with pytest.raises(ValueError):
-        ccr_merge.extract_cfa_plane(np.zeros((2, 2)), colors, 2)
+        ccr_merge.extract_cfa_channel(np.zeros((2, 2)), colors, b"RGBG", "B")
 
 
 # --------------------------------------------------------------------------- #
