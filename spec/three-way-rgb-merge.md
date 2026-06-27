@@ -44,14 +44,19 @@ the existing Positive-mode toggle.
   crop, sliders, dust) are **not saved between sessions**. A first-merge hint
   states this. (Follow-up: key the catalog on a composite of the 3 source
   signatures.)
-- **Bayer (RGGB) sensors only.** "Do not demosaic / take one channel" is a 2×2
-  Bayer-CFA concept. X-Trans (Fujifilm `.raf`), monochrome, and 4-colour
-  (CYGM/RGBE) sensors are rejected at decode time with a clear message.
+- **Bayer (RGGB) and monochrome sensors.** "Do not demosaic / take one channel"
+  applies to a 2×2 Bayer CFA (collapse each tile → one pixel) and, even more
+  naturally, to a monochrome sensor (no CFA at all — the whole grayscale frame is
+  that light's channel, full resolution). X-Trans (Fujifilm `.raf`) and 4-colour
+  (CYGM/RGBE) sensors are rejected at decode time with a clear message. All three
+  frames of a triplet must be the same sensor type.
 - **Non-RAW inputs are not supported.** Validated by extension up front and by a
-  Bayer-CFA guard at decode.
-- **No full-sensor-resolution output.** A no-demosaic channel extraction is
-  inherently a 2×2-binned, half-sensor-resolution image. That binned size *is*
-  the merged image's full resolution.
+  sensor-type guard at decode.
+- **Resolution is sensor-native.** A Bayer merge is inherently a 2×2-binned,
+  half-sensor-resolution image (that binned size *is* its full resolution); a
+  monochrome merge is **full sensor resolution** (no binning needed). For a
+  monochrome merge, `preview`/zoom decodes may run at half size for speed, but
+  export delivers full sensor resolution.
 - The mode is global; no per-image override. No change to the non-merge flow when
   the toggle is OFF.
 - **Positive mode is assumed OFF for merge.** Trichrome frames are negatives; the
@@ -103,10 +108,12 @@ muted text):
   - **Invalid count** (not a multiple of 3): *"3-way RGB merge needs a multiple of
     3 images (got N). Select 3 frames per shot: red, green, blue."* — nothing
     loads.
-  - **Non-RAW present**: *"3-way RGB merge requires RAW (Bayer) files. These are
-    not supported RAW: …"* — nothing loads.
-  - **Non-Bayer RAW** (X-Trans/mono/4-colour, only detectable at decode): the
-    triplet is rejected at decode; the import reports it via `last_merge_error`.
+  - **Non-RAW present**: *"3-way RGB merge requires RAW files. These are not
+    supported RAW: …"* — nothing loads.
+  - **Unsupported sensor** (X-Trans / 4-colour, or a triplet mixing monochrome
+    and Bayer — only detectable at decode): the triplet is rejected at decode;
+    the import reports it via `last_merge_error`. (Monochrome and Bayer are both
+    supported; only X-Trans/4-colour and mixed-type triplets are rejected.)
 
 ### Error surfacing across both entry points
 
@@ -160,9 +167,12 @@ if max_long_side:
 return rgb
 ```
 
-`preview` is accepted but ignored: the merge's native resolution **is**
-half-sensor (the 2×2 bin is the no-demosaic step); there is no cheaper/higher
-decode. Size control is purely via `max_long_side`.
+`preview` is forwarded to `merge_raw_channels`: for **Bayer** it is irrelevant
+(the 2×2 bin is already the only resolution); for **monochrome** it lets the
+decode run at half size for a fast preview/zoom tile. `merge_raw_channels` always
+returns the *canonical full* size (full sensor for monochrome, binned for Bayer)
+so `original_full_size` is correct even when a monochrome preview array is
+half-sensor; `max_long_side` then does the final downsize.
 
 Because the dispatch lives inside `read_image`, **export, zoom hi-res replay,
 slicing, and duplication all compose for free** — each re-reads through
@@ -195,58 +205,76 @@ Merged images must never enter the per-file catalog. Guard **every** path:
 
 ## Processing / Maths
 
-### Why half resolution and "no demosaic"
+### "No demosaic" for the two sensor kinds
 
-A Bayer sensor records one colour per photosite in a 2×2 tile (RGGB). A normal
-decode *demosaics* — interpolates the two missing colours at every site. The
-requirement is the opposite: take only the photosites that natively measured the
-wanted colour, discard the rest, do not interpolate. The clean way is to collapse
-each 2×2 CFA tile to one output pixel: `R = R-site`, `G = mean(two G-sites)`,
-`B = B-site`. That is exactly rawpy/libraw `half_size=True` — a pure bin, **no
-interpolation**. The result is a half-width × half-height RGB image, which is the
-merged frame's full resolution.
+**Bayer.** A Bayer sensor records one colour per photosite in a 2×2 tile (RGGB).
+A normal decode *demosaics* — interpolates the two missing colours at every site.
+The requirement is the opposite: take **only** the photosites that natively
+measured the wanted colour, **never mixing in the other colours** (zero
+inter-channel crosstalk). We read the RAW Bayer mosaic directly
+(`raw.raw_image_visible` + `raw.raw_colors_visible`) and phase-slice out a single
+colour's sites — `mosaic[dy::2, dx::2]`, where `(dy, dx)` is that colour's
+position in the 2×2 tile (read from the actual `colors` at the visible origin, so
+it is offset-safe). **No demosaic and no libraw colour pipeline whatsoever.** R
+and B have one site per quad → that bare site; **green has two sites per quad,
+which are averaged** (both are green, so this is not crosstalk, and it preserves
+the green SNR). The black pedestal is subtracted per site manually (`raw_image`
+carries it). This yields a half-width × half-height plane (one site per quad = the
+Bayer merge's full resolution).
 
-### Per-frame native decode
+> `half_size=True` gives a numerically similar result (it bins each quad to
+> `R = R-site, G = mean(two G-sites), B = B-site`), but it goes through libraw's
+> postprocess pipeline. Reading the mosaic directly keeps full control and
+> guarantees no hidden colour operation, which is why it is used instead.
 
-For each source RAW, decode in **camera-native colour with no channel mixing**:
+**Monochrome.** A monochrome sensor has no CFA, so there is nothing to demosaic:
+every photosite measured the (single) light's intensity. The whole grayscale
+frame **is** that frame's channel, at **full sensor resolution**. This is in fact
+the ideal trichrome sensor — no wasted photosites, no resolution loss.
 
-```python
-raw.postprocess(
-    output_bps=16,
-    no_auto_bright=True,
-    gamma=(1, 1),                 # linear
-    user_flip=0,
-    demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR,  # inert under half_size
-    half_size=True,               # 2×2 bin == the no-demosaic channel extraction
-    use_camera_wb=False,          # no WB scaling
-    use_auto_wb=False,
-    output_color=rawpy.ColorSpace.raw,   # camera-native: NO 3×3 matrix → no mixing
-    no_auto_scale=True,           # absolute sensor values; we scale manually
-    adjust_maximum_thr=0.0,
-    four_color_rgb=False,
-)
-```
+### Per-frame extraction
 
-Verified empirically on `example_raw/DSC07096.ARW`: this yields a byte-identical
-2×2 bin to a manual black-subtracted bin — unmixed, no interpolation; `LINEAR`
-vs `AHD` are identical under `half_size` (the bin, not the algorithm, is what
-avoids interpolation). libraw subtracts the black level during postprocess
-(per-channel min = 0 with `no_auto_scale=True`), so we **do not** black-subtract
-again. The purity guarantee rests on `half_size` + `output_color=raw`, not on the
-demosaic algorithm.
+- **Bayer:** read the raw mosaic; `extract_cfa_channel(mosaic, colors,
+  color_desc, letter, black_levels)` returns that colour's plane — the single
+  site for R/B, the per-site-black-subtracted **average of the two sites for
+  green** — matching contributing sites by CFA letter (so it works whether the
+  two greens share one colour index or use indices 1 and 3). No `raw.postprocess`
+  at all. (`bayer_channel_indices` is still the guard that rejects a non-R/G/B
+  `color_desc`.)
+- **Monochrome:** `raw.postprocess(half_size=preview, output_color=raw,
+  gamma=(1,1), no_auto_bright=True, no_auto_scale=True, use_camera_wb=False)`;
+  the channel **is** the grayscale plane (`rgb` if 2-D, else `rgb[..., 0]` — the
+  channels are equal). `preview` gives a fast half-size decode; the full sensor
+  size is still reported as the canonical resolution.
 
-### Bayer guard (decode-time)
+Either way the plane is scaled by `65535/white_level` in `combine_channels`
+(matching `read_image`'s black-subtracted negative decode).
 
-After `rawpy.imread`, require a 2×2 RGB Bayer mosaic, else raise a clear error
-(surfaced via `last_merge_error`):
+Verified on `example_raw/DSC07096.ARW` (Bayer) against libraw's own
+`half_size`+`output_color=raw` read: R and B are **byte-identical** (max abs diff
+0), and green matches the two-green average to within float-vs-integer **rounding**
+(max abs diff 6 / 65535 ≈ 0.01% of pixels) — confirming the phase, black-level,
+and green-average handling. The direct read reaches the same values as `half_size`
+without going through libraw's postprocess. (Monochrome cannot be CI-verified
+here — the repo ships no monochrome RAW — so its decode mirrors `read_image`'s
+existing monochrome path.)
 
-- `raw.num_colors == 3`,
-- `raw.color_desc` contains exactly the letters `R`, `G`, `B` (a permutation like
-  `RGBG`), and
-- `raw.raw_pattern` has shape `(2, 2)`.
+### Sensor-type guard (decode-time)
 
-Rejects X-Trans (`.raf`, 6×6), monochrome (`num_colors == 1`), and 4-colour
-sensors with a message naming the offending file and reason.
+After `rawpy.imread`, classify the sensor and reject the unsupported kinds, with a
+clear error surfaced via `last_merge_error`:
+
+- **Monochrome** (accepted): `num_colors == 1`, a grey `color_desc`
+  (`b'G'`/`b'GRAY'`/`b'GREY'`), or a `b'RGBG'` desc whose CFA pattern is all one
+  index — mirrors `read_image`'s monochrome detection.
+- **Bayer** (accepted): `num_colors == 3`, `color_desc` a permutation containing
+  `R`,`G`,`B`, and `raw_pattern` shape `(2, 2)`.
+- **Rejected:** X-Trans (`.raf`, 6×6) and 4-colour (CYGM/RGBE) sensors, with a
+  message naming the file and reason.
+
+All three frames of a triplet must be the **same** type (`merge_raw_channels`
+raises if a triplet mixes monochrome and Bayer — they have different
+resolutions).
 
 ### Channel selection by `color_desc` (not hardcoded indices)
 
@@ -300,15 +328,22 @@ def group_into_triplets(sorted_paths) -> list[tuple[str, str, str]]
 def validate_merge_inputs(paths) -> tuple[bool, Optional[str]]
         # (ok, error). Checks: non-empty, len % 3 == 0, all is_raw_path.
 def bayer_channel_indices(color_desc) -> tuple[int, int, int]   # pure
+def is_monochrome_sensor(num_colors, color_desc, raw_pattern=None) -> bool  # pure
+def extract_cfa_channel(mosaic, colors, color_desc, letter, black_levels=None) -> np.ndarray
+        # pure: one CFA colour's plane from the raw mosaic — single site for R/B,
+        # per-site-black-subtracted average of the two sites for green
 def combine_channels(plane_r, plane_g, plane_b, white_levels) -> np.ndarray  # pure
         # crop to common (min H, min W); scale each by 65535/wl; clip; stack -> uint16
-def merge_raw_channels(sources) -> tuple[np.ndarray, tuple[int, int]]
-        # decode 3 RAWs native half-size, Bayer-guard, pick planes via
-        # bayer_channel_indices, combine_channels; returns (merged, (H, W)).
+def merge_raw_channels(sources, preview=False) -> tuple[np.ndarray, tuple[int, int]]
+        # decode 3 RAWs camera-native (Bayer half-size 2x2 bin / monochrome
+        # full-size), sensor-type guard, take each frame's channel, combine;
+        # returns (merged, full_size). preview only affects monochrome.
 ```
 
-`merge_raw_channels` is the only rawpy-touching function; everything else is pure
-and unit-tested.
+`merge_raw_channels` is the only rawpy-touching function; everything else
+(`is_raw_path`, `sort_for_merge`, `group_into_triplets`, `validate_merge_inputs`,
+`bayer_channel_indices`, `is_monochrome_sensor`, `extract_cfa_channel`,
+`combine_channels`) is pure and unit-tested.
 
 ## Integration Points
 
@@ -354,12 +389,16 @@ triplet order stable.
 
 - **Count not a multiple of 3** → rejected, nothing loads (both entry points).
 - **Non-RAW file present** → rejected up front with the offending names.
-- **Non-Bayer RAW** (X-Trans/mono/4-colour) → rejected at decode via the Bayer
-  guard; reported through `last_merge_error`.
+- **Monochrome RAW** → supported: decoded full-sensor, the grayscale frame is the
+  channel (no demosaic needed).
+- **Unsupported sensor** (X-Trans / 4-colour) → rejected at decode via the
+  sensor-type guard; reported through `last_merge_error`.
+- **Mixed-type triplet** (monochrome + Bayer) → rejected at decode (different
+  resolutions would silently misalign); reported through `last_merge_error`.
 - **A source fails to decode** → `merge_raw_channels` raises; the pool task
   catches, records `last_merge_error`, skips that triplet; others still load.
-- **Differing frame dimensions** in a triplet → `combine_channels` crops to the
-  common min H/W.
+- **Differing frame dimensions** within one sensor type → `combine_channels`
+  crops to the common min H/W.
 - **Duplicate of a merged image** → carries `is_merged`/`merge_sources`; initial
   preview reuses the copied `resized_raw`, and zoom/export re-merge correctly.
 - **Slice of a merged image** → children carry `is_merged`/`merge_sources`; the
@@ -428,3 +467,30 @@ dialog. `load_images_from_folder`'s diagnostic failure count is computed in
 triplet units when merge mode is on. The per-worker `last_merge_error` is a
 single last-writer-wins slot (accepted: the message is deliberately generic and
 the set of loaded images is deterministic regardless).
+
+Round 4 (monochrome support): added monochrome sensors as a first-class merge
+input (full-sensor resolution, no CFA — the grayscale frame is the channel). The
+Bayer-only guard became a sensor-type classifier (`is_monochrome_sensor`); the
+decode branches on it (`_decode_frame_plane`), with `merge_raw_channels(preview)`
+running monochrome decodes at half size for fast previews while always reporting
+the canonical full size so `original_full_size` stays correct. Mixed-type
+triplets are rejected. Reviewed for the full → preview/export → slice/duplicate
+resolution round-trip; the only items found were a stale `export_estimator`
+comment (fixed) and the mixed-type guard (added). The monochrome rawpy decode
+itself is not CI-verifiable here (no monochrome RAW in the repo); it mirrors
+`read_image`'s existing monochrome path plus the Bayer absolute-value scaling.
+
+Round 5 (crosstalk-free Bayer): replaced the Bayer `half_size=True` decode with a
+direct raw-mosaic read (`extract_cfa_channel`) that pulls only the wanted colour's
+photosites — no demosaic, no libraw colour pipeline, never mixing the other
+colours — eliminating inter-channel crosstalk. R/B use their single site; green
+**averages its two same-colour sites** (not crosstalk — both green — and it keeps
+the green SNR). Per-site black subtraction. Validated on the example ARW: R and B
+are byte-identical to libraw's single-site read and green matches the two-green
+average within rounding. `half_size` (numerically similar, but via libraw's
+postprocess) is no longer used for Bayer; monochrome still uses `postprocess` (no
+CFA, so no crosstalk to remove).
+
+(During review the green channel was first implemented as a single site — strict
+"no merge" — then changed per request to the two-green average, since averaging
+two same-colour sites is not crosstalk and preserves green resolution/SNR.)

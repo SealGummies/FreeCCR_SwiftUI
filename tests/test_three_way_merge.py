@@ -110,6 +110,97 @@ def test_bayer_indices_rejects_monochrome_and_non_rgb():
 
 
 # --------------------------------------------------------------------------- #
+# is_monochrome_sensor
+# --------------------------------------------------------------------------- #
+def test_monochrome_detected_by_num_colors():
+    assert ccr_merge.is_monochrome_sensor(1, b"RGBG") is True
+    assert ccr_merge.is_monochrome_sensor(1, b"G") is True
+
+
+def test_monochrome_detected_by_grey_desc():
+    for desc in (b"G", b"GRAY", b"GREY"):
+        assert ccr_merge.is_monochrome_sensor(3, desc) is True, desc
+
+
+def test_monochrome_detected_by_flat_rgbg_pattern():
+    flat = np.zeros((2, 2), dtype=np.int32)            # all one colour index
+    assert ccr_merge.is_monochrome_sensor(3, b"RGBG", flat) is True
+
+
+def test_bayer_is_not_monochrome():
+    normal = np.array([[0, 1], [3, 2]], dtype=np.int32)  # real RGGB pattern
+    assert ccr_merge.is_monochrome_sensor(3, b"RGBG", normal) is False
+    assert ccr_merge.is_monochrome_sensor(3, b"RGBG") is False   # no pattern given
+    assert ccr_merge.is_monochrome_sensor(4, b"RGBE") is False   # 4-colour, not mono
+
+
+# --------------------------------------------------------------------------- #
+# extract_cfa_channel (crosstalk-free per-colour extraction from the mosaic)
+# --------------------------------------------------------------------------- #
+def _ramp(n=4):
+    # value = row*10 + col, so each site's origin is identifiable
+    return np.array([[i * 10 + j for j in range(n)] for i in range(n)], dtype=np.float32)
+
+
+# RGGB tile: index 0=R@(0,0), 1=G@(0,1), 3=G2@(1,0), 2=B@(1,1); desc 'RGBG'.
+_RGGB_COLORS = np.array([[0, 1, 0, 1],
+                         [3, 2, 3, 2],
+                         [0, 1, 0, 1],
+                         [3, 2, 3, 2]])
+
+
+def test_extract_channel_red_and_blue_are_single_site():
+    m = _ramp(4)
+    r = ccr_merge.extract_cfa_channel(m, _RGGB_COLORS, b"RGBG", "R")
+    b = ccr_merge.extract_cfa_channel(m, _RGGB_COLORS, b"RGBG", "B")
+    assert r.tolist() == [[0, 2], [20, 22]]      # R@(0,0)
+    assert b.tolist() == [[11, 13], [31, 33]]    # B@(1,1)
+
+
+def test_extract_channel_green_averages_the_two_green_sites():
+    m = _ramp(4)
+    g = ccr_merge.extract_cfa_channel(m, _RGGB_COLORS, b"RGBG", "G")
+    # green sites: (0,1)->[[1,3],[21,23]] and (1,0)->[[10,12],[30,32]]; averaged
+    assert np.allclose(g, [[5.5, 7.5], [25.5, 27.5]])
+
+
+def test_extract_channel_green_average_when_both_greens_share_one_index():
+    # Some cameras map both greens to index 1 (color_desc 'RGB', 3 colours).
+    colors = np.array([[0, 1, 0, 1],
+                       [1, 2, 1, 2],
+                       [0, 1, 0, 1],
+                       [1, 2, 1, 2]])
+    m = _ramp(4)
+    g = ccr_merge.extract_cfa_channel(m, colors, b"RGB", "G")
+    # green index-1 phases (0,1) and (1,0) averaged — same result as RGGB above
+    assert np.allclose(g, [[5.5, 7.5], [25.5, 27.5]])
+
+
+def test_extract_channel_subtracts_black_per_index():
+    m = _ramp(4)
+    r = ccr_merge.extract_cfa_channel(m, _RGGB_COLORS, b"RGBG", "R",
+                                      black_levels=[100, 200, 300, 200])
+    assert r.tolist() == [[0 - 100, 2 - 100], [20 - 100, 22 - 100]]
+
+
+def test_extract_channel_follows_actual_phase():
+    # Shifted CFA phase: R no longer at (0,0).
+    colors = np.array([[1, 0, 1, 0],
+                       [2, 3, 2, 3],
+                       [1, 0, 1, 0],
+                       [2, 3, 2, 3]])
+    m = _ramp(4)
+    r = ccr_merge.extract_cfa_channel(m, colors, b"RGBG", "R")
+    assert r.tolist() == [[1, 3], [21, 23]]      # R@(0,1)
+
+
+def test_extract_channel_missing_colour_raises():
+    colors = np.array([[0, 1], [1, 0]])          # only R/G in the tile, no B
+    with pytest.raises(ValueError):
+        ccr_merge.extract_cfa_channel(np.zeros((2, 2)), colors, b"RGBG", "B")
+
+
+# --------------------------------------------------------------------------- #
 # combine_channels (the pure merge core)
 # --------------------------------------------------------------------------- #
 def _const_plane(h, w, value):
