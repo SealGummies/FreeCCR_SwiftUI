@@ -53,9 +53,19 @@ class CCRImage:
         slice_parent: Optional[Dict[str, Any]] = None,
         color_profile: str = "color",
         areas: Optional[List[Dict[str, Any]]] = None,
+        is_merged: bool = False,
+        merge_sources: Optional[list] = None,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
+        # 3-way RGB-light merge (trichrome): this image is synthesized from three
+        # source RAWs (red, green, blue exposures) by taking each frame's own
+        # channel without demosaicing. file_path is the RED source (a real RAW,
+        # so EXIF/lensfun work); read_image dispatches to a re-merge whenever the
+        # pixels are needed again (export, zoom, slice, duplicate). Session-only:
+        # excluded from the per-file edit catalog. See spec/three-way-rgb-merge.md.
+        self.is_merged = bool(is_merged)
+        self.merge_sources = list(merge_sources) if merge_sources else None
         # Sliced images own a chain of slice operations applied to the source
         # file by read_image in every path (preview load, hi-res zoom,
         # full-res export, B/W sampling). Each op is
@@ -65,7 +75,11 @@ class CCRImage:
         # frame. Nested slices simply append ops. [] = whole file.
         self.source_ops: list = list(source_ops) if source_ops else []
         # Display/export name override (e.g. "scan_s2.ARW" for slice #2);
-        # None = use the file's basename.
+        # None = use the file's basename. A merged image with no explicit name
+        # reads as "<redStem>_RGB<ext>" so the list/export filename is sensible.
+        if display_name is None and self.is_merged:
+            _stem, _ext = os.path.splitext(os.path.basename(self.file_path))
+            display_name = f"{_stem}_RGB{_ext}"
         self.display_name = display_name
         # True for working copies made via Duplicate. Duplicates are session
         # artifacts: removing one from the list also removes its catalog
@@ -399,6 +413,22 @@ class CCRImage:
             four_color_rgb=False,     # Standard 3-color processing
         )
 
+    def _read_merged(self, preview: bool = True,
+                     max_long_side: Optional[int] = None) -> Optional[np.ndarray]:
+        """Decode a 3-way RGB-merged image from its source RAWs. Mirrors the tail
+        of read_image's RAW branch (slice ops, full-size capture, optional
+        downsize) so export / zoom / slice all compose. `preview` is accepted but
+        ignored: the merge's native resolution IS half-sensor (the 2x2 bin is the
+        no-demosaic step); size is controlled purely by max_long_side."""
+        from core import ccr_merge
+        rgb, full_decode_size = ccr_merge.merge_raw_channels(self.merge_sources)
+        # Sliced merged children read only their region of the source.
+        rgb = self._apply_source_ops(rgb)
+        self.original_full_size = self._ops_full_size(full_decode_size)
+        if max_long_side:
+            rgb = self.resize_image_to_max_pixel(rgb, max_long_side)
+        return rgb
+
     def read_image(self, file_path: str, preview = True, max_long_side: Optional[int] = None,
                    positive_override: Optional[bool] = None, apply_input_icc: bool = True) -> Optional[np.ndarray]:
         """
@@ -416,6 +446,14 @@ class CCRImage:
         together they yield the bare device RGB an input profile is fitted on.
         Both default to current behaviour, so existing callers are unaffected.
         """
+        # 3-way RGB merge: this image has no single backing file — it is
+        # re-synthesized from its three source RAWs. Dispatch BEFORE the
+        # extension branch and BEFORE positive_mode is read (a merged frame is
+        # always a camera-native negative). All re-read call sites (export,
+        # zoom, slice, duplicate) flow through here, so they re-merge for free.
+        if getattr(self, "is_merged", False) and self.merge_sources:
+            return self._read_merged(preview=preview, max_long_side=max_long_side)
+
         # Ensure file path is properly encoded for Unicode support
         file_path = os.path.normpath(file_path)
         ext = os.path.splitext(file_path)[1].lower()

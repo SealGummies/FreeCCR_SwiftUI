@@ -150,6 +150,24 @@ class SettingsDialog(QDialog):
             "same toggle is on the thumbnail panel."))
         lay.addWidget(grp2)
 
+        # --- Trichrome (3-way RGB-light) capture ----------------------- #
+        grp3 = QGroupBox("Trichrome capture")
+        g3 = QVBoxLayout(grp3)
+        g3.setSpacing(theme.GAP_ROW)
+        self._cb_rgb_merge = QCheckBox(
+            "3-way RGB merge (combine red/green/blue-light exposures)")
+        self._cb_rgb_merge.toggled.connect(self._on_rgb_merge)
+        g3.addWidget(self._cb_rgb_merge)
+        g3.addWidget(self._muted(
+            "Shoot a static scene three times under pure red, then green, then "
+            "blue light. On your NEXT import, every 3 RAWs (sorted by filename) "
+            "are merged into one colour image — each frame contributes only its "
+            "own channel, with no demosaicing — then converted as a negative. "
+            "RAW (Bayer) only; the selected count must be a multiple of 3. "
+            "Applies to the next import only; merged-image edits are not saved "
+            "between sessions."))
+        lay.addWidget(grp3)
+
         lay.addStretch(1)
         return page
 
@@ -176,6 +194,11 @@ class SettingsDialog(QDialog):
         if bool(checked) == bool(ccr_backend.positive_mode):
             return                                   # programmatic sync, not a user toggle
         self._mw.on_positive_mode_toggled(bool(checked))
+
+    def _on_rgb_merge(self, checked: bool):
+        if bool(checked) == bool(ccr_backend.rgb_merge_mode):
+            return                                   # programmatic sync, not a user toggle
+        self._mw.on_rgb_merge_mode_toggled(bool(checked))
 
     def refresh_color_management(self):
         """Reflect the live active profile, the library list, and Positive mode."""
@@ -205,3 +228,7 @@ class SettingsDialog(QDialog):
         self._cb_positive.blockSignals(True)
         self._cb_positive.setChecked(bool(ccr_backend.positive_mode))
         self._cb_positive.blockSignals(False)
+
+        self._cb_rgb_merge.blockSignals(True)
+        self._cb_rgb_merge.setChecked(bool(ccr_backend.rgb_merge_mode))
+        self._cb_rgb_merge.blockSignals(False)
