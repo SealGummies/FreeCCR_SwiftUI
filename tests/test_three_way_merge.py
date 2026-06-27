@@ -135,6 +135,58 @@ def test_bayer_is_not_monochrome():
 
 
 # --------------------------------------------------------------------------- #
+# extract_cfa_plane (crosstalk-free single-channel extraction from the mosaic)
+# --------------------------------------------------------------------------- #
+def _ramp(n=4):
+    # value = row*10 + col, so each site's origin is identifiable
+    return np.array([[i * 10 + j for j in range(n)] for i in range(n)])
+
+
+def test_extract_cfa_plane_rggb_each_colour_is_its_own_site():
+    # RGGB tile: index 0=R@(0,0), 1=G@(0,1), 3=G2@(1,0), 2=B@(1,1)
+    colors = np.array([[0, 1, 0, 1],
+                       [3, 2, 3, 2],
+                       [0, 1, 0, 1],
+                       [3, 2, 3, 2]])
+    mosaic = _ramp(4)
+    assert ccr_merge.extract_cfa_plane(mosaic, colors, 0).tolist() == [[0, 2], [20, 22]]   # R
+    assert ccr_merge.extract_cfa_plane(mosaic, colors, 2).tolist() == [[11, 13], [31, 33]]  # B
+    assert ccr_merge.extract_cfa_plane(mosaic, colors, 1).tolist() == [[1, 3], [21, 23]]    # G
+
+
+def test_extract_cfa_plane_does_not_merge_the_two_greens():
+    # The two green sub-lattices (index 1 and 3) are DISTINCT — proves we take
+    # one green site, never an average/merge of both.
+    colors = np.array([[0, 1, 0, 1],
+                       [3, 2, 3, 2],
+                       [0, 1, 0, 1],
+                       [3, 2, 3, 2]])
+    mosaic = _ramp(4)
+    g1 = ccr_merge.extract_cfa_plane(mosaic, colors, 1)
+    g2 = ccr_merge.extract_cfa_plane(mosaic, colors, 3)
+    assert g1.tolist() == [[1, 3], [21, 23]]
+    assert g2.tolist() == [[10, 12], [30, 32]]
+    assert g1.tolist() != g2.tolist()
+
+
+def test_extract_cfa_plane_follows_actual_phase_not_assumed_origin():
+    # A shifted CFA phase (R no longer at (0,0)): extraction must use the real
+    # per-pixel colours, not a hardcoded origin.
+    colors = np.array([[1, 0, 1, 0],
+                       [2, 3, 2, 3],
+                       [1, 0, 1, 0],
+                       [2, 3, 2, 3]])
+    mosaic = _ramp(4)
+    assert ccr_merge.extract_cfa_plane(mosaic, colors, 0).tolist() == [[1, 3], [21, 23]]  # R@(0,1)
+
+
+def test_extract_cfa_plane_missing_colour_raises():
+    colors = np.array([[0, 1], [1, 0]])   # no index 2 in the tile
+    with pytest.raises(ValueError):
+        ccr_merge.extract_cfa_plane(np.zeros((2, 2)), colors, 2)
+
+
+# --------------------------------------------------------------------------- #
 # combine_channels (the pure merge core)
 # --------------------------------------------------------------------------- #
 def _const_plane(h, w, value):

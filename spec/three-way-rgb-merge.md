@@ -209,57 +209,50 @@ Merged images must never enter the per-file catalog. Guard **every** path:
 
 **Bayer.** A Bayer sensor records one colour per photosite in a 2×2 tile (RGGB).
 A normal decode *demosaics* — interpolates the two missing colours at every site.
-The requirement is the opposite: take only the photosites that natively measured
-the wanted colour, discard the rest, do not interpolate. The clean way is to
-collapse each 2×2 CFA tile to one output pixel: `R = R-site`,
-`G = mean(two G-sites)`, `B = B-site`. That is exactly rawpy/libraw
-`half_size=True` — a pure bin, **no interpolation** — yielding a half-width ×
-half-height RGB image, which is the Bayer merge's full resolution.
+The requirement is the opposite: take **only** the photosites that natively
+measured the wanted colour, with **no inter-channel crosstalk at all**. We read
+the RAW Bayer mosaic directly (`raw.raw_image_visible` + `raw.raw_colors_visible`)
+and phase-slice out a single colour's sites — `mosaic[dy::2, dx::2]`, where
+`(dy, dx)` is that colour's position in the 2×2 tile (read from the actual
+`colors` at the visible origin, so it is offset-safe). One site per quad, **no
+averaging, no quad-merge, no demosaic, and no libraw colour pipeline whatsoever.**
+The black pedestal is subtracted manually (`raw_image` carries it). This yields a
+half-width × half-height plane (one site per quad = the Bayer merge's full
+resolution).
+
+> `half_size=True` is the quick, lower-rigor alternative: it bins each quad to
+> `R = R-site, G = mean(two G-sites), B = B-site`. It is interpolation-free, but
+> it *mixes the quad* (averages the two greens, and runs the libraw postprocess),
+> so it is **deliberately not used**. For the green channel we take only **one**
+> of the two green sites (taking both would be an average == a merge).
 
 **Monochrome.** A monochrome sensor has no CFA, so there is nothing to demosaic:
 every photosite measured the (single) light's intensity. The whole grayscale
 frame **is** that frame's channel, at **full sensor resolution**. This is in fact
 the ideal trichrome sensor — no wasted photosites, no resolution loss.
 
-### Per-frame native decode
+### Per-frame extraction
 
-For each source RAW, decode in **camera-native colour with no channel mixing**.
-The only differences between the two sensor kinds are `half_size` and (for
-monochrome) which channel to take:
+- **Bayer:** read the raw mosaic, pick the frame's CFA colour index from
+  `color_desc` (`bayer_channel_indices`), and `extract_cfa_plane(mosaic, colors,
+  target)` returns just that colour's sites. Subtract `black_level_per_channel[
+  target]`. No `raw.postprocess` at all.
+- **Monochrome:** `raw.postprocess(half_size=preview, output_color=raw,
+  gamma=(1,1), no_auto_bright=True, no_auto_scale=True, use_camera_wb=False)`;
+  the channel **is** the grayscale plane (`rgb` if 2-D, else `rgb[..., 0]` — the
+  channels are equal). `preview` gives a fast half-size decode; the full sensor
+  size is still reported as the canonical resolution.
 
-```python
-raw.postprocess(
-    output_bps=16,
-    no_auto_bright=True,
-    gamma=(1, 1),                 # linear
-    user_flip=0,
-    demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR,  # inert under half_size
-    half_size=True,               # Bayer: 2×2 bin == the no-demosaic extraction
-                                  # Monochrome: half_size=preview (full for export)
-    use_camera_wb=False,          # no WB scaling
-    use_auto_wb=False,
-    output_color=rawpy.ColorSpace.raw,   # camera-native: NO 3×3 matrix → no mixing
-    no_auto_scale=True,           # absolute sensor values; we scale manually
-    adjust_maximum_thr=0.0,
-    four_color_rgb=False,
-)
-```
+Either way the plane is scaled by `65535/white_level` in `combine_channels`
+(matching `read_image`'s black-subtracted negative decode).
 
-- **Bayer:** `half_size=True`; pick the frame's colour channel
-  (`rgb[..., channel_idx]`, index from `color_desc`).
-- **Monochrome:** `half_size=preview` (full sensor for export, half for fast
-  previews/zoom); the channel **is** the grayscale plane (`rgb` if 2-D, else
-  `rgb[..., 0]` — the channels are equal).
-
-Verified empirically on `example_raw/DSC07096.ARW` (Bayer): this yields a
-byte-identical 2×2 bin to a manual black-subtracted bin — unmixed, no
-interpolation; `LINEAR` vs `AHD` are identical under `half_size`. libraw subtracts
-the black level during postprocess (per-channel min = 0 with `no_auto_scale=True`),
-so we **do not** black-subtract again. The purity guarantee rests on the bin (or
-the absence of a CFA) + `output_color=raw`, not on the demosaic algorithm.
-(Monochrome cannot be CI-verified here — the repo ships no monochrome RAW — so the
-decode mirrors `read_image`'s existing monochrome path plus the Bayer path's
-absolute-value scaling.)
+Verified on `example_raw/DSC07096.ARW` (Bayer): the direct-mosaic R and B planes
+are **byte-identical** (max abs diff 0) to libraw's own `half_size`+`output_color=
+raw` single-site read — proving the phase + black-level handling is correct — while
+the green plane differs (one site vs libraw's two-green average), which is exactly
+the merge being eliminated. (Monochrome cannot be CI-verified here — the repo
+ships no monochrome RAW — so its decode mirrors `read_image`'s existing monochrome
+path.)
 
 ### Sensor-type guard (decode-time)
 
@@ -331,6 +324,8 @@ def validate_merge_inputs(paths) -> tuple[bool, Optional[str]]
         # (ok, error). Checks: non-empty, len % 3 == 0, all is_raw_path.
 def bayer_channel_indices(color_desc) -> tuple[int, int, int]   # pure
 def is_monochrome_sensor(num_colors, color_desc, raw_pattern=None) -> bool  # pure
+def extract_cfa_plane(mosaic, colors, target_index) -> np.ndarray  # pure
+        # phase-slice one CFA colour's sites from the raw mosaic; no merge
 def combine_channels(plane_r, plane_g, plane_b, white_levels) -> np.ndarray  # pure
         # crop to common (min H, min W); scale each by 65535/wl; clip; stack -> uint16
 def merge_raw_channels(sources, preview=False) -> tuple[np.ndarray, tuple[int, int]]
@@ -341,8 +336,8 @@ def merge_raw_channels(sources, preview=False) -> tuple[np.ndarray, tuple[int, i
 
 `merge_raw_channels` is the only rawpy-touching function; everything else
 (`is_raw_path`, `sort_for_merge`, `group_into_triplets`, `validate_merge_inputs`,
-`bayer_channel_indices`, `is_monochrome_sensor`, `combine_channels`) is pure and
-unit-tested.
+`bayer_channel_indices`, `is_monochrome_sensor`, `extract_cfa_plane`,
+`combine_channels`) is pure and unit-tested.
 
 ## Integration Points
 
@@ -478,3 +473,12 @@ resolution round-trip; the only items found were a stale `export_estimator`
 comment (fixed) and the mixed-type guard (added). The monochrome rawpy decode
 itself is not CI-verifiable here (no monochrome RAW in the repo); it mirrors
 `read_image`'s existing monochrome path plus the Bayer absolute-value scaling.
+
+Round 5 (crosstalk-free Bayer): replaced the Bayer `half_size=True` decode with a
+direct raw-mosaic read (`extract_cfa_plane`) that pulls only the wanted colour's
+photosites — one site per quad, no green averaging, no quad-merge, no libraw
+colour pipeline — eliminating inter-channel crosstalk. Validated on the example
+ARW: R and B planes are byte-identical to libraw's single-site read, green now
+uses one site (the eliminated average). `half_size` is documented as the
+lower-rigor alternative and no longer used for Bayer; monochrome still uses
+`postprocess` (no CFA, so no crosstalk to remove).
