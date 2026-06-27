@@ -56,8 +56,12 @@ jobs:
           body: |
             ## What's New
 
+            **v0.8.1**
+            - **3-way RGB merge — monochrome sensors:** trichrome capture now supports monochrome (no-CFA) cameras, the ideal trichrome sensor — each frame is a full-resolution grayscale that becomes one channel, at full sensor resolution.
+            - **3-way RGB merge — crosstalk-free Bayer:** Bayer frames now read the raw sensor mosaic directly and take only the wanted colour's photosites (R/B single site, green = average of its two green sites), never mixing in the other colours — instead of the previous quad-binning decode.
+
             **v0.8.0**
-            - **3-way RGB merge (trichrome capture):** new toggle on Settings → Color Management. Shoot a static scene three times under pure red, then green, then blue light; on import, every 3 RAWs (sorted by filename) merge into one colour image — each frame contributes only its own channel, with no demosaicing — then convert as a negative. Bayer RAW only; the selected count must be a multiple of 3.
+            - **3-way RGB merge (trichrome capture):** new toggle on Settings → Color Management. Shoot a static scene three times under pure red, then green, then blue light; on import, every 3 RAWs (sorted by filename) merge into one colour image — each frame contributes only its own channel, with no demosaicing — then convert as a negative.
 
             ## Install
 
@@ -153,8 +157,12 @@ jobs:
           body: |
             ## What's New
 
+            **v0.8.1**
+            - **3-way RGB merge — monochrome sensors:** trichrome capture now supports monochrome (no-CFA) cameras, the ideal trichrome sensor — each frame is a full-resolution grayscale that becomes one channel, at full sensor resolution.
+            - **3-way RGB merge — crosstalk-free Bayer:** Bayer frames now read the raw sensor mosaic directly and take only the wanted colour's photosites (R/B single site, green = average of its two green sites), never mixing in the other colours — instead of the previous quad-binning decode.
+
             **v0.8.0**
-            - **3-way RGB merge (trichrome capture):** new toggle on Settings → Color Management. Shoot a static scene three times under pure red, then green, then blue light; on import, every 3 RAWs (sorted by filename) merge into one colour image — each frame contributes only its own channel, with no demosaicing — then convert as a negative. Bayer RAW only; the selected count must be a multiple of 3.
+            - **3-way RGB merge (trichrome capture):** new toggle on Settings → Color Management. Shoot a static scene three times under pure red, then green, then blue light; on import, every 3 RAWs (sorted by filename) merge into one colour image — each frame contributes only its own channel, with no demosaicing — then convert as a negative.
 
             ## Install
 
