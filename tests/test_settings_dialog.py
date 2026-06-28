@@ -48,6 +48,7 @@ def _reset_profile_state():
         cm.set_input_profile_disabled(False)
         cm.set_camera_matrix_mode(False)
         ccr_backend.positive_mode = False
+        ccr_backend.density_bwpoint = True
         ccr_backend.active_profile_path = None
         ccr_backend.images = []
     _reset()
@@ -274,6 +275,10 @@ class _StubMW(QWidget):
         self.calls.append(("rgb_merge", bool(c)))
         ccr_backend.rgb_merge_mode = bool(c)
 
+    def on_density_bwpoint_toggled(self, c):
+        self.calls.append(("density", bool(c)))
+        ccr_backend.density_bwpoint = bool(c)
+
 
 def _dialog():
     from widgets.settings_dialog import SettingsDialog
@@ -332,6 +337,22 @@ class TestSettingsDialog:
         ccr_backend.rgb_merge_mode = False
         d.refresh_color_management()
         assert d._cb_rgb_merge.isChecked() is False
+
+    def test_density_checkbox_defaults_on_and_toggles_backend(self):
+        ccr_backend.density_bwpoint = True
+        d = _dialog()                       # refresh runs in __init__
+        assert d._cb_density.isChecked() is True       # default ON
+        d._cb_density.setChecked(False)                # user turns it off
+        assert ("density", False) in d._mw.calls
+        assert ccr_backend.density_bwpoint is False
+
+    def test_density_checkbox_reflects_backend_on_refresh(self):
+        ccr_backend.density_bwpoint = False
+        d = _dialog()
+        assert d._cb_density.isChecked() is False
+        ccr_backend.density_bwpoint = True
+        d.refresh_color_management()
+        assert d._cb_density.isChecked() is True
 
 
 class TestCameraProfileLibrary:

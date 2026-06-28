@@ -47,6 +47,12 @@ class CCRBackend:
         # failure), set by the loader and surfaced by the UI after load, then
         # cleared. Reset at the top of every load so it never goes stale.
         self.last_merge_error: Optional[str] = None
+        # Two-point B/W conversion mode: True recovers optical density (log
+        # space), False uses the legacy linear transmittance stretch. The choice
+        # is baked per image into conversion_inputs["density"]; this holds the
+        # default for NEW conversions. Global, persisted by MainWindow.
+        # See spec/density-bwpoint-toggle.md.
+        self.density_bwpoint: bool = True
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Global input ICC profile (one app-wide setting; applied to every
@@ -681,7 +687,8 @@ class CCRBackend:
             if ci is not None and ci.get("mode") == "bw":
                 black_point, white_point = ci["bw"]
                 processed = ccr_normalize_with_bwpoint(
-                    image_obj, black_point, white_point, water_mark=wm)
+                    image_obj, black_point, white_point, water_mark=wm,
+                    density=ci.get("density", False))
             elif ci is not None and ci.get("mode") == "ref_params":
                 processed = ccr_normalize_with_refparams(
                     image_obj, ci["p_lo"], ci["p_hi"], ci["od"], water_mark=wm)
@@ -1015,6 +1022,45 @@ class CCRBackend:
             if progress_callback:
                 progress_callback(i + 1, total)
 
+    def reprocess_all_for_density_bwpoint_change(self, progress_callback=None) -> None:
+        """Re-convert every loaded TWO-POINT B/W image after the global
+        Density-inversion toggle. Only images converted by a two-point B/W pick
+        (conversion_inputs mode 'bw' with a non-None white point) are affected;
+        reference / ref_params / black-point-only / positive / un-converted
+        images are left untouched.
+
+        Per image: re-stamp the saved recipe with the new density flag, reload
+        the raw scan (this clears conversion_inputs), restore the recipe, and
+        replay the bw convert via _reconvert_in_place (which now reads
+        ci['density']). Inherited tint balance is preserved for slices/dups, as
+        in the positive-mode reprocess. See spec/density-bwpoint-toggle.md."""
+        total = len(self.images)
+        if progress_callback:
+            progress_callback(0, total)
+        for i, img in enumerate(self.images):
+            ci = getattr(img, "conversion_inputs", None)
+            is_twopoint_bw = (
+                img.converted and ci is not None and ci.get("mode") == "bw"
+                and ci.get("bw") and ci["bw"][1] is not None)
+            if is_twopoint_bw:
+                inherited_tbf = (bool(img.source_ops)
+                                 or bool(getattr(img, "is_duplicate", False)))
+                tbf = getattr(img, "tint_balance_factor", 1.0)
+                new_ci = dict(ci)
+                new_ci["density"] = bool(self.density_bwpoint)
+                try:
+                    img.reload_image()                  # back to raw scan; clears ci
+                    img.conversion_inputs = new_ci
+                    if inherited_tbf:
+                        img.tint_balance_factor = tbf
+                    self._reconvert_in_place(img)       # replays bw in the new mode
+                    img.update_thumbnail_and_preview()
+                except Exception as e:
+                    print(f"Density reprocess failed for "
+                          f"{getattr(img, 'file_path', '?')}: {e}")
+            if progress_callback:
+                progress_callback(i + 1, total)
+
     def update_thumbnail_by_index(self, idx: int):
         """
         Updates the thumbnail for the image at the given index.
@@ -1137,7 +1183,8 @@ class CCRBackend:
                                                water_mark=not self.software_activated,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                max_long_side=max_long_side,
-                                               output_colorspace=output_colorspace)
+                                               output_colorspace=output_colorspace,
+                                               density=ci.get("density", False))
                 elif image_obj.reference_frame is None and self.black_point_bgr is not None:
                     # Legacy/un-snapshotted B/W point conversion — global anchors.
                     # white_point_bgr may be None → default-slope mode.
@@ -1145,7 +1192,8 @@ class CCRBackend:
                                                output_path=output_path, water_mark=not self.software_activated,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                max_long_side=max_long_side,
-                                               output_colorspace=output_colorspace)
+                                               output_colorspace=output_colorspace,
+                                               density=self.density_bwpoint)
                 else:
                     ccr_normalize_with_reference(image_obj, output_path=output_path,
                                                  water_mark=not self.software_activated, jpg_out=jpg_output,
@@ -1504,8 +1552,11 @@ class CCRBackend:
                 elif parent_ci is not None and parent_ci.get("mode") == "bw":
                     from core.ccr_processor import apply_bwpoint_normalization
                     black_point, white_point = parent_ci["bw"]
-                    crop = apply_bwpoint_normalization(crop, black_point, white_point)
-                    child_ci = {"mode": "bw", "bw": parent_ci["bw"], "fine_rot": 0}
+                    bw_density = parent_ci.get("density", False)
+                    crop = apply_bwpoint_normalization(crop, black_point, white_point,
+                                                       density=bw_density)
+                    child_ci = {"mode": "bw", "bw": parent_ci["bw"], "fine_rot": 0,
+                                "density": bw_density}
 
                 index = len(children) + 1
                 child = CCRImage(
@@ -1640,6 +1691,7 @@ class CCRBackend:
         ci = template.conversion_inputs if template.converted else None
         norm_params = None
         bw_points = None
+        bw_density = False
         if ci is not None and ci.get("mode") == "ref":
             child_full = template.read_image(template.file_path, preview=True)
             if child_full is not None:
@@ -1653,6 +1705,7 @@ class CCRBackend:
             norm_params = (ci["p_lo"], ci["p_hi"], ci["od"])
         elif ci is not None and ci.get("mode") == "bw":
             bw_points = ci["bw"]
+            bw_density = ci.get("density", False)
 
         # Re-decode the source canvas. The constructor raises if the file is
         # gone/unreadable; fail the reset gracefully and leave the list
@@ -1687,10 +1740,10 @@ class CCRBackend:
                 "p_hi": norm_params[1], "od": norm_params[2]}
         elif bw_points is not None:
             parent.resized_raw = apply_bwpoint_normalization(
-                parent.resized_raw, *bw_points)
+                parent.resized_raw, *bw_points, density=bw_density)
             parent.converted = True
             parent.conversion_inputs = {"mode": "bw", "bw": bw_points,
-                                        "fine_rot": 0}
+                                        "fine_rot": 0, "density": bw_density}
         parent.tint_balance_factor = template.tint_balance_factor
         parent.contrast_base = template.contrast_base
         parent.temperature_base = template.temperature_base
@@ -1761,7 +1814,8 @@ class CCRBackend:
                 if img.converted:
                     img.reload_image()
                 processed = ccr_normalize_with_bwpoint(
-                    img, self.black_point_bgr, self.white_point_bgr
+                    img, self.black_point_bgr, self.white_point_bgr,
+                    density=self.density_bwpoint
                 )
                 if processed is not None:
                     img.resized_raw = processed
@@ -1771,6 +1825,7 @@ class CCRBackend:
                     "bw": (tuple(self.black_point_bgr),
                            tuple(self.white_point_bgr) if self.white_point_bgr is not None else None),
                     "fine_rot": img.fine_rotation_angle,
+                    "density": bool(self.density_bwpoint),
                 }
                 img.update_thumbnail_and_preview()
             except Exception as e:

@@ -189,6 +189,10 @@ class MainWindow(QMainWindow):
         # Restore the global 3-way RGB merge toggle too (affects the next import).
         ccr_backend.rgb_merge_mode = self._settings.value(
             "import/rgb_merge_mode", False, type=bool)
+        # Restore the two-point B/W Density-inversion default (ON). New two-point
+        # conversions bake this; see spec/density-bwpoint-toggle.md.
+        ccr_backend.density_bwpoint = self._settings.value(
+            "conversion/density_bwpoint", True, type=bool)
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
@@ -605,6 +609,32 @@ class MainWindow(QMainWindow):
         else:
             msg = "3-way RGB merge off."
         self.sliders_panel.set_temporary_hint(msg, duration=5000)
+
+    # --- Two-point B/W Density inversion (global, persistent) -------------
+    def on_density_bwpoint_toggled(self, checked: bool):
+        """Flip the global two-point Density-inversion default, persist it, and
+        re-convert any loaded two-point B/W images in the new mode (density/log
+        vs legacy linear). Other conversions are untouched.
+        See spec/density-bwpoint-toggle.md."""
+        ccr_backend.density_bwpoint = bool(checked)
+        self._settings.setValue("conversion/density_bwpoint", bool(checked))
+        if ccr_backend.images:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                ccr_backend.reprocess_all_for_density_bwpoint_change()
+            finally:
+                QApplication.restoreOverrideCursor()
+            # Re-converted images invalidate the zoom hi-res cache.
+            self.image_preview._release_hires(refresh=False)
+            self.thumbnail_list.update_all_thumbnails()
+            if self.image_preview.current_idx is not None:
+                self.image_preview.update_preview(self.image_preview.current_idx)
+            ccr_backend.save_catalog()
+        self.sliders_panel.set_temporary_hint(
+            "Density inversion on — two-point conversions recover optical density."
+            if checked else
+            "Density inversion off — two-point conversions use the linear stretch.",
+            duration=5000)
 
     def show_activation_dialog(self):
         QMessageBox.information(

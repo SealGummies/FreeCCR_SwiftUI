@@ -148,7 +148,8 @@ class TestRenderHiresBaseRouting:
         stub.converted = True
         stub.conversion_inputs = {"mode": "bw",
                                   "bw": (black_point, white_point),
-                                  "fine_rot": fine_rot}
+                                  "fine_rot": fine_rot,
+                                  "density": True}   # match the default-density convert
         got = stub.render_hires_base()
         np.testing.assert_allclose(got.astype(np.int64),
                                    expected.astype(np.int64), atol=2)

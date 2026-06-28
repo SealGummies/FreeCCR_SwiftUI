@@ -148,6 +148,19 @@ class SettingsDialog(QDialog):
         g2.addWidget(self._muted(
             "Treat RAWs as ready positive photos instead of film negatives. The "
             "same toggle is on the thumbnail panel."))
+
+        g2.addWidget(theme.section_separator())
+        self._cb_density = QCheckBox(
+            "Density inversion (recover optical density for clear+dense sampling)")
+        self._cb_density.toggled.connect(self._on_density)
+        g2.addWidget(self._cb_density)
+        g2.addWidget(self._muted(
+            "When you sample BOTH a clear (film-base) and a dense point, invert "
+            "in optical-density (log) space — the physically-correct recovery of "
+            "film density — instead of a linear stretch. On by default. Affects "
+            "two-point sampling only; the auto reference-frame conversion and the "
+            "clear-point-only mode are unchanged. Toggling re-converts any loaded "
+            "two-point images."))
         lay.addWidget(grp2)
 
         # --- Trichrome (3-way RGB-light) capture ----------------------- #
@@ -201,6 +214,11 @@ class SettingsDialog(QDialog):
             return                                   # programmatic sync, not a user toggle
         self._mw.on_rgb_merge_mode_toggled(bool(checked))
 
+    def _on_density(self, checked: bool):
+        if bool(checked) == bool(ccr_backend.density_bwpoint):
+            return                                   # programmatic sync, not a user toggle
+        self._mw.on_density_bwpoint_toggled(bool(checked))
+
     def refresh_color_management(self):
         """Reflect the live active profile, the library list, and Positive mode."""
         icc = getattr(ccr_backend, "input_icc_name", None)
@@ -233,3 +251,7 @@ class SettingsDialog(QDialog):
         self._cb_rgb_merge.blockSignals(True)
         self._cb_rgb_merge.setChecked(bool(ccr_backend.rgb_merge_mode))
         self._cb_rgb_merge.blockSignals(False)
+
+        self._cb_density.blockSignals(True)
+        self._cb_density.setChecked(bool(ccr_backend.density_bwpoint))
+        self._cb_density.blockSignals(False)

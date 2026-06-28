@@ -128,10 +128,12 @@ def test_default_mode_scalar_has_no_baked_color():
 
 
 def test_whitepoint_mode_matches_closed_form():
-    """With a white point supplied, output equals the original two-point formula
-    inverted = clip(65535*(base-img)/(base-white)) — i.e. the path is unchanged."""
+    """Legacy LINEAR two-point path (density=False): output equals the original
+    formula inverted = clip(65535*(img-white)/(base-white)). The density default
+    is covered in test_density_bwpoint.py. See spec/density-bwpoint-toggle.md."""
     test_px = [(5000, 6000, 3000), (2000, 3000, 1500), (800, 700, 200)]
-    out = apply_bwpoint_normalization(_img(test_px), BASE_BGR, WHITE_BGR).astype(int)
+    out = apply_bwpoint_normalization(_img(test_px), BASE_BGR, WHITE_BGR,
+                                      density=False).astype(int)
     for i, px in enumerate(test_px):
         for c in range(3):
             base = max(BASE_BGR[c], 1.0)
