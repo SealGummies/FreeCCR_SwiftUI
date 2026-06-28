@@ -1500,7 +1500,8 @@ class SlidersPanel(QWidget):
             from core.ccr_processor import ccr_normalize_with_bwpoint
             white = ccr_backend.white_point_bgr  # may be None → default slope
             processed = ccr_normalize_with_bwpoint(
-                img, ccr_backend.black_point_bgr, white
+                img, ccr_backend.black_point_bgr, white,
+                density=ccr_backend.density_bwpoint
             )
             if processed is not None:
                 img.resized_raw = processed
@@ -1510,6 +1511,7 @@ class SlidersPanel(QWidget):
                 "bw": (tuple(ccr_backend.black_point_bgr),
                        tuple(white) if white is not None else None),
                 "fine_rot": img.fine_rotation_angle,
+                "density": bool(ccr_backend.density_bwpoint),
             }
             img.update_thumbnail_and_preview()
             mw = self.parent().parent()

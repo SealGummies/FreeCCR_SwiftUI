@@ -204,8 +204,10 @@ class TetherWatchWorker(QObject):
         CCRBackend.apply_bwpoint_to_all_images. On failure the image is left
         unconverted but still importable."""
         from core.ccr_processor import ccr_normalize_with_bwpoint
+        from core.ccr_backend import ccr_backend
         try:
-            processed = ccr_normalize_with_bwpoint(img, black, white)
+            density = bool(ccr_backend.density_bwpoint)
+            processed = ccr_normalize_with_bwpoint(img, black, white, density=density)
             if processed is not None:
                 img.resized_raw = processed
             img.converted = True
@@ -213,6 +215,7 @@ class TetherWatchWorker(QObject):
                 "mode": "bw",
                 "bw": (tuple(black), tuple(white) if white is not None else None),
                 "fine_rot": img.fine_rotation_angle,
+                "density": density,
             }
             img.update_thumbnail_and_preview()
         except Exception as e:

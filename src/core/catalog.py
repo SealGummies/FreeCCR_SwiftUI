@@ -439,7 +439,8 @@ def _replay_conversion(img, ci) -> None:
         img.fine_rotation_angle = ci.get("fine_rot", 0)
         try:
             black_point, white_point = ci["bw"]
-            processed = ccr_normalize_with_bwpoint(img, black_point, white_point)
+            processed = ccr_normalize_with_bwpoint(img, black_point, white_point,
+                                                   density=ci.get("density", False))
         finally:
             img.fine_rotation_angle = saved_fine
         img.resized_raw = processed

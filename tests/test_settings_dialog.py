@@ -48,6 +48,7 @@ def _reset_profile_state():
         cm.set_input_profile_disabled(False)
         cm.set_camera_matrix_mode(False)
         ccr_backend.positive_mode = False
+        ccr_backend.density_bwpoint = False        # product default: opt-in
         ccr_backend.active_profile_path = None
         ccr_backend.images = []
     _reset()
@@ -274,6 +275,10 @@ class _StubMW(QWidget):
         self.calls.append(("rgb_merge", bool(c)))
         ccr_backend.rgb_merge_mode = bool(c)
 
+    def on_density_bwpoint_toggled(self, c):
+        self.calls.append(("density", bool(c)))
+        ccr_backend.density_bwpoint = bool(c)
+
 
 def _dialog():
     from widgets.settings_dialog import SettingsDialog
@@ -313,25 +318,61 @@ class TestSettingsDialog:
         d._import(); d._create_it8()
         assert d._mw.calls == ["import", "it8"]
 
-    def test_positive_checkbox_toggles_backend(self):
+    # --- Staged toggles: nothing applies until Done (accept) -------------- #
+    def test_toggles_are_staged_until_done(self):
+        ccr_backend.positive_mode = False
         d = _dialog()
         d._cb_positive.setChecked(True)
+        # Staged: no handler fired, backend unchanged.
+        assert d._mw.calls == []
+        assert ccr_backend.positive_mode is False
+        d.accept()                                     # Done
         assert ("positive", True) in d._mw.calls
+        assert ccr_backend.positive_mode is True
 
-    def test_rgb_merge_checkbox_toggles_backend(self):
+    def test_done_applies_only_changed_toggles(self):
+        ccr_backend.positive_mode = False
         ccr_backend.rgb_merge_mode = False
+        ccr_backend.density_bwpoint = True
         d = _dialog()
-        d._cb_rgb_merge.setChecked(True)
+        d._cb_rgb_merge.setChecked(True)               # change one only
+        d.accept()
         assert ("rgb_merge", True) in d._mw.calls
+        assert not any(c[0] == "positive" for c in d._mw.calls)   # untouched
+        assert not any(c[0] == "density" for c in d._mw.calls)
         assert ccr_backend.rgb_merge_mode is True
 
-    def test_rgb_merge_checkbox_reflects_backend_on_refresh(self):
+    def test_done_with_no_change_applies_nothing(self):
+        d = _dialog()                                  # all at backend defaults
+        d.accept()
+        assert d._mw.calls == []
+
+    def test_close_without_done_discards_toggles(self):
+        ccr_backend.positive_mode = False
+        ccr_backend.density_bwpoint = True
+        d = _dialog()
+        d._cb_positive.setChecked(True)
+        d._cb_density.setChecked(False)
+        d.reject()                                     # Escape / close, not Done
+        assert d._mw.calls == []
+        assert ccr_backend.positive_mode is False      # nothing applied
+        assert ccr_backend.density_bwpoint is True
+
+    def test_density_checkbox_defaults_off(self):
+        # Product default is OFF (density is opt-in); fixture leaves it False.
+        d = _dialog()
+        assert d._cb_density.isChecked() is False
+
+    def test_toggles_seed_from_backend_at_open(self):
         ccr_backend.rgb_merge_mode = True
-        d = _dialog()                       # refresh runs in __init__
+        ccr_backend.density_bwpoint = False
+        d = _dialog()                                   # seeded in __init__
         assert d._cb_rgb_merge.isChecked() is True
-        ccr_backend.rgb_merge_mode = False
+        assert d._cb_density.isChecked() is False
+        # A profile refresh must NOT clobber the (possibly staged) toggles.
+        d._cb_rgb_merge.setChecked(False)               # stage a change
         d.refresh_color_management()
-        assert d._cb_rgb_merge.isChecked() is False
+        assert d._cb_rgb_merge.isChecked() is False     # staged value preserved
 
 
 class TestCameraProfileLibrary:

@@ -117,7 +117,8 @@ class CCRImage:
         # hi-res replay must use this (not live editable state) so the
         # detail layer always matches the conversion the preview shows.
         # {"mode": "ref", "ref": (x1,y1,x2,y2), "fine_rot": int} or
-        # {"mode": "bw", "bw": ((B,G,R),(B,G,R)), "fine_rot": int}
+        # {"mode": "bw", "bw": ((B,G,R),(B,G,R)|None), "fine_rot": int,
+        #  "density": bool}   # density: two-point log inversion (see spec)
         self.conversion_inputs: Optional[Dict[str, Any]] = None
         # User crop as normalized (x1, y1, x2, y2) fractions of the un-rotated/
         # un-flipped image; None = no crop. Display-level only — resized_raw is
@@ -985,7 +986,8 @@ class CCRImage:
                 img = cv2.warpAffine(img, rot, (w0, h0), flags=cv2.INTER_LINEAR,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             black_point, white_point = ci["bw"]
-            out = apply_bwpoint_normalization(img, black_point, white_point)
+            out = apply_bwpoint_normalization(img, black_point, white_point,
+                                              density=ci.get("density", False))
         else:
             return None
         print(f"Hi-res convert: {time.time() - t0:.2f}s")
