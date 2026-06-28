@@ -56,6 +56,10 @@ jobs:
           body: |
             ## What's New
 
+            **v0.8.2**
+            - **Density inversion (opt-in):** new Settings → Color Management toggle. When you sample both a clear (film-base) and a dense point, the negative is inverted in optical-density (log) space — the physically-correct recovery of film density — instead of the linear stretch. Off by default; note log inversions look darker.
+            - **Staged Settings toggles:** Positive mode, 3-way RGB merge, and Density inversion now apply when you press **Done** (and are discarded if you close the dialog) instead of taking effect on every click.
+
             **v0.8.1**
             - **3-way RGB merge — monochrome sensors:** trichrome capture now supports monochrome (no-CFA) cameras, the ideal trichrome sensor — each frame is a full-resolution grayscale that becomes one channel, at full sensor resolution.
             - **3-way RGB merge — crosstalk-free Bayer:** Bayer frames now read the raw sensor mosaic directly and take only the wanted colour's photosites (R/B single site, green = average of its two green sites), never mixing in the other colours — instead of the previous quad-binning decode.
@@ -156,6 +160,10 @@ jobs:
           # The body is static, so refresh "## What's New" for each release.
           body: |
             ## What's New
+
+            **v0.8.2**
+            - **Density inversion (opt-in):** new Settings → Color Management toggle. When you sample both a clear (film-base) and a dense point, the negative is inverted in optical-density (log) space — the physically-correct recovery of film density — instead of the linear stretch. Off by default; note log inversions look darker.
+            - **Staged Settings toggles:** Positive mode, 3-way RGB merge, and Density inversion now apply when you press **Done** (and are discarded if you close the dialog) instead of taking effect on every click.
 
             **v0.8.1**
             - **3-way RGB merge — monochrome sensors:** trichrome capture now supports monochrome (no-CFA) cameras, the ideal trichrome sensor — each frame is a full-resolution grayscale that becomes one channel, at full sensor resolution.
