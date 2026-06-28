@@ -40,8 +40,11 @@ already density; this change makes the two-point path consistent with it.
 - **Default ON.** Persisted in `QSettings` under `conversion/density_bwpoint`,
   restored at startup into `ccr_backend.density_bwpoint` (mirrors
   `import/positive_mode` / `import/rgb_merge_mode`).
-- Toggling it **reprocesses** the currently-loaded two-point B/W images in place,
-  mirroring `on_positive_mode_toggled`. Per image: `reload_image()` (back to the
+- The checkbox is **staged**: ticking it does nothing until **Done** is pressed
+  (and closing/Escape discards it). On Done, `on_density_bwpoint_toggled`
+  **reprocesses** the currently-loaded two-point B/W images in place,
+  mirroring `on_positive_mode_toggled`. (Staging applies to all three Settings
+  toggles — see spec/settings-page.md §2.) Per image: `reload_image()` (back to the
   raw scan; this clears `conversion_inputs`), re-stamp the saved ci with the new
   `density`, then `_reconvert_in_place` (which reads `ci["density"]` and replays
   the bw convert in the new mode), then refresh preview/thumbnails and save the

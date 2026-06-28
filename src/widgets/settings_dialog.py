@@ -5,7 +5,11 @@ profile (ICC / DCP), the IT8 camera-profile wizard, and the global Positive-mode
 toggle that used to live in the File menu / thumbnail panel.
 
 UI only: it reuses MainWindow's existing colour handlers (file pickers, backend
-apply, re-decode) — settings apply immediately on click. See spec/settings-page.md.
+apply, re-decode). The three global TOGGLES (Positive mode, 3-way RGB merge,
+Density inversion) are STAGED — changing a checkbox does nothing until **Done**
+is pressed, and closing/Escape discards the staged change (reverts to the state
+the dialog opened with). Camera-profile import/delete/IT8 are immediate file
+operations (they have their own dialogs). See spec/settings-page.md.
 """
 import os
 
@@ -23,8 +27,8 @@ from ui import theme
 
 class SettingsDialog(QDialog):
     """Modal settings dialog. Categories on the left, the selected page on the
-    right, a single Done button in the footer (settings apply immediately, so
-    there is no staged Save/Cancel)."""
+    right, a single Done button in the footer. The global toggles are staged and
+    applied on Done (accept); closing without Done discards them."""
 
     def __init__(self, main_window, parent=None):
         super().__init__(parent or main_window)
@@ -69,6 +73,7 @@ class SettingsDialog(QDialog):
         self._sidebar.setCurrentRow(0)
         theme.apply_windows_dark_titlebar(self)
         self.refresh_color_management()
+        self._init_toggles()        # seed staged toggles from the live backend
 
     def _stack_set(self, i):
         if i >= 0:
@@ -143,7 +148,6 @@ class SettingsDialog(QDialog):
         g2.setSpacing(theme.GAP_ROW)
         self._cb_positive = QCheckBox(
             "Positive mode (decode RAWs as positives, skip film inversion)")
-        self._cb_positive.toggled.connect(self._on_positive)
         g2.addWidget(self._cb_positive)
         g2.addWidget(self._muted(
             "Treat RAWs as ready positive photos instead of film negatives. The "
@@ -152,7 +156,6 @@ class SettingsDialog(QDialog):
         g2.addWidget(theme.section_separator())
         self._cb_density = QCheckBox(
             "Density inversion (recover optical density for clear+dense sampling)")
-        self._cb_density.toggled.connect(self._on_density)
         g2.addWidget(self._cb_density)
         g2.addWidget(self._muted(
             "When you sample BOTH a clear (film-base) and a dense point, invert "
@@ -169,7 +172,6 @@ class SettingsDialog(QDialog):
         g3.setSpacing(theme.GAP_ROW)
         self._cb_rgb_merge = QCheckBox(
             "3-way RGB merge (combine red/green/blue-light exposures)")
-        self._cb_rgb_merge.toggled.connect(self._on_rgb_merge)
         g3.addWidget(self._cb_rgb_merge)
         g3.addWidget(self._muted(
             "Shoot a static scene three times under pure red, then green, then "
@@ -186,8 +188,9 @@ class SettingsDialog(QDialog):
         return page
 
     # ------------------------------------------------------------------ #
-    # Actions — delegate to MainWindow (file pickers, backend, re-decode);
-    # everything applies immediately, then the page refreshes its status.
+    # Profile actions — delegate to MainWindow (file pickers, backend,
+    # re-decode); these apply IMMEDIATELY, then the page refreshes its status.
+    # (The global toggles below are staged — applied on Done, not here.)
     # ------------------------------------------------------------------ #
     def _import(self):
         self._mw.import_camera_profile_dialog()
@@ -204,20 +207,35 @@ class SettingsDialog(QDialog):
         self._mw.create_camera_profile_from_it8()
         self.refresh_color_management()
 
-    def _on_positive(self, checked: bool):
-        if bool(checked) == bool(ccr_backend.positive_mode):
-            return                                   # programmatic sync, not a user toggle
-        self._mw.on_positive_mode_toggled(bool(checked))
+    # --- Staged toggles: apply on Done (accept), discard on close ---------- #
+    def _init_toggles(self):
+        """Seed the toggle checkboxes from the live backend once, at open. They
+        are NOT re-synced afterwards (refresh_color_management only touches the
+        profile UI) so a profile import/delete can't clobber a staged toggle."""
+        for cb, val in ((self._cb_positive, ccr_backend.positive_mode),
+                        (self._cb_rgb_merge, ccr_backend.rgb_merge_mode),
+                        (self._cb_density, ccr_backend.density_bwpoint)):
+            cb.blockSignals(True)
+            cb.setChecked(bool(val))
+            cb.blockSignals(False)
 
-    def _on_rgb_merge(self, checked: bool):
-        if bool(checked) == bool(ccr_backend.rgb_merge_mode):
-            return                                   # programmatic sync, not a user toggle
-        self._mw.on_rgb_merge_mode_toggled(bool(checked))
+    def _apply_pending(self):
+        """Apply only the toggles whose checkbox differs from the live backend
+        value. Each MainWindow handler persists + reprocesses as needed; calling
+        them only on change avoids spurious reprocess passes. Positive first (it
+        re-decodes), then merge, then density (replays on the new decode)."""
+        if bool(self._cb_positive.isChecked()) != bool(ccr_backend.positive_mode):
+            self._mw.on_positive_mode_toggled(bool(self._cb_positive.isChecked()))
+        if bool(self._cb_rgb_merge.isChecked()) != bool(ccr_backend.rgb_merge_mode):
+            self._mw.on_rgb_merge_mode_toggled(bool(self._cb_rgb_merge.isChecked()))
+        if bool(self._cb_density.isChecked()) != bool(ccr_backend.density_bwpoint):
+            self._mw.on_density_bwpoint_toggled(bool(self._cb_density.isChecked()))
 
-    def _on_density(self, checked: bool):
-        if bool(checked) == bool(ccr_backend.density_bwpoint):
-            return                                   # programmatic sync, not a user toggle
-        self._mw.on_density_bwpoint_toggled(bool(checked))
+    def accept(self):
+        """Done: commit the staged toggles, then close. (Escape/close → reject,
+        which never reaches here, so staged toggles are discarded.)"""
+        self._apply_pending()
+        super().accept()
 
     def refresh_color_management(self):
         """Reflect the live active profile, the library list, and Positive mode."""
@@ -243,15 +261,6 @@ class SettingsDialog(QDialog):
             it.setData(Qt.UserRole, p["path"])
             self._profile_list.addItem(it)
         self._btn_delete.setEnabled(self._profile_list.count() > 0)
-
-        self._cb_positive.blockSignals(True)
-        self._cb_positive.setChecked(bool(ccr_backend.positive_mode))
-        self._cb_positive.blockSignals(False)
-
-        self._cb_rgb_merge.blockSignals(True)
-        self._cb_rgb_merge.setChecked(bool(ccr_backend.rgb_merge_mode))
-        self._cb_rgb_merge.blockSignals(False)
-
-        self._cb_density.blockSignals(True)
-        self._cb_density.setChecked(bool(ccr_backend.density_bwpoint))
-        self._cb_density.blockSignals(False)
+        # NOTE: the global toggles are intentionally NOT synced here — they are
+        # staged (seeded once by _init_toggles, applied on Done). Re-syncing on
+        # every profile refresh would wipe a staged toggle change.

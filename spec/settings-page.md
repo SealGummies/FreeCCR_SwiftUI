@@ -33,18 +33,23 @@ The dialog reuses the existing, already-tested backend handlers
     thumbnail-panel checkbox).
 - **File ▸ Settings…** (Ctrl+,) opens it; the five colour File-menu actions are
   removed.
-- **Immediate-apply** semantics preserved: choosing/clearing a profile or toggling
-  Positive mode takes effect immediately (re-decode), exactly as today — the footer
-  is a single **Done** button (not a batched Save/Cancel form), because these
-  settings have no staged state.
+- **Apply semantics (updated):** camera-profile actions (choose/clear/import/delete,
+  IT8) take effect **immediately** (they are file operations with their own dialogs).
+  The three global **toggles** — Positive mode, 3-way RGB merge, Density inversion —
+  are **staged**: changing a checkbox does nothing until **Done** is pressed
+  (`accept`), and closing/Escape (`reject`) discards them, reverting to the state
+  the dialog opened with. This avoids firing an expensive re-decode/re-convert on
+  every checkbox flick. The toggles are seeded from the live backend once on open
+  and are not re-synced by profile refreshes (so a staged toggle isn't clobbered).
+  See spec/density-bwpoint-toggle.md.
 - Live status: the page reflects the **currently active** profile (ICC vs DCP vs
   none) and updates after every action and on open.
 
 ### Non-goals
 - **No new colour-science behaviour.** Same decode/profile/positive logic; only the
   UI location and grouping change.
-- **No batched Save/Cancel.** Profile/positive changes re-decode on click (they
-  always have); a staged model would change behaviour and is out of scope.
+- **Partial staging.** The global toggles are staged (apply on Done); camera-profile
+  actions remain immediate (deferring a file import/delete would be awkward).
 - **No export colour-space setting here.** It is an export-time choice already
   remembered by the export dialog (`export/colorspace` QSettings); leaving it there
   avoids a second source of truth. (A future "default export colour space" could be
@@ -74,8 +79,10 @@ replaced (§6.2).
 A modal dialog: a fixed-width **left list of categories** (selected row highlighted)
 and a **right pane** that swaps content per category, with a small **footer**
 (bottom-right buttons). We reproduce the *structure* (sidebar + `QStackedWidget` +
-footer) — the canonical settings shape — using the app's dark theme tokens, not the
-Save/Cancel batching (which doesn't fit our immediate-apply settings, §2).
+footer) — the canonical settings shape — using the app's dark theme tokens. The
+footer is a single **Done** button: it commits the staged toggles (§2) and closes;
+closing without it discards them. Profile actions apply immediately, so there is no
+separate Cancel.
 
 ### 3.3 Theme
 Use `ui.theme`: `PANEL`/`SURFACE`/`BORDER`/`TEXT`/`TEXT_MUTED`, `style_button`
