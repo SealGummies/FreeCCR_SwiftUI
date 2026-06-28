@@ -114,7 +114,10 @@ class SettingsDialog(QDialog):
         g.addWidget(self._status)
 
         self._profile_list = QListWidget()
-        self._profile_list.setMinimumHeight(150)
+        # Cap the height so the list stays compact (it otherwise expands to fill
+        # the pane and pushes the Negative-conversion toggles below the fold).
+        self._profile_list.setMinimumHeight(72)
+        self._profile_list.setMaximumHeight(110)
         g.addWidget(self._profile_list)
 
         row = QHBoxLayout()
@@ -158,13 +161,9 @@ class SettingsDialog(QDialog):
             "Density inversion (recover optical density for clear+dense sampling)")
         g2.addWidget(self._cb_density)
         g2.addWidget(self._muted(
-            "When you sample BOTH a clear (film-base) and a dense point, invert "
-            "in optical-density (log) space — the physically-correct recovery of "
-            "film density — instead of a linear stretch. Off by default (opt-in); "
-            "note log inversions look darker and may need a brightness/curve lift. "
-            "Affects two-point sampling only; the auto reference-frame conversion "
-            "and the clear-point-only mode are unchanged. Toggling re-converts any "
-            "loaded two-point images."))
+            "When you sample both a clear and a dense point, invert using film "
+            "density (log) instead of a linear stretch. Two-point conversions "
+            "only — and they look darker."))
         lay.addWidget(grp2)
 
         # --- Trichrome (3-way RGB-light) capture ----------------------- #
