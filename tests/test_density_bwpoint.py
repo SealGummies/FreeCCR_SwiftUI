@@ -150,9 +150,9 @@ def test_apply_bwpoint_normalization_threads_density_flag():
     den = P.apply_bwpoint_normalization(img, BLACK, WHITE, density=True)
     lin = P.apply_bwpoint_normalization(img, BLACK, WHITE, density=False)
     assert abs(int(den[0, 0, 0]) - int(lin[0, 0, 0])) > 5000
-    # default is density ON
+    # default is the legacy linear path (density is opt-in / OFF)
     dflt = P.apply_bwpoint_normalization(img, BLACK, WHITE)
-    assert np.array_equal(dflt, den)
+    assert np.array_equal(dflt, lin)
 
 
 def test_black_point_only_ignores_density_flag():
@@ -202,12 +202,14 @@ def test_reprocess_flips_only_twopoint_bw(monkeypatch):
                           "fine_rot": 0})
 
     saved_imgs = ccr_backend.images
+    saved_mode = ccr_backend.density_bwpoint
     try:
         ccr_backend.images = [two, ref, blackonly]
         ccr_backend.density_bwpoint = True
         ccr_backend.reprocess_all_for_density_bwpoint_change()
     finally:
         ccr_backend.images = saved_imgs
+        ccr_backend.density_bwpoint = saved_mode
 
     # Only the two-point bw image was re-converted, with the NEW density=True.
     assert recorded == [(id(two), True)]
@@ -229,12 +231,13 @@ def test_reprocess_can_turn_density_off(monkeypatch):
     img = _StubImg({"mode": "bw", "bw": ((4000, 4000, 4000), (400, 400, 400)),
                     "fine_rot": 0, "density": True})
     saved = ccr_backend.images
+    saved_mode = ccr_backend.density_bwpoint
     try:
         ccr_backend.images = [img]
         ccr_backend.density_bwpoint = False
         ccr_backend.reprocess_all_for_density_bwpoint_change()
     finally:
         ccr_backend.images = saved
-        ccr_backend.density_bwpoint = True
+        ccr_backend.density_bwpoint = saved_mode
     assert recorded == [False]
     assert img.conversion_inputs["density"] is False

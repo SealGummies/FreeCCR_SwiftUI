@@ -189,10 +189,10 @@ class MainWindow(QMainWindow):
         # Restore the global 3-way RGB merge toggle too (affects the next import).
         ccr_backend.rgb_merge_mode = self._settings.value(
             "import/rgb_merge_mode", False, type=bool)
-        # Restore the two-point B/W Density-inversion default (ON). New two-point
-        # conversions bake this; see spec/density-bwpoint-toggle.md.
+        # Restore the two-point B/W Density-inversion default (OFF — opt-in).
+        # New two-point conversions bake this; see spec/density-bwpoint-toggle.md.
         ccr_backend.density_bwpoint = self._settings.value(
-            "conversion/density_bwpoint", True, type=bool)
+            "conversion/density_bwpoint", False, type=bool)
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()

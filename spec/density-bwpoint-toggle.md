@@ -6,7 +6,10 @@ When the user converts a negative by sampling **both** a clear (film-base) point
 and a dense (exposed) point — the *two-point B/W* path — do the inversion in
 **optical-density (log) space** instead of the legacy linear-in-transmittance
 stretch. Expose a **"Density inversion"** checkbox in Settings → Color
-Management → *Negative conversion*, **defaulting ON**.
+Management → *Negative conversion*. It is **opt-in (default OFF)**: the legacy
+linear stretch remains the out-of-box behaviour, because a faithful log inversion
+renders darker (it needs a brightness/curve lift) and re-expands shadow noise —
+so density is offered as a deliberate choice, not the default.
 
 ### Why (the science)
 
@@ -37,7 +40,7 @@ already density; this change makes the two-point path consistent with it.
 - New checkbox in the existing **"Negative conversion"** group box of the Color
   Management page (directly below "Positive mode"):
   *"Density inversion (recover optical density for clear+dense sampling)"*.
-- **Default ON.** Persisted in `QSettings` under `conversion/density_bwpoint`,
+- **Default OFF (opt-in).** Persisted in `QSettings` under `conversion/density_bwpoint`,
   restored at startup into `ccr_backend.density_bwpoint` (mirrors
   `import/positive_mode` / `import/rgb_merge_mode`).
 - The checkbox is **staged**: ticking it does nothing until **Done** is pressed
@@ -72,8 +75,12 @@ ci = {"mode": "bw", "bw": (black_bgr, white_bgr|None), "fine_rot": int,
 - `density` is a JSON scalar, so `catalog._ci_to_json/_ci_from_json` (a `dict`
   copy) round-trip it with no change.
 
-`ccr_backend.density_bwpoint: bool = True` holds the default for *new*
-conversions and the target for the reprocess.
+`ccr_backend.density_bwpoint: bool = False` holds the default for *new*
+conversions and the target for the reprocess. The helper functions
+(`ccr_normalize_with_bwpoint`, `apply_bwpoint_normalization`) also default
+`density=False`, so the neutral default everywhere is the legacy linear path;
+density is reached only when a caller explicitly passes the live setting or a
+stamped `ci["density"]`.
 
 ## Processing / maths
 
@@ -83,7 +90,7 @@ independent replay (`apply_bwpoint_normalization`). Per channel, with
 `base = max(black[c],1)` (clear, HIGH scan value) and
 `dense = max(white[c],1)` (dense, LOW scan value):
 
-**density = True** (default):
+**density = True** (opt-in):
 ```
 Dmax = log10(base/dense)              # require base > dense, else channel → 0 (black)
 n    = log10(base / clip(img, floor)) / Dmax
@@ -111,7 +118,7 @@ differs. The black-point-only branch (`white is None`) is unchanged and ignores
 | `_twopoint_invert` helper | ccr_processor.py | NEW — density/linear per-channel map |
 | `ccr_normalize_with_bwpoint(..., density=True)` | ccr_processor.py | two-point branch calls helper |
 | `apply_bwpoint_normalization(..., density=True)` | ccr_processor.py | two-point branch calls helper |
-| `density_bwpoint = True` | ccr_backend.py `__init__` | new default flag |
+| `density_bwpoint = False` | ccr_backend.py `__init__` | new default flag (opt-in) |
 | `_reconvert_in_place` | ccr_backend.py | pass `density=ci.get("density", False)` |
 | `export_image_by_index` (ci bw / legacy) | ccr_backend.py | `ci.get("density", False)` / `self.density_bwpoint` |
 | slice child build | ccr_backend.py | inherit `parent_ci` density into call + child_ci |
@@ -150,10 +157,11 @@ Pure / rawpy-free unit tests (mirroring `test_three_way_merge.py` style):
   - `img` floor (0 input doesn't NaN/inf).
 - `apply_bwpoint_normalization(density=False)` is **bit-identical** to the prior
   output for a sample array (refactor-safety).
-- `ci.get("density", False)` default: a legacy ci (no key) replays linear.
-- Settings dialog: `_cb_density` defaults to backend value, toggling calls
-  `on_density_bwpoint_toggled`, refresh reflects backend (mirror the rgb_merge
-  tests).
+- `ci.get("density", False)` default: a legacy ci (no key) replays linear; the
+  helper functions also default `density=False` (bare call → linear).
+- Settings dialog (staged, default OFF): `_cb_density` seeds OFF from the backend,
+  is staged (no apply on click), and `accept` calls `on_density_bwpoint_toggled`
+  only when it changed; `reject` discards. See spec/settings-page.md §2.
 - Backend: `reprocess_all_for_density_bwpoint_change` flips the stored ci
   `density` for two-point bw images and leaves ref / black-point-only untouched
   (monkeypatch `ccr_normalize_with_bwpoint` to record the density it is called

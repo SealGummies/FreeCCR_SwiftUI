@@ -1067,7 +1067,7 @@ def _twopoint_invert(img_f: np.ndarray, black_point_bgr, white_point_bgr,
     Both modes map the SAME endpoints — clear → black (0), dense → white
     (65535) — and differ only in the curve between them:
 
-    density=True  (default, physically correct): per channel recover optical
+    density=True  (opt-in, physically correct): per channel recover optical
       density D = log10(base/img) and normalise by Dmax = log10(base/dense).
       Because the raw scan is linear in transmittance (V ∝ T), this is the true
       density recovery; the normalised density is ALREADY the positive (clear→0,
@@ -1111,7 +1111,7 @@ def _twopoint_invert(img_f: np.ndarray, black_point_bgr, white_point_bgr,
 def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
                                output_path=None, water_mark=True, jpg_out=False,
                                jpg_quality=95, max_long_side=None,
-                               output_colorspace="srgb", density=True):
+                               output_colorspace="srgb", density=False):
     """
     Film negative conversion using the same pipeline as ccr_normalize_with_reference
     but with explicit per-channel B/W points instead of auto-detected percentiles.
@@ -1123,10 +1123,11 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
                      If None, the default-slope mode is used: a density-space
                      inversion with the baked scalar DEFAULT_DENSITY_SLOPE is
                      applied to the black point alone (see _default_slope_invert).
-    density:         two-point mode only — True (default) recovers optical density
-                     in log space; False uses the legacy linear transmittance
-                     stretch. Ignored when white_point_bgr is None (that path is
-                     always density). See spec/density-bwpoint-toggle.md.
+    density:         two-point mode only — True recovers optical density in log
+                     space; False (default) uses the legacy linear transmittance
+                     stretch. Density is opt-in; callers pass the live setting.
+                     Ignored when white_point_bgr is None (that path is always
+                     density). See spec/density-bwpoint-toggle.md.
 
     Pipeline: BWPN (user B/W points) → inversion → saturation boost → shadow correction
     ODAI is skipped because per-channel B/W point mapping already normalises channels.
@@ -1657,7 +1658,7 @@ def apply_reference_normalization(img: np.ndarray, p_lo, p_hi, od_factors) -> np
 
 
 def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bgr=None,
-                                density: bool = True) -> np.ndarray:
+                                density: bool = False) -> np.ndarray:
     """B/W-point conversion at any resolution: absolute per-channel anchors +
     inversion — mirrors ccr_normalize_with_bwpoint's preview path (the anchors
     are global constants, so no rescaling is needed). Used for the zoom hi-res
@@ -1666,10 +1667,10 @@ def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bg
     When white_point_bgr is None, the default-slope mode is used: a density-space
     inversion with the baked scalar DEFAULT_DENSITY_SLOPE is applied to the black
     point alone (see _default_slope_invert). Otherwise the two-point math runs,
-    in optical-density space when density=True (default) or the legacy linear
-    transmittance stretch when density=False (bit-identical to the prior
-    behaviour). Replay callers pass ci.get("density", False) so legacy
-    conversions stay linear. See spec/density-bwpoint-toggle.md.
+    in optical-density space when density=True or the legacy linear transmittance
+    stretch when density=False (default; bit-identical to the prior behaviour).
+    Replay callers pass ci.get("density", False) so legacy conversions stay
+    linear. See spec/density-bwpoint-toggle.md.
 
     The post-invert "look" stays DISABLED so the hi-res replay matches the
     look-less preview/export path."""

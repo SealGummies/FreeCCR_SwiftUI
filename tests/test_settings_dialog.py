@@ -48,7 +48,7 @@ def _reset_profile_state():
         cm.set_input_profile_disabled(False)
         cm.set_camera_matrix_mode(False)
         ccr_backend.positive_mode = False
-        ccr_backend.density_bwpoint = True
+        ccr_backend.density_bwpoint = False        # product default: opt-in
         ccr_backend.active_profile_path = None
         ccr_backend.images = []
     _reset()
@@ -358,10 +358,10 @@ class TestSettingsDialog:
         assert ccr_backend.positive_mode is False      # nothing applied
         assert ccr_backend.density_bwpoint is True
 
-    def test_density_checkbox_defaults_on(self):
-        ccr_backend.density_bwpoint = True
+    def test_density_checkbox_defaults_off(self):
+        # Product default is OFF (density is opt-in); fixture leaves it False.
         d = _dialog()
-        assert d._cb_density.isChecked() is True        # default ON
+        assert d._cb_density.isChecked() is False
 
     def test_toggles_seed_from_backend_at_open(self):
         ccr_backend.rgb_merge_mode = True

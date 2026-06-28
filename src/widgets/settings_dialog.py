@@ -160,10 +160,11 @@ class SettingsDialog(QDialog):
         g2.addWidget(self._muted(
             "When you sample BOTH a clear (film-base) and a dense point, invert "
             "in optical-density (log) space — the physically-correct recovery of "
-            "film density — instead of a linear stretch. On by default. Affects "
-            "two-point sampling only; the auto reference-frame conversion and the "
-            "clear-point-only mode are unchanged. Toggling re-converts any loaded "
-            "two-point images."))
+            "film density — instead of a linear stretch. Off by default (opt-in); "
+            "note log inversions look darker and may need a brightness/curve lift. "
+            "Affects two-point sampling only; the auto reference-frame conversion "
+            "and the clear-point-only mode are unchanged. Toggling re-converts any "
+            "loaded two-point images."))
         lay.addWidget(grp2)
 
         # --- Trichrome (3-way RGB-light) capture ----------------------- #

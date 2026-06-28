@@ -50,9 +50,9 @@ class CCRBackend:
         # Two-point B/W conversion mode: True recovers optical density (log
         # space), False uses the legacy linear transmittance stretch. The choice
         # is baked per image into conversion_inputs["density"]; this holds the
-        # default for NEW conversions. Global, persisted by MainWindow.
-        # See spec/density-bwpoint-toggle.md.
-        self.density_bwpoint: bool = True
+        # default for NEW conversions. Density is OPT-IN (default off). Global,
+        # persisted by MainWindow. See spec/density-bwpoint-toggle.md.
+        self.density_bwpoint: bool = False
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Global input ICC profile (one app-wide setting; applied to every

@@ -117,10 +117,10 @@ class TestCatalogRoundTrip:
         processed = ccr_normalize_with_bwpoint(img, black_point, white_point)
         img.resized_raw = processed
         img.converted = True
-        # Real conversions stamp the density mode they used (default ON); the
-        # replay reads it back. See spec/density-bwpoint-toggle.md.
+        # Default conversion is the legacy linear path; ci omits "density" (replay
+        # reads ci.get("density", False)). See spec/density-bwpoint-toggle.md.
         img.conversion_inputs = {"mode": "bw", "bw": (black_point, white_point),
-                                 "fine_rot": 0, "density": True}
+                                 "fine_rot": 0}
         original = img.resized_raw.copy()
         catalog.update_for_images([img], path=cat)
 
