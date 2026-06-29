@@ -33,6 +33,14 @@ BASE_BGR = (11385.0, 14569.0, 7022.0)    # clear film base (high scan values)
 WHITE_BGR = (760.0, 420.0, 117.0)        # dense area (low scan values)
 
 
+@pytest.fixture(autouse=True)
+def _force_legacy_full_range(monkeypatch):
+    """These tests pin the LEGACY full-range inversion (base→0, dense→65535). The
+    windowed working space is ON by default now, so explicitly force it OFF here;
+    its behaviour is covered in test_working_space.py."""
+    monkeypatch.setenv("FREECCR_WORKING_SPACE", "0")
+
+
 def _img(pixels_bgr, dtype=np.uint16):
     """Build a (1, N, 3) image from a list of (B,G,R) tuples."""
     return np.array([pixels_bgr], dtype=dtype)

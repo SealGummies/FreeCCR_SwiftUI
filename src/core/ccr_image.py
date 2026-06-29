@@ -12,7 +12,7 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
                                 apply_area_layers, apply_crop_to_image,
-                                apply_dust_removal)
+                                apply_dust_removal, _apply_working_space_recovery)
 from core import color_management
 from ui import theme
 
@@ -55,6 +55,7 @@ class CCRImage:
         areas: Optional[List[Dict[str, Any]]] = None,
         is_merged: bool = False,
         merge_sources: Optional[list] = None,
+        ws_windowed: bool = False,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
@@ -153,6 +154,12 @@ class CCRImage:
         # Non-destructive auto-exposure (default-slope mode), in ch_input_gain
         # units → applied as a uniform gain. See spec/auto-exposure-default-slope.md.
         self.exposure_base: float = 0.0
+        # True when the current converted base is a WINDOWED working-space buffer
+        # (highlight headroom preserved); apply_adjustments de-windows it. Set by
+        # the conversion that produced the base, or passed in for a preloaded
+        # converted base (slice/duplicate) so the first preview render at the end
+        # of __init__ de-windows correctly. See spec/working-space-headroom.md.
+        self._ws_windowed: bool = ws_windowed
         self.histogram_image = None
         self.original_full_size: Optional[tuple[int, int]] = None  # (height, width) of the full-res source, set by read_image
 
@@ -219,6 +226,7 @@ class CCRImage:
         # decode goes straight to user adjustments (no darkening / shadow crush).
         self.brightness_base = 0 if self._positive_mode_active() else -8
         self.exposure_base = 0.0    # Clear auto-exposure when reverting to original scan
+        self._ws_windowed = False   # raw scan is full-range, not a windowed base
         self.conversion_inputs = None
         img = self.read_image(self.file_path, max_long_side=1080)
         if img is None:
@@ -763,9 +771,16 @@ class CCRImage:
         hist_img_f = np.full((hist_height, hist_width, 3),
                              float(theme.Paint.HIST_BG[0]), dtype=np.float32)
 
-        # Find the global max value across all channels for adaptive scaling
-        max_val = max([hist[c].mean() for c in hist]) * 6
-        scale = max(max_val, 0.1)  # prevent division by zero / too-flat lines
+        # Scale to the tallest CONTENT bin, excluding the hard-clip bins 0 and 255.
+        # The old scale (hist.mean()*6) was a constant (= total_pixels/256 * 6,
+        # independent of the distribution), so any clip spike ≥~2.3% of pixels
+        # saturated the plot at full height while real content was squished to ~40%
+        # — and a saturated clip "line" can't shrink as highlights are recovered,
+        # making recovery look broken. Excluding the extremes lets content fill the
+        # height and reflect recovery; the clip bins still draw (an honest clip
+        # indicator) but shrink once clipping falls below the content peak.
+        content_max = max(float(hist[c][1:255].max()) for c in hist)
+        scale = max(content_max, 0.1)  # prevent division by zero / too-flat lines
 
         rows = np.arange(hist_height, dtype=np.int32)[:, None]  # (150, 1)
         masks = []
@@ -776,6 +791,14 @@ class CCRImage:
                                    theme.Paint.HIST_B)):
             h_scaled = np.clip((hist[channel] / scale) * (hist_height - 1),
                                0, hist_height - 1)
+            # Don't draw the hard-clip bins (0, 255) as bars: a concentrated clip
+            # pile is always the tallest single bin, so a bar histogram would draw
+            # it as a full-height line that can't shrink as highlights are recovered
+            # (the reported "vertical line where it clipped"). Excluding them lets
+            # the in-range content — which DOES visibly redistribute on recovery —
+            # own the plot. Clipping still reads from content piling near the edges.
+            h_scaled[0] = 0.0
+            h_scaled[-1] = 0.0
             col_tops = hist_height - h_scaled.astype(np.int32)  # (256,)
             mask = rows >= col_tops[None, :]                    # (150, 256) bool
             masks.append(mask)
@@ -837,15 +860,20 @@ class CCRImage:
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)
         if not s and cb == 0 and tb == 0 and bb == 0 and eb == 0 and not has_areas:
-            # No slider/base/area adjustments — but Black & White still has to
-            # map the image to a single luminance channel.
+            # No slider/base/area adjustments. A windowed working-space base still
+            # has to be de-windowed + window-clamped to a normal full-range image
+            # before display/export (the base itself is not directly renderable).
+            if self._ws_windowed:
+                image = _apply_working_space_recovery(image, 0.0)
+            # Black & White still has to map the image to a single luminance channel.
             return self._to_grayscale(image) if profile == "bw" else image
         adjusted = adjust_image_opencl(image,
                      s.get('temperature', 0) + tb,
                      s.get('tint', 0),
-                     # Auto-exposure (default-slope mode) rides the TONE-AWARE
-                     # exposure as a non-destructive base (UI slider stays 0):
-                     # highlights roll off instead of hard-clipping, midtones lift.
+                     # Auto-exposure (default-slope mode) rides the Gain/Exposure
+                     # stage as a non-destructive base (UI slider stays 0). With the
+                     # working space ON it is applied un-clamped before the window
+                     # clamp, so the lifted top lands in highlight headroom.
                      s.get('exposure', 0) + eb,
                      # Brightness slider is half-strength per click; the
                      # always-on base offset (bb) keeps full weight so the
@@ -875,7 +903,10 @@ class CCRImage:
                      # CPU fallback); None keeps the inactive case free.
                      band_settings=(s if any(s.get(k, 0)
                                              for k in BAND_ADJUSTMENT_KEYS)
-                                    else None))
+                                    else None),
+                     # Windowed working-space base → de-window + Gain/Exposure
+                     # recovery happens inside the adjustment call.
+                     ws_windowed=self._ws_windowed)
         # Tone curves run after the slider pass, in RGB, before any B&W
         # luminance collapse (Photoshop-like). No-op for identity curves.
         curves = s.get('curves')

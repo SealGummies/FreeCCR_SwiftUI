@@ -30,6 +30,14 @@ BLACK = (4000.0, 4000.0, 4000.0)     # clear -> output black
 WHITE = (400.0, 400.0, 400.0)        # dense -> output white  (10x density range)
 
 
+@pytest.fixture(autouse=True)
+def _force_legacy_full_range(monkeypatch):
+    """These tests pin the LEGACY full-range inversion (clear→0, dense→65535). The
+    windowed working space is ON by default now, so explicitly force it OFF here;
+    its behaviour is covered in test_working_space.py."""
+    monkeypatch.setenv("FREECCR_WORKING_SPACE", "0")
+
+
 def _plane(value, h=4, w=4):
     return np.full((h, w, 3), value, dtype=np.float32)
 

@@ -6,9 +6,12 @@ When the user converts a negative by sampling **both** a clear (film-base) point
 and a dense (exposed) point — the *two-point B/W* path — do the inversion in
 **optical-density (log) space** instead of the legacy linear-in-transmittance
 stretch. Expose a **"Density inversion"** checkbox in Settings → Color
-Management → *Negative conversion*. It is **opt-in (default OFF)**: the legacy
-linear stretch remains the out-of-box behaviour, because a faithful log inversion
-renders darker (it needs a brightness/curve lift) and re-expands shadow noise —
+Management → *Negative conversion*. It now **defaults ON** (was opt-in/OFF): with
+the windowed working space, linear two-point keeps almost no highlight headroom
+(~0.15 stops) whereas density keeps ~2 stops, so density is the better default.
+See spec/working-space-headroom.md. Historically it was opt-in because a faithful
+log inversion renders darker (it needs a brightness/curve lift) and re-expands
+shadow noise —
 so density is offered as a deliberate choice, not the default.
 
 ### Why (the science)

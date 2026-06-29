@@ -4,7 +4,7 @@ from core.ccr_image import CCRImage
 from core.ccr_processor import (ccr_normalize_with_reference, ccr_normalize_with_bwpoint,
                                 ccr_normalize_with_refparams, ccr_export_positive,
                                 auto_fine_angle, auto_frame,
-                                auto_frame_v2, log_bwpoint_slopes)
+                                auto_frame_v2, log_bwpoint_slopes, _ws_enabled)
 import os
 import glob
 import concurrent.futures
@@ -50,9 +50,11 @@ class CCRBackend:
         # Two-point B/W conversion mode: True recovers optical density (log
         # space), False uses the legacy linear transmittance stretch. The choice
         # is baked per image into conversion_inputs["density"]; this holds the
-        # default for NEW conversions. Density is OPT-IN (default off). Global,
-        # persisted by MainWindow. See spec/density-bwpoint-toggle.md.
-        self.density_bwpoint: bool = False
+        # default for NEW conversions. Default ON — linear two-point has almost no
+        # highlight headroom (~0.15 stops) in the working space, whereas density
+        # keeps ~2 stops. Global, persisted by MainWindow. See
+        # spec/density-bwpoint-toggle.md and spec/working-space-headroom.md.
+        self.density_bwpoint: bool = True
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Global input ICC profile (one app-wide setting; applied to every
@@ -1388,6 +1390,9 @@ class CCRBackend:
                 # (zoom/export), not decode the red RAW alone.
                 is_merged=getattr(img, "is_merged", False),
                 merge_sources=getattr(img, "merge_sources", None),
+                # preloaded_img is a copy of the (possibly windowed) base — set
+                # the flag before the ctor's first preview render.
+                ws_windowed=getattr(img, "_ws_windowed", False),
             )
             dup.reference_frame = img.reference_frame
             dup.conversion_inputs = (dict(img.conversion_inputs)
@@ -1578,6 +1583,10 @@ class CCRBackend:
                     # and exported file match the merged preview.
                     is_merged=getattr(img_obj, "is_merged", False),
                     merge_sources=getattr(img_obj, "merge_sources", None),
+                    # The crop above replays the parent's conversion, so the
+                    # child's base is windowed iff the parent's was — set before
+                    # the ctor's first preview render so it de-windows.
+                    ws_windowed=getattr(img_obj, "_ws_windowed", False),
                 )
                 child.conversion_inputs = child_ci
                 # Slices descend from the parent's loaded content — carry its
@@ -1735,6 +1744,7 @@ class CCRBackend:
             parent.resized_raw = apply_reference_normalization(
                 parent.resized_raw, *norm_params)
             parent.converted = True
+            parent._ws_windowed = False   # reference path is full-range
             parent.conversion_inputs = {
                 "mode": "ref_params", "p_lo": norm_params[0],
                 "p_hi": norm_params[1], "od": norm_params[2]}
@@ -1742,6 +1752,7 @@ class CCRBackend:
             parent.resized_raw = apply_bwpoint_normalization(
                 parent.resized_raw, *bw_points, density=bw_density)
             parent.converted = True
+            parent._ws_windowed = _ws_enabled()   # bw base is windowed when enabled
             parent.conversion_inputs = {"mode": "bw", "bw": bw_points,
                                         "fine_rot": 0, "density": bw_density}
         parent.tint_balance_factor = template.tint_balance_factor

@@ -837,6 +837,10 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
     gc.collect()
     # --- End of brightness normalization ---
 
+    # Reference-frame conversion does not (yet) use the windowed working space —
+    # its base is full-range, so clear the flag (handles a bw→ref re-convert).
+    ccr_image._ws_windowed = False
+
     # --- apply user adjustments --- only when outputting
     step_start = time.time()
     if output_path is not None:  # this is for processing
@@ -997,6 +1001,76 @@ DEFAULT_DENSITY_GAMMA = 1.0
 _DENSITY_FLOOR = 1.0
 
 
+# --- Working space with headroom (spec/working-space-headroom.md) ---
+# The inverted "base" buffer reserves a narrow DISPLAY WINDOW inside the 16-bit
+# container and keeps out-of-window data as recoverable headroom instead of
+# hard-clipping at white. Display/export render only the window; the White Point
+# slider recovers headroom (it runs un-clamped, BEFORE the window clamp). ON by
+# default on a normal launch; set FREECCR_WORKING_SPACE=0 to force legacy full-range
+# (byte-identical to before). A neutral conversion looks the same either way (only
+# 10-bit-quantized in the window); the difference is recoverable headroom.
+def _ws_enabled() -> bool:
+    return os.environ.get("FREECCR_WORKING_SPACE", "1").strip().lower() not in (
+        "0", "false", "no", "off", "")
+
+
+# Window geometry: a `_WS_BITS`-wide window (default 10-bit = 1024 codes) placed
+# low in the container, leaving `_WS_LO` display units of shadow margin below
+# black and the remainder (~6 stops at 10-bit) as highlight headroom above white.
+_WS_BITS = int(os.environ.get("FREECCR_WS_BITS", "10"))
+_WS_LO = float(os.environ.get("FREECCR_WS_LO", "0.5"))
+_WS_WIDTH = float(1 << _WS_BITS)                   # window width in codes (1024)
+WS_B = _WS_LO * _WS_WIDTH                           # code for display-black (d=0)
+WS_W = (1.0 + _WS_LO) * _WS_WIDTH                   # code for display-white (d=1)
+_WS_INV_WIDTH = 1.0 / (WS_W - WS_B)                 # == 1/_WS_WIDTH
+# Highlight headroom, in stops, between display-white and the container ceiling
+# (~6 at the 10-bit default). The White Point recovery slider spans exactly this
+# range, so WP=-100 maps the ceiling back to white (recovers ALL headroom).
+_WS_HEADROOM_STOPS = float(np.log2((65535.0 - WS_B) / (WS_W - WS_B)))
+
+
+def encode_window(d: np.ndarray) -> np.ndarray:
+    """Map display values `d` (0=black, 1=white, may overshoot either end) into
+    windowed uint16 container codes, clamped to [0,65535]. Only data beyond the
+    container (≈+6 stops / −0.5 below black at the 10-bit default) is discarded;
+    everything between white and the container top survives as recoverable
+    headroom. `d` may be modified in place."""
+    code = d
+    code *= np.float32(WS_W - WS_B)
+    code += np.float32(WS_B)
+    np.clip(code, 0.0, 65535.0, out=code)
+    return code.astype(np.uint16)
+
+
+def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
+                                  white_point: float = 0.0) -> np.ndarray:
+    """De-window a windowed base, apply the highlight-recovery controls UN-clamped
+    (so headroom can be pulled back below white), then clamp to the display window
+    and return a normal full-range [0,65535] positive for the look chain. This
+    single numpy pre-stage is shared by the CPU and GPU adjustment paths, so
+    GPU/CPU parity is automatic — the kernel never sees headroom.
+
+    Two recovery controls, both neutral at 0 (so a neutral edit is byte-identical):
+      White Point — the WIDE-range recovery, stops-based across the FULL headroom:
+        WP=-100 maps the container ceiling exactly to white (recovers everything),
+        WP=0 neutral, WP>0 pushes highlights up. Perceptual feel: typical blown
+        highlights come back within the first chunk of negative travel.
+      Gain/Exposure — the existing linear `1/(1−v/300)` gain (±~0.74 stops), kept
+        for fine tone control on top of the White Point recovery."""
+    d = img16.astype(np.float32)
+    d -= np.float32(WS_B)
+    d *= np.float32(_WS_INV_WIDTH)
+    if white_point != 0.0:
+        wp = float(np.clip(white_point, -100.0, 100.0))
+        d *= np.float32(2.0 ** (_WS_HEADROOM_STOPS * wp / 100.0))   # un-clamped
+    if exposure != 0.0:
+        white_val = 1.0 - np.clip(exposure, -200.0, 200.0) / 300.0
+        d *= np.float32(1.0 / white_val)        # un-clamped: recovers overshoot
+    np.clip(d, 0.0, 1.0, out=d)                  # window clamp: enter display range
+    d *= np.float32(65535.0)
+    return d.astype(np.uint16)
+
+
 def _default_slope_invert(img_f: np.ndarray, black_point_bgr) -> np.ndarray:
     """Density-space inversion for the black-point-only mode, using the baked
     scalar DEFAULT_DENSITY_SLOPE. `img_f` is a float32 (H,W,3) BGR array.
@@ -1015,6 +1089,11 @@ def _default_slope_invert(img_f: np.ndarray, black_point_bgr) -> np.ndarray:
         np.maximum(ch, 0.0, out=ch)                      # clamp (img brighter than base)
         out[..., c] = ch
     out *= np.float32(DEFAULT_DENSITY_SLOPE)             # single scalar = contrast
+    if _ws_enabled():
+        # Keep highlight overshoot (density above the 1/SLOPE ceiling) as headroom.
+        if DEFAULT_DENSITY_GAMMA != 1.0:
+            np.power(out, np.float32(1.0 / DEFAULT_DENSITY_GAMMA), out=out)
+        return encode_window(out)
     np.clip(out, 0.0, 1.0, out=out)
     if DEFAULT_DENSITY_GAMMA != 1.0:
         np.power(out, np.float32(1.0 / DEFAULT_DENSITY_GAMMA), out=out)
@@ -1031,19 +1110,28 @@ EXPOSURE_BASE_MIN = -100.0          # exposure-base clamp (-2 EV nominal)
 EXPOSURE_BASE_MAX = 100.0           # exposure-base clamp (+2 EV nominal)
 
 
-def compute_auto_exposure_gain(img_bgr: np.ndarray) -> float:
-    """Auto-exposure for default-slope mode: return the EXPOSURE-base value (in
-    exposure-slider units, where 2^(x/50) is the nominal stop multiplier) that
+def compute_auto_exposure_gain(img_bgr: np.ndarray, ws_windowed: bool = False) -> float:
+    """Auto-exposure for default-slope mode: return the EXPOSURE-base value that
     would place the (film-holder-excluded) AUTO_EXPOSURE_PERCENTILE luminance at
     AUTO_EXPOSURE_TARGET of full scale.
 
-    The value is applied through the TONE-AWARE exposure (not a uniform gain), so
-    the boost mainly lifts midtones while highlights roll off near white instead
-    of hard-clipping — i.e. this is the nominal target; the top compresses
-    gracefully toward it. Pure-white pixels (luminance >= WHITE_EXCLUDE_FRACTION·
-    65535) are the film holder / clear surround and are excluded so they don't
-    peg the estimate. Returns 0.0 when there isn't enough non-white content."""
-    img = img_bgr.astype(np.float32, copy=False)
+    The value rides the Gain/Exposure stage (a uniform `1/(1−v/300)` gain). With
+    the working space ON it is applied UN-clamped before the window clamp (see
+    _apply_working_space_recovery), so the lifted top lands in highlight headroom
+    instead of hard-clipping. Pure-white pixels (luminance >= WHITE_EXCLUDE_FRACTION·
+    65535 in display scale) are the film holder / clear surround and are excluded
+    so they don't peg the estimate. Returns 0.0 when there isn't enough non-white
+    content. When `ws_windowed`, `img_bgr` is a windowed base, so it is decoded to
+    the display [0,65535] scale (clamped) first so the percentile target matches
+    the legacy full-range behaviour."""
+    if ws_windowed:
+        img = img_bgr.astype(np.float32)
+        img -= np.float32(WS_B)
+        img *= np.float32(_WS_INV_WIDTH)
+        np.clip(img, 0.0, 1.0, out=img)
+        img *= np.float32(65535.0)
+    else:
+        img = img_bgr.astype(np.float32, copy=False)
     # BGR → luminance.
     lum = 0.114 * img[..., 0] + 0.587 * img[..., 1] + 0.299 * img[..., 2]
     keep = lum < (WHITE_EXCLUDE_FRACTION * 65535.0)
@@ -1078,6 +1166,35 @@ def _twopoint_invert(img_f: np.ndarray, black_point_bgr, white_point_bgr,
       (img − dense)/(base − dense), then a linear 65535−x invert. Bit-identical
       to the prior two-point behaviour. See spec/density-bwpoint-toggle.md.
     """
+    ws = _ws_enabled()
+    if ws:
+        # Working-space path: build the per-channel DISPLAY positive `d` (0=clear,
+        # 1=dense) WITHOUT clipping the top, so density beyond the sampled dense
+        # point survives as headroom, then encode into the window.
+        d = np.empty_like(img_f)
+        for c in range(3):
+            base = max(float(black_point_bgr[c]), 1.0)
+            dense = max(float(white_point_bgr[c]), 1.0)
+            if density:
+                dmax = float(np.log10(base / dense)) if base > dense else 0.0
+                if dmax <= 1e-6:                        # no usable density range
+                    d[..., c] = 0.0
+                    continue
+                ch = np.maximum(img_f[..., c], _DENSITY_FLOOR)
+                np.divide(base, ch, out=ch)
+                np.log10(ch, out=ch)
+                np.divide(ch, dmax, out=ch)             # clear→0, dense→1 (overshoot kept)
+                d[..., c] = ch
+            else:
+                denom = base - dense
+                if abs(denom) < 1.0:
+                    d[..., c] = 1.0                      # degenerate → white (matches legacy)
+                    continue
+                # positive d = 1 − transmittance-stretch (overshoot kept)
+                t = (img_f[..., c] - dense) / denom
+                np.subtract(1.0, t, out=d[..., c])
+        return encode_window(d)
+
     norm = np.empty_like(img_f)
     for c in range(3):
         base = max(float(black_point_bgr[c]), 1.0)     # clear / film base (HIGH)
@@ -1220,12 +1337,22 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
     ccr_image.contrast_base = 0
     ccr_image.temperature_base = 0
 
+    # Working space: the B/W-point inversions emit a WINDOWED base when enabled
+    # (highlight headroom preserved). Flag the image so apply_adjustments de-windows
+    # this base. False when the feature is off → legacy full-range, byte-identical.
+    ws = _ws_enabled()
+    ccr_image._ws_windowed = ws
+    if ws:
+        print(f"[working-space] windowed base: ~{_WS_HEADROOM_STOPS:.1f} stops "
+              f"highlight headroom — recover with White Point (drag negative)")
+
     # Auto-exposure (default-slope mode only): compute once from the preview and
     # store as a non-destructive uniform-gain base; export/zoom reuse it. With a
     # white point the two-point map already sets the cut, so force it to 0.
     if output_path is None:
         ccr_image.exposure_base = (
-            compute_auto_exposure_gain(rgb_result) if white_point_bgr is None else 0.0)
+            compute_auto_exposure_gain(rgb_result, ws_windowed=ws)
+            if white_point_bgr is None else 0.0)
 
     # --- User adjustments (export only) ---
     if output_path is not None:
@@ -1404,6 +1531,7 @@ def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
         raise ValueError("CCRImage: could not load image data for ref-params conversion")
 
     rgb_result = apply_reference_normalization(img, p_lo, p_hi, od_factors)
+    ccr_image._ws_windowed = False   # reference path is full-range, not windowed
 
     if output_path is None:
         print(f"TOTAL ref-params normalization time: {time.time() - total_start_time:.3f}s")
@@ -2155,6 +2283,7 @@ def adjust_image(
     ch_b_blackpoint: float = 0.0,
     sub_saturation: float = 0.0,
     band_settings: dict = None,
+    ws_windowed: bool = False,
 ) -> np.ndarray:
     """
     Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
@@ -2162,8 +2291,15 @@ def adjust_image(
     All input factors are in range [-100, 100], 0 = no change.
     band_settings optionally carries the per-color-band sliders
     (band_<color>_<param> keys), applied as the final step.
+    ws_windowed: when True, img16 is a windowed working-space base — de-window it,
+    apply the Gain/Exposure recovery un-clamped, clamp to the display window, and
+    consume exposure here (the rest of the chain runs on a normal full-range image).
     Returns a 16-bit image.
     """
+    if ws_windowed:
+        img16 = _apply_working_space_recovery(img16, exposure, whitepoint)
+        exposure = 0.0      # consumed by the recovery pre-stage
+        whitepoint = 0.0    # White Point is the headroom-recovery control here
     img = img16.astype(np.float32)
 
     # Map input factors from [-100, 100] to useful ranges
@@ -2693,12 +2829,24 @@ def adjust_image_opencl(
     ch_b_blackpoint: float = 0.0,
     sub_saturation: float = 0.0,
     band_settings: dict = None,
+    ws_windowed: bool = False,
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
     Uses cached OpenCL context and compiled program for better performance.
     """
     global _opencl_cache
+
+    # Working space: do the de-window + Gain/Exposure recovery + window clamp in
+    # numpy here (cheap on the ≤1080px preview), then run the kernel on the
+    # resulting normal full-range image with exposure consumed. Sharing this
+    # pre-stage with the CPU path makes GPU/CPU parity automatic — the kernel
+    # never sees headroom.
+    if ws_windowed:
+        img16 = _apply_working_space_recovery(img16, exposure, whitepoint)
+        exposure = 0.0
+        whitepoint = 0.0
+        ws_windowed = False
 
     # Spatial band feathering is a CPU post-blur the per-pixel kernel can't
     # do, so run the whole adjustment on the CPU when it is active (keeps the
