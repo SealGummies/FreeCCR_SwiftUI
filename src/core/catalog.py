@@ -434,6 +434,7 @@ def _replay_conversion(img, ci) -> None:
     elif mode == "ref_params":
         img.resized_raw = apply_reference_normalization(
             img.resized_raw, ci["p_lo"], ci["p_hi"], ci["od"])
+        img._ws_windowed = False   # reference path is full-range, not windowed
     elif mode == "bw":
         saved_fine = img.fine_rotation_angle
         img.fine_rotation_angle = ci.get("fine_rot", 0)
