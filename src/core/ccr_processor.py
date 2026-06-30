@@ -1042,6 +1042,25 @@ def encode_window(d: np.ndarray) -> np.ndarray:
     return code.astype(np.uint16)
 
 
+# --- Exposure (photographic EV), spec/exposure-slider.md ---------------------
+# A second, wide brightness control under the Gain slider, ported from
+# OpenEnlarge's faithful exposure arm (FAITHFUL_EXPO_K = 1.0): a black-anchored
+# LINEAR-LIGHT gain `×2^EV` applied in scene-linear light before the tone curve
+# ("one EV ≈ one photographic stop"). Distinct from the legacy `exposure` param,
+# which drives the *Gain* slider (`1/(1−v/300)`). The raw slider value v ∈
+# [−100,100] maps to EV = (v/100)·EXPO_EV_MAX, so ±100 = ±5 EV (×32 / ÷32) and
+# v=0 is an exact identity (gain 1.0). Applied un-clamped in the working space so
+# +EV lands in highlight headroom (recoverable by lowering EV), like Gain.
+EXPO_EV_MAX = 5.0          # EV magnitude at slider ±100 (matches OpenEnlarge ±5 EV)
+
+
+def _exposure_ev_gain(v: float) -> float:
+    """Raw Exposure-slider value [−100,100] → linear-light multiply 2^EV.
+    v=0 → 1.0 (identity); v=±20 → ×2 / ÷2 (±1 EV); v=±100 → ×32 / ÷32 (±5 EV)."""
+    ev = float(np.clip(v, -100.0, 100.0)) / 100.0 * EXPO_EV_MAX
+    return float(2.0 ** ev)
+
+
 _WB_TEMP_STRENGTH = 0.40   # full-slider R/B scale: s = (slider/100)*0.40 (matches
                            #   the previous tone-aware WB midtone strength)
 _WB_TINT_STRENGTH = 0.26   # = 0.18 * skin(0.45): the previous tint midtone strength
@@ -1069,7 +1088,8 @@ def _white_balance_gains(kelvin_shift: float, tint_shift: float,
 def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
                                   white_point: float = 0.0,
                                   kelvin_shift: float = 0.0, tint_shift: float = 0.0,
-                                  tint_balance_factor: float = 1.0) -> np.ndarray:
+                                  tint_balance_factor: float = 1.0,
+                                  exposure_ev: float = 0.0) -> np.ndarray:
     """De-window a windowed base, apply the highlight-recovery controls UN-clamped
     (so headroom can be pulled back below white), then clamp to the display window
     and return a normal full-range [0,65535] positive for the look chain. This
@@ -1081,8 +1101,10 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
         WP=-100 maps the container ceiling exactly to white (recovers everything),
         WP=0 neutral, WP>0 pushes highlights up. Perceptual feel: typical blown
         highlights come back within the first chunk of negative travel.
-      Gain/Exposure — the existing linear `1/(1−v/300)` gain (±~0.74 stops), kept
-        for fine tone control on top of the White Point recovery."""
+      Gain — the existing linear `1/(1−v/300)` gain (±~0.74 stops), kept for fine
+        tone control on top of the White Point recovery.
+      Exposure — `exposure_ev`, the photographic ±5 EV `×2^EV` linear-light gain
+        (spec/exposure-slider.md). Also un-clamped here, so +EV lands in headroom."""
     d = img16.astype(np.float32)
     d -= np.float32(WS_B)
     d *= np.float32(_WS_INV_WIDTH)
@@ -1103,6 +1125,10 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
     if exposure != 0.0:
         white_val = 1.0 - np.clip(exposure, -200.0, 200.0) / 300.0
         d *= np.float32(1.0 / white_val)        # un-clamped: recovers overshoot
+    if exposure_ev != 0.0:
+        # Exposure (photographic EV): black-anchored linear-light ×2^EV, un-clamped
+        # alongside Gain so +EV lands in highlight headroom (recoverable by -EV).
+        d *= np.float32(_exposure_ev_gain(exposure_ev))
     np.clip(d, 0.0, 1.0, out=d)                  # window clamp: enter display range
     d *= np.float32(65535.0)
     return d.astype(np.uint16)
@@ -2351,6 +2377,7 @@ def adjust_image(
     sub_saturation: float = 0.0,
     band_settings: dict = None,
     ws_windowed: bool = False,
+    exposure_ev: float = 0.0,
 ) -> np.ndarray:
     """
     Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
@@ -2361,15 +2388,20 @@ def adjust_image(
     ws_windowed: when True, img16 is a windowed working-space base — de-window it,
     apply the Gain/Exposure recovery un-clamped, clamp to the display window, and
     consume exposure here (the rest of the chain runs on a normal full-range image).
+    exposure_ev: photographic Exposure slider [-100,100] -> ×2^EV linear-light gain
+    (spec/exposure-slider.md); consumed in the ws pre-stage, or applied here (clamped)
+    for the legacy non-windowed path.
     Returns a 16-bit image.
     """
     if ws_windowed:
         img16 = _apply_working_space_recovery(img16, exposure, whitepoint,
-                                              kelvin_shift, tint_shift, tint_balance_factor)
+                                              kelvin_shift, tint_shift, tint_balance_factor,
+                                              exposure_ev)
         exposure = 0.0       # consumed by the recovery pre-stage
         whitepoint = 0.0     # White Point is the headroom-recovery control here
         kelvin_shift = 0.0   # White Balance consumed (flat per-channel gain, pre-clamp)
         tint_shift = 0.0
+        exposure_ev = 0.0    # Exposure consumed (un-clamped, headroom-safe)
     img = img16.astype(np.float32)
 
     # White balance - flat per-channel gain (spec/working-space-white-balance.md).
@@ -2391,6 +2423,14 @@ def adjust_image(
     contrast_scale = 1.0 + (contrast / 100.0)      # 0.0 to 2.0
     saturation_scale = 1.0 + (saturation / 100.0)  # 0.0 to 2.0
 
+
+    # Exposure (photographic EV) — legacy non-windowed path (the ws path consumed
+    # it above, un-clamped). Black-anchored linear-light ×2^EV, clamped to [0,1].
+    # clip(img/65535*m,0,1)*65535 == clip(img*m,0,65535), matching the GPU numpy
+    # pre-multiply for byte-identical CPU/GPU parity.
+    if exposure_ev != 0.0:
+        m = _exposure_ev_gain(exposure_ev)
+        img = np.clip(img * np.float32(m), 0.0, 65535.0)
 
     # Gain — shares Channel Levels "Master Gain"'s /300 curve: a uniform linear
     # gain out = in / (1 - v/300), hard-clipped to [0,1] (v=200 -> 3x, v=100 ->
@@ -2804,6 +2844,7 @@ def adjust_image_opencl(
     sub_saturation: float = 0.0,
     band_settings: dict = None,
     ws_windowed: bool = False,
+    exposure_ev: float = 0.0,
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
@@ -2818,12 +2859,14 @@ def adjust_image_opencl(
     # never sees headroom.
     if ws_windowed:
         img16 = _apply_working_space_recovery(img16, exposure, whitepoint,
-                                              kelvin_shift, tint_shift, tint_balance_factor)
+                                              kelvin_shift, tint_shift, tint_balance_factor,
+                                              exposure_ev)
         exposure = 0.0
         whitepoint = 0.0
         ws_windowed = False
         kelvin_shift = 0.0
         tint_shift = 0.0
+        exposure_ev = 0.0
 
     # White balance - flat per-channel gain done in numpy so the kernel (and the
     # CPU fallback) never apply WB -> automatic CPU/GPU parity. ws consumed above.
@@ -2835,6 +2878,15 @@ def adjust_image_opencl(
         img16[..., 2] *= np.float32(_gb)
         kelvin_shift = 0.0
         tint_shift = 0.0
+
+    # Exposure (photographic EV) — legacy non-windowed path. Done in numpy (like
+    # WB) so the kernel and CPU fallback never re-apply it -> exact CPU/GPU parity.
+    # clip(img*m,0,65535) matches adjust_image's clamped form. ws consumed above.
+    if exposure_ev != 0.0:
+        img16 = np.asarray(img16, dtype=np.float32)
+        np.multiply(img16, np.float32(_exposure_ev_gain(exposure_ev)), out=img16)
+        np.clip(img16, 0.0, 65535.0, out=img16)
+        exposure_ev = 0.0
 
     # Spatial band feathering is a CPU post-blur the per-pixel kernel can't
     # do, so run the whole adjustment on the CPU when it is active (keeps the
@@ -2852,7 +2904,8 @@ def adjust_image_opencl(
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
                           ch_b_shift, ch_b_gain, ch_b_blackpoint,
                           sub_saturation=sub_saturation,
-                          band_settings=band_settings)
+                          band_settings=band_settings,
+                          exposure_ev=exposure_ev)  # already consumed above (0); kept explicit
 
     try:
       # Serialize GPU submissions: the hi-res zoom worker may run this
@@ -2918,7 +2971,8 @@ def adjust_image_opencl(
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
                           ch_b_shift, ch_b_gain, ch_b_blackpoint,
                           sub_saturation=sub_saturation,
-                          band_settings=band_settings)
+                          band_settings=band_settings,
+                          exposure_ev=exposure_ev)  # already consumed above (0); kept explicit
 
 
 

@@ -874,6 +874,9 @@ class CCRImage:
                      band_settings=(s if any(s.get(k, 0)
                                              for k in BAND_ADJUSTMENT_KEYS)
                                     else None),
+                     # Exposure (photographic ±5 EV, ×2^EV) — independent of Auto
+                     # Gain / eb (which ride the Gain stage above); stacks on top.
+                     exposure_ev=s.get('exposure_ev', 0),
                      # Windowed working-space base → de-window + Gain/Exposure
                      # recovery happens inside the adjustment call.
                      ws_windowed=self._ws_windowed)
@@ -927,7 +930,8 @@ class CCRImage:
                      sub_saturation=s.get('sub_saturation', 0),
                      band_settings=(s if any(s.get(k, 0)
                                              for k in BAND_ADJUSTMENT_KEYS)
-                                    else None))
+                                    else None),
+                     exposure_ev=s.get('exposure_ev', 0))
         curves = s.get('curves')
         if curves:
             adjusted = apply_curves(adjusted, curves)
