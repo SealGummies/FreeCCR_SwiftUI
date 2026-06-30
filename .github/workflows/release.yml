@@ -56,6 +56,11 @@ jobs:
           body: |
             ## What's New
 
+            **v0.9.0**
+            - **Auto gain (on by default):** the brightest highlights are placed at the top of the working range automatically, without moving the Gain slider — the top 0.1% of the in-range highlights are set to 99.8% of full. Pixels outside the sampled clear/dense film range are ignored, and it applies to film conversions only. Turn it off in **Settings → General**.
+            - **White balance now uses highlight headroom:** Temperature/Tint are applied in the scene-linear working space *before* the highlight clamp, so warming or cooling a channel lands in recoverable headroom instead of clipping — and cooling can pull blown highlights back down into range.
+            - **Redesigned histogram:** a crisper, self-drawn RGB histogram with a percentile-clipped vertical scale, so a few blown-out highlights no longer crush the rest of the detail to the floor.
+
             **v0.8.2**
             - **Density inversion (opt-in):** new Settings → Color Management toggle. When you sample both a clear (film-base) and a dense point, the negative is inverted in optical-density (log) space — the physically-correct recovery of film density — instead of the linear stretch. Off by default; note log inversions look darker.
             - **Staged Settings toggles:** Positive mode, 3-way RGB merge, and Density inversion now apply when you press **Done** (and are discarded if you close the dialog) instead of taking effect on every click.
@@ -160,6 +165,11 @@ jobs:
           # The body is static, so refresh "## What's New" for each release.
           body: |
             ## What's New
+
+            **v0.9.0**
+            - **Auto gain (on by default):** the brightest highlights are placed at the top of the working range automatically, without moving the Gain slider — the top 0.1% of the in-range highlights are set to 99.8% of full. Pixels outside the sampled clear/dense film range are ignored, and it applies to film conversions only. Turn it off in **Settings → General**.
+            - **White balance now uses highlight headroom:** Temperature/Tint are applied in the scene-linear working space *before* the highlight clamp, so warming or cooling a channel lands in recoverable headroom instead of clipping — and cooling can pull blown highlights back down into range.
+            - **Redesigned histogram:** a crisper, self-drawn RGB histogram with a percentile-clipped vertical scale, so a few blown-out highlights no longer crush the rest of the detail to the floor.
 
             **v0.8.2**
             - **Density inversion (opt-in):** new Settings → Color Management toggle. When you sample both a clear (film-base) and a dense point, the negative is inverted in optical-density (log) space — the physically-correct recovery of film density — instead of the linear stretch. Off by default; note log inversions look darker.
