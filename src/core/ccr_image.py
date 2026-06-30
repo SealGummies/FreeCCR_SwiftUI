@@ -12,7 +12,8 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
                                 apply_area_layers, apply_crop_to_image,
-                                apply_dust_removal, _apply_working_space_recovery)
+                                apply_dust_removal, _apply_working_space_recovery,
+                                compute_auto_gain_offset)
 from core import color_management
 
 # Import optional libraries with fallbacks
@@ -814,7 +815,19 @@ class CCRImage:
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)
-        if not s and cb == 0 and tb == 0 and bb == 0 and eb == 0 and not has_areas:
+        # Auto Gain (spec/auto-gain.md): a hidden, live offset on the Gain stage
+        # that places the top-0.1% in-bound highlight at 99% of the working-space
+        # window. Film CONVERSIONS only — its reference is the sampled clear/dense
+        # range, which positive mode has no concept of (positive previews stay
+        # identity; adjustments own the look). When ON it SUPERSEDES the legacy
+        # baked auto-exposure (eb) so they don't double-apply. Deferred import —
+        # ccr_backend imports CCRImage at load.
+        from core.ccr_backend import ccr_backend
+        auto_on = getattr(ccr_backend, "auto_gain", True) and self.converted
+        ag = compute_auto_gain_offset(image, self._ws_windowed) if auto_on else 0.0
+        eb_eff = 0.0 if auto_on else eb        # suppress-overlap with the baked eb
+        if (not s and cb == 0 and tb == 0 and bb == 0 and eb_eff == 0 and ag == 0
+                and not has_areas):
             # No slider/base/area adjustments. A windowed working-space base still
             # has to be de-windowed + window-clamped to a normal full-range image
             # before display/export (the base itself is not directly renderable).
@@ -828,8 +841,10 @@ class CCRImage:
                      # Auto-exposure (default-slope mode) rides the Gain/Exposure
                      # stage as a non-destructive base (UI slider stays 0). With the
                      # working space ON it is applied un-clamped before the window
-                     # clamp, so the lifted top lands in highlight headroom.
-                     s.get('exposure', 0) + eb,
+                     # clamp, so the lifted top lands in highlight headroom. Auto
+                     # Gain (ag) is the live, toggleable generalization; when on it
+                     # replaces eb (eb_eff == 0). Both ride this same Gain value.
+                     s.get('exposure', 0) + eb_eff + ag,
                      # Brightness slider is half-strength per click; the
                      # always-on base offset (bb) keeps full weight so the
                      # default look is unchanged.

@@ -58,6 +58,7 @@ class SettingsDialog(QDialog):
         body.addWidget(self._stack, 1)
         root.addLayout(body, 1)
 
+        self._add_category("General", self._build_general_page())
         self._add_category("Color Management", self._build_color_management_page())
 
         root.addWidget(theme.section_separator())
@@ -85,6 +86,30 @@ class SettingsDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setWidget(page)
         self._stack.addWidget(scroll)
+
+    # ------------------------------------------------------------------ #
+    # General page
+    # ------------------------------------------------------------------ #
+    def _build_general_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        theme.apply_panel_spacing(lay, spacing=theme.GAP_SECTION)
+
+        grp = QGroupBox("Exposure")
+        g = QVBoxLayout(grp)
+        g.setSpacing(theme.GAP_ROW)
+        self._cb_auto_gain = QCheckBox("Auto gain")
+        g.addWidget(self._cb_auto_gain)
+        g.addWidget(self._muted(
+            "Automatically place the brightest highlights at the top of the "
+            "working range without moving the Gain slider — the top 0.1% of the "
+            "in-range highlights are set to 99.8% of full. Pixels outside the "
+            "sampled clear/dense film range are ignored. Turn off to control "
+            "exposure with the Gain slider alone."))
+        lay.addWidget(grp)
+
+        lay.addStretch(1)
+        return page
 
     # ------------------------------------------------------------------ #
     # Color Management page
@@ -214,7 +239,8 @@ class SettingsDialog(QDialog):
         profile UI) so a profile import/delete can't clobber a staged toggle."""
         for cb, val in ((self._cb_positive, ccr_backend.positive_mode),
                         (self._cb_rgb_merge, ccr_backend.rgb_merge_mode),
-                        (self._cb_density, ccr_backend.density_bwpoint)):
+                        (self._cb_density, ccr_backend.density_bwpoint),
+                        (self._cb_auto_gain, ccr_backend.auto_gain)):
             cb.blockSignals(True)
             cb.setChecked(bool(val))
             cb.blockSignals(False)
@@ -230,6 +256,8 @@ class SettingsDialog(QDialog):
             self._mw.on_rgb_merge_mode_toggled(bool(self._cb_rgb_merge.isChecked()))
         if bool(self._cb_density.isChecked()) != bool(ccr_backend.density_bwpoint):
             self._mw.on_density_bwpoint_toggled(bool(self._cb_density.isChecked()))
+        if bool(self._cb_auto_gain.isChecked()) != bool(ccr_backend.auto_gain):
+            self._mw.on_auto_gain_toggled(bool(self._cb_auto_gain.isChecked()))
 
     def accept(self):
         """Done: commit the staged toggles, then close. (Escape/close → reject,
