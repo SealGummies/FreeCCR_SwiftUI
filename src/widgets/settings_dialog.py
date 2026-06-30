@@ -103,7 +103,7 @@ class SettingsDialog(QDialog):
         g.addWidget(self._muted(
             "Automatically place the brightest highlights at the top of the "
             "working range without moving the Gain slider — the top 0.1% of the "
-            "in-range highlights are set to 99% of full. Pixels outside the "
+            "in-range highlights are set to 99.8% of full. Pixels outside the "
             "sampled clear/dense film range are ignored. Turn off to control "
             "exposure with the Gain slider alone."))
         lay.addWidget(grp)

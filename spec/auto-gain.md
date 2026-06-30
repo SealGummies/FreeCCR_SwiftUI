@@ -35,7 +35,7 @@ supersedes when on), [`spec/working-space-headroom.md`](working-space-headroom.m
 
 Auto Gain is a toggleable (Settings → **General**) convenience that, **without
 moving the Gain slider**, secretly offsets the Gain stage so the top 0.1 % of
-in-bound highlights lands at 99 % of the working-space window (display 0.99). It
+in-bound highlights lands at 99.8 % of the working-space window (display 0.998). It
 rides the exact mechanism the legacy default-slope auto-exposure already uses —
 an invisible additive offset on the `exposure` (Gain) parameter — but is general
 (all converted images), live, user-toggleable, and respects the sampled
@@ -51,7 +51,7 @@ clear/dense range when measuring the highlight.
   (`s['exposure'] + offset`) — the UI slider is never touched (mirrors the
   existing `exposure_base`).
 - Reference: the **99.9th percentile** of in-bound luminance is placed at
-  **display 0.99** ("99 % of the workspace window value").
+  **display 0.998** ("99.8 % of the workspace window value").
 - **In-bound** = de-windowed display value in `[0, 1]` (between the sampled
   clear→dense points); headroom/over-range and sub-black pixels are discarded.
 - When ON, **suppress the legacy `exposure_base`** so they don't double-apply;
@@ -118,20 +118,20 @@ if vals.size < MIN_CONTENT_FRACTION * lum.size:  # not enough in-bound content
 p = percentile(vals, AG_PERCENTILE)              # 99.9th
 if p <= AG_EPS:
     return 0.0
-g = AG_TARGET / p                                # gain that puts p at 0.99
+g = AG_TARGET / p                                # gain that puts p at 0.998
 g = clip(g, AG_GMIN, AG_GMAX)                    # [0.6, 3.0] — the stage's range
 v = 300.0 * (1.0 - 1.0/g)                        # inverse of g = 1/(1 - v/300)
 return clip(v, -200.0, 200.0)
 ```
 
-Constants: `AG_PERCENTILE = 99.9`, `AG_TARGET = 0.99`, `AG_HI = 1.0`,
+Constants: `AG_PERCENTILE = 99.9`, `AG_TARGET = 0.998`, `AG_HI = 1.0`,
 `AG_GMIN = 0.6`, `AG_GMAX = 3.0`, `AG_EPS = 1e-4`; reuse `MIN_CONTENT_FRACTION`
 (0.005). The bottom bound (`lum < 0`) is excluded for completeness but never
 affects a top-0.1 % percentile.
 
 Why this is the correct inverse: the offset is added to the user's Gain value and
 the **sum** is fed to `g = 1/(1 − v/300)`. With the slider at 0, the sum is `v`
-and the realized gain is exactly the clamped `g`, so `p·g = 0.99`. With the slider
+and the realized gain is exactly the clamped `g`, so `p·g = 0.998`. With the slider
 moved, the user is deliberately deviating (same as `exposure_base` today).
 
 ### 4.2 Wiring in `apply_adjustments`
@@ -196,7 +196,7 @@ in `_init_toggles`, staged, and applied on Done in `_apply_pending` by calling
   nor `ag`; acceptable (degenerate frame).
 - **Highlights already at the window top** (p99.9 ≈ 0.99): offset ≈ 0 (no-op).
 - **Very dark frame** (p99.9 < 0.33): `g` clamps at 3.0 → offset 200, lifted as
-  far as the stage allows (cannot reach 0.99; flagged by the histogram, not here).
+  far as the stage allows (cannot reach 0.998; flagged by the histogram, not here).
 - **Blown frame in headroom** (p99.9 > 1, ws on): excluded by `AG_HI`, so the
   *in-bound* p99.9 (just under 1) drives a small pull. With the working space on,
   the un-clamped gain still pulls the over-range pixels down too.
@@ -218,7 +218,7 @@ in `_init_toggles`, staged, and applied on Done in `_apply_pending` by calling
 - **Neutral**: in-bound p99.9 already ≈ 0.99 → offset ≈ 0.
 - **Insufficient content**: < 0.5 % in-bound pixels → offset 0.0.
 - **Clamp**: a very dark base → offset 200 (g capped at 3.0); a bright/blown base
-  → offset floored at −200 (g capped at 0.6) only if in-bound p99.9 > 0.99/0.6.
+  → offset floored at −200 (g capped at 0.6) only if in-bound p99.9 > 0.998/0.6.
 - **Suppress-overlap**: with `ccr_backend.auto_gain=True`, a default-slope image's
   render uses `ag` and **not** `eb` (assert eb path is bypassed); with it False,
   `eb` is applied and `ag` is 0.

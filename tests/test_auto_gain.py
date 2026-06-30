@@ -2,7 +2,7 @@
 """Tests for Auto Gain (spec/auto-gain.md).
 
 Auto Gain is a hidden, live offset on the Gain stage that places the top-0.1%
-*in-bound* highlight at 99% of the working-space window without moving the Gain
+*in-bound* highlight at 99.8% of the working-space window without moving the Gain
 slider. "In-bound" = a de-windowed display value in [0, 1] (between the sampled
 clear→0 and dense→1 conversion points); over-range/specular (>1) and sub-black
 (<0) pixels are discarded. Pure numpy core, runs headless.
@@ -39,20 +39,21 @@ def _realized_gain(v):
 
 def test_constants():
     assert AG_PERCENTILE == 99.9
-    assert AG_TARGET == 0.99
+    assert AG_TARGET == 0.998
     assert AG_HI == 1.0
     assert (AG_GMIN, AG_GMAX) == (0.6, 3.0)
 
 
-def test_uniform_midtone_targets_99pct():
-    """A flat in-bound 0.5 base → an offset whose realized gain lands 0.5 at 0.99."""
+def test_uniform_midtone_targets_top():
+    """A flat in-bound 0.5 base → an offset whose realized gain lands 0.5 at the
+    target (0.998)."""
     base = _ws_base(np.full((32, 32, 3), 0.5))
     v = compute_auto_gain_offset(base, ws_windowed=True)
     assert 0.5 * _realized_gain(v) == pytest.approx(AG_TARGET, abs=2e-3)
 
 
 def test_already_at_target_is_noop():
-    base = _ws_base(np.full((32, 32, 3), 0.99))
+    base = _ws_base(np.full((32, 32, 3), AG_TARGET))
     v = compute_auto_gain_offset(base, ws_windowed=True)
     assert v == pytest.approx(0.0, abs=1.0)        # within ~1 slider unit
 
@@ -100,7 +101,7 @@ def test_insufficient_inbound_content_returns_zero():
 
 def test_roundtrip_places_highlight_at_target():
     """Feeding the computed offset as the Gain value through adjust_image puts
-    the 99.9th percentile of the output at ≈ 0.99·65535."""
+    the 99.9th percentile of the output at ≈ AG_TARGET·65535."""
     rng = np.random.default_rng(0)
     d = rng.uniform(0.05, 0.7, size=(80, 80, 3)).astype(np.float32)
     base = _ws_base(d)
@@ -113,10 +114,10 @@ def test_roundtrip_places_highlight_at_target():
 
 def test_at_target_is_near_noop_render():
     """A base already at the target produces an offset at most window-quantization
-    sized (the 10-bit window can't represent 0.99 exactly), so the render barely
-    moves from the un-gained de-window. (A genuine offset of 0.0 — e.g. the
+    sized (the 10-bit window can't represent the target exactly), so the render
+    barely moves from the un-gained de-window. (A genuine offset of 0.0 — e.g. the
     insufficient-content case — is an exact no-op via the early-return guard.)"""
-    base = _ws_base(np.full((16, 16, 3), 0.99))
+    base = _ws_base(np.full((16, 16, 3), AG_TARGET))
     v = compute_auto_gain_offset(base, ws_windowed=True)
     assert abs(v) < 1.5                                  # quantization noise only
     ref = adjust_image(base, exposure=0.0, ws_windowed=True).astype(np.int32)

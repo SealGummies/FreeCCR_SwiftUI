@@ -1184,14 +1184,14 @@ def compute_auto_exposure_gain(img_bgr: np.ndarray, ws_windowed: bool = False) -
 
 
 # --- Auto Gain (spec/auto-gain.md) -------------------------------------------
-# Secretly offset the Gain stage so the top-0.1% in-bound highlight lands at 99%
+# Secretly offset the Gain stage so the top-0.1% in-bound highlight lands at 99.8%
 # of the working-space window — without moving the Gain slider. "In-bound" = a
 # de-windowed display value in [0, 1]: between the sampled clear (→0) and dense
 # (→1) conversion points. Over-range / specular pixels (>1, denser than the dense
 # sample) and sub-black pixels (<0, clearer than the clear sample / film holder)
 # are discarded so they don't drive the gain. Toggleable in Settings → General.
 AG_PERCENTILE = 99.9       # top 0.1% highlight
-AG_TARGET = 0.99           # placed at 99% of the window (display white = 1.0)
+AG_TARGET = 0.998          # placed at 99.8% of the window (display white = 1.0)
 AG_HI = 1.0                # in-bound ceiling = sampled dense point / SLOPE ceiling
 AG_GMIN = 0.6              # Gain stage range: v=-200..+200 → g = 1/(1-v/300) = 0.6..3.0
 AG_GMAX = 3.0
