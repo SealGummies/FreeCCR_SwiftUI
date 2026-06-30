@@ -194,6 +194,12 @@ class MainWindow(QMainWindow):
         # New two-point conversions bake this; see spec/density-bwpoint-toggle.md.
         ccr_backend.density_bwpoint = self._settings.value(
             "conversion/density_bwpoint", True, type=bool)
+        # Restore the Auto Gain toggle (default ON). When on, a hidden live offset
+        # on the Gain stage places the top-0.1% in-bound highlight at 99% of the
+        # working-space window (supersedes the baked auto-exposure). See
+        # spec/auto-gain.md.
+        ccr_backend.auto_gain = self._settings.value(
+            "adjust/auto_gain", True, type=bool)
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
@@ -635,6 +641,32 @@ class MainWindow(QMainWindow):
             "Density inversion on — two-point conversions recover optical density."
             if checked else
             "Density inversion off — two-point conversions use the linear stretch.",
+            duration=5000)
+
+    # --- Auto Gain (global, persistent) ----------------------------------
+    def on_auto_gain_toggled(self, checked: bool):
+        """Flip the global Auto Gain flag, persist it, and re-render all loaded
+        images. Auto Gain is a hidden, live offset on the Gain stage (it never
+        moves the slider) and is NOT baked per image, so this only re-renders —
+        no re-conversion and no catalog write. See spec/auto-gain.md."""
+        ccr_backend.auto_gain = bool(checked)
+        self._settings.setValue("adjust/auto_gain", bool(checked))
+        if ccr_backend.images:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                # The auto-gain offset recomputes live in apply_adjustments, so a
+                # plain re-render reflects the new state. Drop the zoom hi-res
+                # cache (its render baked the old offset).
+                self.image_preview._release_hires(refresh=False)
+                self.thumbnail_list.update_all_thumbnails()
+                if self.image_preview.current_idx is not None:
+                    self.image_preview.update_preview(self.image_preview.current_idx)
+            finally:
+                QApplication.restoreOverrideCursor()
+        self.sliders_panel.set_temporary_hint(
+            "Auto gain on — highlights auto-placed at the top of the window."
+            if checked else
+            "Auto gain off — the Gain slider alone controls exposure.",
             duration=5000)
 
     def show_activation_dialog(self):

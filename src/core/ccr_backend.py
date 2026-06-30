@@ -55,6 +55,11 @@ class CCRBackend:
         # keeps ~2 stops. Global, persisted by MainWindow. See
         # spec/density-bwpoint-toggle.md and spec/working-space-headroom.md.
         self.density_bwpoint: bool = True
+        # Auto Gain: when True, a hidden live offset on the Gain stage places the
+        # top-0.1% in-bound highlight at 99% of the working-space window (the Gain
+        # slider is never moved). Supersedes the legacy baked auto-exposure while
+        # on. Global, persisted by MainWindow. See spec/auto-gain.md.
+        self.auto_gain: bool = True
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Global input ICC profile (one app-wide setting; applied to every

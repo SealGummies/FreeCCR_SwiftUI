@@ -1183,6 +1183,50 @@ def compute_auto_exposure_gain(img_bgr: np.ndarray, ws_windowed: bool = False) -
     return float(np.clip(exposure_base, EXPOSURE_BASE_MIN, EXPOSURE_BASE_MAX))
 
 
+# --- Auto Gain (spec/auto-gain.md) -------------------------------------------
+# Secretly offset the Gain stage so the top-0.1% in-bound highlight lands at 99%
+# of the working-space window — without moving the Gain slider. "In-bound" = a
+# de-windowed display value in [0, 1]: between the sampled clear (→0) and dense
+# (→1) conversion points. Over-range / specular pixels (>1, denser than the dense
+# sample) and sub-black pixels (<0, clearer than the clear sample / film holder)
+# are discarded so they don't drive the gain. Toggleable in Settings → General.
+AG_PERCENTILE = 99.9       # top 0.1% highlight
+AG_TARGET = 0.99           # placed at 99% of the window (display white = 1.0)
+AG_HI = 1.0                # in-bound ceiling = sampled dense point / SLOPE ceiling
+AG_GMIN = 0.6              # Gain stage range: v=-200..+200 → g = 1/(1-v/300) = 0.6..3.0
+AG_GMAX = 3.0
+AG_EPS = 1e-4
+
+
+def compute_auto_gain_offset(base_u16: np.ndarray, ws_windowed: bool = False) -> float:
+    """Return the invisible Gain-slider offset that places the AG_PERCENTILE
+    in-bound highlight luminance at AG_TARGET of the working-space window.
+
+    The offset rides the Gain/Exposure stage (g = 1/(1 - v/300)) and is ADDED to
+    the user's Gain value; with the slider at 0 the realized gain is exactly the
+    clamped g, so the measured highlight lands at AG_TARGET. Depends only on the
+    base pixels + window geometry (NOT on any slider), so it is constant across a
+    slider drag. Index 0=R, 1=G, 2=B. Returns 0.0 when there isn't enough in-bound
+    content (mostly headroom/holder). See spec/auto-gain.md."""
+    d = base_u16.astype(np.float32)
+    if ws_windowed:
+        d -= np.float32(WS_B)
+        d *= np.float32(_WS_INV_WIDTH)        # de-window; headroom kept (d may exceed 1)
+    else:
+        d *= np.float32(1.0 / 65535.0)        # legacy full-range base
+    lum = 0.299 * d[..., 0] + 0.587 * d[..., 1] + 0.114 * d[..., 2]   # RGB
+    keep = (lum >= 0.0) & (lum <= AG_HI)       # in-bound: between clear(0)/dense(1)
+    vals = lum[keep]
+    if vals.size < MIN_CONTENT_FRACTION * lum.size:
+        return 0.0
+    p = float(np.percentile(vals, AG_PERCENTILE))
+    if p <= AG_EPS:
+        return 0.0
+    g = float(np.clip(AG_TARGET / p, AG_GMIN, AG_GMAX))
+    v = 300.0 * (1.0 - 1.0 / g)                # inverse of g = 1/(1 - v/300)
+    return float(np.clip(v, -200.0, 200.0))
+
+
 def _twopoint_invert(img_f: np.ndarray, black_point_bgr, white_point_bgr,
                      density: bool) -> np.ndarray:
     """Two-point B/W-point inversion → positive uint16, BGR (H,W,3).
