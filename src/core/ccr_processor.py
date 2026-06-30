@@ -1042,8 +1042,34 @@ def encode_window(d: np.ndarray) -> np.ndarray:
     return code.astype(np.uint16)
 
 
+_WB_TEMP_STRENGTH = 0.40   # full-slider R/B scale: s = (slider/100)*0.40 (matches
+                           #   the previous tone-aware WB midtone strength)
+_WB_TINT_STRENGTH = 0.26   # = 0.18 * skin(0.45): the previous tint midtone strength
+
+
+def _white_balance_gains(kelvin_shift: float, tint_shift: float,
+                         tint_balance_factor: float = 1.0):
+    """Flat per-channel white-balance gains (gr, gg, gb) for Temperature/Tint.
+    Temperature: s=(kelvin/100)*0.40 -> R*(1+s), B*(1-s). Tint:
+    t=tanh(tint*0.02)*0.26*balance -> G*(1-t), R*(1+0.3t), B*(1+0.3t). Neutral
+    (0,0) -> (1,1,1). See spec/working-space-white-balance.md."""
+    gr = gg = gb = 1.0
+    if kelvin_shift != 0.0:
+        s = (kelvin_shift / 100.0) * _WB_TEMP_STRENGTH
+        gr *= (1.0 + s)
+        gb *= (1.0 - s)
+    if tint_shift != 0.0:
+        t = float(np.tanh(tint_shift * 0.02)) * _WB_TINT_STRENGTH * tint_balance_factor
+        gg *= (1.0 - t)
+        gr *= (1.0 + 0.3 * t)
+        gb *= (1.0 + 0.3 * t)
+    return float(gr), float(gg), float(gb)
+
+
 def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
-                                  white_point: float = 0.0) -> np.ndarray:
+                                  white_point: float = 0.0,
+                                  kelvin_shift: float = 0.0, tint_shift: float = 0.0,
+                                  tint_balance_factor: float = 1.0) -> np.ndarray:
     """De-window a windowed base, apply the highlight-recovery controls UN-clamped
     (so headroom can be pulled back below white), then clamp to the display window
     and return a normal full-range [0,65535] positive for the look chain. This
@@ -1060,6 +1086,17 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
     d = img16.astype(np.float32)
     d -= np.float32(WS_B)
     d *= np.float32(_WS_INV_WIDTH)
+    # White balance - flat per-channel gain in the scene-linear working domain
+    # (before the window clamp) so a warm/cool shift lands in headroom (recoverable)
+    # instead of clipping, and cooling can pull highlights back. Index 0=R,1=G,2=B.
+    if kelvin_shift != 0.0 or tint_shift != 0.0:
+        gr, gg, gb = _white_balance_gains(kelvin_shift, tint_shift, tint_balance_factor)
+        if gr != 1.0:
+            d[..., 0] *= np.float32(gr)
+        if gg != 1.0:
+            d[..., 1] *= np.float32(gg)
+        if gb != 1.0:
+            d[..., 2] *= np.float32(gb)
     if white_point != 0.0:
         wp = float(np.clip(white_point, -100.0, 100.0))
         d *= np.float32(2.0 ** (_WS_HEADROOM_STOPS * wp / 100.0))   # un-clamped
@@ -2212,44 +2249,30 @@ def compute_neutral_temp_tint(r: float, g: float, b: float,
     compute the temperature and tint slider values [-100, 100] that make that
     point neutral (R == G == B) after adjust_image's temperature/tint stage.
 
-    Inverts the same perceptual formulas adjust_image applies:
-        temperature:  r *= (1 + s),  b *= (1 - s)
-                      s = (slider/100) * 0.40 * tone_curve
-        tint:         g *= (1 - t),  r *= (1 + 0.3t),  b *= (1 + 0.3t)
-                      t = tanh(slider * 0.02) * 0.18 * tone_curve
-                          * balance_factor * skin_tone_sensitivity
-    Solving r(1+s) = b(1-s) gives s; then m(1+0.3t) = g(1-t) gives t, where
-    m is the common R/B value after the temperature step.
+    Inverts the FLAT per-channel WB that _white_balance_gains applies (no tone or
+    skin weighting; see spec/working-space-white-balance.md):
+        temperature:  r *= (1 + s),  b *= (1 - s),   s = (slider/100) * 0.40
+        tint:         g *= (1 - t),  r *= (1 + 0.3t),  b *= (1 + 0.3t),
+                      t = tanh(slider * 0.02) * 0.26 * balance_factor
+    Solving r(1+s) = b(1-s) gives s; then m(1+0.3t) = g(1-t) gives t, where m is
+    the common R/B value after the temperature step.
     """
     eps = 1e-6
     r = max(float(r), eps)
     g = max(float(g), eps)
     b = max(float(b), eps)
-    lum = (0.299 * r + 0.587 * g + 0.114 * b) / 65535.0
-
-    # Same piecewise tone-aware strength curve as adjust_image (luminance is
-    # taken from the un-adjusted pixel there too, so this matches apply time).
-    if lum <= 0.3:
-        tone = 0.8 + 0.2 * min(max(lum / 0.3, 0.0), 1.0)
-    elif lum <= 0.6:
-        tone = 1.0
-    else:
-        progress = (lum - 0.6) / 0.4
-        sigmoid = 1.0 / (1.0 + np.exp(-8.0 * (progress - 0.5)))
-        tone = 1.0 - 0.75 * sigmoid
 
     # Temperature: choose s so the R and B channels meet.
     s = (b - r) / (b + r)
-    temp_slider = float(np.clip(s * 100.0 / (0.40 * tone), -100.0, 100.0))
+    temp_slider = float(np.clip(s * 100.0 / _WB_TEMP_STRENGTH, -100.0, 100.0))
 
     # Use the achieved (possibly clamped) scale for the tint step.
-    s_eff = (temp_slider / 100.0) * 0.40 * tone
+    s_eff = (temp_slider / 100.0) * _WB_TEMP_STRENGTH
     m = (r * (1.0 + s_eff) + b * (1.0 - s_eff)) / 2.0
 
     # Tint: choose t so G meets the common R/B level m.
     t = (g - m) / (g + 0.3 * m)
-    skin = 1.0 + 0.5 * np.exp(-12.0 * (lum - 0.35) ** 2)
-    denom = 0.18 * tone * tint_balance_factor * skin
+    denom = _WB_TINT_STRENGTH * tint_balance_factor
     x = float(np.clip(t / max(denom, eps), -0.999, 0.999))
     tint_slider = float(np.clip(np.arctanh(x) / 0.02, -100.0, 100.0))
 
@@ -2297,14 +2320,26 @@ def adjust_image(
     Returns a 16-bit image.
     """
     if ws_windowed:
-        img16 = _apply_working_space_recovery(img16, exposure, whitepoint)
-        exposure = 0.0      # consumed by the recovery pre-stage
-        whitepoint = 0.0    # White Point is the headroom-recovery control here
+        img16 = _apply_working_space_recovery(img16, exposure, whitepoint,
+                                              kelvin_shift, tint_shift, tint_balance_factor)
+        exposure = 0.0       # consumed by the recovery pre-stage
+        whitepoint = 0.0     # White Point is the headroom-recovery control here
+        kelvin_shift = 0.0   # White Balance consumed (flat per-channel gain, pre-clamp)
+        tint_shift = 0.0
     img = img16.astype(np.float32)
 
+    # White balance - flat per-channel gain (spec/working-space-white-balance.md).
+    # ws_windowed consumed it above (pre-clamp, headroom-safe); this covers the
+    # non-windowed paths. Index 0=R, 1=G, 2=B.
+    if kelvin_shift != 0.0 or tint_shift != 0.0:
+        _gr, _gg, _gb = _white_balance_gains(kelvin_shift, tint_shift, tint_balance_factor)
+        img[..., 0] *= np.float32(_gr)
+        img[..., 1] *= np.float32(_gg)
+        img[..., 2] *= np.float32(_gb)
+        kelvin_shift = 0.0
+        tint_shift = 0.0
+
     # Map input factors from [-100, 100] to useful ranges
-    kelvin_scale = 0.003 * kelvin_shift      # -1.0 to +1.0
-    tint_scale = 0.002 * tint_shift          # -1.0 to +1.0
     exposure_scale = exposure * 2.0 / 100.0  # -2.0 to +2.0 stops
     brightness_scale = brightness / 8.0
     blackpoint_scale = 1.0 - (blackpoint / 100.0)    # -1.0 to +1.0 (fraction of 65535)
@@ -2312,111 +2347,6 @@ def adjust_image(
     contrast_scale = 1.0 + (contrast / 100.0)      # 0.0 to 2.0
     saturation_scale = 1.0 + (saturation / 100.0)  # 0.0 to 2.0
 
-    # Temperature and Tint (Lightroom-like perceptual adjustments)
-    if kelvin_shift != 0.0 or tint_shift != 0.0:
-        # Calculate luminance for tone-aware masking
-        img_norm = img / 65535.0
-        luminance = np.dot(img_norm[..., :3], [0.299, 0.587, 0.114])
-        
-        # Create smooth asymmetric tone-aware strength curve (Lightroom-like)
-        # Shadows get strong effect, midtones get maximum effect, highlights get minimal effect
-        # Using piecewise smooth curves for natural transitions
-        
-        # Define strength levels for different tonal regions
-        shadow_strength = 0.8      # 80% strength in shadows (0-30% luminance)
-        midtone_strength = 1.0     # 100% strength in midtones (30-60% luminance)  
-        highlight_strength = 0.25  # 25% strength in highlights (60-100% luminance)
-        
-        # Transition points
-        shadow_to_mid = 0.3       # Shadows to midtones transition at 30% luminance
-        mid_to_highlight = 0.6    # Midtones to highlights transition at 60% luminance
-        
-        # Create smooth asymmetric curve using sigmoid blending
-        tone_curve = np.zeros_like(luminance)
-        
-        # Shadow region (0-30%): smooth transition from 80% to 100%
-        shadow_mask = luminance <= shadow_to_mid
-        shadow_progress = np.clip(luminance[shadow_mask] / shadow_to_mid, 0, 1)
-        tone_curve[shadow_mask] = shadow_strength + (midtone_strength - shadow_strength) * shadow_progress
-        
-        # Midtone region (30-60%): stay at 100% strength
-        midtone_mask = (luminance > shadow_to_mid) & (luminance <= mid_to_highlight)
-        tone_curve[midtone_mask] = midtone_strength
-        
-        # Highlight region (60-100%): smooth sigmoid transition from 100% to 25%
-        highlight_mask = luminance > mid_to_highlight
-        highlight_progress = (luminance[highlight_mask] - mid_to_highlight) / (1.0 - mid_to_highlight)
-        # Use sigmoid for smooth natural rolloff
-        sigmoid_factor = 1.0 / (1.0 + np.exp(-8 * (highlight_progress - 0.5)))
-        tone_curve[highlight_mask] = midtone_strength - (midtone_strength - highlight_strength) * sigmoid_factor
-        
-        # Expand tone_curve to match image dimensions for broadcasting
-        tone_curve = np.expand_dims(tone_curve, axis=-1)
-        
-        # Temperature (R/B scaling with logarithmic perceptual response)
-        if kelvin_shift != 0.0:
-            # Map slider values [-100, 100] to Kelvin temperatures [2000K, 8000K]
-            # Neutral point (slider 0) = 5000K
-            neutral_kelvin = 5000.0
-            if kelvin_shift > 0:
-                # Positive shift: 0 to +100 maps to 5000K to 8000K
-                current_kelvin = neutral_kelvin + (kelvin_shift / 100.0) * 3000.0
-            else:
-                # Negative shift: -100 to 0 maps to 2000K to 5000K
-                current_kelvin = neutral_kelvin + (kelvin_shift / 100.0) * 3000.0
-            
-            # Calculate Kelvin delta from neutral
-            kelvin_delta = current_kelvin - neutral_kelvin
-            
-            # Logarithmic scaling for Kelvin - stronger impact at low end
-            # Simulate the fact that 3000K->4000K has more visual impact than 7000K->8000K
-            kelvin_abs = abs(kelvin_delta)
-            
-            # Create logarithmic response curve based on actual Kelvin values
-            # Linear scale: 1K delta ≈ 0.013% R/B shift; full 3000K = 40% shift
-            perceptual_scale = (kelvin_delta / 3000.0) * 0.40
-
-            # tone_curve already handles spatial (shadow/highlight) weighting
-            effective_scale = perceptual_scale * tone_curve[..., 0]
-            
-            r_scale = 1.0 + effective_scale
-            b_scale = 1.0 - effective_scale
-            
-            img[..., 0] *= r_scale  # R
-            img[..., 2] *= b_scale  # B
-
-        # Tint (G-M scaling with perceptual mapping and enhanced midtone sensitivity)
-        if tint_shift != 0.0:
-            # Perceptual mapping for tint - non-linear response based on existing color balance
-            # Tint impact varies with the current white balance state
-            
-            # Use pre-calculated balance factor instead of calculating it here
-            balance_factor = tint_balance_factor
-            
-            # Enhanced midtone and skin tone sensitivity for tint
-            # Tint is most visible in skin tones and neutral areas
-            skin_tone_sensitivity = 1.0 + 0.5 * np.exp(-12 * (luminance - 0.35)**2)  # Peak at 35% luminance
-            skin_tone_sensitivity = np.expand_dims(skin_tone_sensitivity, axis=-1)
-            
-            # Create perceptual tint curve - stronger response in certain ranges
-            tint_abs = abs(tint_shift)
-            if tint_abs > 0:
-                # Sigmoid-like curve for tint perception
-                perceptual_tint = np.tanh(tint_abs * 0.02) * np.sign(tint_shift) * 0.18
-            else:
-                perceptual_tint = 0.0
-            
-            # Apply perceptual tint with tone awareness, balance factor, and skin tone sensitivity
-            effective_tint = perceptual_tint * tone_curve[..., 0] * balance_factor * skin_tone_sensitivity[..., 0]
-            
-            # Tint primarily affects green, with complementary adjustments to R/B
-            g_scale = 1.0 - effective_tint  # Green channel (inverse of tint shift)
-            r_scale = 1.0 + (0.3 * effective_tint)  # Slight red compensation
-            b_scale = 1.0 + (0.3 * effective_tint)  # Slight blue compensation
-            
-            img[..., 1] *= g_scale  # G
-            img[..., 0] *= r_scale  # R  
-            img[..., 2] *= b_scale  # B
 
     # Gain — shares Channel Levels "Master Gain"'s /300 curve: a uniform linear
     # gain out = in / (1 - v/300), hard-clipped to [0,1] (v=200 -> 3x, v=100 ->
@@ -2843,10 +2773,24 @@ def adjust_image_opencl(
     # pre-stage with the CPU path makes GPU/CPU parity automatic — the kernel
     # never sees headroom.
     if ws_windowed:
-        img16 = _apply_working_space_recovery(img16, exposure, whitepoint)
+        img16 = _apply_working_space_recovery(img16, exposure, whitepoint,
+                                              kelvin_shift, tint_shift, tint_balance_factor)
         exposure = 0.0
         whitepoint = 0.0
         ws_windowed = False
+        kelvin_shift = 0.0
+        tint_shift = 0.0
+
+    # White balance - flat per-channel gain done in numpy so the kernel (and the
+    # CPU fallback) never apply WB -> automatic CPU/GPU parity. ws consumed above.
+    if kelvin_shift != 0.0 or tint_shift != 0.0:
+        _gr, _gg, _gb = _white_balance_gains(kelvin_shift, tint_shift, tint_balance_factor)
+        img16 = img16.astype(np.float32)
+        img16[..., 0] *= np.float32(_gr)
+        img16[..., 1] *= np.float32(_gg)
+        img16[..., 2] *= np.float32(_gb)
+        kelvin_shift = 0.0
+        tint_shift = 0.0
 
     # Spatial band feathering is a CPU post-blur the per-pixel kernel can't
     # do, so run the whole adjustment on the CPU when it is active (keeps the

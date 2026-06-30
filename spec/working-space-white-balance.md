@@ -1,9 +1,32 @@
 # Spec: White Balance in the Working Space
 
-Status: DRAFT v1 (open questions in §9 — refine before implementing)
+Status: REFINED v2 (decisions locked — ready to implement)
 Owner: FreeCCR
 Feature branch: `feature/working-space-white-balance`
 Related: [`spec/working-space-headroom.md`](working-space-headroom.md), `spec/auto-exposure-default-slope.md`
+
+## 0. Decisions (locked 2026-06-29)
+
+All §9 open questions resolved (confirmed against a measured demo of the current WB):
+- **Q1 — flat WB.** Replace the tone-aware/perceptual WB with a **flat per-channel
+  gain**. The headroom removes the reason for the highlight de-weighting.
+- **Q2 — constants matched to today's midtone** (so the slider feel is unchanged
+  at shadows/midtones; verified identical at midtone, near-identical in shadows):
+  - Temperature: `s = 0.004·temp_slider` → `R·=(1+s)`, `B·=(1−s)`.
+  - Tint: `t = tanh(0.02·tint_slider)·0.26·tint_balance_factor` →
+    `G·=(1−t)`, `R·=(1+0.3·t)`, `B·=(1+0.3·t)`. (`0.26 = 0.18·skin(0.45)` — the
+    current tint's midtone effective strength with the skin-tone factor folded in.)
+- **Highlights — pure flat (full strength).** Highlights get full-strength WB
+  (correct balance), not today's `0.25×` roll-off; headroom-safe.
+- **Q3 — everywhere.** Apply the flat WB on all paths (windowed, reference,
+  legacy). One WB code path.
+- **Q4 — fold into one gain.** WB + White Point + Gain/Exposure are all
+  multiplicative in the working domain → combine into a single per-channel gain.
+- **Neutral picker** (`compute_neutral_temp_tint`) updated to invert the flat
+  model exactly (drop the per-pixel `tone_curve`/`skin` terms; use 0.40 and 0.26).
+
+Measured trade-off (demo): flat matches today at shadow/mid; the only visible
+difference is that highlight tint no longer rolls toward neutral — accepted.
 
 ## 1. Summary
 
@@ -136,9 +159,12 @@ windowed path. Catalog / undo / copy-paste / sync are unaffected (same keys).
 - `adjust_image` — pass `kelvin_shift`/`tint_shift` into the pre-stage when
   `ws_windowed`; **remove** the post-clamp Temperature/Tint block for that path;
   zero them so they aren't double-applied.
-- `adjust_image_opencl` — feed WB through the same numpy pre-stage; **remove** WB
-  from the kernel for the windowed path (kernel keeps WB only if the
-  non-windowed path still routes through it — see below).
+- `adjust_image_opencl` — feed WB through the same numpy pre-stage and zero
+  `kelvin_shift`/`tint_shift` before the kernel/fallback, so the kernel's WB block
+  is **never executed** (params[0]=params[1]=0) → CPU/GPU parity is automatic.
+  NOTE (as implemented): the kernel's old tone-aware WB C-source is left in place
+  but bypassed (dead) rather than deleted, to avoid an un-GPU-testable kernel edit;
+  remove it in a follow-up once verified on a GPU.
 - Non-windowed paths (reference mode, legacy/`FREECCR_WORKING_SPACE=0`): no
   headroom, so behaviour is "WB then clip" as today. Decision Q3: either (a)
   leave the existing tone-aware WB for these paths, or (b) unify on the flat WB
@@ -170,7 +196,7 @@ windowed path. Catalog / undo / copy-paste / sync are unaffected (same keys).
 - **Legacy/reference path**: documented behaviour per Q3 (unchanged, or the
   flat-WB look change captured in a baseline test).
 
-## 9. Open questions (resolve in refinement)
+## 9. Open questions — RESOLVED (see §0 for the locked answers)
 - **Q1 — tone-aware vs flat WB.** Recommend dropping the luminance-masked
   perceptual WB in favour of a flat per-channel gain (the headroom removes the
   reason for the highlight de-weighting, and it makes the math exact). This
