@@ -286,10 +286,12 @@ def _dialog():
 
 
 class TestSettingsDialog:
-    def test_has_color_management_category(self):
+    def test_has_categories(self):
         d = _dialog()
         names = [d._sidebar.item(i).text() for i in range(d._sidebar.count())]
-        assert names == ["Color Management"]
+        assert names == ["General", "Color Management"]
+        # The General tab carries the Auto gain toggle (spec/auto-gain.md).
+        assert hasattr(d, "_cb_auto_gain")
 
     def test_no_disable_checkbox(self):
         # The disable checkbox is gone — "None" in the picker replaces it.

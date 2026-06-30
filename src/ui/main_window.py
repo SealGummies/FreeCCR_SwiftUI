@@ -213,8 +213,9 @@ class MainWindow(QMainWindow):
 
         # Restore the active camera-profile selection (applied to every decode).
         # Done before any images load so the first batch picks it up. A fresh
-        # install / a vanished profile file defaults to Camera Matrix (the prior
-        # Adobe RGB + auto-scale out-of-box look). "none" = explicit bare-RAW.
+        # install / a vanished or unreadable profile defaults to None (bare
+        # camera-native RAW). Camera Matrix (Adobe RGB + auto-scale) and ICC/DCP
+        # profiles are opt-in; "none" is the explicit bare-RAW selection.
         CM = ccr_backend.CAMERA_MATRIX
         saved = self._settings.value("import/active_profile_path", "", type=str)
 
@@ -224,8 +225,8 @@ class MainWindow(QMainWindow):
                 self._settings.setValue("import/active_profile_path",
                                         sel if sel else "none")
             except Exception:
-                ccr_backend.set_active_profile(CM)
-                self._settings.setValue("import/active_profile_path", CM)
+                ccr_backend.set_active_profile(None)
+                self._settings.setValue("import/active_profile_path", "none")
 
         if saved == "none":
             ccr_backend.set_active_profile(None)
@@ -236,7 +237,7 @@ class MainWindow(QMainWindow):
         else:
             legacy = (self._settings.value("import/input_icc_path", "", type=str)
                       or self._settings.value("import/input_dcp_path", "", type=str))
-            _restore(legacy if (legacy and os.path.exists(legacy)) else CM)
+            _restore(legacy if (legacy and os.path.exists(legacy)) else None)
         self.thumbnail_list.refresh_profile_combo()
         self._refresh_profile_ui()
 
