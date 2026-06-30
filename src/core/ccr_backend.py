@@ -404,11 +404,11 @@ class CCRBackend:
             return preview
         return None
 
-    def get_histogram_image_by_index(self, idx: int) -> Optional[CCRImage]:
+    def get_histogram_data_by_index(self, idx: int):
+        """Raw per-channel histogram counts (np.ndarray (3, 256), R/G/B) for the
+        image at ``idx``, or None. HistogramWidget turns these into the plot."""
         if idx is not None and 0 <= idx < len(self.images):
-            image = self.images[idx]
-            histogram_image = image.histogram_image if image.histogram_image is not None else None
-            return histogram_image
+            return self.images[idx].histogram_data
         return None
     
     def set_adjustment_by_index(self, idx: int, adjustment: dict):

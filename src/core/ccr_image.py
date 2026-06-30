@@ -14,7 +14,6 @@ from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal, _apply_working_space_recovery)
 from core import color_management
-from ui import theme
 
 # Import optional libraries with fallbacks
 try:
@@ -160,7 +159,7 @@ class CCRImage:
         # converted base (slice/duplicate) so the first preview render at the end
         # of __init__ de-windows correctly. See spec/working-space-headroom.md.
         self._ws_windowed: bool = ws_windowed
-        self.histogram_image = None
+        self.histogram_data = None   # raw per-channel counts (3, 256) R/G/B, or None
         self.original_full_size: Optional[tuple[int, int]] = None  # (height, width) of the full-res source, set by read_image
 
         self.info = self.get_camera_and_lens_for_lensfun(self.file_path)  # Extract camera and lens info for lensfun
@@ -750,67 +749,23 @@ class CCRImage:
         preview_img = self.resize_image_to_max_pixel(display_img, preview_size)
         qimage = self.generate_qimage_from_np_array_8(to_8bit(preview_img))
         self.resized_preview = QPixmap.fromImage(qimage)
-        # Calculate histogram for the 8-bit preview (RGB). When a crop is set,
-        # the histogram is computed over only the kept (cropped) region so it
-        # matches what the canvas shows. Same normalized-rect + angle contract
-        # as the display/export crop path; apply_crop_to_image returns the
-        # input unchanged when crop_rect is None.
-        hist = {}
+        # Compute the per-channel histogram over the 8-bit preview (RGB). When a
+        # crop is set, it's computed over only the kept (cropped) region so it
+        # matches what the canvas shows. Same normalized-rect + angle contract as
+        # the display/export crop path; apply_crop_to_image returns the input
+        # unchanged when crop_rect is None.
+        #
+        # We store only the raw counts here (shape (3, 256), R/G/B order). All
+        # presentation — the percentile-clipped vertical scale, smoothing,
+        # filled curves and clip markers — lives in HistogramWidget, which paints
+        # at the widget's real resolution. See widgets/histogram_widget.py.
         preview_img_8bit = to_8bit(preview_img)
         hist_source = apply_crop_to_image(
             preview_img_8bit, self.crop_rect, getattr(self, "crop_angle", 0.0) or 0.0)
-        for i, color in enumerate(['r', 'g', 'b']):
-            hist[color] = cv2.calcHist([hist_source], [i], None, [256], [0, 256]).flatten()
-
-        # Generate a histogram image (RGB channels overlaid). Fully vectorized:
-        # the previous per-column cv2.addWeighted loop took ~55 ms per call
-        # (every load AND every slider tick); this renders in ~2 ms.
-        hist_height = 150
-        hist_width = 256
-        alpha = 0.33  # transparency for histogram curves
-        hist_img_f = np.full((hist_height, hist_width, 3),
-                             float(theme.Paint.HIST_BG[0]), dtype=np.float32)
-
-        # Scale to the tallest CONTENT bin, excluding the hard-clip bins 0 and 255.
-        # The old scale (hist.mean()*6) was a constant (= total_pixels/256 * 6,
-        # independent of the distribution), so any clip spike ≥~2.3% of pixels
-        # saturated the plot at full height while real content was squished to ~40%
-        # — and a saturated clip "line" can't shrink as highlights are recovered,
-        # making recovery look broken. Excluding the extremes lets content fill the
-        # height and reflect recovery; the clip bins still draw (an honest clip
-        # indicator) but shrink once clipping falls below the content peak.
-        content_max = max(float(hist[c][1:255].max()) for c in hist)
-        scale = max(content_max, 0.1)  # prevent division by zero / too-flat lines
-
-        rows = np.arange(hist_height, dtype=np.int32)[:, None]  # (150, 1)
-        masks = []
-        # RGB order: hist_img is rendered via QImage Format_RGB888, not cv2.imshow,
-        # so colors must be RGB — (255,0,0) draws the R-data curve in red.
-        for channel, color in zip(('r', 'g', 'b'),
-                                  (theme.Paint.HIST_R, theme.Paint.HIST_G,
-                                   theme.Paint.HIST_B)):
-            h_scaled = np.clip((hist[channel] / scale) * (hist_height - 1),
-                               0, hist_height - 1)
-            # Don't draw the hard-clip bins (0, 255) as bars: a concentrated clip
-            # pile is always the tallest single bin, so a bar histogram would draw
-            # it as a full-height line that can't shrink as highlights are recovered
-            # (the reported "vertical line where it clipped"). Excluding them lets
-            # the in-range content — which DOES visibly redistribute on recovery —
-            # own the plot. Clipping still reads from content piling near the edges.
-            h_scaled[0] = 0.0
-            h_scaled[-1] = 0.0
-            col_tops = hist_height - h_scaled.astype(np.int32)  # (256,)
-            mask = rows >= col_tops[None, :]                    # (150, 256) bool
-            masks.append(mask)
-            hist_img_f[mask] = (hist_img_f[mask] * (1.0 - alpha)
-                                + np.array(color, dtype=np.float32) * alpha)
-
-        hist_img = hist_img_f.astype(np.uint8)
-        # Where all three channels overlap, set to white
-        hist_img[masks[0] & masks[1] & masks[2]] = theme.Paint.HIST_PEAK
-        hist_img = np.ascontiguousarray(hist_img)
-
-        self.histogram_image = QPixmap.fromImage(self.generate_qimage_from_np_array_8(hist_img))
+        counts = np.empty((3, 256), dtype=np.float32)
+        for i in range(3):   # 0=R, 1=G, 2=B
+            counts[i] = cv2.calcHist([hist_source], [i], None, [256], [0, 256]).flatten()
+        self.histogram_data = counts
 
     def generate_qimage_from_np_array_8(self, thumb_img_8):
         h, w, ch = thumb_img_8.shape

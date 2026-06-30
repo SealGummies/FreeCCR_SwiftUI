@@ -1126,7 +1126,7 @@ class ImagePreview(QWidget):
             # Apply transformations which will handle fitting consistently
             # (it also redraws the crop/area overlay after the scene.clear()).
             self.apply_transformations()
-            histogram = ccr_backend.get_histogram_image_by_index(idx)
+            histogram = ccr_backend.get_histogram_data_by_index(idx)
             self.parent().parent().sliders_panel.set_histogram(histogram)
 
             # A confirmed crop magnifies the kept region even at the fitted

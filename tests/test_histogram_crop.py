@@ -21,7 +21,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import cv2  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout  # noqa: E402
-from PySide6.QtGui import QImage  # noqa: E402
 
 _app = QApplication.instance() or QApplication(sys.argv[:1])
 
@@ -49,8 +48,10 @@ def _half_image(h=40, w=60):
 
 
 def _hist_bytes(img):
-    qimg = img.histogram_image.toImage().convertToFormat(QImage.Format_RGB888)
-    return bytes(qimg.constBits())
+    # The histogram is now stored as raw per-channel counts ((3, 256) array);
+    # comparing those bytes tests the crop-aware computation directly (the
+    # presentation lives in HistogramWidget and is exercised separately).
+    return img.histogram_data.tobytes()
 
 
 class TestHistogramReflectsCrop:

@@ -100,12 +100,14 @@ class Paint:
     CURVE_NODE = "#f0f0f0"
     CURVE_NODE_OUTLINE = "#222222"
     CURVE_NODE_DISABLED = "#777777"
-    # Histogram (numpy-rendered) — kept as RGB tuples to match ccr_image.py.
+    # Histogram (widgets/histogram_widget.py paints it with QPainter). RGB
+    # tuples: the model stores raw counts, the widget builds QColors from these.
     HIST_BG = (42, 42, 42)            # == PANEL #2a2a2a (keep container in sync)
+    HIST_GRID = (255, 255, 255, 16)   # quarter-tone gridlines — faint over HIST_BG
     HIST_R = (230, 80, 80)
     HIST_G = (90, 200, 90)
     HIST_B = (100, 140, 235)
-    HIST_PEAK = (235, 235, 235)
+    HIST_PEAK = (235, 235, 235)       # where all channels overlap / clip-all wedge
 
 
 class Overlay:
