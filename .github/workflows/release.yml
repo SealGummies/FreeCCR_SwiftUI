@@ -56,6 +56,9 @@ jobs:
           body: |
             ## What's New
 
+            **v0.9.1**
+            - **Camera profile defaults to None:** new installs now decode RAWs in bare camera-native space (no colour matrix) by default, instead of Camera Matrix (Adobe RGB). Pick Camera Matrix or an ICC/DCP profile from the “Camera profile” dropdown for a matrixed/profiled look; existing selections are unchanged.
+
             **v0.9.0**
             - **Auto gain (on by default):** the brightest highlights are placed at the top of the working range automatically, without moving the Gain slider — the top 0.1% of the in-range highlights are set to 99.8% of full. Pixels outside the sampled clear/dense film range are ignored, and it applies to film conversions only. Turn it off in **Settings → General**.
             - **White balance now uses highlight headroom:** Temperature/Tint are applied in the scene-linear working space *before* the highlight clamp, so warming or cooling a channel lands in recoverable headroom instead of clipping — and cooling can pull blown highlights back down into range.
@@ -165,6 +168,9 @@ jobs:
           # The body is static, so refresh "## What's New" for each release.
           body: |
             ## What's New
+
+            **v0.9.1**
+            - **Camera profile defaults to None:** new installs now decode RAWs in bare camera-native space (no colour matrix) by default, instead of Camera Matrix (Adobe RGB). Pick Camera Matrix or an ICC/DCP profile from the “Camera profile” dropdown for a matrixed/profiled look; existing selections are unchanged.
 
             **v0.9.0**
             - **Auto gain (on by default):** the brightest highlights are placed at the top of the working range automatically, without moving the Gain slider — the top 0.1% of the in-range highlights are set to 99.8% of full. Pixels outside the sampled clear/dense film range are ignored, and it applies to film conversions only. Turn it off in **Settings → General**.
