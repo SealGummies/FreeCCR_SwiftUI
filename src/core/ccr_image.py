@@ -12,9 +12,8 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
                                 apply_area_layers, apply_crop_to_image,
-                                apply_dust_removal)
+                                apply_dust_removal, _apply_working_space_recovery)
 from core import color_management
-from ui import theme
 
 # Import optional libraries with fallbacks
 try:
@@ -55,6 +54,7 @@ class CCRImage:
         areas: Optional[List[Dict[str, Any]]] = None,
         is_merged: bool = False,
         merge_sources: Optional[list] = None,
+        ws_windowed: bool = False,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
@@ -153,7 +153,13 @@ class CCRImage:
         # Non-destructive auto-exposure (default-slope mode), in ch_input_gain
         # units → applied as a uniform gain. See spec/auto-exposure-default-slope.md.
         self.exposure_base: float = 0.0
-        self.histogram_image = None
+        # True when the current converted base is a WINDOWED working-space buffer
+        # (highlight headroom preserved); apply_adjustments de-windows it. Set by
+        # the conversion that produced the base, or passed in for a preloaded
+        # converted base (slice/duplicate) so the first preview render at the end
+        # of __init__ de-windows correctly. See spec/working-space-headroom.md.
+        self._ws_windowed: bool = ws_windowed
+        self.histogram_data = None   # raw per-channel counts (3, 256) R/G/B, or None
         self.original_full_size: Optional[tuple[int, int]] = None  # (height, width) of the full-res source, set by read_image
 
         self.info = self.get_camera_and_lens_for_lensfun(self.file_path)  # Extract camera and lens info for lensfun
@@ -219,6 +225,7 @@ class CCRImage:
         # decode goes straight to user adjustments (no darkening / shadow crush).
         self.brightness_base = 0 if self._positive_mode_active() else -8
         self.exposure_base = 0.0    # Clear auto-exposure when reverting to original scan
+        self._ws_windowed = False   # raw scan is full-range, not a windowed base
         self.conversion_inputs = None
         img = self.read_image(self.file_path, max_long_side=1080)
         if img is None:
@@ -742,52 +749,23 @@ class CCRImage:
         preview_img = self.resize_image_to_max_pixel(display_img, preview_size)
         qimage = self.generate_qimage_from_np_array_8(to_8bit(preview_img))
         self.resized_preview = QPixmap.fromImage(qimage)
-        # Calculate histogram for the 8-bit preview (RGB). When a crop is set,
-        # the histogram is computed over only the kept (cropped) region so it
-        # matches what the canvas shows. Same normalized-rect + angle contract
-        # as the display/export crop path; apply_crop_to_image returns the
-        # input unchanged when crop_rect is None.
-        hist = {}
+        # Compute the per-channel histogram over the 8-bit preview (RGB). When a
+        # crop is set, it's computed over only the kept (cropped) region so it
+        # matches what the canvas shows. Same normalized-rect + angle contract as
+        # the display/export crop path; apply_crop_to_image returns the input
+        # unchanged when crop_rect is None.
+        #
+        # We store only the raw counts here (shape (3, 256), R/G/B order). All
+        # presentation — the percentile-clipped vertical scale, smoothing,
+        # filled curves and clip markers — lives in HistogramWidget, which paints
+        # at the widget's real resolution. See widgets/histogram_widget.py.
         preview_img_8bit = to_8bit(preview_img)
         hist_source = apply_crop_to_image(
             preview_img_8bit, self.crop_rect, getattr(self, "crop_angle", 0.0) or 0.0)
-        for i, color in enumerate(['r', 'g', 'b']):
-            hist[color] = cv2.calcHist([hist_source], [i], None, [256], [0, 256]).flatten()
-
-        # Generate a histogram image (RGB channels overlaid). Fully vectorized:
-        # the previous per-column cv2.addWeighted loop took ~55 ms per call
-        # (every load AND every slider tick); this renders in ~2 ms.
-        hist_height = 150
-        hist_width = 256
-        alpha = 0.33  # transparency for histogram curves
-        hist_img_f = np.full((hist_height, hist_width, 3),
-                             float(theme.Paint.HIST_BG[0]), dtype=np.float32)
-
-        # Find the global max value across all channels for adaptive scaling
-        max_val = max([hist[c].mean() for c in hist]) * 6
-        scale = max(max_val, 0.1)  # prevent division by zero / too-flat lines
-
-        rows = np.arange(hist_height, dtype=np.int32)[:, None]  # (150, 1)
-        masks = []
-        # RGB order: hist_img is rendered via QImage Format_RGB888, not cv2.imshow,
-        # so colors must be RGB — (255,0,0) draws the R-data curve in red.
-        for channel, color in zip(('r', 'g', 'b'),
-                                  (theme.Paint.HIST_R, theme.Paint.HIST_G,
-                                   theme.Paint.HIST_B)):
-            h_scaled = np.clip((hist[channel] / scale) * (hist_height - 1),
-                               0, hist_height - 1)
-            col_tops = hist_height - h_scaled.astype(np.int32)  # (256,)
-            mask = rows >= col_tops[None, :]                    # (150, 256) bool
-            masks.append(mask)
-            hist_img_f[mask] = (hist_img_f[mask] * (1.0 - alpha)
-                                + np.array(color, dtype=np.float32) * alpha)
-
-        hist_img = hist_img_f.astype(np.uint8)
-        # Where all three channels overlap, set to white
-        hist_img[masks[0] & masks[1] & masks[2]] = theme.Paint.HIST_PEAK
-        hist_img = np.ascontiguousarray(hist_img)
-
-        self.histogram_image = QPixmap.fromImage(self.generate_qimage_from_np_array_8(hist_img))
+        counts = np.empty((3, 256), dtype=np.float32)
+        for i in range(3):   # 0=R, 1=G, 2=B
+            counts[i] = cv2.calcHist([hist_source], [i], None, [256], [0, 256]).flatten()
+        self.histogram_data = counts
 
     def generate_qimage_from_np_array_8(self, thumb_img_8):
         h, w, ch = thumb_img_8.shape
@@ -837,15 +815,20 @@ class CCRImage:
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)
         if not s and cb == 0 and tb == 0 and bb == 0 and eb == 0 and not has_areas:
-            # No slider/base/area adjustments — but Black & White still has to
-            # map the image to a single luminance channel.
+            # No slider/base/area adjustments. A windowed working-space base still
+            # has to be de-windowed + window-clamped to a normal full-range image
+            # before display/export (the base itself is not directly renderable).
+            if self._ws_windowed:
+                image = _apply_working_space_recovery(image, 0.0)
+            # Black & White still has to map the image to a single luminance channel.
             return self._to_grayscale(image) if profile == "bw" else image
         adjusted = adjust_image_opencl(image,
                      s.get('temperature', 0) + tb,
                      s.get('tint', 0),
-                     # Auto-exposure (default-slope mode) rides the TONE-AWARE
-                     # exposure as a non-destructive base (UI slider stays 0):
-                     # highlights roll off instead of hard-clipping, midtones lift.
+                     # Auto-exposure (default-slope mode) rides the Gain/Exposure
+                     # stage as a non-destructive base (UI slider stays 0). With the
+                     # working space ON it is applied un-clamped before the window
+                     # clamp, so the lifted top lands in highlight headroom.
                      s.get('exposure', 0) + eb,
                      # Brightness slider is half-strength per click; the
                      # always-on base offset (bb) keeps full weight so the
@@ -875,7 +858,10 @@ class CCRImage:
                      # CPU fallback); None keeps the inactive case free.
                      band_settings=(s if any(s.get(k, 0)
                                              for k in BAND_ADJUSTMENT_KEYS)
-                                    else None))
+                                    else None),
+                     # Windowed working-space base → de-window + Gain/Exposure
+                     # recovery happens inside the adjustment call.
+                     ws_windowed=self._ws_windowed)
         # Tone curves run after the slider pass, in RGB, before any B&W
         # luminance collapse (Photoshop-like). No-op for identity curves.
         curves = s.get('curves')

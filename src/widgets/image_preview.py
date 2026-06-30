@@ -315,6 +315,12 @@ class GraphicsImageView(QGraphicsView):
         crop = data[max(0, y - rad):min(h, y + rad + 1),
                     max(0, x - rad):min(w, x + rad + 1), :]
         means = np.mean(crop.reshape(-1, 3), axis=0)
+        # A windowed working-space base is in container codes, not display values;
+        # de-window (+ window-clamp) the sample so the neutral pick matches the
+        # displayed positive (a no-op when the feature is off / base is full-range).
+        if getattr(img_obj, '_ws_windowed', False):
+            from core.ccr_processor import WS_B, WS_W
+            means = np.clip((means - WS_B) / (WS_W - WS_B), 0.0, 1.0) * 65535.0
 
         from core.ccr_processor import compute_neutral_temp_tint
         temp, tint = compute_neutral_temp_tint(
@@ -1120,7 +1126,7 @@ class ImagePreview(QWidget):
             # Apply transformations which will handle fitting consistently
             # (it also redraws the crop/area overlay after the scene.clear()).
             self.apply_transformations()
-            histogram = ccr_backend.get_histogram_image_by_index(idx)
+            histogram = ccr_backend.get_histogram_data_by_index(idx)
             self.parent().parent().sliders_panel.set_histogram(histogram)
 
             # A confirmed crop magnifies the kept region even at the fitted

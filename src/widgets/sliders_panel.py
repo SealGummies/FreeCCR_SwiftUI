@@ -3,11 +3,12 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayou
                                 QPushButton, QDialog, QMessageBox, QScrollArea,
                                 QCheckBox, QComboBox)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QRectF
-from PySide6.QtGui import (QPixmap, QKeySequence, QShortcut, QPainter, QColor,
+from PySide6.QtGui import (QKeySequence, QShortcut, QPainter, QColor,
                            QLinearGradient, QPen)
 from core.ccr_backend import ccr_backend
 from core.ccr_processor import COLOR_BANDS, BAND_PARAMS, BAND_ADJUSTMENT_KEYS
 from widgets.curve_editor import CurveEditor
+from widgets.histogram_widget import HistogramWidget
 from ui import theme
 import copy
 
@@ -311,19 +312,15 @@ class SlidersPanel(QWidget):
         layout.setSpacing(theme.GAP_ROW)
 
         # --- Histogram — fixed at top, outside scroll area ---
-        self.histogram_label = QLabel()
-        self.histogram_label.setFixedHeight(150)
-        self.histogram_label.setAlignment(Qt.AlignCenter)
-        self.histogram_label.setFrameShape(QFrame.NoFrame)
-        self.histogram_label.setText("")
-        self.histogram_label.setStyleSheet(
-            f"background-color: rgb({theme.Paint.HIST_BG[0]},{theme.Paint.HIST_BG[1]},{theme.Paint.HIST_BG[2]}); border: none; border-radius: 12px;"
-        )
+        # Self-painting widget (paints its own rounded background + curves at the
+        # widget's real resolution). See widgets/histogram_widget.py.
+        self.histogram = HistogramWidget()
+        self.histogram.setFixedHeight(150)
         # Inset to match the content below so it isn't flush against the panel's
         # right border (the scroll area below keeps its scrollbar at the edge).
         hist_row = QHBoxLayout()
         hist_row.setContentsMargins(theme.GAP_PANEL, theme.GAP_PANEL, theme.GAP_PANEL, 0)
-        hist_row.addWidget(self.histogram_label)
+        hist_row.addWidget(self.histogram)
         layout.addLayout(hist_row)
 
         # --- Scrollable middle section ---
@@ -672,21 +669,10 @@ class SlidersPanel(QWidget):
         self.paste_shortcut = QShortcut(QKeySequence.Paste, self)
         self.paste_shortcut.activated.connect(self.paste_adjustment_settings)
 
-    def set_histogram(self, pixmap: QPixmap):
-        """
-        Set the histogram image in the container.
-        """
-        if pixmap is not None:
-            self.histogram_label.setPixmap(pixmap.scaled(
-                self.histogram_label.width(),
-                self.histogram_label.height(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            ))
-            self.histogram_label.setText("")  # Remove placeholder text
-        else:
-            self.histogram_label.clear()
-            self.histogram_label.setText("")
+    def set_histogram(self, data):
+        """Feed the histogram widget raw per-channel counts ((3, 256) array) or
+        None to clear. The widget handles all scaling/painting."""
+        self.histogram.set_data(data)
 
     def create_slider(self, label_text, min_value=-100, max_value=100,
                       default_value=0, gradient=None):
