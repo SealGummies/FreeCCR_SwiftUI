@@ -2815,6 +2815,11 @@ class ImagePreview(QWidget):
         angle = (angle + 180.0) % 360.0 - 180.0
         if abs(angle) < 0.75:
             angle = 0.0  # snap to straight
+        # The knob and the panel straighten slider are two-way synced and the
+        # slider only spans ±45°; clamp here so the knob can't drive the box past
+        # what the slider can represent (which would desync them and silently
+        # drop the excess rotation on the next slider nudge).
+        angle = max(-45.0, min(45.0, angle))
         self._pending_crop_angle = angle
         self._pending_crop_local = QRectF(box0)
 
@@ -3029,6 +3034,17 @@ class ImagePreview(QWidget):
                     cleared = new_crop is None
             else:
                 too_small = True
+        elif img_obj is not None and sel is None:
+            # Reset clears the pending box (Free ratio leaves no box). Confirming
+            # with no selection means "remove the crop", so Reset + Done actually
+            # restores the full frame instead of silently keeping the previously
+            # committed crop. A no-op when the image isn't cropped.
+            if img_obj.crop_rect is not None or getattr(img_obj, "crop_angle", 0.0):
+                img_obj.push_undo_state()
+                img_obj.crop_rect = None
+                img_obj.crop_angle = 0.0
+                applied = True
+                cleared = True
         self._exit_crop_mode()
         if applied and img_obj is not None:
             # The kept pixel region changed, so the histogram (computed over

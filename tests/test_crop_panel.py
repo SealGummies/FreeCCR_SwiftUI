@@ -190,6 +190,19 @@ class TestCropHooks:
         ip.set_pending_straighten(3.5)
         assert ip._pending_crop_angle == pytest.approx(3.5)
 
+    def test_rotate_knob_clamped_to_straighten_range(self):
+        # The rotate knob must not drive the box past the ±45° straighten slider
+        # range, or the two desync and the extra rotation is silently lost.
+        ip, _h = _make_preview()
+        # box centered at (150,150); start straight up, drag to +90° raw.
+        drag = {"box0": QRectF(100, 100, 100, 100),
+                "start": QPointF(150, 50), "angle0": 0.0}
+        ip._drag_rotate_box(drag, QPointF(250, 150))
+        assert ip._pending_crop_angle == pytest.approx(45.0)   # clamped, not 90
+        # Same drag the other way clamps to -45.
+        ip._drag_rotate_box(drag, QPointF(50, 150))
+        assert ip._pending_crop_angle == pytest.approx(-45.0)
+
     def test_reset_pending_crop(self):
         ip, _h = _make_preview()
         ip.set_crop_panel(_RatioPanel(1.5))
@@ -251,6 +264,28 @@ class TestStraightenFoldIn:
         ip, img, _ok = self._entered(fine=300)
         ip.cancel_crop_mode()
         assert img.fine_rotation_angle == 300                 # untouched on cancel
+
+    def test_reset_then_confirm_clears_committed_crop(self):
+        # Regression: entering crop on a cropped image, clicking Reset (Free
+        # ratio -> pending box becomes None), then Done must actually clear the
+        # committed crop — not silently keep it.
+        ip, img, _ok = self._entered(fine=0, crop_rect=(0.1, 0.1, 0.9, 0.9))
+        assert ip._pending_crop_local is not None   # seeded from the committed crop
+        ip.reset_pending_crop()                     # user clicks Reset (Free)
+        assert ip._pending_crop_local is None
+        ip.confirm_crop()                           # user clicks Done
+        assert img.crop_rect is None                # crop actually removed
+        assert img.crop_angle == pytest.approx(0.0)
+        assert img.undo                             # one undo snapshot pushed
+
+    def test_confirm_no_box_on_uncropped_is_noop(self):
+        # Entering crop on an uncropped Free image and pressing Done with no box
+        # must not push a junk undo state or change anything.
+        ip, img, _ok = self._entered(fine=0)
+        assert ip._pending_crop_local is None
+        ip.confirm_crop()
+        assert img.crop_rect is None
+        assert not img.undo                          # no-op, no undo snapshot
 
 
 # --------------------------------------------------------------------------
