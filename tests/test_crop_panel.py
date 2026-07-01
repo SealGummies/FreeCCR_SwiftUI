@@ -203,6 +203,18 @@ class TestCropHooks:
         ip._drag_rotate_box(drag, QPointF(50, 150))
         assert ip._pending_crop_angle == pytest.approx(-45.0)
 
+    def test_rotate_knob_preserves_folded_angle_over_45(self):
+        # A crop entered with a folded micro-rotation can legitimately start
+        # beyond ±45 (committed crop_angle ±45 folded with the canvas rotation
+        # ±45 → up to ±90). An incidental knob touch must NOT snap it to 45 (that
+        # silently discards rotation) — it may only forbid pushing further out.
+        ip, _h = _make_preview()
+        drag = {"box0": QRectF(100, 100, 100, 100),
+                "start": QPointF(150, 50), "angle0": 60.0}
+        ip._drag_rotate_box(drag, QPointF(145, 50))    # tiny nudge
+        assert ip._pending_crop_angle > 45.0            # not collapsed to 45
+        assert ip._pending_crop_angle <= 60.0 + 1e-6    # not pushed past the start
+
     def test_reset_pending_crop(self):
         ip, _h = _make_preview()
         ip.set_crop_panel(_RatioPanel(1.5))
@@ -286,6 +298,21 @@ class TestStraightenFoldIn:
         ip.confirm_crop()
         assert img.crop_rect is None
         assert not img.undo                          # no-op, no undo snapshot
+
+    def test_reset_then_confirm_clears_folded_fine_rotation(self):
+        # Entering crop on a cropped image that also has a fine micro-rotation
+        # folds the rotation into the (leveled) straighten. Reset zeroes the
+        # straighten and the preview shows level, so Done must clear the fine
+        # rotation too — not let it snap back on exit (matches the box-present
+        # fold path).
+        ip, img, _ok = self._entered(fine=500, crop_rect=(0.1, 0.1, 0.9, 0.9))
+        assert ip._crop_fold_fine is True
+        ip.reset_pending_crop()                      # box -> None, straighten -> 0
+        ip.confirm_crop()                            # Done
+        assert img.crop_rect is None                 # crop cleared
+        assert img.fine_rotation_angle == 0          # leveled, matching straighten 0
+        assert img.undo
+        assert img.undo[-1][2] == 500                # original fine captured for undo
 
 
 # --------------------------------------------------------------------------

@@ -1676,6 +1676,11 @@ class ImagePreview(QWidget):
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "exposure_base", 0.0),
                 getattr(img, "color_profile", "color"),
+                # Global display modes read live inside apply_adjustments — a
+                # toggle must invalidate the baked hi-res tile (spec/auto-gain.md,
+                # spec/gamma-luminance-mode.md).
+                bool(getattr(ccr_backend, "gamma_luminance", False)),
+                bool(getattr(ccr_backend, "auto_gain", True)),
                 areas_sig, dust_sig)
 
     HIRES_MAX_LONG_SIDE = 4500   # bounds non-RAW decodes (RAW half-size passes through)
@@ -2815,11 +2820,14 @@ class ImagePreview(QWidget):
         angle = (angle + 180.0) % 360.0 - 180.0
         if abs(angle) < 0.75:
             angle = 0.0  # snap to straight
-        # The knob and the panel straighten slider are two-way synced and the
-        # slider only spans ±45°; clamp here so the knob can't drive the box past
-        # what the slider can represent (which would desync them and silently
-        # drop the excess rotation on the next slider nudge).
-        angle = max(-45.0, min(45.0, angle))
+        # The knob and the panel straighten slider are two-way synced over ±45°,
+        # so hold a FRESH box to that range. But a crop entered with a folded
+        # micro-rotation can legitimately start beyond ±45 (committed crop_angle
+        # ±45 folded with the canvas rotation ±45 → up to ±90); never snap that
+        # existing angle inward on an incidental touch — only forbid pushing it
+        # further out. `angle0` is the box angle at drag start.
+        base = drag["angle0"]
+        angle = max(min(-45.0, base), min(max(45.0, base), angle))
         self._pending_crop_angle = angle
         self._pending_crop_local = QRectF(box0)
 
@@ -3039,10 +3047,19 @@ class ImagePreview(QWidget):
             # with no selection means "remove the crop", so Reset + Done actually
             # restores the full frame instead of silently keeping the previously
             # committed crop. A no-op when the image isn't cropped.
-            if img_obj.crop_rect is not None or getattr(img_obj, "crop_angle", 0.0):
+            fold = self._crop_fold_fine and bool(
+                getattr(img_obj, "fine_rotation_angle", 0))
+            if (img_obj.crop_rect is not None
+                    or getattr(img_obj, "crop_angle", 0.0) or fold):
                 img_obj.push_undo_state()
                 img_obj.crop_rect = None
                 img_obj.crop_angle = 0.0
+                if fold:
+                    # Entry folded the image's micro-rotation into the (now reset)
+                    # straighten; the leveled crop-mode preview + 0° slider showed
+                    # it gone, so clear it too instead of letting it snap back on
+                    # exit. Matches the box-present fold path above; one undo.
+                    img_obj.fine_rotation_angle = 0
                 applied = True
                 cleared = True
         self._exit_crop_mode()
