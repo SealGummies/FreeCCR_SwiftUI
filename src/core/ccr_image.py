@@ -881,10 +881,12 @@ class CCRImage:
         # Gamma slider: a center-point tone curve driven through the SAME
         # monotone-cubic path as the Curves editor (a single 'rgb' point moving
         # diagonally from center). Applied before the user's manual curves so the
-        # two compose predictably. No-op at 0.
+        # two compose predictably. No-op at 0. Per-channel by default; the global
+        # gamma_luminance flag switches it to hue-preserving (luminance) mode.
         gamma = s.get('gamma', 0)
         if gamma:
-            adjusted = apply_gamma_curve(adjusted, gamma)
+            adjusted = apply_gamma_curve(adjusted, gamma,
+                                         luminance=ccr_backend.gamma_luminance)
         # Tone curves run after the slider pass, in RGB, before any B&W
         # luminance collapse (Photoshop-like). No-op for identity curves.
         curves = s.get('curves')
@@ -938,7 +940,9 @@ class CCRImage:
                                     else None))
         gamma = s.get('gamma', 0)
         if gamma:
-            adjusted = apply_gamma_curve(adjusted, gamma)
+            from core.ccr_backend import ccr_backend
+            adjusted = apply_gamma_curve(adjusted, gamma,
+                                         luminance=ccr_backend.gamma_luminance)
         curves = s.get('curves')
         if curves:
             adjusted = apply_curves(adjusted, curves)

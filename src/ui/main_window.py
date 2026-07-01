@@ -200,6 +200,11 @@ class MainWindow(QMainWindow):
         # spec/auto-gain.md.
         ccr_backend.auto_gain = self._settings.value(
             "adjust/auto_gain", True, type=bool)
+        # Restore the Gamma application mode (default OFF = per-channel). When on,
+        # the Gamma slider is applied to luminance and RGB is scaled together, so
+        # midtone moves don't shift hue. See spec/gamma-luminance-mode.md.
+        ccr_backend.gamma_luminance = self._settings.value(
+            "adjust/gamma_luminance", False, type=bool)
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
@@ -668,6 +673,31 @@ class MainWindow(QMainWindow):
             "Auto gain on — highlights auto-placed at the top of the window."
             if checked else
             "Auto gain off — the Gain slider alone controls exposure.",
+            duration=5000)
+
+    # --- Gamma application mode (global, persistent) ----------------------
+    def on_gamma_mode_toggled(self, checked: bool):
+        """Flip the global Gamma mode (per-channel vs hue-preserving luminance),
+        persist it, and re-render all loaded images. Gamma is a display-domain
+        tone op, so this only re-renders — no re-conversion, no catalog write.
+        Mirrors on_auto_gain_toggled. See spec/gamma-luminance-mode.md."""
+        ccr_backend.gamma_luminance = bool(checked)
+        self._settings.setValue("adjust/gamma_luminance", bool(checked))
+        if ccr_backend.images:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                # The mode is read live in apply_adjustments, so a plain re-render
+                # reflects it. Drop the zoom hi-res cache (it baked the old mode).
+                self.image_preview._release_hires(refresh=False)
+                self.thumbnail_list.update_all_thumbnails()
+                if self.image_preview.current_idx is not None:
+                    self.image_preview.update_preview(self.image_preview.current_idx)
+            finally:
+                QApplication.restoreOverrideCursor()
+        self.sliders_panel.set_temporary_hint(
+            "Gamma: hue-preserving (luminance) mode."
+            if checked else
+            "Gamma: per-channel mode (standard).",
             duration=5000)
 
     def show_activation_dialog(self):

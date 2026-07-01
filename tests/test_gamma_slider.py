@@ -102,3 +102,51 @@ def test_endpoints_pinned(g):
     """Pure black and pure white are invariant (the effect stays in the window)."""
     assert int(apply_gamma_curve(_solid(0), g)[0, 0, 0]) == 0
     assert int(apply_gamma_curve(_solid(65535), g)[0, 0, 0]) == 65535
+
+
+# --- luminance (hue-preserving) mode ---------------------------------------
+# apply_gamma_curve(..., luminance=True) applies the SAME tone curve to luminance
+# and scales RGB together, so chromaticity (hue + HSV saturation) is preserved
+# except where a channel clips. See spec/gamma-luminance-mode.md.
+
+_COLOR = np.array([[[20000, 12000, 6000]]], dtype=np.uint16)   # non-clipping warm
+
+
+def test_luminance_zero_is_identity():
+    img = np.linspace(0, 65535, 4 * 4 * 3).reshape(4, 4, 3).astype(np.uint16)
+    assert np.array_equal(apply_gamma_curve(img, 0, luminance=True), img)
+
+
+@pytest.mark.parametrize("g", [60, -60, 37, -100])
+@pytest.mark.parametrize("v255", [0, 1, 40, 128, 200, 255])
+def test_luminance_neutral_matches_per_channel(v255, g):
+    """Grays render bit-for-bit identically in both modes — toggling the mode
+    only changes non-neutral colours."""
+    gray = _solid(_to16(v255))
+    assert np.array_equal(apply_gamma_curve(gray, g, luminance=True),
+                          apply_gamma_curve(gray, g))
+
+
+@pytest.mark.parametrize("g", [60, -60])
+def test_luminance_preserves_channel_ratios(g):
+    """A non-clipping colour keeps its R:G:B ratios (uniform scale) — the point
+    of the feature."""
+    inp = _COLOR[0, 0].astype(float)
+    out = apply_gamma_curve(_COLOR, g, luminance=True)[0, 0].astype(float)
+    assert np.allclose(out / out.max(), inp / inp.max(), atol=0.01)
+
+
+def test_per_channel_shifts_channel_ratios():
+    """The default per-channel path DOES distort the ratios (this is the hue
+    shift the luminance mode avoids)."""
+    inp = _COLOR[0, 0].astype(float)
+    out = apply_gamma_curve(_COLOR, 60)[0, 0].astype(float)
+    assert not np.allclose(out / out.max(), inp / inp.max(), atol=0.01)
+
+
+def test_luminance_clips_bright_saturated_highlight():
+    """The hue guarantee holds only pre-clip: a bright saturated colour with a
+    strong +gamma scales its top channel past white, which clips."""
+    px = np.array([[[60000, 20000, 10000]]], dtype=np.uint16)
+    out = apply_gamma_curve(px, 100, luminance=True)[0, 0]
+    assert int(out[0]) == 65535
