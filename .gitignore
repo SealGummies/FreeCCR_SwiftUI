@@ -21,5 +21,8 @@ win_installer
 activation-server
 dmg_temp
 
+# local test scans / RAWs + profiles (large binaries, never commit)
+example_raw/
+
 # qt-testing skill: offscreen widget screenshots
 scratch/
