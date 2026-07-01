@@ -3091,6 +3091,31 @@ def apply_curves(img16: np.ndarray, curves) -> np.ndarray:
     return out
 
 
+# --- Gamma slider (center-point tone curve) --------------------------------
+# The Gamma slider is a single control point on the composite ("rgb") tone
+# curve that moves diagonally, perpendicular to the identity line, from the
+# center (127.5, 127.5): toward the top-left to brighten (+) or the bottom-right
+# to darken (-). It reuses the exact monotone-cubic interpolation of the Curves
+# editor (build_channel_lut / _monotone_cubic via apply_curves), so the result
+# is identical to dragging that midpoint by hand. Endpoints stay pinned, so the
+# effect is confined to the visible [0,1] window. See spec/gamma-slider.md.
+_GAMMA_MAX_OFFSET = 63.75   # perpendicular offset (0..255 domain) at slider +-100
+
+
+def gamma_curve_points(gamma: float):
+    """The 3-point 'rgb' control-point list for a Gamma slider value, in the
+    0..255 domain used by the Curves editor. gamma=0 -> identity diagonal."""
+    offset = (float(gamma) / 100.0) * _GAMMA_MAX_OFFSET
+    return [[0.0, 0.0], [127.5 - offset, 127.5 + offset], [255.0, 255.0]]
+
+
+def apply_gamma_curve(img16: np.ndarray, gamma: float) -> np.ndarray:
+    """Apply the Gamma slider as a center-point tone curve. No-op at 0."""
+    if not gamma:
+        return img16
+    return apply_curves(img16, {"rgb": gamma_curve_points(gamma)})
+
+
 # --- Dust removal (spot inpainting) ----------------------------------------
 # Dust edits are stored as NORMALIZED spots (fractions of width/height) on the
 # image, so the same definition reproduces at the 1080px preview, the hi-res
