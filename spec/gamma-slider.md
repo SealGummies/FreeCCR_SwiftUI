@@ -4,14 +4,18 @@
 
 - Add a dedicated **Gamma** slider directly below **Brightness** in the adjustment
   panel.
-- It applies the classic single-anchor *midtone gamma bow*: a monotonic tone
-  curve with the endpoints pinned at `(0,0)` and `(1,1)` and the midpoint bowed
-  up (brighten) or down (darken). Dragging the slider conceptually moves the
-  midpoint dot diagonally up/down.
-- Give it a **clean, predictable, symmetric** mapping (unlike Brightness, whose
-  `1 - 0.3·b/8` exponent is asymmetric and goes negative at the extremes).
-- Behave as a plain **look-domain operator on the visible `[0,1]` window** — no
-  interaction with the working-space highlight headroom.
+- It is a **single control point on the composite ("rgb") tone curve** that
+  moves diagonally, perpendicular to the identity line, from the center
+  `(127.5, 127.5)`: toward the **top-left to brighten** (+) or the
+  **bottom-right to darken** (−). Endpoints stay pinned at `(0,0)`/`(255,255)`.
+- It renders through the **exact same monotone-cubic interpolation as the Curves
+  editor** (`apply_curves` → `build_channel_lut` → `_monotone_cubic`), so the
+  result is identical to dragging that midpoint by hand. This is the key
+  requirement: the shape must match the curve editor, **not** a global `x^γ`
+  power law (which bows differently).
+- Behave as a plain **look-domain operator on the visible `[0,1]` window** —
+  endpoints pinned means no interaction with the working-space highlight
+  headroom.
 
 ## Non-goals
 
@@ -53,59 +57,60 @@ the slider is named **Gamma**.
 
 ## Processing / math
 
-Look-domain operator, applied **right after the Brightness block** in the tone
-chain (both the CPU `adjust_image` and the OpenCL kernel), operating on the
-normalized visible window:
+The slider value is turned into a 3-point control-point list in the `0..255`
+domain (the domain the Curves editor / `apply_curves` use), and that curve is
+applied via `apply_curves` — the same monotone-cubic path as a hand-drawn curve:
 
 ```
-gamma_exp = 2 ** (-gamma / 100)      # +100 -> 0.5, 0 -> 1.0, -100 -> 2.0
-x         = clip(img / 65535, 0, 1)  # visible [0,1] window
-out       = x ** gamma_exp * 65535
+offset = (gamma / 100) * GAMMA_MAX_OFFSET      # GAMMA_MAX_OFFSET = 63.75
+points = [[0, 0], [127.5 - offset, 127.5 + offset], [255, 255]]
+out    = apply_curves(img, {"rgb": points})
 ```
 
-- Symmetric in log space: `+100` and `-100` are reciprocal exponents
-  (`0.5` ↔ `2.0`), so equal-and-opposite slider moves are visual inverses.
-- Endpoints pinned: `0^e = 0`, `1^e = 1` for any `e > 0`.
-- Applied per channel with the same exponent (matches how Brightness behaves;
-  slight, expected saturation interaction in deep tones).
+- **Perpendicular movement through center**: the middle point keeps
+  `cx + cy = 255`, i.e. it slides along the anti-diagonal — `+gamma` up-left
+  (brighten), `−gamma` down-right (darken). This matches observed editor drags
+  (sample points move along a slope ≈ −1 line through `(127.5, 127.5)`).
+- **Strength**: `GAMMA_MAX_OFFSET = 63.75` (`= 255/4`) puts the control point at
+  `(63.75, 191.25)` at `+100`. Chosen to fit real drag samples
+  (`g≈20/47/75` reproduce `[115.8,141.5]`, `[97.75,158.1]`, `[80.75,175.95]`).
+- **Endpoints pinned** by construction, so the effect stays in the visible
+  window; no highlight-headroom interaction.
 
 ### Pipeline placement
 
-`... Gain → Brightness → Gamma → Highlights/Shadows → B/W point → Contrast → ...`
-
-Because it runs on the post-clamp `[0,1]` data, it never sees or recovers
-highlight headroom — satisfying "applies only to the visible window".
+Applied in `apply_adjustments` **after the slider pass**, immediately **before**
+the user's manual `curves` (so the Gamma curve and any hand-drawn curve compose
+predictably), and before the B&W luminance collapse — the same stage where
+`apply_curves` already runs. It is *not* part of the per-pixel `adjust_image` /
+OpenCL slider pass (a monotone-cubic LUT is a CPU curve op, like the editor's).
 
 ## Integration points
 
 1. `src/core/ccr_processor.py`
-   - `adjust_image(...)`: add `gamma: float = 0.0` (keyword, after
-     `sub_saturation`); add the CPU gamma block after the Brightness block.
-   - OpenCL kernel: declare `float gamma = params[25];`; add the gamma block
-     after the Brightness block (per-channel `pow`).
-   - `adjust_image_opencl(...)`: add `gamma` param; append it to the `params`
-     array at index `25` (after the `band_active` flag at `24`, to avoid
-     renumbering); pass `gamma=gamma` in both CPU fallbacks.
+   - Add `gamma_curve_points(gamma)` (3-point control-point builder) and
+     `apply_gamma_curve(img16, gamma)` (delegates to `apply_curves`), next to
+     `apply_curves`. `adjust_image` / the OpenCL kernel are **not** touched.
 2. `src/core/ccr_image.py`
-   - `apply_adjustments`: pass `gamma=s.get('gamma', 0)`.
-   - `_adjust_for_area`: pass `gamma=s.get('gamma', 0)` (areas get their own
-     gamma; base offsets stay zeroed, gamma has none anyway).
+   - Import `apply_gamma_curve`.
+   - `apply_adjustments` and `_adjust_for_area`: after the slider pass, if
+     `s.get('gamma')` is non-zero, `adjusted = apply_gamma_curve(adjusted, g)`
+     before the existing `apply_curves(adjusted, curves)` call.
 3. `src/widgets/sliders_panel.py`
    - `ADJUSTMENT_KEYS`, `slider_labels`, `create_slider("Gamma")`,
      `scroll_layout.addLayout(...)`, and the `"tone"` `SYNC_GROUPS` tuple.
 
-Positional call-site safety: `gamma` is always passed by keyword and placed
-after the last positional argument, so existing positional calls (fallbacks,
-`tests/test_opencl_accuracy.py`) are unaffected.
-
 ## Test plan (`tests/test_gamma_slider.py`)
 
-- **Identity**: `gamma=0` returns the input unchanged.
-- **Lift**: `gamma=+100` maps mid-gray `0.25` → `~0.5` (increase).
-- **Lower**: `gamma=-100` maps mid-gray `0.5` → `~0.25` (decrease).
-- **Pinned endpoints**: pure black (`0`) stays `0` and pure white (`65535`)
-  stays `65535` for `gamma ∈ {+100, -100}`.
-- **Symmetry**: applying `+g` then `-g` (as reciprocal exponents) round-trips a
-  mid value back to itself within tolerance.
-- **CPU/OpenCL parity** (skipped if OpenCL unavailable): `adjust_image` vs
-  `adjust_image_opencl` agree within tolerance for a non-zero gamma.
+- **Points identity**: `gamma_curve_points(0)` is the identity diagonal.
+- **Perpendicular movement**: control point keeps `cx + cy == 255`, endpoints
+  pinned, `cx/cy = 127.5 ∓ offset`, across several slider values.
+- **Direction**: `+` puts the point above the diagonal (brighten), `−` below.
+- **Sign symmetry**: `+g` and `−g` mirror the point (`cx/cy` swap).
+- **Identity render**: `apply_gamma_curve(img, 0)` returns the input unchanged.
+- **Same path as editor**: `apply_gamma_curve(img, g)` equals
+  `apply_curves(img, {"rgb": gamma_curve_points(g)})`.
+- **Lift/lower**: mid-gray increases for `+g`, decreases for `−g`.
+- **Control point maps to target**: a value at `cx` maps ~onto `cy` (the curve
+  passes through the node), within LUT quantization.
+- **Pinned endpoints**: black stays `0`, white stays `65535` for any gamma.

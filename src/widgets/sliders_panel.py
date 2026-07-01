@@ -475,9 +475,11 @@ class SlidersPanel(QWidget):
             "Tint", gradient=theme.TINT_GRADIENT)
         self.exposure_slider_layout = self.create_slider("Gain", min_value=-200, max_value=200)
         self.brightness_slider_layout = self.create_slider("Brightness")
-        # Gamma: a clean, endpoint-pinned midtone bow on the visible [0,1] window
-        # (gamma_exp = 2^(-gamma/100)). Sits directly below Brightness. Must be
-        # created right after Brightness to keep the ADJUSTMENT_KEYS positional zip.
+        # Gamma: a center control point on the composite tone curve that moves
+        # diagonally from center (brighten up-left / darken down-right), rendered
+        # through the SAME monotone-cubic path as the Curves editor (see
+        # apply_gamma_curve). Sits directly below Brightness; must be created right
+        # after it to keep the ADJUSTMENT_KEYS positional zip.
         self.gamma_slider_layout = self.create_slider("Gamma")
         self.highlights_slider_layout = self.create_slider("Highlights")
         self.white_point_slider_layout = self.create_slider("White Point")

@@ -11,6 +11,7 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 #import lensfunpy  # Make sure lensfunpy is installed
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
+                                apply_gamma_curve,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal, _apply_working_space_recovery,
                                 compute_auto_gain_offset)
@@ -854,7 +855,6 @@ class CCRImage:
                      s.get('contrast', 0) + cb,
                      s.get('saturation', 0),
                      self.tint_balance_factor,
-                     gamma=s.get('gamma', 0),
                      highlights=s.get('highlights', 0),
                      shadows=s.get('shadows', 0),
                      ch_input_gain=s.get('ch_input_gain', 0),
@@ -878,6 +878,13 @@ class CCRImage:
                      # Windowed working-space base → de-window + Gain/Exposure
                      # recovery happens inside the adjustment call.
                      ws_windowed=self._ws_windowed)
+        # Gamma slider: a center-point tone curve driven through the SAME
+        # monotone-cubic path as the Curves editor (a single 'rgb' point moving
+        # diagonally from center). Applied before the user's manual curves so the
+        # two compose predictably. No-op at 0.
+        gamma = s.get('gamma', 0)
+        if gamma:
+            adjusted = apply_gamma_curve(adjusted, gamma)
         # Tone curves run after the slider pass, in RGB, before any B&W
         # luminance collapse (Photoshop-like). No-op for identity curves.
         curves = s.get('curves')
@@ -911,7 +918,6 @@ class CCRImage:
                      s.get('contrast', 0),
                      s.get('saturation', 0),
                      self.tint_balance_factor,
-                     gamma=s.get('gamma', 0),
                      highlights=s.get('highlights', 0),
                      shadows=s.get('shadows', 0),
                      ch_input_gain=s.get('ch_input_gain', 0),
@@ -930,6 +936,9 @@ class CCRImage:
                      band_settings=(s if any(s.get(k, 0)
                                              for k in BAND_ADJUSTMENT_KEYS)
                                     else None))
+        gamma = s.get('gamma', 0)
+        if gamma:
+            adjusted = apply_gamma_curve(adjusted, gamma)
         curves = s.get('curves')
         if curves:
             adjusted = apply_curves(adjusted, curves)

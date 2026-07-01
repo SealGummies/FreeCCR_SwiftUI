@@ -100,9 +100,6 @@ def _initialize_opencl():
             float ch_b_gain       = params[21];
             float ch_b_blackpoint = params[22];
             float sub_saturation  = params[23];
-            // params[24] is the per-color-band enable flag; gamma rides at [25]
-            // (appended at the end to avoid renumbering the existing params).
-            float gamma           = params[25];
 
             int idx = gid * 3;
             float r = img[idx];
@@ -232,16 +229,6 @@ def _initialize_opencl():
                 r = img_norm_r * 65535.0f;
                 g = img_norm_g * 65535.0f;
                 b = img_norm_b * 65535.0f;
-            }
-
-            // Gamma (midtone bow): predictable, endpoint-pinned power curve on
-            // the visible [0,1] window. gamma_exp = 2^(-gamma/100): +100 -> 0.5
-            // (lift), -100 -> 2.0 (lower), 0 -> identity. Matches the CPU block.
-            if (gamma != 0.0f) {
-                float gamma_exp = pow(2.0f, -gamma / 100.0f);
-                r = pow(clamp(r / 65535.0f, 0.0f, 1.0f), gamma_exp) * 65535.0f;
-                g = pow(clamp(g / 65535.0f, 0.0f, 1.0f), gamma_exp) * 65535.0f;
-                b = pow(clamp(b / 65535.0f, 0.0f, 1.0f), gamma_exp) * 65535.0f;
             }
 
             // Highlights / Shadows (anchored per-channel tone-region roll-off)
@@ -2362,12 +2349,11 @@ def adjust_image(
     ch_b_gain: float = 0.0,
     ch_b_blackpoint: float = 0.0,
     sub_saturation: float = 0.0,
-    gamma: float = 0.0,
     band_settings: dict = None,
     ws_windowed: bool = False,
 ) -> np.ndarray:
     """
-    Apply temperature, tint, exposure, brightness, gamma, blackpoint, whitepoint, highlights, shadows,
+    Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
     contrast, and saturation adjustments to a 16-bit image.
     All input factors are in range [-100, 100], 0 = no change.
     band_settings optionally carries the per-color-band sliders
@@ -2423,16 +2409,6 @@ def adjust_image(
         img_norm = np.power(img_norm, curve)
         img_norm = np.clip(img_norm, 0.0, 1.0)
         img = img_norm * 65535.0
-
-    # Gamma (midtone bow): a clean, predictable power curve on the visible [0,1]
-    # window with the endpoints pinned. Symmetric in log space —
-    # gamma_exp = 2^(-gamma/100), so +100 -> 0.5 (lift midtones), -100 -> 2.0
-    # (lower midtones), 0 -> identity. Distinct from Brightness's asymmetric
-    # 1-0.3*b/8 mapping. Pure look-domain op; no highlight-headroom interaction.
-    if gamma != 0.0:
-        gamma_exp = 2.0 ** (-gamma / 100.0)
-        img_norm = np.clip(img / 65535.0, 0.0, 1.0)
-        img = np.power(img_norm, gamma_exp) * 65535.0
 
     # Highlights / Shadows (anchored per-channel tone-region roll-off)
     # Region "bumps" are zero at both endpoints (0 and 1) so pure black and
@@ -2826,7 +2802,6 @@ def adjust_image_opencl(
     ch_b_gain: float = 0.0,
     ch_b_blackpoint: float = 0.0,
     sub_saturation: float = 0.0,
-    gamma: float = 0.0,
     band_settings: dict = None,
     ws_windowed: bool = False,
 ) -> np.ndarray:
@@ -2877,7 +2852,6 @@ def adjust_image_opencl(
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
                           ch_b_shift, ch_b_gain, ch_b_blackpoint,
                           sub_saturation=sub_saturation,
-                          gamma=gamma,
                           band_settings=band_settings)
 
     try:
@@ -2909,7 +2883,7 @@ def adjust_image_opencl(
 
         # Prepare parameters as numpy array (params[0..10] existing,
         # params[11..22] channel levels, params[23] subtractive saturation,
-        # params[24] per-color-band enable flag, params[25] gamma)
+        # params[24] per-color-band enable flag)
         params = np.array([
             kelvin_shift, tint_shift, exposure, brightness,
             blackpoint, whitepoint, contrast, saturation, balance_factor,
@@ -2920,7 +2894,6 @@ def adjust_image_opencl(
             ch_b_shift, ch_b_gain, ch_b_blackpoint,
             sub_saturation,
             band_active,
-            gamma,          # params[25] — appended so params[0..24] keep their indices
         ], dtype=np.float32)
 
         params_buf = cl_array.to_device(queue, params)
@@ -2945,7 +2918,6 @@ def adjust_image_opencl(
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
                           ch_b_shift, ch_b_gain, ch_b_blackpoint,
                           sub_saturation=sub_saturation,
-                          gamma=gamma,
                           band_settings=band_settings)
 
 
@@ -3117,6 +3089,31 @@ def apply_curves(img16: np.ndarray, curves) -> np.ndarray:
                           composed * (65535.0 / 255.0)).astype(np.uint16)
         out[..., c] = lut16[img16[..., c]]
     return out
+
+
+# --- Gamma slider (center-point tone curve) --------------------------------
+# The Gamma slider is a single control point on the composite ("rgb") tone
+# curve that moves diagonally, perpendicular to the identity line, from the
+# center (127.5, 127.5): toward the top-left to brighten (+) or the bottom-right
+# to darken (-). It reuses the exact monotone-cubic interpolation of the Curves
+# editor (build_channel_lut / _monotone_cubic via apply_curves), so the result
+# is identical to dragging that midpoint by hand. Endpoints stay pinned, so the
+# effect is confined to the visible [0,1] window. See spec/gamma-slider.md.
+_GAMMA_MAX_OFFSET = 63.75   # perpendicular offset (0..255 domain) at slider +-100
+
+
+def gamma_curve_points(gamma: float):
+    """The 3-point 'rgb' control-point list for a Gamma slider value, in the
+    0..255 domain used by the Curves editor. gamma=0 -> identity diagonal."""
+    offset = (float(gamma) / 100.0) * _GAMMA_MAX_OFFSET
+    return [[0.0, 0.0], [127.5 - offset, 127.5 + offset], [255.0, 255.0]]
+
+
+def apply_gamma_curve(img16: np.ndarray, gamma: float) -> np.ndarray:
+    """Apply the Gamma slider as a center-point tone curve. No-op at 0."""
+    if not gamma:
+        return img16
+    return apply_curves(img16, {"rgb": gamma_curve_points(gamma)})
 
 
 # --- Dust removal (spot inpainting) ----------------------------------------
