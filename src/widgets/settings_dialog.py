@@ -108,6 +108,19 @@ class SettingsDialog(QDialog):
             "exposure with the Gain slider alone."))
         lay.addWidget(grp)
 
+        grp_gamma = QGroupBox("Gamma")
+        gg = QVBoxLayout(grp_gamma)
+        gg.setSpacing(theme.GAP_ROW)
+        self._cb_gamma_lum = QCheckBox("Hue-preserving Gamma (apply to luminance only)")
+        gg.addWidget(self._cb_gamma_lum)
+        gg.addWidget(self._muted(
+            "Apply the Gamma slider to luminance and scale the colour channels "
+            "together, so midtone adjustments don't shift hue or saturation. Off "
+            "(default) applies Gamma per channel — the standard look, which adds a "
+            "little saturation as it brightens/darkens. Highlights that would "
+            "exceed white still clip."))
+        lay.addWidget(grp_gamma)
+
         lay.addStretch(1)
         return page
 
@@ -240,7 +253,8 @@ class SettingsDialog(QDialog):
         for cb, val in ((self._cb_positive, ccr_backend.positive_mode),
                         (self._cb_rgb_merge, ccr_backend.rgb_merge_mode),
                         (self._cb_density, ccr_backend.density_bwpoint),
-                        (self._cb_auto_gain, ccr_backend.auto_gain)):
+                        (self._cb_auto_gain, ccr_backend.auto_gain),
+                        (self._cb_gamma_lum, ccr_backend.gamma_luminance)):
             cb.blockSignals(True)
             cb.setChecked(bool(val))
             cb.blockSignals(False)
@@ -258,6 +272,8 @@ class SettingsDialog(QDialog):
             self._mw.on_density_bwpoint_toggled(bool(self._cb_density.isChecked()))
         if bool(self._cb_auto_gain.isChecked()) != bool(ccr_backend.auto_gain):
             self._mw.on_auto_gain_toggled(bool(self._cb_auto_gain.isChecked()))
+        if bool(self._cb_gamma_lum.isChecked()) != bool(ccr_backend.gamma_luminance):
+            self._mw.on_gamma_mode_toggled(bool(self._cb_gamma_lum.isChecked()))
 
     def accept(self):
         """Done: commit the staged toggles, then close. (Escape/close → reject,

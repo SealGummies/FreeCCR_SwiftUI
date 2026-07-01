@@ -60,6 +60,11 @@ class CCRBackend:
         # slider is never moved). Supersedes the legacy baked auto-exposure while
         # on. Global, persisted by MainWindow. See spec/auto-gain.md.
         self.auto_gain: bool = True
+        # Gamma slider application mode: False = per-channel (default filmic look,
+        # shifts hue), True = apply to luminance and scale RGB together
+        # (hue-preserving). Global display mode, persisted by MainWindow. See
+        # spec/gamma-luminance-mode.md.
+        self.gamma_luminance: bool = False
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Global input ICC profile (one app-wide setting; applied to every

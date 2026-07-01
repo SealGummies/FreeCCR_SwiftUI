@@ -49,6 +49,7 @@ def _reset_profile_state():
         cm.set_camera_matrix_mode(False)
         ccr_backend.positive_mode = False
         ccr_backend.density_bwpoint = False        # product default: opt-in
+        ccr_backend.gamma_luminance = False        # product default: per-channel
         ccr_backend.active_profile_path = None
         ccr_backend.images = []
     _reset()
@@ -279,6 +280,14 @@ class _StubMW(QWidget):
         self.calls.append(("density", bool(c)))
         ccr_backend.density_bwpoint = bool(c)
 
+    def on_auto_gain_toggled(self, c):
+        self.calls.append(("auto_gain", bool(c)))
+        ccr_backend.auto_gain = bool(c)
+
+    def on_gamma_mode_toggled(self, c):
+        self.calls.append(("gamma_lum", bool(c)))
+        ccr_backend.gamma_luminance = bool(c)
+
 
 def _dialog():
     from widgets.settings_dialog import SettingsDialog
@@ -364,6 +373,35 @@ class TestSettingsDialog:
         # Product default is OFF (density is opt-in); fixture leaves it False.
         d = _dialog()
         assert d._cb_density.isChecked() is False
+
+    # --- Gamma mode toggle (spec/gamma-luminance-mode.md) ----------------- #
+    def test_general_page_has_gamma_toggle(self):
+        d = _dialog()
+        assert hasattr(d, "_cb_gamma_lum")
+        assert d._cb_gamma_lum.isChecked() is False    # per-channel by default
+
+    def test_gamma_toggle_seeds_from_backend(self):
+        ccr_backend.gamma_luminance = True
+        d = _dialog()
+        assert d._cb_gamma_lum.isChecked() is True
+
+    def test_gamma_toggle_staged_until_done(self):
+        ccr_backend.gamma_luminance = False
+        d = _dialog()
+        d._cb_gamma_lum.setChecked(True)
+        assert d._mw.calls == []                        # staged: nothing yet
+        assert ccr_backend.gamma_luminance is False
+        d.accept()                                      # Done
+        assert ("gamma_lum", True) in d._mw.calls
+        assert ccr_backend.gamma_luminance is True
+
+    def test_gamma_toggle_discarded_on_close(self):
+        ccr_backend.gamma_luminance = False
+        d = _dialog()
+        d._cb_gamma_lum.setChecked(True)
+        d.reject()                                      # Escape / close, not Done
+        assert d._mw.calls == []
+        assert ccr_backend.gamma_luminance is False
 
     def test_toggles_seed_from_backend_at_open(self):
         ccr_backend.rgb_merge_mode = True

@@ -3109,10 +3109,57 @@ def gamma_curve_points(gamma: float):
     return [[0.0, 0.0], [127.5 - offset, 127.5 + offset], [255.0, 255.0]]
 
 
-def apply_gamma_curve(img16: np.ndarray, gamma: float) -> np.ndarray:
-    """Apply the Gamma slider as a center-point tone curve. No-op at 0."""
+def _gamma_lut16(gamma: float) -> np.ndarray:
+    """Full 16-bit LUT (65536 -> uint16) for the Gamma tone curve, expanded the
+    same way apply_curves builds the composite 'rgb' LUT — including its 256-level
+    rounding (apply_curves composes through an identity per-channel ramp with
+    np.rint) — so a neutral pixel renders bit-for-bit identically in both the
+    per-channel and luminance paths."""
+    curve256 = np.rint(build_channel_lut(gamma_curve_points(gamma)))   # 256 levels
+    sample = np.arange(65536, dtype=np.float32)
+    src_idx = np.arange(256, dtype=np.float32) * (65535.0 / 255.0)
+    return np.interp(sample, src_idx,
+                     curve256 * (65535.0 / 255.0)).astype(np.uint16)
+
+
+# Rec.601 luma weights (R, G, B) — the same weights the saturation / shadow
+# stages in this module already use.
+_GAMMA_LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+
+
+def _apply_gamma_luminance(img16: np.ndarray, gamma: float) -> np.ndarray:
+    """Hue-preserving Gamma: apply the tone curve to luminance only, then scale
+    the RGB channels by the ratio L'/L. Uniform scaling leaves chromaticity (hue
+    + HSV saturation) untouched except where a channel clips. Neutrals render
+    bit-for-bit identically to the per-channel path (out = L'/L * v = L' when
+    R=G=B=v). See spec/gamma-luminance-mode.md."""
+    lut16 = _gamma_lut16(gamma)
+    rgbf = img16.astype(np.float32)
+    lum = rgbf @ _GAMMA_LUMA                                       # (H, W)
+    idx = np.clip(np.rint(lum), 0, 65535).astype(np.uint16)
+    lum_out = lut16[idx].astype(np.float32)
+    # Floor the denominator at one count: pure black (lum==0 -> lum_out==0) stays
+    # black, and near-black pixels can't blow up k (which would amplify shadow
+    # chroma noise).
+    k = lum_out / np.maximum(lum, 1.0)
+    out = rgbf * k[..., np.newaxis]
+    # Round (not truncate) so a neutral pixel recovers lut16[v] exactly: for
+    # R=G=B=v, out = v * lut16[v] / v differs from lut16[v] only by float error.
+    return np.clip(np.rint(out), 0.0, 65535.0).astype(np.uint16)
+
+
+def apply_gamma_curve(img16: np.ndarray, gamma: float,
+                      luminance: bool = False) -> np.ndarray:
+    """Apply the Gamma slider as a center-point tone curve. No-op at 0.
+
+    luminance=False (default): apply the curve PER CHANNEL (via apply_curves) —
+    the standard filmic look, which shifts hue/saturation of non-neutral colours.
+    luminance=True: apply the curve to luminance and scale RGB together, so hue
+    and HSV saturation are preserved (except where a channel clips)."""
     if not gamma:
         return img16
+    if luminance:
+        return _apply_gamma_luminance(img16, gamma)
     return apply_curves(img16, {"rgb": gamma_curve_points(gamma)})
 
 
