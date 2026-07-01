@@ -19,7 +19,7 @@ SYNC_GROUPS = [
     ("profile", "Color Profile (Color / B&W)", ()),
     ("wb", "White Balance / Tint", ("temperature", "tint")),
     ("tone", "Tone (gain, brightness, contrast, ...)",
-     ("exposure", "brightness", "highlights", "white_point",
+     ("exposure", "brightness", "gamma", "highlights", "white_point",
       "shadows", "black_point", "contrast")),
     ("sat", "Saturation", ("saturation", "sub_saturation")),
     ("crop", "Crop", ()),
@@ -245,7 +245,7 @@ class SlidersPanel(QWidget):
     # Order must match the create_slider() call order exactly — the two
     # lists are zipped positionally.
     ADJUSTMENT_KEYS = [
-        "temperature", "tint", "exposure", "brightness", "highlights",
+        "temperature", "tint", "exposure", "brightness", "gamma", "highlights",
         "white_point", "shadows", "black_point", "contrast", "saturation",
         "sub_saturation",
         # Per-channel levels controls (collapsible section)
@@ -338,7 +338,7 @@ class SlidersPanel(QWidget):
         layout.addWidget(scroll_area, 1)  # stretch=1: fills remaining height
 
         self.slider_labels = [
-            "Temperature", "Tint", "Gain", "Brightness",
+            "Temperature", "Tint", "Gain", "Brightness", "Gamma",
             "Highlights", "White Point", "Shadows", "Black Point", "Contrast", "Saturation",
             "Subtracted Sat"
         ]
@@ -475,6 +475,10 @@ class SlidersPanel(QWidget):
             "Tint", gradient=theme.TINT_GRADIENT)
         self.exposure_slider_layout = self.create_slider("Gain", min_value=-200, max_value=200)
         self.brightness_slider_layout = self.create_slider("Brightness")
+        # Gamma: a clean, endpoint-pinned midtone bow on the visible [0,1] window
+        # (gamma_exp = 2^(-gamma/100)). Sits directly below Brightness. Must be
+        # created right after Brightness to keep the ADJUSTMENT_KEYS positional zip.
+        self.gamma_slider_layout = self.create_slider("Gamma")
         self.highlights_slider_layout = self.create_slider("Highlights")
         self.white_point_slider_layout = self.create_slider("White Point")
         self.shadows_slider_layout = self.create_slider("Shadows")
@@ -488,6 +492,7 @@ class SlidersPanel(QWidget):
         scroll_layout.addLayout(self.tint_slider_layout)
         scroll_layout.addLayout(self.exposure_slider_layout)
         scroll_layout.addLayout(self.brightness_slider_layout)
+        scroll_layout.addLayout(self.gamma_slider_layout)
         scroll_layout.addLayout(self.highlights_slider_layout)
         scroll_layout.addLayout(self.white_point_slider_layout)
         scroll_layout.addLayout(self.shadows_slider_layout)
