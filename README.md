@@ -19,7 +19,7 @@ No subscriptions. No license keys. No cloud. Your images never leave your comput
 </div>
 
 <div align="center">
-  <img src="docs/screenshot.png" width="900" alt="FreeCCR converting a roll of color negative film — thumbnail strip, large preview, histogram, and adjustment panel">
+  <img src="docs/screenshot.png" width="900" alt="FreeCCR converting a color negative — thumbnail strip of RAW scans, the large frame preview with its film-sprocket border, the RGB histogram, and the Film B/W Point + adjustment panel">
 </div>
 
 ---
