@@ -72,6 +72,15 @@ class CCRBackend:
         self.gamma_luminance: bool = False
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
+        # Selected film-stock preset for the black-point-only conversion:
+        # per-channel density slopes (B, G, R), or None → the baked scalar
+        # DEFAULT_DENSITY_SLOPE. A sampled white point always overrides it.
+        # Owned by the sliders panel (combo) and persisted there in QSettings;
+        # the name is kept for the mode label / hints only. Unlike the B/W
+        # points this survives a new batch — the preset is per stock, not per
+        # roll. See spec/film-stock-slopes.md.
+        self.film_stock_slopes = None
+        self.film_stock_name = None
         # Global input ICC profile (one app-wide setting; applied to every
         # decode before conversion/adjustments). The parsed profile lives in
         # color_management's module-level holder; these mirror it for the UI.
@@ -743,7 +752,8 @@ class CCRBackend:
                 black_point, white_point = ci["bw"]
                 processed = ccr_normalize_with_bwpoint(
                     image_obj, black_point, white_point,
-                    density=ci.get("density", False))
+                    density=ci.get("density", False),
+                    slopes_bgr=ci.get("slopes"))
             elif ci is not None and ci.get("mode") == "ref_params":
                 processed = ccr_normalize_with_refparams(
                     image_obj, ci["p_lo"], ci["p_hi"], ci["od"])
@@ -1267,16 +1277,21 @@ class CCRBackend:
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                max_long_side=max_long_side,
                                                output_colorspace=output_colorspace,
-                                               density=ci.get("density", False))
+                                               density=ci.get("density", False),
+                                               slopes_bgr=ci.get("slopes"))
                 elif image_obj.reference_frame is None and self.black_point_bgr is not None:
                     # Legacy/un-snapshotted B/W point conversion — global anchors.
-                    # white_point_bgr may be None → default-slope mode.
+                    # white_point_bgr may be None → default-slope mode (with the
+                    # live film-stock slopes, if a preset is selected).
                     ccr_normalize_with_bwpoint(image_obj, self.black_point_bgr, self.white_point_bgr,
                                                output_path=output_path,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                max_long_side=max_long_side,
                                                output_colorspace=output_colorspace,
-                                               density=self.density_bwpoint)
+                                               density=self.density_bwpoint,
+                                               slopes_bgr=(self.film_stock_slopes
+                                                           if self.white_point_bgr is None
+                                                           else None))
                 else:
                     ccr_normalize_with_reference(image_obj, output_path=output_path,
                                                  jpg_out=jpg_output,
@@ -1642,10 +1657,12 @@ class CCRBackend:
                     from core.ccr_processor import apply_bwpoint_normalization
                     black_point, white_point = parent_ci["bw"]
                     bw_density = parent_ci.get("density", False)
+                    bw_slopes = parent_ci.get("slopes")
                     crop = apply_bwpoint_normalization(crop, black_point, white_point,
-                                                       density=bw_density)
+                                                       density=bw_density,
+                                                       slopes_bgr=bw_slopes)
                     child_ci = {"mode": "bw", "bw": parent_ci["bw"], "fine_rot": 0,
-                                "density": bw_density}
+                                "density": bw_density, "slopes": bw_slopes}
 
                 index = len(children) + 1
                 child = CCRImage(
@@ -1786,6 +1803,7 @@ class CCRBackend:
         norm_params = None
         bw_points = None
         bw_density = False
+        bw_slopes = None
         if ci is not None and ci.get("mode") == "ref":
             child_full = template.read_image(template.file_path, preview=True)
             if child_full is not None:
@@ -1800,6 +1818,7 @@ class CCRBackend:
         elif ci is not None and ci.get("mode") == "bw":
             bw_points = ci["bw"]
             bw_density = ci.get("density", False)
+            bw_slopes = ci.get("slopes")
 
         # Re-decode the source canvas. The constructor raises if the file is
         # gone/unreadable; fail the reset gracefully and leave the list
@@ -1835,11 +1854,13 @@ class CCRBackend:
                 "p_hi": norm_params[1], "od": norm_params[2]}
         elif bw_points is not None:
             parent.resized_raw = apply_bwpoint_normalization(
-                parent.resized_raw, *bw_points, density=bw_density)
+                parent.resized_raw, *bw_points, density=bw_density,
+                slopes_bgr=bw_slopes)
             parent.converted = True
             parent._ws_windowed = _ws_enabled()   # bw base is windowed when enabled
             parent.conversion_inputs = {"mode": "bw", "bw": bw_points,
-                                        "fine_rot": 0, "density": bw_density}
+                                        "fine_rot": 0, "density": bw_density,
+                                        "slopes": bw_slopes}
         parent.tint_balance_factor = template.tint_balance_factor
         parent.contrast_base = template.contrast_base
         parent.temperature_base = template.temperature_base
@@ -1888,6 +1909,18 @@ class CCRBackend:
     def set_black_point(self, bgr_tuple):
         self.black_point_bgr = bgr_tuple
 
+    def set_film_stock(self, name, slopes_bgr):
+        """Select a saved film-stock preset: its per-channel density slopes
+        drive the black-point-only conversion instead of the baked scalar
+        DEFAULT_DENSITY_SLOPE. See spec/film-stock-slopes.md."""
+        self.film_stock_name = name
+        self.film_stock_slopes = tuple(float(s) for s in slopes_bgr)
+
+    def clear_film_stock(self):
+        """Back to the baked default scalar slope for black-point-only mode."""
+        self.film_stock_name = None
+        self.film_stock_slopes = None
+
     def apply_bwpoint_to_all_images(self, progress_callback=None):
         """
         Apply B/W point film negative conversion to all loaded images using the same
@@ -1901,6 +1934,10 @@ class CCRBackend:
         # only a black point, conversion uses the baked default slope.
         if self.white_point_bgr is not None:
             log_bwpoint_slopes(self.black_point_bgr, self.white_point_bgr)
+        # Film-stock slopes apply only in black-point-only mode — a sampled
+        # white point wins. Snapshot once so every image in the batch converts
+        # (and records) the same recipe.
+        slopes = self.film_stock_slopes if self.white_point_bgr is None else None
         total = len(self.images)
         if progress_callback:
             progress_callback(0, total)
@@ -1911,7 +1948,7 @@ class CCRBackend:
                     img.reload_image()
                 processed = ccr_normalize_with_bwpoint(
                     img, self.black_point_bgr, self.white_point_bgr,
-                    density=self.density_bwpoint
+                    density=self.density_bwpoint, slopes_bgr=slopes
                 )
                 if processed is not None:
                     img.resized_raw = processed
@@ -1922,6 +1959,7 @@ class CCRBackend:
                            tuple(self.white_point_bgr) if self.white_point_bgr is not None else None),
                     "fine_rot": img.fine_rotation_angle,
                     "density": bool(self.density_bwpoint),
+                    "slopes": slopes,
                 }
                 img.update_thumbnail_and_preview()
             except Exception as e:

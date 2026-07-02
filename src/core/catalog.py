@@ -80,7 +80,7 @@ def _ci_to_json(ci):
     if out.get("bw") is not None:
         black, white = out["bw"]
         out["bw"] = [list(black), (list(white) if white is not None else None)]
-    for key in ("p_lo", "p_hi", "od"):
+    for key in ("p_lo", "p_hi", "od", "slopes"):
         if out.get(key) is not None:
             out[key] = list(out[key])
     return out
@@ -95,7 +95,7 @@ def _ci_from_json(ci):
     if out.get("bw") is not None:
         black, white = out["bw"]
         out["bw"] = (tuple(black), (tuple(white) if white is not None else None))
-    for key in ("p_lo", "p_hi", "od"):
+    for key in ("p_lo", "p_hi", "od", "slopes"):
         if out.get(key) is not None:
             out[key] = tuple(out[key])
     return out
@@ -441,7 +441,8 @@ def _replay_conversion(img, ci) -> None:
         try:
             black_point, white_point = ci["bw"]
             processed = ccr_normalize_with_bwpoint(img, black_point, white_point,
-                                                   density=ci.get("density", False))
+                                                   density=ci.get("density", False),
+                                                   slopes_bgr=ci.get("slopes"))
         finally:
             img.fine_rotation_angle = saved_fine
         img.resized_raw = processed

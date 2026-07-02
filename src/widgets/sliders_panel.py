@@ -1,16 +1,25 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayout,
                                 QSizePolicy, QStyleOptionSlider, QFrame, QStyle,
                                 QPushButton, QDialog, QMessageBox, QScrollArea,
-                                QCheckBox, QComboBox)
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QRectF
+                                QCheckBox, QComboBox, QInputDialog)
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QRectF, QSettings
 from PySide6.QtGui import (QKeySequence, QShortcut, QPainter, QColor,
                            QLinearGradient, QPen)
 from core.ccr_backend import ccr_backend
-from core.ccr_processor import COLOR_BANDS, BAND_PARAMS, BAND_ADJUSTMENT_KEYS
+from core.ccr_processor import (COLOR_BANDS, BAND_PARAMS, BAND_ADJUSTMENT_KEYS,
+                                compute_density_slopes)
+from core.film_stocks import (decode_film_stocks, encode_film_stocks,
+                              find_film_stock, upsert_film_stock,
+                              remove_film_stock)
 from widgets.curve_editor import CurveEditor
 from widgets.histogram_widget import HistogramWidget
 from ui import theme
 import copy
+from datetime import date
+
+# First combo entry of the film-stock selector: the baked scalar
+# DEFAULT_DENSITY_SLOPE (no preset). See spec/film-stock-slopes.md.
+FILM_STOCK_DEFAULT_LABEL = "Default slope"
 
 # Setting groups offered by the "Sync to All" dialog. The adjustment-key
 # groups partition SlidersPanel.ADJUSTMENT_KEYS exactly; "crop" syncs the
@@ -410,6 +419,45 @@ class SlidersPanel(QWidget):
         bwp_row.addWidget(self.white_point_btn)
         bwp_row.addWidget(self.clear_white_point_btn)
         scroll_layout.addLayout(bwp_row)
+
+        # --- Film-stock slope presets (spec/film-stock-slopes.md) ---
+        # Save the per-channel density slopes implied by a sampled B/W pair
+        # under a stock name; a selected stock replaces the baked scalar
+        # DEFAULT_DENSITY_SLOPE for black-point-only conversions. A sampled
+        # white point always wins, so the selector is disabled then.
+        stock_label = QLabel("Film Stock")
+        stock_label.setFixedWidth(theme.LABEL_COL_W)
+        stock_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        stock_label.setFixedHeight(theme.CONTROL_H)
+        stock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.film_stock_combo = QComboBox()
+        self.film_stock_combo.setFixedHeight(theme.CONTROL_H)
+        self.save_film_stock_btn = QPushButton("＋")
+        self.save_film_stock_btn.setFixedWidth(theme.GLYPH_W)
+        self.save_film_stock_btn.setFixedHeight(theme.CONTROL_H)
+        self.save_film_stock_btn.setToolTip(
+            "Save the sampled B/W-point pair as a named film stock — its "
+            "slope then converts future rolls from just a black point")
+        self.delete_film_stock_btn = QPushButton("−")
+        self.delete_film_stock_btn.setFixedWidth(theme.GLYPH_W)
+        self.delete_film_stock_btn.setFixedHeight(theme.CONTROL_H)
+        theme.style_button(self.delete_film_stock_btn, "danger", glyph_only=True)
+        self.delete_film_stock_btn.setToolTip("Delete the selected film stock")
+        stock_row = QHBoxLayout()
+        stock_row.setSpacing(theme.GAP_TIGHT)
+        stock_row.addWidget(stock_label, alignment=Qt.AlignVCenter)
+        stock_row.addWidget(self.film_stock_combo, 1)
+        stock_row.addWidget(self.save_film_stock_btn)
+        stock_row.addWidget(self.delete_film_stock_btn)
+        scroll_layout.addLayout(stock_row)
+        # Presets + last selection persist across sessions (same QSettings
+        # store as the persisted B/W points themselves).
+        self._settings = QSettings("FreeCCR", "FreeCCR")
+        self._film_stocks = decode_film_stocks(
+            self._settings.value("convert/film_stocks", "", type=str))
+        self._reload_film_stock_combo(
+            select=self._settings.value("convert/film_stock_selected", "", type=str))
+
         # Shows which slope source the next conversion will use.
         self.bwp_mode_label = QLabel("")
         self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
@@ -652,6 +700,9 @@ class SlidersPanel(QWidget):
         self.white_point_btn.clicked.connect(self._on_set_white_point)
         self.clear_white_point_btn.clicked.connect(self._on_clear_white_point)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
+        self.film_stock_combo.currentIndexChanged.connect(self._on_film_stock_changed)
+        self.save_film_stock_btn.clicked.connect(self._on_save_film_stock)
+        self.delete_film_stock_btn.clicked.connect(self._on_delete_film_stock)
         self.convert_current_bwp_btn.clicked.connect(self._on_convert_current_bwpoint)
         self.convert_all_bwp_btn.clicked.connect(self._on_convert_all_bwpoint)
 
@@ -815,8 +866,14 @@ class SlidersPanel(QWidget):
         convert. The toolbar's Convert/Un-convert/Auto Frame are gated
         separately in ImagePreview."""
         for btn in (self.white_point_btn, self.black_point_btn,
-                    self.convert_current_bwp_btn, self.convert_all_bwp_btn):
+                    self.convert_current_bwp_btn, self.convert_all_bwp_btn,
+                    self.film_stock_combo, self.save_film_stock_btn,
+                    self.delete_film_stock_btn):
             btn.setEnabled(enabled)
+        if enabled:
+            # Leaving Positive mode: re-apply the conditional film-stock
+            # gating (save needs both points, selector needs no white point).
+            self._update_bwp_mode_label()
 
     def save_slider_values(self, image_id):
         pass
@@ -1438,21 +1495,144 @@ class SlidersPanel(QWidget):
             "before converting.", duration=6000)
 
     def _update_bwp_mode_label(self):
-        """Reflect which slope source the next B/W-point conversion will use."""
+        """Reflect which slope source the next B/W-point conversion will use,
+        and gate the film-stock controls to the states where they apply."""
         if not hasattr(self, "bwp_mode_label"):
             return
         bp_set = ccr_backend.black_point_bgr is not None
         wp_set = ccr_backend.white_point_bgr is not None
+        stock = ccr_backend.film_stock_name
         if not bp_set:
             text = ""
         elif wp_set:
             text = "Slope source: white point (two-point)"
+        elif stock:
+            text = f'Slope source: film stock "{stock}" (black point only)'
         else:
             text = "Slope source: default slope (black point only)"
         self.bwp_mode_label.setText(text)
         # Hide when empty so it reserves no vertical space — keeps the Set-point
         # row and the Convert row tight together (no gap) until a point is set.
         self.bwp_mode_label.setVisible(bool(text))
+        # Film-stock controls: a sampled white point overrides any preset (the
+        # two-point math uses the pair), so selector + delete are disabled then.
+        # Save needs BOTH points — that's the only time slopes can be computed.
+        # All stay disabled in global Positive mode (nothing to convert), like
+        # the rest of the section (set_negative_controls_enabled).
+        positive = bool(ccr_backend.positive_mode)
+        self.film_stock_combo.setEnabled(not wp_set and not positive)
+        self.film_stock_combo.setToolTip(
+            "White point set — two-point conversion in use; clear it (✕) to "
+            "use a film-stock slope" if wp_set else
+            "Slope preset for black-point-only conversion: a saved film "
+            "stock's per-channel slopes, or the built-in default")
+        self.save_film_stock_btn.setEnabled(bp_set and wp_set and not positive)
+        self.delete_film_stock_btn.setEnabled(
+            not wp_set and not positive
+            and self.film_stock_combo.currentIndex() > 0)
+
+    # --- Film-stock slope presets (spec/film-stock-slopes.md) --------------
+
+    def _reload_film_stock_combo(self, select=""):
+        """Rebuild the combo from self._film_stocks and select the stock named
+        `select` (''/unknown → Default). Pushes the result into the backend."""
+        combo = self.film_stock_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(FILM_STOCK_DEFAULT_LABEL)
+        for stock in self._film_stocks:
+            combo.addItem(stock["name"])
+        selected = find_film_stock(self._film_stocks, select)
+        combo.setCurrentIndex(
+            0 if selected is None else 1 + self._film_stocks.index(selected))
+        combo.blockSignals(False)
+        self._apply_film_stock_selection()
+
+    def _apply_film_stock_selection(self):
+        """Sync the combo's selection into the backend (the slopes the next
+        black-point-only conversion uses), persist it, refresh the label."""
+        idx = self.film_stock_combo.currentIndex()
+        if idx <= 0:
+            ccr_backend.clear_film_stock()
+            self._settings.remove("convert/film_stock_selected")
+        else:
+            stock = self._film_stocks[idx - 1]
+            ccr_backend.set_film_stock(stock["name"], stock["slopes_bgr"])
+            self._settings.setValue("convert/film_stock_selected", stock["name"])
+        self._update_bwp_mode_label()
+
+    def _on_film_stock_changed(self, _index):
+        self._apply_film_stock_selection()
+
+    def _save_film_stocks_to_settings(self):
+        self._settings.setValue("convert/film_stocks",
+                                encode_film_stocks(self._film_stocks))
+
+    def _on_save_film_stock(self):
+        """Save the sampled B/W pair's per-channel density slopes as a named
+        film stock, and select it — so clearing the white point (✕) switches
+        the roll straight onto the new preset."""
+        black = ccr_backend.black_point_bgr
+        white = ccr_backend.white_point_bgr
+        if black is None or white is None:
+            return
+        slopes = compute_density_slopes(black, white)
+        if slopes is None:
+            QMessageBox.warning(
+                self, "Unusable B/W Pair",
+                "These B/W points don't span a usable density range on every "
+                "channel — the black point (film base) must be brighter than "
+                "the white point (dense area) in all of R, G and B. Re-sample "
+                "the points and try again.")
+            return
+        name, ok = QInputDialog.getText(
+            self, "Save Film Stock", 'Film stock name (e.g. "Portra 400"):')
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if find_film_stock(self._film_stocks, name) is not None:
+            if QMessageBox.question(
+                    self, "Replace Film Stock",
+                    f'A film stock named "{name}" already exists. Replace it?',
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No) != QMessageBox.Yes:
+                return
+        self._film_stocks = upsert_film_stock(self._film_stocks, {
+            "name": name,
+            "slopes_bgr": list(slopes),
+            # Provenance only — the slopes are the invariant the preset needs.
+            "black_bgr": [float(v) for v in black],
+            "white_bgr": [float(v) for v in white],
+            "created": date.today().isoformat(),
+        })
+        self._save_film_stocks_to_settings()
+        self._reload_film_stock_combo(select=name)
+        self.set_temporary_hint(
+            f'Film stock "{name}" saved — clear the White Point (✕) to '
+            "convert future rolls of this stock from just a black point.",
+            duration=8000)
+
+    def _on_delete_film_stock(self):
+        """Delete the selected stock; selection falls back to Default. Images
+        already converted with it keep their conversion — the slopes were
+        snapshotted by value into conversion_inputs at convert time."""
+        idx = self.film_stock_combo.currentIndex()
+        if idx <= 0:
+            return
+        name = self._film_stocks[idx - 1]["name"]
+        if QMessageBox.question(
+                self, "Delete Film Stock",
+                f'Delete film stock "{name}"? Images already converted with '
+                "it are unaffected.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._film_stocks = remove_film_stock(self._film_stocks, name)
+        self._save_film_stocks_to_settings()
+        self._reload_film_stock_combo()   # falls back to Default slope
+        self.set_temporary_hint(f'Film stock "{name}" deleted.', duration=5000)
 
     def on_bwpoint_sampled(self, mode):
         label = "White Point" if mode == "white" else "Black Point"
@@ -1468,9 +1648,12 @@ class SlidersPanel(QWidget):
             self.set_temporary_hint(
                 f"{label} sampled! Both points set — click <b>Convert All</b>.", duration=5000)
         elif bp_set:
-            # Black point alone is enough — default slope fills in for the white.
+            # Black point alone is enough — the selected film stock (or the
+            # default slope) fills in for the white.
+            stock = ccr_backend.film_stock_name
+            source = f'film stock "{stock}"' if stock else "the default slope"
             self.set_temporary_hint(
-                "Black Point sampled! Click <b>Convert</b> to use the default slope, "
+                f"Black Point sampled! Click <b>Convert</b> to use {source}, "
                 "or set a <b>White Point</b> for a custom slope.", duration=6000)
         else:
             self.set_temporary_hint(
@@ -1492,9 +1675,13 @@ class SlidersPanel(QWidget):
                 img.reload_image()
             from core.ccr_processor import ccr_normalize_with_bwpoint
             white = ccr_backend.white_point_bgr  # may be None → default slope
+            # Film-stock slopes apply only in black-point-only mode — a
+            # sampled white point wins (spec/film-stock-slopes.md).
+            slopes = ccr_backend.film_stock_slopes if white is None else None
             processed = ccr_normalize_with_bwpoint(
                 img, ccr_backend.black_point_bgr, white,
-                density=ccr_backend.density_bwpoint
+                density=ccr_backend.density_bwpoint,
+                slopes_bgr=slopes
             )
             if processed is not None:
                 img.resized_raw = processed
@@ -1505,6 +1692,7 @@ class SlidersPanel(QWidget):
                        tuple(white) if white is not None else None),
                 "fine_rot": img.fine_rotation_angle,
                 "density": bool(ccr_backend.density_bwpoint),
+                "slopes": slopes,
             }
             img.update_thumbnail_and_preview()
             mw = self.parent().parent()

@@ -215,6 +215,9 @@ class MainWindow(QMainWindow):
         # Restore a persisted global B/W point (set in a prior session) so
         # tethering can auto-convert captures right away. Before any image loads.
         self._restore_bwpoint()
+        # Reflect the restored B/W state (and the panel's restored film-stock
+        # selection) in the slope-source label right away.
+        self.sliders_panel._update_bwp_mode_label()
 
         self.installEventFilter(self)
         self.create_menu()

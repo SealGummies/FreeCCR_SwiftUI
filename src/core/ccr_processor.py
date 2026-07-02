@@ -1070,24 +1070,31 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
     return d.astype(np.uint16)
 
 
-def _default_slope_invert(img_f: np.ndarray, black_point_bgr) -> np.ndarray:
-    """Density-space inversion for the black-point-only mode, using the baked
-    scalar DEFAULT_DENSITY_SLOPE. `img_f` is a float32 (H,W,3) BGR array.
+def _default_slope_invert(img_f: np.ndarray, black_point_bgr,
+                          slopes_bgr=None) -> np.ndarray:
+    """Density-space inversion for the black-point-only mode. `img_f` is a
+    float32 (H,W,3) BGR array.
 
-    Per channel: out = clip(DEFAULT_DENSITY_SLOPE * max(log10(base/img), 0), 0, 1),
-    then an optional display gamma, scaled to uint16. The per-channel base divide
-    is the ONLY place colour balance enters, and log10(base/img) cancels any
-    per-channel light-source scaling — so re-sampling the black point under a new
-    light keeps colour consistent without a white point."""
+    Per channel: out = clip(slope[c] * max(log10(base/img), 0), 0, 1),
+    then an optional display gamma, scaled to uint16. `slopes_bgr` is a saved
+    film-stock preset's per-channel density slopes (spec/film-stock-slopes.md);
+    None uses the baked scalar DEFAULT_DENSITY_SLOPE for every channel —
+    byte-identical to the pre-preset behaviour. The per-channel base divide
+    carries the light source's colour balance (log10(base/img) cancels any
+    per-channel light scaling, so re-sampling the black point under a new
+    light keeps colour consistent without a white point); a film stock's
+    slopes add that stock's per-channel contrast character on top."""
     out = np.empty_like(img_f)
     for c in range(3):
         base = max(float(black_point_bgr[c]), 1.0)
+        slope = (DEFAULT_DENSITY_SLOPE if slopes_bgr is None
+                 else float(slopes_bgr[c]))
         ch = np.maximum(img_f[..., c], _DENSITY_FLOOR)   # copy; avoids /0 & log(0)
         np.divide(base, ch, out=ch)                      # base / img
         np.log10(ch, out=ch)                             # optical density above base
         np.maximum(ch, 0.0, out=ch)                      # clamp (img brighter than base)
+        ch *= np.float32(slope)                          # slope = contrast (per channel)
         out[..., c] = ch
-    out *= np.float32(DEFAULT_DENSITY_SLOPE)             # single scalar = contrast
     if _ws_enabled():
         # Keep highlight overshoot (density above the 1/SLOPE ceiling) as headroom.
         if DEFAULT_DENSITY_GAMMA != 1.0:
@@ -1271,7 +1278,8 @@ def _twopoint_invert(img_f: np.ndarray, black_point_bgr, white_point_bgr,
 def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
                                output_path=None, jpg_out=False,
                                jpg_quality=95, max_long_side=None,
-                               output_colorspace="srgb", density=False):
+                               output_colorspace="srgb", density=False,
+                               slopes_bgr=None):
     """
     Film negative conversion using the same pipeline as ccr_normalize_with_reference
     but with explicit per-channel B/W points instead of auto-detected percentiles.
@@ -1288,6 +1296,11 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
                      stretch. Density is opt-in; callers pass the live setting.
                      Ignored when white_point_bgr is None (that path is always
                      density). See spec/density-bwpoint-toggle.md.
+    slopes_bgr:      black-point-only mode only — a saved film-stock preset's
+                     per-channel density slopes replacing the scalar
+                     DEFAULT_DENSITY_SLOPE. None = default slope. Ignored when
+                     a white point is given (the sampled pair wins). See
+                     spec/film-stock-slopes.md.
 
     Pipeline: BWPN (user B/W points) → inversion → saturation boost → shadow correction
     ODAI is skipped because per-channel B/W point mapping already normalises channels.
@@ -1317,9 +1330,10 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
     img_f = img.astype(np.float32)
     if white_point_bgr is None:
         # --- Default-slope mode (black point only): density-space inversion ---
-        rgb_inverted = _default_slope_invert(img_f, black_point_bgr)
+        rgb_inverted = _default_slope_invert(img_f, black_point_bgr, slopes_bgr)
         del img_f
-        print(f"BWPN (default slope): {time.time() - total_start_time:.3f}s")
+        print(f"BWPN ({'film-stock slope' if slopes_bgr is not None else 'default slope'}): "
+              f"{time.time() - total_start_time:.3f}s")
     else:
         # --- Two-point mode (ODAI skipped: per-channel B/W points already
         # equalise channels). density=True recovers optical density (log space);
@@ -1796,26 +1810,29 @@ def apply_reference_normalization(img: np.ndarray, p_lo, p_hi, od_factors) -> np
 
 
 def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bgr=None,
-                                density: bool = False) -> np.ndarray:
+                                density: bool = False,
+                                slopes_bgr=None) -> np.ndarray:
     """B/W-point conversion at any resolution: absolute per-channel anchors +
     inversion — mirrors ccr_normalize_with_bwpoint's preview path (the anchors
     are global constants, so no rescaling is needed). Used for the zoom hi-res
     replay and slice/reset, so it MUST match the entry pipeline exactly.
 
     When white_point_bgr is None, the default-slope mode is used: a density-space
-    inversion with the baked scalar DEFAULT_DENSITY_SLOPE is applied to the black
-    point alone (see _default_slope_invert). Otherwise the two-point math runs,
-    in optical-density space when density=True or the legacy linear transmittance
-    stretch when density=False (default; bit-identical to the prior behaviour).
-    Replay callers pass ci.get("density", False) so legacy conversions stay
-    linear. See spec/density-bwpoint-toggle.md.
+    inversion applied to the black point alone (see _default_slope_invert), with
+    `slopes_bgr` (a film-stock preset's per-channel density slopes, snapshotted
+    in conversion_inputs["slopes"]) or the baked scalar DEFAULT_DENSITY_SLOPE
+    when None. Otherwise the two-point math runs, in optical-density space when
+    density=True or the legacy linear transmittance stretch when density=False
+    (default; bit-identical to the prior behaviour). Replay callers pass
+    ci.get("density", False) / ci.get("slopes") so legacy conversions stay
+    as converted. See spec/density-bwpoint-toggle.md, spec/film-stock-slopes.md.
 
     The post-invert "look" stays DISABLED so the hi-res replay matches the
     look-less preview/export path."""
     img_f = img.astype(np.float32)
     if white_point_bgr is None:
         # Default-slope mode (black point only): density-space inversion.
-        return _default_slope_invert(img_f, black_point_bgr)
+        return _default_slope_invert(img_f, black_point_bgr, slopes_bgr)
     return _twopoint_invert(img_f, black_point_bgr, white_point_bgr, density)
 
 
@@ -1860,6 +1877,30 @@ def log_bwpoint_slopes(black_point_bgr, white_point_bgr):
         print(f"  per-channel LINEAR  (B,G,R) = {[round(s, 4) for s in lin]}")
         print(f"  per-channel DENSITY (B,G,R) = {[round(s, 4) for s in den]}")
     print("=== bake the LINEAR vector (current pipeline) OR the DENSITY vector (log) ===")
+
+
+def compute_density_slopes(black_point_bgr, white_point_bgr):
+    """Per-channel DENSITY slopes implied by a sampled B/W-point pair:
+    S[c] = 1 / log10(base[c] / dense[c]) — the value that maps the pair's dense
+    sample to display white in _default_slope_invert. This is what a film-stock
+    preset stores (spec/film-stock-slopes.md): a property of the stock (its
+    per-dye-layer characteristic-curve gamma), invariant to per-channel light
+    scaling — unlike the linear slope (see log_bwpoint_slopes above).
+
+    Returns a (B, G, R) tuple of floats, or None when ANY channel is unusable
+    (non-positive sample, base not above dense, or ~zero density range): a pair
+    that can't characterise all three channels is rejected whole."""
+    slopes = []
+    for c in range(3):
+        base = float(black_point_bgr[c])
+        dense = float(white_point_bgr[c])
+        if base <= 0.0 or dense <= 0.0 or base <= dense:
+            return None
+        d = float(np.log10(base / dense))
+        if d <= 1e-6:
+            return None
+        slopes.append(1.0 / d)
+    return tuple(slopes)
 
 
 def auto_fine_angle(img16: np.ndarray, debug: bool = False) -> float:

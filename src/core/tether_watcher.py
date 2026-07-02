@@ -186,19 +186,21 @@ class TetherWatchWorker(QObject):
             black = ccr_backend.black_point_bgr
             white = ccr_backend.white_point_bgr
             positive = ccr_backend.positive_mode
-            # white may be None → default-slope conversion (black point only).
+            # white may be None → default-slope conversion (black point only),
+            # where a selected film-stock preset supplies per-channel slopes.
+            slopes = ccr_backend.film_stock_slopes if white is None else None
             convert = (not positive and black is not None)
             for img in imgs:
                 if self._cancelled:
                     return
                 if convert and not img.converted:
-                    self._convert(img, black, white)
+                    self._convert(img, black, white, slopes)
                 self.captured.emit(img)
         except Exception as e:
             self.captureError.emit(path, str(e))
 
     @staticmethod
-    def _convert(img, black, white):
+    def _convert(img, black, white, slopes=None):
         """Bake the saved B/W-point conversion into the image (preview + the
         conversion_inputs snapshot the export/catalog paths replay). Mirrors
         CCRBackend.apply_bwpoint_to_all_images. On failure the image is left
@@ -207,7 +209,8 @@ class TetherWatchWorker(QObject):
         from core.ccr_backend import ccr_backend
         try:
             density = bool(ccr_backend.density_bwpoint)
-            processed = ccr_normalize_with_bwpoint(img, black, white, density=density)
+            processed = ccr_normalize_with_bwpoint(img, black, white, density=density,
+                                                   slopes_bgr=slopes)
             if processed is not None:
                 img.resized_raw = processed
             img.converted = True
@@ -216,6 +219,7 @@ class TetherWatchWorker(QObject):
                 "bw": (tuple(black), tuple(white) if white is not None else None),
                 "fine_rot": img.fine_rotation_angle,
                 "density": density,
+                "slopes": tuple(slopes) if slopes is not None else None,
             }
             img.update_thumbnail_and_preview()
         except Exception as e:
