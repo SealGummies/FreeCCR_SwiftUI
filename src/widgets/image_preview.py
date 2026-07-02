@@ -247,24 +247,39 @@ class GraphicsImageView(QGraphicsView):
             self.viewport().update()
             self.parent_widget.update_reference_rect(self._drag_start, self._drag_end)
 
-    def _update_bw_rect(self, start, end):
-        """Draw the B/W point selection rect on the canvas."""
+    def _display_transform(self):
+        """The pixmap item's full display transform: coarse flips/90° PLUS the
+        fine rotation about the pixmap center. Must mirror
+        apply_transformations exactly (including its crop/dust-mode fine-
+        rotation suppression) — sampling that inverts only the coarse part
+        lands tens of pixels away from the on-screen cursor/marquee whenever a
+        fine rotation is active (e.g. set automatically by Auto Frame)."""
         pw = self.parent_widget
         cx = pw.current_pixmap.width() / 2
         cy = pw.current_pixmap.height() / 2
-        base_transform = QTransform()
-        base_transform.translate(cx, cy)
+        t = QTransform()
+        t.translate(cx, cy)
         if pw.current_vertical_flip:
-            base_transform.scale(1, -1)
+            t.scale(1, -1)
         if pw.current_horizontal_flip:
-            base_transform.scale(-1, 1)
+            t.scale(-1, 1)
         if pw.current_rotation:
-            base_transform.rotate(pw.current_rotation)
-        base_transform.translate(-cx, -cy)
+            t.rotate(pw.current_rotation)
+        t.translate(-cx, -cy)
+        if pw.current_fine_rotation and not pw.crop_mode and not pw.dust_mode:
+            t.translate(cx, cy)
+            t.rotate(pw.current_fine_rotation / 100.0)
+            t.translate(-cx, -cy)
+        return t
 
-        if not base_transform.isInvertible():
+    def _update_bw_rect(self, start, end):
+        """Draw the B/W point selection rect on the canvas. The rect lives in
+        image space (its item carries the display transform), so what is
+        drawn is exactly the region the release handler samples."""
+        display_transform = self._display_transform()
+        if not display_transform.isInvertible():
             return
-        inv = base_transform.inverted()[0]
+        inv = display_transform.inverted()[0]
         s = inv.map(start)
         e = inv.map(end)
         rect = QRectF(min(s.x(), e.x()), min(s.y(), e.y()),
@@ -278,26 +293,16 @@ class GraphicsImageView(QGraphicsView):
         else:
             self._bw_rect_item.setPen(QPen(color, 2, Qt.DashLine))
             self._bw_rect_item.setRect(rect)
-        self._bw_rect_item.setTransform(base_transform)
+        self._bw_rect_item.setTransform(display_transform)
 
     def _sample_wb_point(self, scene_pos):
         """Sample a small neighborhood at the clicked point and auto-set the
         temperature/tint sliders so that point becomes neutral."""
         pw = self.parent_widget
-        cx = pw.current_pixmap.width() / 2
-        cy = pw.current_pixmap.height() / 2
-        base_transform = QTransform()
-        base_transform.translate(cx, cy)
-        if pw.current_vertical_flip:
-            base_transform.scale(1, -1)
-        if pw.current_horizontal_flip:
-            base_transform.scale(-1, 1)
-        if pw.current_rotation:
-            base_transform.rotate(pw.current_rotation)
-        base_transform.translate(-cx, -cy)
-        if not base_transform.isInvertible():
+        display_transform = self._display_transform()
+        if not display_transform.isInvertible():
             return
-        local = base_transform.inverted()[0].map(scene_pos)
+        local = display_transform.inverted()[0].map(scene_pos)
         # Displayed pixmap may be a crop of the full image — map back to
         # full-image coordinates before indexing resized_raw.
         fx, fy = pw.map_displayed_to_full(local.x(), local.y())
@@ -364,17 +369,9 @@ class GraphicsImageView(QGraphicsView):
             drag_end_scene = self.mapToScene(event.pos())
 
             pw = self.parent_widget
-            cx = pw.current_pixmap.width() / 2
-            cy = pw.current_pixmap.height() / 2
-            base_transform = QTransform()
-            base_transform.translate(cx, cy)
-            if pw.current_vertical_flip:
-                base_transform.scale(1, -1)
-            if pw.current_horizontal_flip:
-                base_transform.scale(-1, 1)
-            if pw.current_rotation:
-                base_transform.rotate(pw.current_rotation)
-            base_transform.translate(-cx, -cy)
+            # Full display transform (incl. fine rotation) — the sampled
+            # region must be the pixels under the on-screen marquee.
+            display_transform = self._display_transform()
 
             mode = self.bwpoint_mode
             self.bwpoint_mode = None
@@ -382,8 +379,8 @@ class GraphicsImageView(QGraphicsView):
             self._bw_drag_end = None
             self.setCursor(Qt.ArrowCursor)
 
-            if base_transform.isInvertible():
-                inv = base_transform.inverted()[0]
+            if display_transform.isInvertible():
+                inv = display_transform.inverted()[0]
                 s = inv.map(drag_start_scene)
                 e = inv.map(drag_end_scene)
                 # Map from displayed (possibly cropped/rotated) coords to
