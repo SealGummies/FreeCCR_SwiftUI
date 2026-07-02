@@ -188,6 +188,10 @@ class MainWindow(QMainWindow):
         # Restore the global 3-way RGB merge toggle too (affects the next import).
         ccr_backend.rgb_merge_mode = self._settings.value(
             "import/rgb_merge_mode", False, type=bool)
+        # Merge detail: demosaic (full res, default) vs single photosite (half
+        # res). Captured per image at import. See spec/trichrome-demosaic-mode.md.
+        ccr_backend.rgb_merge_demosaic = self._settings.value(
+            "import/rgb_merge_demosaic", True, type=bool)
         # Restore the two-point B/W Density-inversion default (ON — density keeps
         # real highlight headroom in the working space; linear has ~0.15 stops).
         # New two-point conversions bake this; see spec/density-bwpoint-toggle.md.
@@ -629,6 +633,19 @@ class MainWindow(QMainWindow):
         else:
             msg = "3-way RGB merge off."
         self.sliders_panel.set_temporary_hint(msg, duration=5000)
+
+    def on_rgb_merge_demosaic_changed(self, demosaic: bool):
+        """Set how merge imports extract each frame's channel (demosaic at full
+        resolution vs single photosite at half) and persist it. Captured per
+        image at import — already-loaded merges keep their decode; only the
+        NEXT import is affected. See spec/trichrome-demosaic-mode.md."""
+        ccr_backend.rgb_merge_demosaic = bool(demosaic)
+        self._settings.setValue("import/rgb_merge_demosaic", bool(demosaic))
+        self.sliders_panel.set_temporary_hint(
+            ("Trichrome merge detail: demosaic (full resolution)."
+             if demosaic else
+             "Trichrome merge detail: single photosite (half resolution).")
+            + " Applies to the next import.", duration=5000)
 
     # --- Two-point B/W Density inversion (global, persistent) -------------
     def on_density_bwpoint_toggled(self, checked: bool):

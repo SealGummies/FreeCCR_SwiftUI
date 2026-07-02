@@ -15,9 +15,9 @@ import os
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QDialog, QGroupBox, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QPushButton, QScrollArea, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QGroupBox,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QScrollArea,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from core import color_management
@@ -215,11 +215,26 @@ class SettingsDialog(QDialog):
             "Shoot a static scene three times under pure red, then green, then "
             "blue light. On your NEXT import, every 3 RAWs (sorted by filename) "
             "are merged into one colour image — each frame contributes only its "
-            "own channel, with no demosaicing — then converted as a negative. "
+            "own channel — then converted as a negative. "
             "RAW only (Bayer or monochrome); the selected count must be a "
             "multiple of 3. "
             "Applies to the next import only; merged-image edits are not saved "
             "between sessions."))
+        detail_row = QHBoxLayout()
+        detail_row.setSpacing(theme.GAP_BTN)
+        detail_row.addWidget(QLabel("Merge detail:"))
+        self._combo_merge_detail = QComboBox()
+        self._combo_merge_detail.addItem("Demosaic (full resolution)", True)
+        self._combo_merge_detail.addItem(
+            "Single photosite (half resolution)", False)
+        detail_row.addWidget(self._combo_merge_detail, 1)
+        g3.addLayout(detail_row)
+        g3.addWidget(self._muted(
+            "Demosaic interpolates each frame's own channel from its own "
+            "photosites (bilinear — still no channel mixing) at full sensor "
+            "resolution. Single photosite reads only the raw colour sites — "
+            "no interpolation at all — at half resolution. Applies to the "
+            "next import."))
         lay.addWidget(grp3)
 
         lay.addStretch(1)
@@ -258,6 +273,11 @@ class SettingsDialog(QDialog):
             cb.blockSignals(True)
             cb.setChecked(bool(val))
             cb.blockSignals(False)
+        self._combo_merge_detail.blockSignals(True)
+        self._combo_merge_detail.setCurrentIndex(
+            self._combo_merge_detail.findData(
+                bool(getattr(ccr_backend, "rgb_merge_demosaic", True))))
+        self._combo_merge_detail.blockSignals(False)
 
     def _apply_pending(self):
         """Apply only the toggles whose checkbox differs from the live backend
@@ -268,6 +288,9 @@ class SettingsDialog(QDialog):
             self._mw.on_positive_mode_toggled(bool(self._cb_positive.isChecked()))
         if bool(self._cb_rgb_merge.isChecked()) != bool(ccr_backend.rgb_merge_mode):
             self._mw.on_rgb_merge_mode_toggled(bool(self._cb_rgb_merge.isChecked()))
+        staged_detail = bool(self._combo_merge_detail.currentData())
+        if staged_detail != bool(getattr(ccr_backend, "rgb_merge_demosaic", True)):
+            self._mw.on_rgb_merge_demosaic_changed(staged_detail)
         if bool(self._cb_density.isChecked()) != bool(ccr_backend.density_bwpoint):
             self._mw.on_density_bwpoint_toggled(bool(self._cb_density.isChecked()))
         if bool(self._cb_auto_gain.isChecked()) != bool(ccr_backend.auto_gain):

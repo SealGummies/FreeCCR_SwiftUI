@@ -195,10 +195,19 @@ def extract_cfa_channel(mosaic: np.ndarray, colors: np.ndarray, color_desc,
     return acc / len(phases)            # 1 site for R/B; average of 2 for green
 
 
-def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False):
+def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False,
+                        demosaic: bool = False):
     """Decode one source RAW and return (plane_2d, white_level, is_mono,
     sensor_full) for the single colour this frame contributes (frame_pos
     0=R/1=G/2=B).
+
+    `demosaic` (Bayer only; monochrome has no CFA and ignores it) switches the
+    channel extraction from the raw-mosaic phase slice to a full-resolution
+    LINEAR (bilinear) demosaic that the frame's channel is then taken from.
+    Bilinear interpolates each colour plane only from its OWN photosites, so
+    the "each frame contributes only its own channel, no inter-channel
+    crosstalk" guarantee still holds — now at full sensor resolution. See
+    spec/trichrome-demosaic-mode.md.
 
     * Bayer (RGGB): read the RAW Bayer mosaic directly (`raw.raw_image_visible`)
       and take ONLY this frame's colour photosites — no demosaic, no libraw
@@ -251,8 +260,32 @@ def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False):
             raise ValueError(
                 f"3-way merge requires a 2x2 Bayer mosaic or a monochrome "
                 f"sensor; {os.path.basename(path)} is non-Bayer (e.g. X-Trans).")
-        bayer_channel_indices(color_desc)        # guard: raises if not R/G/B
+        channel_indices = bayer_channel_indices(color_desc)  # raises if not R/G/B
         letter = "RGB"[frame_pos]                 # this frame's colour
+
+        if demosaic:
+            # Full-resolution LINEAR demosaic, then take this frame's channel.
+            # Identical decode kwargs to the monochrome path above: linear,
+            # absolute values (no_auto_scale; combine scales by white_level),
+            # black-subtracted by libraw, camera-native. Bilinear interpolates
+            # each plane from its own sites only — no inter-channel mixing.
+            rgb = raw.postprocess(
+                output_bps=16,
+                no_auto_bright=True,
+                gamma=(1, 1),                                  # linear
+                user_flip=0,
+                demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR,
+                half_size=preview,     # full res unless a fast preview decode
+                use_camera_wb=False,
+                use_auto_wb=False,
+                output_color=rawpy.ColorSpace.raw,
+                no_auto_scale=True,    # absolute sensor values; scale manually
+                adjust_maximum_thr=0.0,
+                four_color_rgb=False,
+            )
+            plane = rgb[..., channel_indices[frame_pos]]
+            return (np.ascontiguousarray(plane), white_level, False,
+                    sensor_full)
 
         # Read the RAW mosaic and pull only this colour's sites (R/B single,
         # green = average of its two sites) with per-site black subtraction;
@@ -270,13 +303,18 @@ def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False):
                 (plane.shape[0], plane.shape[1]))
 
 
-def merge_raw_channels(sources: Sequence[str],
-                       preview: bool = False) -> Tuple[np.ndarray, Tuple[int, int]]:
+def merge_raw_channels(sources: Sequence[str], preview: bool = False,
+                       demosaic: bool = False) -> Tuple[np.ndarray, Tuple[int, int]]:
     """Merge a (red, green, blue) triplet of RAW files into one (H, W, 3) uint16
-    linear-RGB image, taking only each frame's own colour channel with no
-    demosaicing. Bayer → half-sensor resolution (2x2 bin); monochrome → full
-    sensor resolution (no CFA). `preview` lets a monochrome decode run at half
-    size for fast preview/zoom (Bayer ignores it).
+    linear-RGB image, taking only each frame's own colour channel.
+
+    `demosaic=False` (single photosite): Bayer frames are mosaic-phase-sliced —
+    no demosaic at all — at half-sensor resolution (2x2 bin). `demosaic=True`:
+    Bayer frames go through a LINEAR (bilinear, per-channel — still no
+    inter-channel mixing) demosaic at FULL sensor resolution. Monochrome
+    sensors have no CFA and decode identically in both modes (full sensor).
+    `preview` lets a monochrome or demosaic decode run at half size for fast
+    preview/zoom (the photosite read is already cheap and ignores it).
 
     Returns (merged_rgb, full_size=(H, W)) where full_size is the merged image's
     canonical FULL (export) resolution. Raises ValueError on an unsupported
@@ -293,7 +331,8 @@ def merge_raw_channels(sources: Sequence[str],
     monos: List[bool] = []
     sensor_full: Optional[Tuple[int, int]] = None
     for frame_pos, path in enumerate(sources):       # 0=red, 1=green, 2=blue
-        plane, white_level, mono, sfull = _decode_frame_plane(path, frame_pos, preview)
+        plane, white_level, mono, sfull = _decode_frame_plane(
+            path, frame_pos, preview, demosaic=demosaic)
         planes.append(plane)
         white_levels.append(white_level)
         monos.append(mono)
@@ -309,8 +348,10 @@ def merge_raw_channels(sources: Sequence[str],
                          "(all Bayer, or all monochrome).")
 
     merged = combine_channels(planes[0], planes[1], planes[2], white_levels)
-    # Canonical FULL (export) resolution: full sensor for monochrome (the merge
-    # is full-res; a preview decode may have produced a smaller `merged`), the
-    # 2x2-binned size for Bayer (its only resolution).
-    full_size = sensor_full if any_mono else (merged.shape[0], merged.shape[1])
+    # Canonical FULL (export) resolution: full sensor for monochrome and for a
+    # demosaiced Bayer merge (both may decode a half-size preview while their
+    # export resolution is the full sensor); the 2x2-binned size for a
+    # photosite Bayer merge (its only resolution).
+    full_size = (sensor_full if (any_mono or demosaic)
+                 else (merged.shape[0], merged.shape[1]))
     return merged, full_size

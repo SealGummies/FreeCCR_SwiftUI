@@ -46,7 +46,7 @@ def _clean_backend():
 def fake_merge(monkeypatch):
     calls = []
 
-    def _fake(sources, preview=False):
+    def _fake(sources, preview=False, demosaic=False):
         calls.append((tuple(sources), preview))
         return MERGED.copy(), MERGED.shape[:2]
 

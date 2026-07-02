@@ -57,6 +57,7 @@ class CCRImage:
         areas: Optional[List[Dict[str, Any]]] = None,
         is_merged: bool = False,
         merge_sources: Optional[list] = None,
+        merge_demosaic: bool = True,
         ws_windowed: bool = False,
         ):
         # Normalize file path to handle Unicode characters properly
@@ -69,6 +70,14 @@ class CCRImage:
         # excluded from the per-file edit catalog. See spec/three-way-rgb-merge.md.
         self.is_merged = bool(is_merged)
         self.merge_sources = list(merge_sources) if merge_sources else None
+        # How this merge extracts each frame's channel — captured at import
+        # (like merge_sources) so every re-read (zoom, export, linear TIFF,
+        # slice, duplicate) reproduces the same decode at the same canonical
+        # resolution regardless of later Settings changes. True = LINEAR
+        # demosaic at full sensor resolution (default); False = raw-mosaic
+        # single-photosite read at half resolution. Monochrome ignores it.
+        # See spec/trichrome-demosaic-mode.md.
+        self.merge_demosaic = bool(merge_demosaic)
         # Sliced images own a chain of slice operations applied to the source
         # file by read_image in every path (preview load, hi-res zoom,
         # full-res export, B/W sampling). Each op is
@@ -429,13 +438,16 @@ class CCRImage:
         """Decode a 3-way RGB-merged image from its source RAWs. Mirrors the tail
         of read_image's RAW branch (slice ops, full-size capture, optional
         downsize) so export / zoom / slice all compose. The merge's native
-        resolution is sensor-native: half-sensor for Bayer (the 2x2 bin is the
-        no-demosaic step), full-sensor for monochrome (no CFA). `preview` only
-        speeds up a monochrome decode (half size); full_decode_size always
-        reports the canonical full resolution, and max_long_side does the rest."""
+        resolution follows the captured merge_demosaic mode: full-sensor for a
+        demosaiced Bayer merge and for monochrome (no CFA), half-sensor for the
+        single-photosite Bayer read (the 2x2 bin IS its full resolution).
+        `preview` speeds up monochrome/demosaic decodes (half size);
+        full_decode_size always reports the canonical full resolution, and
+        max_long_side does the rest."""
         from core import ccr_merge
-        rgb, full_decode_size = ccr_merge.merge_raw_channels(self.merge_sources,
-                                                             preview=preview)
+        rgb, full_decode_size = ccr_merge.merge_raw_channels(
+            self.merge_sources, preview=preview,
+            demosaic=getattr(self, "merge_demosaic", True))
         # Sliced merged children read only their region of the source.
         rgb = self._apply_source_ops(rgb)
         self.original_full_size = self._ops_full_size(full_decode_size)

@@ -42,6 +42,12 @@ class CCRBackend:
         # triplet into one camera-native image (no demosaicing). Global, like
         # positive_mode; persisted by MainWindow. See spec/three-way-rgb-merge.md.
         self.rgb_merge_mode: bool = False
+        # How merge imports extract each frame's channel: True = LINEAR
+        # demosaic at full sensor resolution (default), False = raw-mosaic
+        # single-photosite read at half resolution. Captured per image at
+        # import (CCRImage.merge_demosaic); toggling affects the NEXT import.
+        # Persisted by MainWindow. See spec/trichrome-demosaic-mode.md.
+        self.rgb_merge_demosaic: bool = True
         # Last merge-import rejection (bad count / non-RAW / non-Bayer / decode
         # failure), set by the loader and surfaced by the UI after load, then
         # cleared. Reset at the top of every load so it never goes stale.
@@ -228,7 +234,8 @@ class CCRBackend:
                 return None
             red = triplet[0]
             try:
-                img = CCRImage(red, is_merged=True, merge_sources=list(triplet))
+                img = CCRImage(red, is_merged=True, merge_sources=list(triplet),
+                               merge_demosaic=self.rgb_merge_demosaic)
             except Exception as e:
                 print(f"3-way merge failed for {os.path.basename(red)}: {e}")
                 self.last_merge_error = (
@@ -1202,8 +1209,9 @@ class CCRBackend:
         slice rotation) interpolates. See spec/trichrome-linear-tiff-export.md."""
         from core import ccr_merge
         from core.ccr_processor import apply_crop_to_image, safe_tifffile_imwrite
-        merged, _full = ccr_merge.merge_raw_channels(image_obj.merge_sources,
-                                                     preview=False)
+        merged, _full = ccr_merge.merge_raw_channels(
+            image_obj.merge_sources, preview=False,
+            demosaic=getattr(image_obj, "merge_demosaic", True))
         if getattr(image_obj, "source_ops", None):
             merged = image_obj._apply_source_ops(merged)
         merged = apply_crop_to_image(merged, getattr(image_obj, "crop_rect", None),
@@ -1465,6 +1473,7 @@ class CCRBackend:
                 # (zoom/export), not decode the red RAW alone.
                 is_merged=getattr(img, "is_merged", False),
                 merge_sources=getattr(img, "merge_sources", None),
+                merge_demosaic=getattr(img, "merge_demosaic", True),
                 # preloaded_img is a copy of the (possibly windowed) base — set
                 # the flag before the ctor's first preview render.
                 ws_windowed=getattr(img, "_ws_windowed", False),
@@ -1658,6 +1667,7 @@ class CCRBackend:
                     # and exported file match the merged preview.
                     is_merged=getattr(img_obj, "is_merged", False),
                     merge_sources=getattr(img_obj, "merge_sources", None),
+                    merge_demosaic=getattr(img_obj, "merge_demosaic", True),
                     # The crop above replays the parent's conversion, so the
                     # child's base is windowed iff the parent's was — set before
                     # the ctor's first preview render so it de-windows.
