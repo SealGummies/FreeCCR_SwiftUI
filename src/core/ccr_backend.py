@@ -83,10 +83,18 @@ class CCRBackend:
         # Removal must not lose their stored edits, so saves merge these
         # back into the records (duplicates, by contrast, are deleted).
         self._catalog_preserved = {}
+        # Load-generation token: every load_images_from_files call and clear()
+        # bumps it, and a loader thread only publishes its batch when its
+        # snapshot is still current (see _commit_load). Protects against a
+        # cancelled load resurrecting its partial batch and against a stale,
+        # abandoned loader thread clobbering a newer load.
+        self._load_generation = 0
 
     def load_images_from_files(self, file_paths: List[str], cancel_flag=None) -> int:
         """Load files (with catalog restore). Returns the number of FILES
         that produced at least one image (a sliced file yields several)."""
+        self._load_generation += 1
+        gen = self._load_generation
         self.images.clear()
         self.file_paths = file_paths
         # A fresh batch is a new roll: drop any B/W point sampled from the
@@ -105,7 +113,7 @@ class CCRBackend:
         # 3-way RGB merge: handle the whole batch on a dedicated path (sort,
         # validate multiple-of-3 + RAW, group into triplets, merge each).
         if self.rgb_merge_mode:
-            return self._load_merged_triplets(file_paths, cancel_flag)
+            return self._load_merged_triplets(file_paths, cancel_flag, gen)
 
         # Read the catalog ONCE for the whole batch — per-file reads would
         # re-parse the entire JSON N times across the loader threads.
@@ -135,6 +143,9 @@ class CCRBackend:
         max_workers = min(8, os.cpu_count() or 1)
         
         loaded_file_count = 0
+        # Collect into a local list (both branches) and publish once at the
+        # end — the backend lists must never hold a half-loaded batch.
+        results = []
         if max_workers == 1:
             # Sequential fallback
             for path in file_paths:
@@ -142,11 +153,9 @@ class CCRBackend:
                     break
                 _path, imgs = load_single_image(path)
                 if imgs:
-                    self.images.extend(imgs)
+                    results.extend(imgs)
                     loaded_file_count += 1
         else:
-            # Parallel loading - collect into local list to avoid concurrent modification
-            results = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_path = {executor.submit(load_single_image, path): path for path in file_paths}
 
@@ -158,16 +167,39 @@ class CCRBackend:
                         results.extend(imgs)
                         loaded_file_count += 1
 
-            # Slices of one file keep their catalog order within the file
-            results.sort(key=lambda img: (os.path.basename(img.file_path),
-                                          getattr(img, "_catalog_order", 0)))
-            self.images = results
-
-        # Keep file_paths derived from actually-loaded images so the two lists stay in sync
-        self.file_paths = [img.file_path for img in self.images]
+        # Slices of one file keep their catalog order within the file
+        results.sort(key=lambda img: (os.path.basename(img.file_path),
+                                      getattr(img, "_catalog_order", 0)))
+        # Publish only when still current: a cancelled load must not resurrect
+        # the batch the Cancel handler just cleared, and a superseded load
+        # (user re-opened while this thread was still decoding) must not
+        # clobber the newer batch.
+        if not self._commit_load(gen, results, cancel_flag):
+            return 0
         return loaded_file_count
 
-    def _load_merged_triplets(self, file_paths: List[str], cancel_flag=None) -> int:
+    def _commit_load(self, gen, results, cancel_flag=None) -> bool:
+        """Atomically publish a finished load. Refuses when the load was
+        cancelled or when the generation snapshot is stale (a newer load or
+        clear() superseded this thread) — a stale loader must never resurrect
+        its batch over the current one. gen=None commits unconditionally
+        unless cancelled. Returns True when the batch was published."""
+        stale = gen is not None and gen != self._load_generation
+        if cancel_flag and cancel_flag():
+            # Cancelled while still current (no newer load owns the state):
+            # leave a consistent empty session, not entry-time file_paths
+            # alongside an empty image list.
+            if not stale:
+                self.images = []
+                self.file_paths = []
+            return False
+        if stale:
+            return False
+        self.images = results
+        self.file_paths = [img.file_path for img in results]
+        return True
+
+    def _load_merged_triplets(self, file_paths: List[str], cancel_flag=None, gen=None) -> int:
         """3-way RGB merge load: sort by filename, validate (multiple of 3, all
         RAW), group into (red, green, blue) triplets, and merge each into one
         CCRImage (in parallel). Returns the number of merged images produced. A
@@ -178,15 +210,18 @@ class CCRBackend:
 
         ordered = ccr_merge.sort_for_merge(file_paths)
         ok, err = ccr_merge.validate_merge_inputs(ordered)
+        current = gen is None or gen == self._load_generation
         if not ok:
             self.last_merge_error = err
-            self.images = []
-            self.file_paths = []
+            if current:  # a stale thread must not wipe a newer batch
+                self.images = []
+                self.file_paths = []
             return 0
 
         triplets = ccr_merge.group_into_triplets(ordered)
         # Progress bar in merged units: total = number of triplets (not 3N files).
-        self.file_paths = [t[0] for t in triplets]
+        if current:
+            self.file_paths = [t[0] for t in triplets]
 
         def load_triplet(order, triplet):
             if cancel_flag and cancel_flag():
@@ -234,8 +269,8 @@ class CCRBackend:
         results.sort(key=lambda im: (os.path.basename(im.file_path),
                                      getattr(im, "_catalog_order", 0)))
         self._dedupe_display_names(results)
-        self.images = results
-        self.file_paths = [im.file_path for im in self.images]
+        if not self._commit_load(gen, results, cancel_flag):
+            return 0
         return len(results)
 
     @staticmethod
@@ -260,6 +295,9 @@ class CCRBackend:
         Clear all images and file paths from the backend.
         This is useful for resetting the state of the backend.
         """
+        # Invalidate any in-flight loader commit (see _commit_load): Cancel
+        # clears the session, and the loader must not resurrect its batch.
+        self._load_generation += 1
         self.images.clear()
         self.file_paths.clear()
 

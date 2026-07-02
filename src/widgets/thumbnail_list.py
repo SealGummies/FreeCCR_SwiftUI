@@ -173,10 +173,13 @@ class ThumbnailList(QWidget):
     def show_loading_dialog(self):
         # Pass a callback to cancel the worker thread
         def cancel_loading():
-            # Access the worker from the main window and call cancel
+            # Access the worker from the main window and call cancel.
+            # _loader_worker can already be None (cleanup ran while the
+            # dialog was still up) — Cancel must not die on None.cancel().
             main_window = self._main_window()
-            if hasattr(main_window, '_loader_worker'):
-                main_window._loader_worker.cancel()
+            worker = getattr(main_window, '_loader_worker', None)
+            if worker is not None:
+                worker.cancel()
         self.loading_dialog = LoadingDialog(self, cancel_callback=cancel_loading)
         self.loading_dialog.show()
         QApplication.processEvents()
