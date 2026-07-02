@@ -26,6 +26,9 @@ def _stub_image(color_profile="color", adjustment_settings=None):
     img.contrast_base = 0
     img.temperature_base = 0
     img.brightness_base = 0
+    img.exposure_base = 0
+    img.converted = False
+    img._ws_windowed = False
     img.tint_balance_factor = 1.0
     return img
 

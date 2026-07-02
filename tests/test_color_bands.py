@@ -236,6 +236,9 @@ class TestPipelineIntegration:
         img_obj.contrast_base = 0
         img_obj.temperature_base = 0
         img_obj.brightness_base = 0
+        img_obj.exposure_base = 0
+        img_obj.converted = False
+        img_obj._ws_windowed = False
         img_obj.tint_balance_factor = 1.0
         out = img_obj.apply_adjustments(_patch(RED))
         assert _hsv_of(out)[..., 1].max() < 0.02
@@ -248,6 +251,9 @@ class TestPipelineIntegration:
         img_obj.contrast_base = 0
         img_obj.temperature_base = 0
         img_obj.brightness_base = 0
+        img_obj.exposure_base = 0
+        img_obj.converted = False
+        img_obj._ws_windowed = False
         img_obj.tint_balance_factor = 1.0
         img = _patch(RED)
         out = img_obj.apply_adjustments(img)
