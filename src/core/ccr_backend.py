@@ -1192,17 +1192,40 @@ class CCRBackend:
             except Exception as e:
                 print(f"Failed to convert image at index {idx}: {e}")
 
+    def _export_merged_linear(self, image_obj, output_path: str) -> None:
+        """Write the raw trichrome combination as an untagged 16-bit linear
+        TIFF: exactly what merge_raw_channels produced at full canonical
+        resolution — NO source_ops/crop/orientation/conversion/adjustments/
+        colour management. See spec/trichrome-linear-tiff-export.md."""
+        from core import ccr_merge
+        from core.ccr_processor import safe_tifffile_imwrite
+        merged, _full = ccr_merge.merge_raw_channels(image_obj.merge_sources,
+                                                     preview=False)
+        out = os.path.splitext(output_path)[0] + ".tiff"
+        if not safe_tifffile_imwrite(out, merged, photometric="rgb",
+                                     compression="deflate"):
+            raise IOError(f"Failed to save image to {out}")
+        print(f"Linear merge saved to {out}")
+
     def export_image_by_index(self, idx: int, output_path: str, jpg_output: bool = False,
                               jpg_quality: int = 95, max_long_side: int = None,
-                              output_colorspace: str = "srgb") -> bool:
+                              output_colorspace: str = "srgb",
+                              linear_merge: bool = False) -> bool:
         """
         Exports the processed image at the given index to the specified output path.
         Routes to bwpoint or reference-frame pipeline depending on how the image was converted.
+        linear_merge=True (trichrome only) bypasses ALL of that and writes the
+        raw channel combination as a linear TIFF.
         Returns True on success.
         """
         if idx is not None and 0 <= idx < len(self.images):
             image_obj = self.images[idx]
             try:
+                if linear_merge:
+                    if not getattr(image_obj, "is_merged", False):
+                        raise ValueError("not a merged trichrome image")
+                    self._export_merged_linear(image_obj, output_path)
+                    return True
                 if self.positive_mode:
                     # Positive mode: export the adjusted positive directly — no
                     # inversion, regardless of any leftover reference_frame.
@@ -1251,7 +1274,8 @@ class CCRBackend:
 
     def export_items(self, items, jpg_output: bool = False, jpg_quality: int = 95,
                      max_long_side: int = None, output_colorspace: str = "srgb",
-                     progress_callback=None, cancel_check=None) -> dict:
+                     progress_callback=None, cancel_check=None,
+                     linear_merge: bool = False) -> dict:
         """
         Exports specific images to explicit output paths using parallel processing.
 
@@ -1285,7 +1309,8 @@ class CCRBackend:
             start_time = time.time()
             success = self.export_image_by_index(idx, output_path, jpg_output=jpg_output,
                                                  jpg_quality=jpg_quality, max_long_side=max_long_side,
-                                                 output_colorspace=output_colorspace)
+                                                 output_colorspace=output_colorspace,
+                                                 linear_merge=linear_merge)
             elapsed = time.time() - start_time
             base_name = os.path.basename(output_path)
             if success:
