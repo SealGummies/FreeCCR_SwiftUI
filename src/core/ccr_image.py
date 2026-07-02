@@ -534,10 +534,19 @@ class CCRImage:
 
                     if is_monochrome:
                         print(f"Detected monochrome sensor for: {os.path.basename(file_path)}")
-                        # For monochrome sensors, use different processing
+                        # Fixed absolute sensor values, like the colour negative
+                        # decode (and ccr_merge's mono path): linear gamma, no
+                        # auto-bright, no_auto_scale — the single manual
+                        # white-level scale below owns the range mapping.
+                        # Without no_auto_scale libraw already stretches to full
+                        # 16-bit and the scale below multiplies AGAIN, clipping
+                        # everything above white_level; auto-bright also varies
+                        # per frame, breaking the "B/W points are absolute
+                        # anchors, constant across the roll" contract.
                         rgb = raw.postprocess(
                             output_bps=16,
-                            no_auto_bright=False,
+                            no_auto_bright=True,
+                            no_auto_scale=True,
                             gamma=(1, 1),
                             user_flip=0,
                             half_size=preview,
@@ -799,10 +808,12 @@ class CCRImage:
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,
                           color_profile=None, areas_override=None,
-                          exposure_base=None) -> np.ndarray:
+                          exposure_base=None, ws_windowed=None) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
-        live state the GUI thread may be mutating concurrently."""
+        live state the GUI thread may be mutating concurrently — and let the
+        export pipeline describe the buffer it just produced (ws_windowed)
+        without mutating this image's live state."""
         # Dust removal runs FIRST so the inpainted positive flows through the
         # rest of the adjustment stage (and so a dust-only image is still
         # cleaned even when the early-return guard below would otherwise skip).
@@ -812,6 +823,7 @@ class CCRImage:
         tb = self.temperature_base if temperature_base is None else temperature_base
         bb = self.brightness_base if brightness_base is None else brightness_base
         eb = self.exposure_base if exposure_base is None else exposure_base
+        ws = self._ws_windowed if ws_windowed is None else ws_windowed
         profile = self.color_profile if color_profile is None else color_profile
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)
@@ -825,14 +837,14 @@ class CCRImage:
         # ccr_backend imports CCRImage at load.
         from core.ccr_backend import ccr_backend
         auto_on = getattr(ccr_backend, "auto_gain", True) and self.converted
-        ag = compute_auto_gain_offset(image, self._ws_windowed) if auto_on else 0.0
+        ag = compute_auto_gain_offset(image, ws) if auto_on else 0.0
         eb_eff = 0.0 if auto_on else eb        # suppress-overlap with the baked eb
         if (not s and cb == 0 and tb == 0 and bb == 0 and eb_eff == 0 and ag == 0
                 and not has_areas):
             # No slider/base/area adjustments. A windowed working-space base still
             # has to be de-windowed + window-clamped to a normal full-range image
             # before display/export (the base itself is not directly renderable).
-            if self._ws_windowed:
+            if ws:
                 image = _apply_working_space_recovery(image, 0.0)
             # Black & White still has to map the image to a single luminance channel.
             return self._to_grayscale(image) if profile == "bw" else image
@@ -877,7 +889,7 @@ class CCRImage:
                                     else None),
                      # Windowed working-space base → de-window + Gain/Exposure
                      # recovery happens inside the adjustment call.
-                     ws_windowed=self._ws_windowed)
+                     ws_windowed=ws)
         # Gamma slider: a center-point tone curve driven through the SAME
         # monotone-cubic path as the Curves editor (a single 'rgb' point moving
         # diagonally from center). Applied before the user's manual curves so the
@@ -992,15 +1004,10 @@ class CCRImage:
             # parent's frame coordinates would be meaningless here).
             out = apply_reference_normalization(img, ci["p_lo"], ci["p_hi"], ci["od"])
         elif ci.get("mode") == "bw":
-            # The bwpoint pipeline bakes the fine rotation into the preview
-            # pixels BEFORE normalization — replicate that here so the
-            # detail layer lines up with the preview content.
-            fine_angle = ci.get("fine_rot", 0) / 100.0
-            if fine_angle != 0:
-                h0, w0 = img.shape[:2]
-                rot = cv2.getRotationMatrix2D((w0 // 2, h0 // 2), -fine_angle, 1.0)
-                img = cv2.warpAffine(img, rot, (w0, h0), flags=cv2.INTER_LINEAR,
-                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            # The bwpoint pipeline keeps the preview un-rotated (display
+            # semantics — the canvas item applies the fine rotation), so the
+            # replay must NOT warp either; ci["fine_rot"] is an informational
+            # snapshot only.
             black_point, white_point = ci["bw"]
             out = apply_bwpoint_normalization(img, black_point, white_point,
                                               density=ci.get("density", False))

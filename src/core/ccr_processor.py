@@ -1299,17 +1299,16 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
     if img is None:
         raise ValueError("CCRImage: could not load image data for B/W point conversion")
 
-    # --- Fine rotation (same as main pipeline) ---
+    # Fine rotation uses DISPLAY semantics, like the reference pipeline: the
+    # per-pixel B/W-point mapping is rotation-independent, so the preview
+    # result stays un-rotated (the canvas item applies the live angle) and an
+    # export warps ONCE at the end, on an expanded canvas. Warping here as
+    # well used to (a) show the rotation twice on screen — the baked warp
+    # plus the display transform — and (b) double-warp exports, with the
+    # first warp cropping the corners on the un-expanded canvas.
     fine_angle = ccr_image.fine_rotation_angle / 100.0
     h_flip = ccr_image.horizontal_mirrored
     v_flip = ccr_image.vertical_mirrored
-    h, w = img.shape[:2]
-    if fine_angle != 0:
-        center_rot = (w // 2, h // 2)
-        rot_mat = cv2.getRotationMatrix2D(center_rot, -fine_angle, 1.0)
-        img = cv2.warpAffine(img, rot_mat, (w, h), flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        del rot_mat
 
     # --- BWPN: B/W point values are absolute anchors, constant across the whole roll ---
     #
@@ -1375,16 +1374,20 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
     # del shadow_corrected, gamma_corrected, rgb_inverted
     gc.collect()
 
-    # Non-destructive base offsets applied through the adjustment pipeline (UI shows 0).
-    # contrast_base set to 0 to disable the baked-in contrast S-curve (was 40).
-    ccr_image.contrast_base = 0
-    ccr_image.temperature_base = 0
-
     # Working space: the B/W-point inversions emit a WINDOWED base when enabled
-    # (highlight headroom preserved). Flag the image so apply_adjustments de-windows
-    # this base. False when the feature is off → legacy full-range, byte-identical.
+    # (highlight headroom preserved). False when the feature is off → legacy
+    # full-range, byte-identical.
     ws = _ws_enabled()
-    ccr_image._ws_windowed = ws
+    if output_path is None:
+        # Preview conversion: the result becomes the live resized_raw, so the
+        # live state is updated to describe it. Non-destructive base offsets
+        # applied through the adjustment pipeline (UI shows 0); contrast_base
+        # 0 disables the baked-in contrast S-curve (was 40). An EXPORT must
+        # not touch any of this — flagging a never-converted image's live
+        # full-range resized_raw as windowed blows its preview to near-white.
+        ccr_image.contrast_base = 0
+        ccr_image.temperature_base = 0
+        ccr_image._ws_windowed = ws
     if ws:
         print(f"[working-space] windowed base: ~{_WS_HEADROOM_STOPS:.1f} stops "
               f"highlight headroom — recover with White Point (drag negative)")
@@ -1399,7 +1402,12 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
 
     # --- User adjustments (export only) ---
     if output_path is not None:
-        rgb_result = ccr_image.apply_adjustments(rgb_result)
+        # Describe the buffer this conversion just produced via overrides
+        # (same values a preview conversion would have baked into live state)
+        # so a never-converted image's live state stays untouched.
+        rgb_result = ccr_image.apply_adjustments(rgb_result, contrast_base=0,
+                                                 temperature_base=0,
+                                                 ws_windowed=ws)
 
     # --- Export path: flips, rotation, file write ---
     if output_path is not None:
