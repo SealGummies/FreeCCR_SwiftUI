@@ -22,7 +22,11 @@ def _new_slice_group() -> str:
 
 class CCRBackend:
     _instance = None
-    software_activated = False  # Flag to indicate if the backend is activated
+    # Suppresses the export/conversion watermark (each call passes
+    # water_mark=not software_activated). The license-activation module that used
+    # to set this True at startup was removed; kept True here so the watermark
+    # stays off. Set False (or wire a real gate) to re-enable watermarking.
+    software_activated = True
 
     def __new__(cls):
         if cls._instance is None:
