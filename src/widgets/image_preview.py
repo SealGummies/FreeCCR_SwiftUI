@@ -3950,6 +3950,7 @@ class ExportItemsWorker(QThread):
                 output_colorspace=self.plan.output_colorspace,
                 progress_callback=progress_callback,
                 cancel_check=lambda: self._stop_requested,
+                linear_merge=getattr(self.plan, "linear_merge", False),
             )
         except Exception as e:
             print(f"Failed to export images: {e}")

@@ -33,6 +33,10 @@ class ExportPlan:
     open_folder: bool = False
     destination: str = ""
     skipped: int = 0  # files dropped by the "skip existing" policy
+    # Trichrome only: write the raw channel combination as an untagged 16-bit
+    # linear TIFF — no conversion/adjustments/geometry/colour management.
+    # See spec/trichrome-linear-tiff-export.md.
+    linear_merge: bool = False
 
 
 class ExportSettingsDialog(QDialog):
@@ -71,6 +75,14 @@ class ExportSettingsDialog(QDialog):
         # are dropped here.
         converted_set = set(self._converted_indices)
         self._selected_converted = [i for i in (selected_indices or []) if i in converted_set]
+        # Trichrome: the linear-merge format exports MERGED images (converted
+        # or not — conversion is irrelevant to the raw channel combination).
+        self._merged_indices = [idx for idx, img in enumerate(ccr_backend.images)
+                                if getattr(img, "is_merged", False)]
+        merged_set = set(self._merged_indices)
+        self._current_merged = (
+            current_idx is not None and current_idx in merged_set)
+        self._selected_merged = [i for i in (selected_indices or []) if i in merged_set]
         self._bpp_cache = {}  # quality -> bytes per pixel sample
 
         self._settings = QSettings("FreeCCR", "FreeCCR")
@@ -144,6 +156,10 @@ class ExportSettingsDialog(QDialog):
         self.format_combo = QComboBox()
         self.format_combo.addItem("TIFF 16-bit (lossless)", "tiff")
         self.format_combo.addItem("JPEG", "jpeg")
+        if self._merged_indices:
+            # Trichrome only: raw channel combination, nothing else applied.
+            self.format_combo.addItem("TIFF 16-bit linear merge (unprocessed)",
+                                      "linear")
         self.format_combo.currentIndexChanged.connect(self._on_format_changed)
         form.addRow("Format:", self.format_combo)
 
@@ -154,7 +170,8 @@ class ExportSettingsDialog(QDialog):
         self.colorspace_combo.addItem("sRGB", "srgb")
         self.colorspace_combo.addItem("ProPhoto RGB (wide gamut)", "prophoto")
         self.colorspace_combo.currentIndexChanged.connect(self._on_colorspace_changed)
-        form.addRow("Color space:", self.colorspace_combo)
+        self.colorspace_row_label = QLabel("Color space:")
+        form.addRow(self.colorspace_row_label, self.colorspace_combo)
         self.colorspace_hint = QLabel(
             "8-bit ProPhoto JPEG can band — prefer 16-bit TIFF for wide gamut.")
         self.colorspace_hint.setStyleSheet(f"color: {theme.TEXT_MUTED};")
@@ -252,7 +269,12 @@ class ExportSettingsDialog(QDialog):
         self.quality_slider.setValue(s.value("export/jpeg_quality", 92, type=int))
         resize_index = self.resize_combo.findData(s.value("export/resize", 0, type=int))
         if resize_index >= 0:
-            self.resize_combo.setCurrentIndex(resize_index)
+            if self._is_linear():
+                # Format restored to linear merge: the combo is locked at
+                # "Original size" — park the preference for a format switch.
+                self._resize_index_before_linear = resize_index
+            else:
+                self.resize_combo.setCurrentIndex(resize_index)
         conflict_index = self.conflict_combo.findData(s.value("export/conflict", "rename", type=str))
         if conflict_index >= 0:
             self.conflict_combo.setCurrentIndex(conflict_index)
@@ -271,20 +293,60 @@ class ExportSettingsDialog(QDialog):
         s.setValue("export/scope", scope)
         s.setValue("export/filename_template", self.filename_edit.text())
         s.setValue("export/format", self.format_combo.currentData())
-        s.setValue("export/colorspace", self.colorspace_combo.currentData())
+        # Linear merge hides the colour space and forces Original size — don't
+        # let those forced values clobber the user's normal-format preferences.
+        if not self._is_linear():
+            s.setValue("export/colorspace", self.colorspace_combo.currentData())
+            s.setValue("export/resize", self.resize_combo.currentData())
         s.setValue("export/jpeg_quality", self.quality_slider.value())
-        s.setValue("export/resize", self.resize_combo.currentData())
         s.setValue("export/conflict", self.conflict_combo.currentData())
         s.setValue("export/open_folder", self.open_folder_checkbox.isChecked())
 
     # ---------- helpers ----------
 
+    def _is_linear(self) -> bool:
+        return self.format_combo.currentData() == "linear"
+
+    def _exportable_all(self) -> List[int]:
+        return self._merged_indices if self._is_linear() else self._converted_indices
+
+    def _current_exportable(self) -> bool:
+        return self._current_merged if self._is_linear() else self._current_converted
+
+    def _selected_exportable(self) -> List[int]:
+        return self._selected_merged if self._is_linear() else self._selected_converted
+
     def _scope_indices(self) -> List[int]:
-        if self.scope_current_radio.isChecked() and self._current_converted:
+        if self.scope_current_radio.isChecked() and self._current_exportable():
             return [self._current_idx]
-        if self.scope_selected_radio.isChecked() and self._selected_converted:
-            return list(self._selected_converted)
-        return list(self._converted_indices)
+        if self.scope_selected_radio.isChecked() and self._selected_exportable():
+            return list(self._selected_exportable())
+        return list(self._exportable_all())
+
+    def _update_scope_radios(self):
+        """Re-label and re-enable the scope radios for the active format —
+        the linear-merge format exports merged images regardless of
+        conversion, the others export converted (or positive-mode) images."""
+        if self._is_linear():
+            all_label = "All merged images"
+            current_tip = "The current image is not a merged trichrome image."
+            selected_tip = "No merged images are selected."
+        else:
+            all_label = "All images" if self._positive_mode else "All converted images"
+            current_tip = "The current image has not been converted yet."
+            selected_tip = "No converted images are selected."
+        self.scope_all_radio.setText(f"{all_label} ({len(self._exportable_all())})")
+        current_ok = self._current_exportable()
+        self.scope_current_radio.setEnabled(current_ok)
+        self.scope_current_radio.setToolTip("" if current_ok else current_tip)
+        selected = self._selected_exportable()
+        self.scope_selected_radio.setText(f"Selected images ({len(selected)})")
+        self.scope_selected_radio.setEnabled(bool(selected))
+        self.scope_selected_radio.setToolTip("" if selected else selected_tip)
+        # A checked radio that just became empty falls back to All.
+        if ((self.scope_current_radio.isChecked() and not current_ok)
+                or (self.scope_selected_radio.isChecked() and not selected)):
+            self.scope_all_radio.setChecked(True)
 
     def _base_names(self, indices) -> List[str]:
         names = []
@@ -329,14 +391,44 @@ class ExportSettingsDialog(QDialog):
     def _on_format_changed(self):
         self._update_quality_visibility()
         self._update_colorspace_hint()
+        self._update_scope_radios()
+        self._update_linear_mode()
         self._update_example()
         self._schedule_estimate()
+
+    def _update_linear_mode(self):
+        """Linear merge is the raw combination at full resolution: hide the
+        colour-space choice (untagged camera-native data) and force the
+        resize to Original size WITHOUT clobbering the user's stored resize
+        preference for the normal formats."""
+        linear = self._is_linear()
+        self.colorspace_row_label.setVisible(not linear)
+        self.colorspace_combo.setVisible(not linear)
+        if linear:
+            if self.resize_combo.isEnabled():
+                self._resize_index_before_linear = self.resize_combo.currentIndex()
+            self.resize_combo.setCurrentIndex(0)  # "Original size"
+            self.resize_combo.setEnabled(False)
+        elif not self.resize_combo.isEnabled():
+            self.resize_combo.setEnabled(True)
+            restore = getattr(self, "_resize_index_before_linear", None)
+            if restore is not None:
+                self.resize_combo.setCurrentIndex(restore)
 
     def _on_colorspace_changed(self):
         self._update_colorspace_hint()
 
     def _update_colorspace_hint(self):
+        if self._is_linear():
+            self.colorspace_hint.setText(
+                "Raw trichrome combination: camera-native linear RGB, no "
+                "profile embedded, no conversion or adjustments. Crop and "
+                "slice framing apply; rotation and flips do not.")
+            self.colorspace_hint.setVisible(True)
+            return
         # The banding caution is only relevant for 8-bit ProPhoto JPEG.
+        self.colorspace_hint.setText(
+            "8-bit ProPhoto JPEG can band — prefer 16-bit TIFF for wide gamut.")
         is_prophoto = self.colorspace_combo.currentData() == "prophoto"
         is_jpeg = self.format_combo.currentData() == "jpeg"
         self.colorspace_hint.setVisible(is_prophoto and is_jpeg)
@@ -375,6 +467,8 @@ class ExportSettingsDialog(QDialog):
             self.estimate_label.setText("Estimated total size: —")
             return
         fmt = self.format_combo.currentData()
+        if fmt == "linear":
+            fmt = "tiff"  # same container; the estimator knows tiff/jpeg only
         max_long_side = self._selected_max_long_side()
         bpp = None
         if fmt == "jpeg":
@@ -421,8 +515,9 @@ class ExportSettingsDialog(QDialog):
 
         indices = self._scope_indices()
         if not indices:
+            what = "merged" if self._is_linear() else "converted"
             QMessageBox.information(self, "Nothing to Export",
-                                    "There are no converted images to export.")
+                                    f"There are no {what} images to export.")
             return
 
         names = build_export_names(self._base_names(indices), self.filename_edit.text(),
@@ -445,11 +540,12 @@ class ExportSettingsDialog(QDialog):
             items=items,
             jpg_output=self.format_combo.currentData() == "jpeg",
             jpg_quality=self.quality_slider.value(),
-            max_long_side=self._selected_max_long_side(),
+            max_long_side=None if self._is_linear() else self._selected_max_long_side(),
             output_colorspace=self.colorspace_combo.currentData(),
             open_folder=self.open_folder_checkbox.isChecked(),
             destination=destination,
             skipped=skipped,
+            linear_merge=self._is_linear(),
         )
         self._save_settings()
         self.accept()

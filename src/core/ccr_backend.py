@@ -42,6 +42,12 @@ class CCRBackend:
         # triplet into one camera-native image (no demosaicing). Global, like
         # positive_mode; persisted by MainWindow. See spec/three-way-rgb-merge.md.
         self.rgb_merge_mode: bool = False
+        # How merge imports extract each frame's channel: True = LINEAR
+        # demosaic at full sensor resolution (default), False = raw-mosaic
+        # single-photosite read at half resolution. Captured per image at
+        # import (CCRImage.merge_demosaic); toggling affects the NEXT import.
+        # Persisted by MainWindow. See spec/trichrome-demosaic-mode.md.
+        self.rgb_merge_demosaic: bool = True
         # Last merge-import rejection (bad count / non-RAW / non-Bayer / decode
         # failure), set by the loader and surfaced by the UI after load, then
         # cleared. Reset at the top of every load so it never goes stale.
@@ -228,7 +234,8 @@ class CCRBackend:
                 return None
             red = triplet[0]
             try:
-                img = CCRImage(red, is_merged=True, merge_sources=list(triplet))
+                img = CCRImage(red, is_merged=True, merge_sources=list(triplet),
+                               merge_demosaic=self.rgb_merge_demosaic)
             except Exception as e:
                 print(f"3-way merge failed for {os.path.basename(red)}: {e}")
                 self.last_merge_error = (
@@ -1192,17 +1199,48 @@ class CCRBackend:
             except Exception as e:
                 print(f"Failed to convert image at index {idx}: {e}")
 
+    def _export_merged_linear(self, image_obj, output_path: str) -> None:
+        """Write the raw trichrome combination as an untagged 16-bit linear
+        TIFF: what merge_raw_channels produced at full canonical resolution,
+        plus FRAMING only — the slice chain and the user crop (which is
+        defined in the sliced frame's space, so source_ops must accompany
+        it). NO orientation/conversion/adjustments/colour management; an
+        axis-aligned crop is a bit-exact sub-array, an angled crop (or a
+        slice rotation) interpolates. See spec/trichrome-linear-tiff-export.md."""
+        from core import ccr_merge
+        from core.ccr_processor import apply_crop_to_image, safe_tifffile_imwrite
+        merged, _full = ccr_merge.merge_raw_channels(
+            image_obj.merge_sources, preview=False,
+            demosaic=getattr(image_obj, "merge_demosaic", True))
+        if getattr(image_obj, "source_ops", None):
+            merged = image_obj._apply_source_ops(merged)
+        merged = apply_crop_to_image(merged, getattr(image_obj, "crop_rect", None),
+                                     getattr(image_obj, "crop_angle", 0.0) or 0.0)
+        out = os.path.splitext(output_path)[0] + ".tiff"
+        if not safe_tifffile_imwrite(out, merged, photometric="rgb",
+                                     compression="deflate"):
+            raise IOError(f"Failed to save image to {out}")
+        print(f"Linear merge saved to {out}")
+
     def export_image_by_index(self, idx: int, output_path: str, jpg_output: bool = False,
                               jpg_quality: int = 95, max_long_side: int = None,
-                              output_colorspace: str = "srgb") -> bool:
+                              output_colorspace: str = "srgb",
+                              linear_merge: bool = False) -> bool:
         """
         Exports the processed image at the given index to the specified output path.
         Routes to bwpoint or reference-frame pipeline depending on how the image was converted.
+        linear_merge=True (trichrome only) bypasses ALL of that and writes the
+        raw channel combination as a linear TIFF.
         Returns True on success.
         """
         if idx is not None and 0 <= idx < len(self.images):
             image_obj = self.images[idx]
             try:
+                if linear_merge:
+                    if not getattr(image_obj, "is_merged", False):
+                        raise ValueError("not a merged trichrome image")
+                    self._export_merged_linear(image_obj, output_path)
+                    return True
                 if self.positive_mode:
                     # Positive mode: export the adjusted positive directly — no
                     # inversion, regardless of any leftover reference_frame.
@@ -1251,7 +1289,8 @@ class CCRBackend:
 
     def export_items(self, items, jpg_output: bool = False, jpg_quality: int = 95,
                      max_long_side: int = None, output_colorspace: str = "srgb",
-                     progress_callback=None, cancel_check=None) -> dict:
+                     progress_callback=None, cancel_check=None,
+                     linear_merge: bool = False) -> dict:
         """
         Exports specific images to explicit output paths using parallel processing.
 
@@ -1285,7 +1324,8 @@ class CCRBackend:
             start_time = time.time()
             success = self.export_image_by_index(idx, output_path, jpg_output=jpg_output,
                                                  jpg_quality=jpg_quality, max_long_side=max_long_side,
-                                                 output_colorspace=output_colorspace)
+                                                 output_colorspace=output_colorspace,
+                                                 linear_merge=linear_merge)
             elapsed = time.time() - start_time
             base_name = os.path.basename(output_path)
             if success:
@@ -1433,6 +1473,7 @@ class CCRBackend:
                 # (zoom/export), not decode the red RAW alone.
                 is_merged=getattr(img, "is_merged", False),
                 merge_sources=getattr(img, "merge_sources", None),
+                merge_demosaic=getattr(img, "merge_demosaic", True),
                 # preloaded_img is a copy of the (possibly windowed) base — set
                 # the flag before the ctor's first preview render.
                 ws_windowed=getattr(img, "_ws_windowed", False),
@@ -1626,6 +1667,7 @@ class CCRBackend:
                     # and exported file match the merged preview.
                     is_merged=getattr(img_obj, "is_merged", False),
                     merge_sources=getattr(img_obj, "merge_sources", None),
+                    merge_demosaic=getattr(img_obj, "merge_demosaic", True),
                     # The crop above replays the parent's conversion, so the
                     # child's base is windowed iff the parent's was — set before
                     # the ctor's first preview render so it de-windows.
