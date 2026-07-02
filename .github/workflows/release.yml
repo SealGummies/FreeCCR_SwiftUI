@@ -56,6 +56,11 @@ jobs:
           body: |
             ## What's New
 
+            **v1.0.0**
+            - **Gamma midtone slider:** a dedicated Gamma slider below Brightness that lifts or lowers midtones through the same tone-curve engine as the Curves editor.
+            - **Hue-preserving Gamma mode:** an optional **Settings → General** toggle that applies Gamma to luminance and scales the colour channels together, so midtone adjustments don't shift hue or saturation. Off by default — the standard per-channel look stays the default.
+            - Bug fixes and stability improvements.
+
             **v0.9.1**
             - **Camera profile defaults to None:** new installs now decode RAWs in bare camera-native space (no colour matrix) by default, instead of Camera Matrix (Adobe RGB). Pick Camera Matrix or an ICC/DCP profile from the “Camera profile” dropdown for a matrixed/profiled look; existing selections are unchanged.
 
@@ -168,6 +173,11 @@ jobs:
           # The body is static, so refresh "## What's New" for each release.
           body: |
             ## What's New
+
+            **v1.0.0**
+            - **Gamma midtone slider:** a dedicated Gamma slider below Brightness that lifts or lowers midtones through the same tone-curve engine as the Curves editor.
+            - **Hue-preserving Gamma mode:** an optional **Settings → General** toggle that applies Gamma to luminance and scales the colour channels together, so midtone adjustments don't shift hue or saturation. Off by default — the standard per-channel look stays the default.
+            - Bug fixes and stability improvements.
 
             **v0.9.1**
             - **Camera profile defaults to None:** new installs now decode RAWs in bare camera-native space (no colour matrix) by default, instead of Camera Matrix (Adobe RGB). Pick Camera Matrix or an ICC/DCP profile from the “Camera profile” dropdown for a matrixed/profiled look; existing selections are unchanged.
