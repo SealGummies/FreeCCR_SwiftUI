@@ -1744,6 +1744,19 @@ class ImagePreview(QWidget):
         self._refresh_item_pixmap()
         self.apply_transformations()
 
+    def shutdown_workers(self):
+        """Quiesce in-flight hi-res render threads (app close). A running
+        parentless QThread whose Python wrapper is destroyed at interpreter
+        teardown hard-aborts the process ("QThread: Destroyed while thread is
+        still running"), so closeEvent must wait them out. The interruption
+        checkpoints in HiResDetailWorker.run keep the wait short — the
+        un-interruptible part is at most one RAW decode."""
+        for w in list(self._hires_workers):
+            w.requestInterruption()
+        for w in list(self._hires_workers):
+            w.wait()
+        self._hires_workers.clear()
+
     def _invalidate_hires_display(self):
         """Same-image refresh (adjustments/crop/conversion changed): drop the
         stale hi-res display layer, keep the decoded base where possible, and
@@ -3796,7 +3809,7 @@ class HiResDetailWorker(QThread):
                 base = self._img.render_hires_base(
                     max_long_side=self._cap,
                     conversion_inputs=self._conversion_inputs)
-            if base is None:
+            if base is None or self.isInterruptionRequested():
                 return
             t1 = _time.perf_counter()
             display = self._img.apply_adjustments(
@@ -3817,6 +3830,8 @@ class HiResDetailWorker(QThread):
             print(f"Hi-res detail: base {(t1 - t0) * 1000:.0f} ms, "
                   f"adjust+8bit {(t2 - t1) * 1000:.0f} ms "
                   f"({display8.shape[1]}x{display8.shape[0]})")
+            if self.isInterruptionRequested():
+                return  # app is closing — receiver is being torn down
             self.finished_hires.emit(self.req_img, self.req_sig,
                                      self.req_adj_sig, base, display8)
         except Exception as e:

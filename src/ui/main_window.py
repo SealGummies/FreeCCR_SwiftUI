@@ -296,6 +296,19 @@ class MainWindow(QMainWindow):
             # running QThread can't abort the process at teardown.
             if hasattr(self, "dust_panel"):
                 self.dust_panel.shutdown()
+            # Same for in-flight hi-res zoom renders (parentless QThreads
+            # tracked by the preview): destroyed-while-running aborts the exit.
+            if hasattr(self, "image_preview"):
+                self.image_preview.shutdown_workers()
+            # And for loader threads — active or previously abandoned. Their
+            # RAW decodes are not interruptible, so wait them out; the
+            # load-generation guard keeps their results from landing.
+            self._stop_loader_if_running()
+            for t in list(getattr(self, '_abandoned_loaders', [])):
+                try:
+                    t.wait()
+                except RuntimeError:
+                    pass
             # Persist the edit catalog so reopening these files restores
             # their conversion/slices/crop/adjustments.
             ccr_backend.save_catalog()
@@ -760,18 +773,49 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "3-way RGB merge", err)
 
     def _stop_loader_if_running(self):
-        """Cancel and join any in-progress loader thread."""
-        if getattr(self, '_loader_thread', None) is not None:
-            try:
-                if self._loader_thread.isRunning():
-                    if self._loader_worker is not None:
-                        self._loader_worker.cancel()
-                    self._loader_thread.quit()
-                    self._loader_thread.wait(3000)
-            except RuntimeError:
-                pass
-            self._loader_thread = None
-            self._loader_worker = None
+        """Cancel and join any in-progress loader thread. A loader that
+        outlives the wait (in-flight RAW decodes are not interruptible) is
+        parked instead of dropped: its UI effects are disconnected here, its
+        backend commit is refused by the load-generation guard, and the
+        Python refs are kept until it really finishes — a running QThread
+        whose wrapper is garbage-collected hard-aborts the process."""
+        thread = getattr(self, '_loader_thread', None)
+        worker = getattr(self, '_loader_worker', None)
+        self._loader_thread = None
+        self._loader_worker = None
+        if thread is None:
+            return
+        try:
+            if thread.isRunning():
+                if worker is not None:
+                    worker.cancel()
+                thread.quit()
+                if not thread.wait(3000):
+                    # Detach the stale thread's UI effects; keep its
+                    # quit/deleteLater wiring so it still winds down.
+                    if worker is not None:
+                        try:
+                            worker.finished.disconnect(self.thumbnail_list.load_thumbnails)
+                        except (RuntimeError, TypeError):
+                            pass
+                    try:
+                        thread.finished.disconnect(self._cleanup_loader)
+                    except (RuntimeError, TypeError):
+                        pass
+                    if not hasattr(self, '_abandoned_loaders'):
+                        self._abandoned_loaders = []
+                    self._abandoned_loaders.append(thread)
+                    thread.finished.connect(
+                        lambda t=thread: self._reap_abandoned_loader(t))
+        except RuntimeError:
+            pass
+
+    def _reap_abandoned_loader(self, thread):
+        """Drop the parked reference once an abandoned loader has finished."""
+        try:
+            self._abandoned_loaders.remove(thread)
+        except (AttributeError, ValueError):
+            pass
 
     def open_files(self):
         # Loading a new batch replaces the current one — persist its edits first

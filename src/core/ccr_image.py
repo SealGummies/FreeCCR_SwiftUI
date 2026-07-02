@@ -7,6 +7,7 @@ import exifread
 import cv2
 import logging
 import time
+from PySide6.QtCore import QCoreApplication, QThread
 from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage, QPixmap if you use PySide
 #import lensfunpy  # Make sure lensfunpy is installed
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
@@ -741,16 +742,24 @@ class CCRImage:
                        if (self.converted or self._positive_mode_active())
                        else self._auto_brightness_for_preview(adjusted_img))
 
-        # Create thumbnail
-        thumb_img = self.resize_image_to_max_pixel(display_img, thumbnail_size)
-        thumb_img_8 = to_8bit(thumb_img)
-        qimage = self.generate_qimage_from_np_array_8(thumb_img_8)
-        self.thumbnail = QPixmap.fromImage(qimage)
-
-        # Create preview
+        # Create thumbnail + preview pixels (8-bit RGB numpy — safe on any thread)
+        thumb_img_8 = to_8bit(self.resize_image_to_max_pixel(display_img, thumbnail_size))
         preview_img = self.resize_image_to_max_pixel(display_img, preview_size)
-        qimage = self.generate_qimage_from_np_array_8(to_8bit(preview_img))
-        self.resized_preview = QPixmap.fromImage(qimage)
+        preview_img_8bit = to_8bit(preview_img)
+
+        # QPixmap may only be created on the GUI thread, but the batch paths
+        # (initial load, auto-frame-all, B/W convert-all) run this method on
+        # pool/QThread workers. Off the GUI thread, stash the pixels and let
+        # the first GUI-thread read of .thumbnail/.resized_preview build the
+        # pixmaps (see the property getters).
+        if self._on_gui_thread():
+            self.thumbnail = QPixmap.fromImage(
+                self.generate_qimage_from_np_array_8(thumb_img_8))
+            self.resized_preview = QPixmap.fromImage(
+                self.generate_qimage_from_np_array_8(preview_img_8bit))
+        else:
+            self._thumb_np8 = thumb_img_8
+            self._preview_np8 = preview_img_8bit
         # Compute the per-channel histogram over the 8-bit preview (RGB). When a
         # crop is set, it's computed over only the kept (cropped) region so it
         # matches what the canvas shows. Same normalized-rect + angle contract as
@@ -761,7 +770,6 @@ class CCRImage:
         # presentation — the percentile-clipped vertical scale, smoothing,
         # filled curves and clip markers — lives in HistogramWidget, which paints
         # at the widget's real resolution. See widgets/histogram_widget.py.
-        preview_img_8bit = to_8bit(preview_img)
         hist_source = apply_crop_to_image(
             preview_img_8bit, self.crop_rect, getattr(self, "crop_angle", 0.0) or 0.0)
         counts = np.empty((3, 256), dtype=np.float32)
@@ -776,6 +784,44 @@ class CCRImage:
             thumb_img_8.data, w, h, bytes_per_line, QImage.Format_RGB888
         )
         return qimage
+
+    @staticmethod
+    def _on_gui_thread() -> bool:
+        """True on the Qt GUI thread — or with no app at all, where eager
+        QPixmap creation matches the historical (pre-deferral) behaviour."""
+        app = QCoreApplication.instance()
+        return app is None or QThread.currentThread() is app.thread()
+
+    # QPixmap is GUI-thread-only. When update_thumbnail_and_preview runs on a
+    # worker (batch load / auto-frame-all / B/W convert-all pools), it stashes
+    # the rendered 8-bit pixels in _thumb_np8/_preview_np8 instead of building
+    # pixmaps; the first GUI-thread read below materializes them. A read from
+    # a worker thread returns the previous pixmap untouched.
+    @property
+    def thumbnail(self):
+        if self._thumb_np8 is not None and self._on_gui_thread():
+            self._thumbnail_pix = QPixmap.fromImage(
+                self.generate_qimage_from_np_array_8(self._thumb_np8))
+            self._thumb_np8 = None
+        return self._thumbnail_pix
+
+    @thumbnail.setter
+    def thumbnail(self, value):
+        self._thumbnail_pix = value
+        self._thumb_np8 = None
+
+    @property
+    def resized_preview(self):
+        if self._preview_np8 is not None and self._on_gui_thread():
+            self._preview_pix = QPixmap.fromImage(
+                self.generate_qimage_from_np_array_8(self._preview_np8))
+            self._preview_np8 = None
+        return self._preview_pix
+
+    @resized_preview.setter
+    def resized_preview(self, value):
+        self._preview_pix = value
+        self._preview_np8 = None
 
     @staticmethod
     def _to_grayscale(image: np.ndarray) -> np.ndarray:
