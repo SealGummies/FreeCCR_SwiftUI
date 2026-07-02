@@ -657,23 +657,32 @@ class MainWindow(QMainWindow):
         no re-conversion and no catalog write. See spec/auto-gain.md."""
         ccr_backend.auto_gain = bool(checked)
         self._settings.setValue("adjust/auto_gain", bool(checked))
+        self._rerender_all_for_global_mode(
+            "Auto gain on — highlights auto-placed at the top of the window."
+            if checked else
+            "Auto gain off — the Gain slider alone controls exposure.")
+
+    def _rerender_all_for_global_mode(self, hint: str):
+        """Re-render every loaded image after a global DISPLAY-mode change (Auto
+        gain, Gamma mode) that is read live inside apply_adjustments but is NOT
+        baked per image. The cached resized_preview/thumbnail must be REGENERATED
+        before re-display — update_all_thumbnails/update_preview only re-show the
+        cache (see sliders_panel._on_curve_edit_finished), so without the
+        regenerate pass the change wouldn't appear until the user nudged a slider.
+        No re-conversion, no catalog write."""
         if ccr_backend.images:
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
-                # The auto-gain offset recomputes live in apply_adjustments, so a
-                # plain re-render reflects the new state. Drop the zoom hi-res
-                # cache (its render baked the old offset).
+                for img in ccr_backend.images:
+                    img.update_thumbnail_and_preview()
+                # The zoom hi-res cache baked the old mode — drop it.
                 self.image_preview._release_hires(refresh=False)
                 self.thumbnail_list.update_all_thumbnails()
                 if self.image_preview.current_idx is not None:
                     self.image_preview.update_preview(self.image_preview.current_idx)
             finally:
                 QApplication.restoreOverrideCursor()
-        self.sliders_panel.set_temporary_hint(
-            "Auto gain on — highlights auto-placed at the top of the window."
-            if checked else
-            "Auto gain off — the Gain slider alone controls exposure.",
-            duration=5000)
+        self.sliders_panel.set_temporary_hint(hint, duration=5000)
 
     # --- Gamma application mode (global, persistent) ----------------------
     def on_gamma_mode_toggled(self, checked: bool):
@@ -683,22 +692,9 @@ class MainWindow(QMainWindow):
         Mirrors on_auto_gain_toggled. See spec/gamma-luminance-mode.md."""
         ccr_backend.gamma_luminance = bool(checked)
         self._settings.setValue("adjust/gamma_luminance", bool(checked))
-        if ccr_backend.images:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            try:
-                # The mode is read live in apply_adjustments, so a plain re-render
-                # reflects it. Drop the zoom hi-res cache (it baked the old mode).
-                self.image_preview._release_hires(refresh=False)
-                self.thumbnail_list.update_all_thumbnails()
-                if self.image_preview.current_idx is not None:
-                    self.image_preview.update_preview(self.image_preview.current_idx)
-            finally:
-                QApplication.restoreOverrideCursor()
-        self.sliders_panel.set_temporary_hint(
-            "Gamma: hue-preserving (luminance) mode."
-            if checked else
-            "Gamma: per-channel mode (standard).",
-            duration=5000)
+        self._rerender_all_for_global_mode(
+            "Gamma: hue-preserving (luminance) mode." if checked else
+            "Gamma: per-channel mode (standard).")
 
     def show_activation_dialog(self):
         QMessageBox.information(

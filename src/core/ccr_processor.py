@@ -3064,6 +3064,20 @@ def build_channel_lut(points) -> np.ndarray:
     return np.clip(y, 0.0, 255.0).astype(np.float32)
 
 
+# Shared LUT expansion: turn a 256-entry (0..255) curve into a full
+# 65536 -> uint16 LUT. Used by both apply_curves (per-channel) and the Gamma
+# luminance LUT, so the two stay bit-for-bit identical. The sample/source ramps
+# are pure constants — built once at import, not per call.
+_LUT16_SAMPLE = np.arange(65536, dtype=np.float32)
+_LUT16_SRC_IDX = np.arange(256, dtype=np.float32) * (65535.0 / 255.0)
+
+
+def _expand_curve256_to_lut16(curve256: np.ndarray) -> np.ndarray:
+    """Expand a 256-entry (output 0..255) curve to a 16-bit input->output LUT."""
+    return np.interp(_LUT16_SAMPLE, _LUT16_SRC_IDX,
+                     curve256 * (65535.0 / 255.0)).astype(np.uint16)
+
+
 def apply_curves(img16: np.ndarray, curves) -> np.ndarray:
     """Apply Photoshop-style tone curves to a 16-bit RGB image.
 
@@ -3076,17 +3090,14 @@ def apply_curves(img16: np.ndarray, curves) -> np.ndarray:
         return img16
 
     rgb_lut = build_channel_lut(curves.get("rgb"))     # 256 -> 0..255 float
-    sample = np.arange(65536, dtype=np.float32)
-    src_idx = np.arange(256, dtype=np.float32) * (65535.0 / 255.0)
+    rgb_idx = np.clip(np.rint(rgb_lut), 0, 255).astype(np.intp)
 
     out = np.empty_like(img16)
     for c, key in enumerate(("r", "g", "b")):
-        # Compose per-channel curve over the composite curve in 0..255 space.
+        # Compose the per-channel curve over the composite curve in 0..255 space,
+        # then expand to a full 16-bit LUT (shared with the Gamma luminance path).
         ch_lut = build_channel_lut(curves.get(key))
-        composed = ch_lut[np.clip(np.rint(rgb_lut), 0, 255).astype(np.intp)]
-        # Expand the 256-point composed curve to a full 16-bit LUT.
-        lut16 = np.interp(sample, src_idx,
-                          composed * (65535.0 / 255.0)).astype(np.uint16)
+        lut16 = _expand_curve256_to_lut16(ch_lut[rgb_idx])
         out[..., c] = lut16[img16[..., c]]
     return out
 
@@ -3116,10 +3127,7 @@ def _gamma_lut16(gamma: float) -> np.ndarray:
     np.rint) — so a neutral pixel renders bit-for-bit identically in both the
     per-channel and luminance paths."""
     curve256 = np.rint(build_channel_lut(gamma_curve_points(gamma)))   # 256 levels
-    sample = np.arange(65536, dtype=np.float32)
-    src_idx = np.arange(256, dtype=np.float32) * (65535.0 / 255.0)
-    return np.interp(sample, src_idx,
-                     curve256 * (65535.0 / 255.0)).astype(np.uint16)
+    return _expand_curve256_to_lut16(curve256)
 
 
 # Rec.601 luma weights (R, G, B) — the same weights the saturation / shadow
