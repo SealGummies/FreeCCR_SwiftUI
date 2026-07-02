@@ -1194,13 +1194,20 @@ class CCRBackend:
 
     def _export_merged_linear(self, image_obj, output_path: str) -> None:
         """Write the raw trichrome combination as an untagged 16-bit linear
-        TIFF: exactly what merge_raw_channels produced at full canonical
-        resolution — NO source_ops/crop/orientation/conversion/adjustments/
-        colour management. See spec/trichrome-linear-tiff-export.md."""
+        TIFF: what merge_raw_channels produced at full canonical resolution,
+        plus FRAMING only — the slice chain and the user crop (which is
+        defined in the sliced frame's space, so source_ops must accompany
+        it). NO orientation/conversion/adjustments/colour management; an
+        axis-aligned crop is a bit-exact sub-array, an angled crop (or a
+        slice rotation) interpolates. See spec/trichrome-linear-tiff-export.md."""
         from core import ccr_merge
-        from core.ccr_processor import safe_tifffile_imwrite
+        from core.ccr_processor import apply_crop_to_image, safe_tifffile_imwrite
         merged, _full = ccr_merge.merge_raw_channels(image_obj.merge_sources,
                                                      preview=False)
+        if getattr(image_obj, "source_ops", None):
+            merged = image_obj._apply_source_ops(merged)
+        merged = apply_crop_to_image(merged, getattr(image_obj, "crop_rect", None),
+                                     getattr(image_obj, "crop_angle", 0.0) or 0.0)
         out = os.path.splitext(output_path)[0] + ".tiff"
         if not safe_tifffile_imwrite(out, merged, photometric="rgb",
                                      compression="deflate"):

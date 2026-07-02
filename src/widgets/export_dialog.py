@@ -422,9 +422,8 @@ class ExportSettingsDialog(QDialog):
         if self._is_linear():
             self.colorspace_hint.setText(
                 "Raw trichrome combination: camera-native linear RGB, no "
-                "profile embedded, no conversion or adjustments — full merged "
-                "resolution. Slices and duplicates export the full original "
-                "frame.")
+                "profile embedded, no conversion or adjustments. Crop and "
+                "slice framing apply; rotation and flips do not.")
             self.colorspace_hint.setVisible(True)
             return
         # The banding caution is only relevant for 8-bit ProPhoto JPEG.

@@ -1,14 +1,16 @@
 # Trichrome Linear TIFF Export
 
-> Status: refined (round 2 folded inline — see "Review resolutions" at the end).
+> Status: refined (round 2 folded inline — see "Review resolutions" at the end;
+> round 3 added crop support on request).
 
 ## Summary
 
 In trichrome (3-way RGB merge) sessions, let the user export a merged image as a
 **16-bit linear TIFF of the raw channel combination** — the exact array
 `merge_raw_channels` produces (each frame's own channel, black-subtracted,
-white-level-scaled, stacked) — with **no other operation**: no negative
-conversion, no adjustments, no crop/orientation, no colour-space re-encode, no
+white-level-scaled, stacked) — plus **framing only**: the slice chain (for
+sliced images) and the user's crop. No value processing of any kind: no negative
+conversion, no adjustments, no orientation, no colour-space re-encode, no
 resize, no ICC burn-in. Conversion is **not** required to export. The option
 exists only for merged (trichrome) images.
 
@@ -33,12 +35,15 @@ inversion look is applied.
 
 - **Not a general "skip processing" export** for normal (non-merged) images —
   trichrome only, per the request.
-- **No geometry of any kind**: slices and duplicates of a merged image export
-  the **full original merged frame** (values and geometry untouched). A slice's
-  `source_ops`, crops, flips, rotations, and fine rotation are all ignored on
-  this path. Documented in the dialog hint. (Trichrome captures are single
-  static scenes; slicing them is rare. Follow-up if ever needed: apply
-  `source_ops` only.)
+- **Framing yes, orientation no** (round 3): the export applies the geometry
+  that defines *which pixels the image is* — the slice chain (`source_ops`)
+  and the user crop (`crop_rect` + `crop_angle`, via `apply_crop_to_image`) —
+  but not the display orientation (flips / 90° rotation / fine rotation).
+  An axis-aligned crop is a pure sub-array (values bit-exact); an **angled**
+  crop (and a slice chain with a baked rotation) necessarily resamples with
+  linear interpolation — inherent to the operation, values stay linear.
+  Crop coordinates are defined relative to the (sliced) frame, which is why
+  `source_ops` must apply whenever the crop does.
 - **No resize** — the format forces "Original size" (the combo is disabled
   while this format is selected and its stored preference is not overwritten).
 - **No ICC embedding, no colour-space option** — the data is camera-native
@@ -60,8 +65,8 @@ inversion look is applied.
   - Quality row hidden (existing non-JPEG behaviour).
   - Colour-space row hidden; in its place the (re-used) `colorspace_hint` label
     shows: *"Raw trichrome combination: camera-native linear RGB, no profile
-    embedded, no conversion or adjustments — full merged resolution. Slices and
-    duplicates export the full original frame."*
+    embedded, no conversion or adjustments. Crop and slice framing apply;
+    rotation and flips do not."*
   - Resize combo disabled and displayed at "Original size" (selection restored
     when switching back to another format; the persisted `export/resize`
     preference is not clobbered — `_save_settings` skips the resize key for
@@ -117,18 +122,24 @@ None — that is the point. The write path is:
 # ccr_backend.py
 def _export_merged_linear(self, image_obj, output_path: str) -> None:
     """Write the raw trichrome combination as an untagged 16-bit linear TIFF.
-    Full-resolution re-merge; NO source_ops/crop/orientation/conversion/
-    adjustments/colour management — the file is exactly what
-    merge_raw_channels produced."""
+    Full-resolution re-merge + framing only (slice chain, user crop);
+    NO orientation/conversion/adjustments/colour management."""
     from core import ccr_merge
-    from core.ccr_processor import safe_tifffile_imwrite
+    from core.ccr_processor import apply_crop_to_image, safe_tifffile_imwrite
     merged, _full = ccr_merge.merge_raw_channels(image_obj.merge_sources,
                                                  preview=False)
+    if getattr(image_obj, "source_ops", None):
+        merged = image_obj._apply_source_ops(merged)   # slice framing
+    merged = apply_crop_to_image(merged, getattr(image_obj, "crop_rect", None),
+                                 getattr(image_obj, "crop_angle", 0.0) or 0.0)
     out = os.path.splitext(output_path)[0] + ".tiff"
     if not safe_tifffile_imwrite(out, merged, photometric="rgb",
                                  compression="deflate"):
         raise IOError(f"Failed to save image to {out}")
 ```
+
+`apply_crop_to_image` is a no-op for `crop_rect is None`, so the uncropped,
+unsliced export remains byte-identical to round 2.
 
 - `compression="deflate"` is lossless (bit-exact values), matching the normal
   TIFF export; no `iccprofile` argument → untagged.
@@ -154,10 +165,13 @@ is reused untouched.
 
 - **Source RAW missing/moved since load** → `merge_raw_channels` raises → the
   existing per-item failure handling records it; other items continue.
-- **Duplicate of a merged image in scope** → same sources ⇒ identical pixels
-  under a distinct (de-duplicated) display name. Allowed; harmless.
-- **Slice of a merged image in scope** → full original frame (see Non-Goals);
-  the dialog hint states this.
+- **Duplicate of a merged image in scope** → same sources; identical pixels
+  unless their crops differ. Allowed; harmless.
+- **Slice of a merged image in scope** → its slice chain (and any crop set on
+  the slice) applies, so the file is the framed region the user sees — in raw
+  linear merge values.
+- **Degenerate/None crop** → `apply_crop_to_image` returns the input unchanged
+  (existing guard).
 - **Non-merged image reaches the linear path** (defensive; scope should
   prevent it) → recorded failure, not a crash.
 - **Positive mode on** → irrelevant: the linear path never consults
@@ -221,3 +235,16 @@ the pre-conversion negative content and full merged resolution.
   linear path must skip `_load_export_source` (which honours crops and resize)
   and `apply_export_colorspace`; entering the existing chokepoint and disabling
   most of it piecemeal is more fragile than one small, self-contained writer.
+
+## Round 3 (crop support, on request)
+
+The original non-goal "no geometry of any kind" is relaxed to **framing yes,
+orientation no**: the slice chain and the user crop now apply (they define
+*which pixels* the image is), while flips/rotation/fine rotation and every
+value-processing stage remain excluded. Axis-aligned crops are bit-exact
+sub-arrays; angled crops/slice rotations interpolate (inherent). `source_ops`
+must accompany the crop because crop coordinates live in the sliced frame's
+space. Dialog hint updated accordingly. Tests: axis-aligned crop equals the
+`apply_crop_to_image` sub-array (and stays bit-exact vs the merge), angled
+crop has the box's dimensions, slice chain applies, and the
+uncropped/unsliced path stays byte-identical.

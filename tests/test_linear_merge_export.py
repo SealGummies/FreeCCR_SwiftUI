@@ -141,6 +141,56 @@ def test_normal_export_unaffected_by_default_flag(tmp_path, fake_merge,
     assert routed == ["bw"]
 
 
+# --- framing: crop + slice chain (round 3) -----------------------------------
+
+def test_linear_export_applies_axis_aligned_crop_bit_exact(tmp_path, fake_merge):
+    from core.ccr_processor import apply_crop_to_image
+    stub = _merged_stub(tmp_path)
+    stub.crop_rect = (0.25, 0.25, 0.75, 0.75)
+    stub.crop_angle = 0.0
+    ccr_backend.images = [stub]
+    out = str(tmp_path / "crop.tiff")
+    assert ccr_backend.export_image_by_index(0, out, linear_merge=True)
+    written = tifffile.imread(out)
+    expected = apply_crop_to_image(MERGED, stub.crop_rect, 0.0)
+    assert written.dtype == np.uint16
+    assert written.shape[0] < MERGED.shape[0] and written.shape[1] < MERGED.shape[1]
+    assert np.array_equal(written, expected)  # pure sub-array, values untouched
+
+
+def test_linear_export_applies_angled_crop(tmp_path, fake_merge):
+    stub = _merged_stub(tmp_path)
+    stub.crop_rect = (0.25, 0.25, 0.75, 0.75)
+    stub.crop_angle = 10.0
+    ccr_backend.images = [stub]
+    out = str(tmp_path / "angled.tiff")
+    assert ccr_backend.export_image_by_index(0, out, linear_merge=True)
+    written = tifffile.imread(out)
+    # The rotated crop outputs the box's own dimensions (interpolated values).
+    assert written.shape == (MERGED.shape[0] // 2, MERGED.shape[1] // 2, 3)
+    assert written.dtype == np.uint16
+
+
+def test_linear_export_applies_slice_chain_and_crop(tmp_path, fake_merge):
+    """A sliced merged image exports its framed region (slice chain, then the
+    crop defined in the sliced frame's space) — values stay bit-exact for
+    unrotated framing."""
+    from types import MethodType
+    from core.ccr_image import CCRImage
+
+    stub = _merged_stub(tmp_path)
+    stub.source_ops = [(0, (0.5, 0.0, 1.0, 0.5))]  # right-top quadrant
+    stub._apply_source_ops = MethodType(CCRImage._apply_source_ops, stub)
+    stub.crop_rect = (0.0, 0.0, 0.5, 1.0)          # left half OF THE SLICE
+    stub.crop_angle = 0.0
+    ccr_backend.images = [stub]
+    out = str(tmp_path / "slice.tiff")
+    assert ccr_backend.export_image_by_index(0, out, linear_merge=True)
+    written = tifffile.imread(out)
+    h, w = MERGED.shape[:2]
+    assert np.array_equal(written, MERGED[0:h // 2, w // 2:w // 2 + w // 4])
+
+
 # --- dialog ------------------------------------------------------------------
 
 @pytest.fixture
