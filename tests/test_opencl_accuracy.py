@@ -9,10 +9,13 @@ import sys
 import os
 import time
 
-# Add src directory to path to import ccr_processor
+# Add repo root AND src/ to the path (like the other test files): ccr_processor's
+# own internal imports use `from core...`, so src/ must be importable — otherwise
+# this file only collects when another test happens to have added src/ first.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from src.core.ccr_processor import adjust_image, adjust_image_opencl, OPENCL_AVAILABLE, cleanup_opencl
+from core.ccr_processor import adjust_image, adjust_image_opencl, OPENCL_AVAILABLE, cleanup_opencl
 
 def test_adjustment_accuracy():
     """Test that OpenCL produces identical results to CPU version."""
@@ -157,7 +160,7 @@ def test_opencl_initialization():
         print("OpenCL not available")
         return False
     
-    from src.core.ccr_processor import _initialize_opencl
+    from core.ccr_processor import _initialize_opencl
     
     success = _initialize_opencl()
     if success:
