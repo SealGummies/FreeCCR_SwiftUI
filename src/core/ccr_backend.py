@@ -22,11 +22,6 @@ def _new_slice_group() -> str:
 
 class CCRBackend:
     _instance = None
-    # Suppresses the export/conversion watermark (each call passes
-    # water_mark=not software_activated). The license-activation module that used
-    # to set this True at startup was removed; kept True here so the watermark
-    # stays off. Set False (or wire a real gate) to re-enable watermarking.
-    software_activated = True
 
     def __new__(cls):
         if cls._instance is None:
@@ -698,18 +693,17 @@ class CCRBackend:
         on the freshly re-decoded resized_raw, in place — so a profile re-grade
         keeps the conversion. No-op if there is no recipe to replay."""
         ci = getattr(image_obj, "conversion_inputs", None)
-        wm = not self.software_activated
         try:
             if ci is not None and ci.get("mode") == "bw":
                 black_point, white_point = ci["bw"]
                 processed = ccr_normalize_with_bwpoint(
-                    image_obj, black_point, white_point, water_mark=wm,
+                    image_obj, black_point, white_point,
                     density=ci.get("density", False))
             elif ci is not None and ci.get("mode") == "ref_params":
                 processed = ccr_normalize_with_refparams(
-                    image_obj, ci["p_lo"], ci["p_hi"], ci["od"], water_mark=wm)
+                    image_obj, ci["p_lo"], ci["p_hi"], ci["od"])
             elif image_obj.reference_frame is not None:
-                processed = ccr_normalize_with_reference(image_obj, water_mark=wm)
+                processed = ccr_normalize_with_reference(image_obj)
             else:
                 return
             if processed is not None:
@@ -752,7 +746,7 @@ class CCRBackend:
                 #reload the image if it has already been converted
                 image_obj.reload_image()
             try:
-                processed = ccr_normalize_with_reference(image_obj,water_mark=not self.software_activated)
+                processed = ccr_normalize_with_reference(image_obj)
                 image_obj.resized_raw = processed
                 image_obj.converted = True
                 # Snapshot what this conversion was baked with (the zoom
@@ -1175,7 +1169,6 @@ class CCRBackend:
                     # Positive mode: export the adjusted positive directly — no
                     # inversion, regardless of any leftover reference_frame.
                     ccr_export_positive(image_obj, output_path=output_path,
-                                        water_mark=not self.software_activated,
                                         jpg_out=jpg_output, jpg_quality=jpg_quality,
                                         max_long_side=max_long_side,
                                         output_colorspace=output_colorspace)
@@ -1186,7 +1179,6 @@ class CCRBackend:
                     # stored conversion constants at full resolution.
                     ccr_normalize_with_refparams(image_obj, ci["p_lo"], ci["p_hi"], ci["od"],
                                                  output_path=output_path,
-                                                 water_mark=not self.software_activated,
                                                  jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                  max_long_side=max_long_side,
                                                  output_colorspace=output_colorspace)
@@ -1196,7 +1188,6 @@ class CCRBackend:
                     black_point, white_point = ci["bw"]
                     ccr_normalize_with_bwpoint(image_obj, black_point, white_point,
                                                output_path=output_path,
-                                               water_mark=not self.software_activated,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                max_long_side=max_long_side,
                                                output_colorspace=output_colorspace,
@@ -1205,14 +1196,14 @@ class CCRBackend:
                     # Legacy/un-snapshotted B/W point conversion — global anchors.
                     # white_point_bgr may be None → default-slope mode.
                     ccr_normalize_with_bwpoint(image_obj, self.black_point_bgr, self.white_point_bgr,
-                                               output_path=output_path, water_mark=not self.software_activated,
+                                               output_path=output_path,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                max_long_side=max_long_side,
                                                output_colorspace=output_colorspace,
                                                density=self.density_bwpoint)
                 else:
                     ccr_normalize_with_reference(image_obj, output_path=output_path,
-                                                 water_mark=not self.software_activated, jpg_out=jpg_output,
+                                                 jpg_out=jpg_output,
                                                  jpg_quality=jpg_quality, max_long_side=max_long_side,
                                                  output_colorspace=output_colorspace)
                 return True

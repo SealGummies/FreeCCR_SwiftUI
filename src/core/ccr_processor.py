@@ -610,7 +610,7 @@ def _load_export_source(ccr_image, output_path, max_long_side):
     return ccr_image.read_image(ccr_image.file_path, preview=False)
 
 
-def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_out=False,jpg_quality=95,max_long_side=None,output_colorspace="srgb") -> np.ndarray:
+def ccr_normalize_with_reference(ccr_image,output_path=None,jpg_out=False,jpg_quality=95,max_long_side=None,output_colorspace="srgb") -> np.ndarray:
     """
     Normalize and align the image using the CCR algorithm, using a reference rectangle
     for percentile calculations instead of a crop factor.
@@ -878,44 +878,6 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,water_mark=True,jpg_
         # --- END BLOCK ---
         print(rgb_brightness_normalized.shape)
         print(f"Flips and rotation transforms: {time.time() - step_start:.3f}s")
-
-        final_mapped_rect = map_rect_to_original(
-                img_ref.shape,
-                rgb_brightness_normalized.shape,
-                reference_rect
-            )
-        x1, y1, x2, y2 = final_mapped_rect
-        del final_mapped_rect  # Clean up as it's no longer needed
-        if getattr(ccr_image, 'crop_rect', None) is not None:
-            # A crop invalidates the reference-rect scaling above — anchor
-            # the watermark to the output's bottom-right corner instead
-            # (same as the bwpoint pipeline).
-            y2, x2 = rgb_brightness_normalized.shape[:2]
-        step_start = time.time()
-        if water_mark:
-            # Ensure the array is contiguous for OpenCV
-            rgb_brightness_normalized = np.ascontiguousarray(rgb_brightness_normalized)
-            
-            # Add a watermark to the image
-            watermark_text = "FreeCCR Unpaid Demo"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            # Make font_scale so text height is about 1/10 of image height
-            # At font_scale=1, text height is about 32 px, so scale accordingly
-            font_scale = rgb_brightness_normalized.shape[1] / (30 * 32)
-            font_thickness = max(3, int(font_scale * 2))
-            text_size = cv2.getTextSize(watermark_text, font, font_scale, font_thickness)[0]
-            text_x = max(0, int(x2 - text_size[0] - 10))
-            text_y = max(text_size[1], int(y2 - text_size[1] - 10))
-            cv2.putText(
-                rgb_brightness_normalized,
-                watermark_text,
-                (text_x, text_y),
-                font,
-                font_scale,
-                (30000, 30000, 30000),
-                font_thickness
-            )
-        print(f"Watermark: {time.time() - step_start:.3f}s")
 
         print(f"Rotated image by {angle} degrees (no crop)")
         step_start = time.time()
@@ -1307,7 +1269,7 @@ def _twopoint_invert(img_f: np.ndarray, black_point_bgr, white_point_bgr,
 
 
 def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
-                               output_path=None, water_mark=True, jpg_out=False,
+                               output_path=None, jpg_out=False,
                                jpg_quality=95, max_long_side=None,
                                output_colorspace="srgb", density=False):
     """
@@ -1439,7 +1401,7 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
     if output_path is not None:
         rgb_result = ccr_image.apply_adjustments(rgb_result)
 
-    # --- Export path: flips, rotation, watermark, file write ---
+    # --- Export path: flips, rotation, file write ---
     if output_path is not None:
         # User crop (normalized rect in un-rotated/un-flipped space) — applied
         # before flips/rotation so it matches the cropped preview orientation.
@@ -1461,20 +1423,6 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
             rgb_result = np.rot90(rgb_result, k=2)
         elif angle == 270:
             rgb_result = np.rot90(rgb_result, k=1)
-
-        # Watermark (positioned at bottom-right of image)
-        if water_mark:
-            rgb_result = np.ascontiguousarray(rgb_result)
-            h_out, w_out = rgb_result.shape[:2]
-            watermark_text = "FreeCCR Unpaid Demo"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = w_out / (30 * 32)
-            font_thickness = max(3, int(font_scale * 2))
-            text_size = cv2.getTextSize(watermark_text, font, font_scale, font_thickness)[0]
-            text_x = max(0, w_out - text_size[0] - 10)
-            text_y = max(text_size[1], h_out - text_size[1] - 10)
-            cv2.putText(rgb_result, watermark_text, (text_x, text_y),
-                        font, font_scale, (30000, 30000, 30000), font_thickness)
 
         # Fine rotation at full resolution
         if fine_angle != 0:
@@ -1505,13 +1453,13 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
     return rgb_result
 
 
-def ccr_export_positive(ccr_image, output_path=None, water_mark=True, jpg_out=False,
+def ccr_export_positive(ccr_image, output_path=None, jpg_out=False,
                         jpg_quality=95, max_long_side=None, output_colorspace="srgb"):
     """Positive-mode processing/export: NO negative inversion.
 
     The image is already a normal positive (decoded in sRGB; see
     spec/positive-mode.md), so this just applies the user adjustments, crop,
-    orientation, optional watermark and output colour space — mirroring the
+    orientation and output colour space — mirroring the
     bwpoint export tail without the normalization step.
 
     output_path is None returns the adjusted in-memory array (parity with the
@@ -1555,20 +1503,6 @@ def ccr_export_positive(ccr_image, output_path=None, water_mark=True, jpg_out=Fa
     elif angle == 270:
         rgb_result = np.rot90(rgb_result, k=1)
 
-    # Watermark (positioned at bottom-right of image)
-    if water_mark:
-        rgb_result = np.ascontiguousarray(rgb_result)
-        h_out, w_out = rgb_result.shape[:2]
-        watermark_text = "FreeCCR Unpaid Demo"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = w_out / (30 * 32)
-        font_thickness = max(3, int(font_scale * 2))
-        text_size = cv2.getTextSize(watermark_text, font, font_scale, font_thickness)[0]
-        text_x = max(0, w_out - text_size[0] - 10)
-        text_y = max(text_size[1], h_out - text_size[1] - 10)
-        cv2.putText(rgb_result, watermark_text, (text_x, text_y),
-                    font, font_scale, (30000, 30000, 30000), font_thickness)
-
     # Fine rotation at full resolution (canvas-expanding, like the other paths)
     if fine_angle != 0:
         h_r, w_r = rgb_result.shape[:2]
@@ -1595,7 +1529,7 @@ def ccr_export_positive(ccr_image, output_path=None, water_mark=True, jpg_out=Fa
 
 
 def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
-                                 output_path=None, water_mark=True, jpg_out=False,
+                                 output_path=None, jpg_out=False,
                                  jpg_quality=95, max_long_side=None,
                                  output_colorspace="srgb"):
     """
@@ -1618,7 +1552,7 @@ def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
         print(f"TOTAL ref-params normalization time: {time.time() - total_start_time:.3f}s")
         return rgb_result
 
-    # --- Export path: adjustments, crop, flips, rotation, watermark, write ---
+    # --- Export path: adjustments, crop, flips, rotation, write ---
     rgb_result = ccr_image.apply_adjustments(rgb_result)
     rgb_result = apply_crop_to_image(rgb_result, getattr(ccr_image, 'crop_rect', None),
                                      getattr(ccr_image, 'crop_angle', 0.0))
@@ -1639,19 +1573,6 @@ def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
         rgb_result = np.rot90(rgb_result, k=2)
     elif angle == 270:
         rgb_result = np.rot90(rgb_result, k=1)
-
-    if water_mark:
-        rgb_result = np.ascontiguousarray(rgb_result)
-        h_out, w_out = rgb_result.shape[:2]
-        watermark_text = "FreeCCR Unpaid Demo"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = w_out / (30 * 32)
-        font_thickness = max(3, int(font_scale * 2))
-        text_size = cv2.getTextSize(watermark_text, font, font_scale, font_thickness)[0]
-        text_x = max(0, w_out - text_size[0] - 10)
-        text_y = max(text_size[1], h_out - text_size[1] - 10)
-        cv2.putText(rgb_result, watermark_text, (text_x, text_y),
-                    font, font_scale, (30000, 30000, 30000), font_thickness)
 
     fine_angle = ccr_image.fine_rotation_angle / 100.0
     if fine_angle != 0:

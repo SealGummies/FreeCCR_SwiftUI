@@ -197,7 +197,7 @@ def test_reprocess_flips_only_twopoint_bw(monkeypatch):
 
     recorded = []
 
-    def fake_bw(im, b, w, water_mark=True, density=False, **kw):
+    def fake_bw(im, b, w, density=False, **kw):
         recorded.append((id(im), density))
         return im.resized_raw
 
@@ -233,7 +233,7 @@ def test_reprocess_can_turn_density_off(monkeypatch):
 
     recorded = []
     monkeypatch.setattr(B, "ccr_normalize_with_bwpoint",
-                        lambda im, b, w, water_mark=True, density=False, **kw:
+                        lambda im, b, w, density=False, **kw:
                         (recorded.append(density) or im.resized_raw))
 
     img = _StubImg({"mode": "bw", "bw": ((4000, 4000, 4000), (400, 400, 400)),
