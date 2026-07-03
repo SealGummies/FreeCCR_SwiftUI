@@ -212,6 +212,18 @@ def test_scope_widgets_accept_none():
     assert not p.vectorscope.grab().isNull()
 
 
+def test_body_height_resize_clamps_and_keeps_vectorscope_square():
+    p = _panel()
+    p.set_body_height(300)
+    assert p.body_height() == 300
+    assert p.vectorscope.minimumWidth() == 300
+    p.set_body_height(10_000)      # clamp to max
+    assert p.body_height() == 420
+    p.set_body_height(-50)         # clamp to min
+    assert p.body_height() == 140
+    p.set_body_height(180)         # restore the default
+
+
 # --- ImagePreview capture helper ---------------------------------------------
 
 def test_capture_display_image():

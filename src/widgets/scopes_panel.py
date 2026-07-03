@@ -23,7 +23,9 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSizePolicy,
 from core import scopes
 from ui import theme
 
-_BODY_H = 180          # expanded body height (vectorscope is _BODY_H square)
+_BODY_H = 180          # default expanded body height (vectorscope is square)
+_BODY_MIN = 140        # drag-resize clamp (grip on the panel's top edge)
+_BODY_MAX = 420
 _RADIUS = 10           # rounded scope backgrounds (matches HistogramWidget)
 _PAD = 6.0             # plot inset inside the rounded background
 _MARKER_R = 4.0        # probe circle radius
@@ -262,9 +264,54 @@ class VectorscopeWidget(_ScopeWidgetBase):
         self._end_paint(p)
 
 
+class _ResizeGrip(QWidget):
+    """Thin grab bar on the panel's top edge: drag UP to enlarge the scopes
+    body, down to shrink, clamped to [_BODY_MIN, _BODY_MAX]. Only shown while
+    the panel is expanded; the final height persists in QSettings."""
+
+    def __init__(self, panel):
+        super().__init__(panel)
+        self._panel = panel
+        self._drag = None    # (press global y, body height at press)
+        self.setFixedHeight(7)
+        self.setCursor(Qt.SizeVerCursor)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(*theme.Paint.SCOPE_LABEL))
+        w = 36.0
+        p.drawRoundedRect(
+            QRectF(self.width() / 2.0 - w / 2.0, 2.0, w, 3.0), 1.5, 1.5)
+        p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag = (event.globalPosition().y(),
+                          self._panel.body_height())
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag is not None:
+            start_y, start_h = self._drag
+            # The panel sits at the bottom of the canvas column, so dragging
+            # the top edge UP means a LARGER body.
+            self._panel.set_body_height(
+                start_h + (start_y - event.globalPosition().y()))
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._drag is not None:
+            self._drag = None
+            self._panel._save_body_height()
+            event.accept()
+
+
 class ScopesPanel(QWidget):
     """Header (toggle + hover RGB readout, always visible) over a collapsible
-    body holding the parade and the vectorscope."""
+    body holding the parade and the vectorscope. The top edge is a drag
+    handle for resizing the body height."""
 
     expanded_changed = Signal(bool)
 
@@ -308,10 +355,8 @@ class ScopesPanel(QWidget):
 
         self.parade = ParadeScopeWidget()
         self.vectorscope = VectorscopeWidget()
-        self.vectorscope.setFixedWidth(_BODY_H)
 
         self._body = QWidget()
-        self._body.setFixedHeight(_BODY_H)
         body_layout = QHBoxLayout(self._body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(theme.GAP_BTN)
@@ -319,9 +364,16 @@ class ScopesPanel(QWidget):
         body_layout.addWidget(self.vectorscope)
         self._body.setVisible(expanded)
 
+        # Drag-resizable body height (grip on the top edge), persisted.
+        self._grip = _ResizeGrip(self)
+        self._grip.setVisible(expanded)
+        self.set_body_height(
+            self._settings.value("scopes/height", _BODY_H, type=int))
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, theme.GAP_ROW, 0, 0)
         outer.setSpacing(theme.GAP_ROW)
+        outer.addWidget(self._grip)
         outer.addLayout(header)
         outer.addWidget(self._body)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
@@ -329,7 +381,7 @@ class ScopesPanel(QWidget):
         self._sync_toggle_text()
         self._set_swatch(None)
 
-    # -- collapse ---------------------------------------------------------
+    # -- collapse / resize ------------------------------------------------
     def is_expanded(self):
         return self._toggle_btn.isChecked()
 
@@ -339,9 +391,23 @@ class ScopesPanel(QWidget):
 
     def _on_toggle(self, checked):
         self._body.setVisible(checked)
+        self._grip.setVisible(checked)
         self._sync_toggle_text()
         self._settings.setValue("scopes/expanded", bool(checked))
         self.expanded_changed.emit(bool(checked))
+
+    def body_height(self):
+        # minimumHeight == the fixed height — reliable even before layout.
+        return self._body.minimumHeight()
+
+    def set_body_height(self, h):
+        """Clamp + apply a body height; the vectorscope stays square."""
+        h = int(max(_BODY_MIN, min(_BODY_MAX, h)))
+        self._body.setFixedHeight(h)
+        self.vectorscope.setFixedWidth(h)
+
+    def _save_body_height(self):
+        self._settings.setValue("scopes/height", self.body_height())
 
     # -- data -------------------------------------------------------------
     def set_frame(self, rgb, mask):

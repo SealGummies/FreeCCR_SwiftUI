@@ -3141,6 +3141,44 @@ def apply_gamma_curve(img16: np.ndarray, gamma: float,
     return apply_curves(img16, {"rgb": gamma_curve_points(gamma)})
 
 
+# --- Cineon film log → Rec.709 (γ 2.2) display conversion -------------------
+# Optional FINAL pipeline stage (the "Cineon Log → Rec.709" checkbox in the
+# Channel Levels section; settings key "cineon_log"): interpret the fully-
+# adjusted image as Cineon printing-density log and convert to Rec.709 video
+# with a plain 2.2 gamma. Standard Kodak constants: 10-bit code 95 = black
+# (Dmin), 685 = 90% white — the same codes the Scopes parade marks — with
+# 0.002 log10 density per code over a 0.6 negative gamma. Values above 685
+# clip to white (the classic video-range conversion, no soft shoulder). See
+# spec/cineon-display-transform.md.
+CINEON_BLACK_CODE = 95.0
+CINEON_WHITE_CODE = 685.0
+_CINEON_NEG_GAMMA = 0.6
+_CINEON_DENSITY_PER_CODE = 0.002
+
+_cineon_lut16_cache = None
+
+
+def _cineon_rec709_lut16() -> np.ndarray:
+    """65536-entry uint16 LUT: 16-bit input (≡ 10-bit code · 1023/65535) →
+    Rec.709 gamma-2.2 output. Built once and cached."""
+    global _cineon_lut16_cache
+    if _cineon_lut16_cache is None:
+        code = np.linspace(0.0, 1023.0, 65536, dtype=np.float64)
+        gain = _CINEON_DENSITY_PER_CODE / _CINEON_NEG_GAMMA
+        off = 10.0 ** ((CINEON_BLACK_CODE - CINEON_WHITE_CODE) * gain)
+        lin = (10.0 ** ((code - CINEON_WHITE_CODE) * gain) - off) / (1.0 - off)
+        lin = np.clip(lin, 0.0, 1.0)
+        _cineon_lut16_cache = np.round(
+            np.power(lin, 1.0 / 2.2) * 65535.0).astype(np.uint16)
+    return _cineon_lut16_cache
+
+
+def apply_cineon_to_rec709(img16: np.ndarray) -> np.ndarray:
+    """Cineon log → Rec.709 (γ 2.2), per channel. Applied after ALL other
+    adjustments so preview, hi-res zoom and export transform identically."""
+    return _cineon_rec709_lut16()[img16]
+
+
 # --- Dust removal (spot inpainting) ----------------------------------------
 # Dust edits are stored as NORMALIZED spots (fractions of width/height) on the
 # image, so the same definition reproduces at the 1080px preview, the hi-res

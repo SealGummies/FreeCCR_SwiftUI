@@ -288,3 +288,8 @@ Pure math (no Qt beyond an offscreen QApplication where widgets are smoked):
   (dashed, `SCOPE_REF` amber, labels at the right edge).
 - **Skin-tone line**: vectorscope draws the +I-axis line from the center to
   the 100% circle (`scopes.skin_tone_direction()`, `SCOPE_SKIN`).
+- **Drag-resizable height**: a thin grab bar on the panel's top edge
+  (visible only while expanded, `SizeVerCursor`); dragging up enlarges the
+  body, clamped to [140, 420] px (default 180). The vectorscope stays
+  square (width follows height); the height persists in QSettings
+  (`scopes/height`).
