@@ -57,14 +57,11 @@ jobs:
           body: |
             ## What's New
 
-            **FreeCCR 1.1** — colour scopes, a rebuilt dust-removal engine, and film-stock slope presets.
+            **FreeCCR 1.1.1** — fixes for the macOS scanner-TIFF reports (issues #86 and #87). Thanks for the detailed reports!
 
-            - **Colour scopes panel** — RGB parade + vectorscope under the canvas, computed from the visible viewport. 10-bit parade axis with Cineon 95/685 reference lines, a skin-tone line on the vectorscope, and a drag-resizable panel.
-            - **Dust removal, rebuilt** — spots now heal by cloning real neighbouring texture (film grain preserved, 16-bit native) instead of a blurry averaged fill — no more smooth round smudges or streaky patches, and traced hairs no longer leave a bright ghost of the stroke.
-            - **Dust tools** — adjustable edge **Feather** (per image, re-heals live), a much finer minimum brush (0.05% of image width on a log-scaled slider), and **Ctrl+Z** in dust mode now undoes the last spot while keeping your zoom.
-            - **Film-stock slope presets** — save a sampled B/W pair's per-channel density slopes under a name (e.g. "Portra 400") and convert whole rolls with it in black-point-only mode. The selection resets to **Default** for every new roll, so a stock never silently applies to the next batch.
-            - **Trichrome / 3-way merge** — linear TIFF export (raw channel combination), exports honour the crop, and a merge-detail dropdown (demosaic vs single photosite).
-            - **Stability** — fixes for a thread-safety crash class (worker-thread pixmaps, loader cancel race, threads at exit) and a wrong-output class (export state corruption, mono double-scale, fine-rotation sampling).
+            - **B/W-point conversion no longer fails on macOS.** The .app launches with an ASCII console encoding, and a diagnostic log line crashed every conversion with `'ascii' codec can't encode character…` ("Convert All" silently produced un-inverted frames). Logging can no longer abort any operation.
+            - **Pakon / Nikon Coolscan TIFFs load correctly.** Planar TIFFs (Pakon `expRGB` exports) were silently decoded with scrambled channels; LZW/deflate-compressed scans could take minutes or never finish loading; float and wide-integer sample formats rendered black. All fixed.
+            - **Consistent film-base colour on import.** The un-converted preview's auto-brightness no longer shifts hue per frame — the film base reads the same colour on a mostly-blank frame as on an exposed one. (Display only; conversion and export are unchanged.)
 
             ## Install
 
@@ -163,14 +160,11 @@ jobs:
           body: |
             ## What's New
 
-            **FreeCCR 1.1** — colour scopes, a rebuilt dust-removal engine, and film-stock slope presets.
+            **FreeCCR 1.1.1** — fixes for the macOS scanner-TIFF reports (issues #86 and #87). Thanks for the detailed reports!
 
-            - **Colour scopes panel** — RGB parade + vectorscope under the canvas, computed from the visible viewport. 10-bit parade axis with Cineon 95/685 reference lines, a skin-tone line on the vectorscope, and a drag-resizable panel.
-            - **Dust removal, rebuilt** — spots now heal by cloning real neighbouring texture (film grain preserved, 16-bit native) instead of a blurry averaged fill — no more smooth round smudges or streaky patches, and traced hairs no longer leave a bright ghost of the stroke.
-            - **Dust tools** — adjustable edge **Feather** (per image, re-heals live), a much finer minimum brush (0.05% of image width on a log-scaled slider), and **Ctrl+Z** in dust mode now undoes the last spot while keeping your zoom.
-            - **Film-stock slope presets** — save a sampled B/W pair's per-channel density slopes under a name (e.g. "Portra 400") and convert whole rolls with it in black-point-only mode. The selection resets to **Default** for every new roll, so a stock never silently applies to the next batch.
-            - **Trichrome / 3-way merge** — linear TIFF export (raw channel combination), exports honour the crop, and a merge-detail dropdown (demosaic vs single photosite).
-            - **Stability** — fixes for a thread-safety crash class (worker-thread pixmaps, loader cancel race, threads at exit) and a wrong-output class (export state corruption, mono double-scale, fine-rotation sampling).
+            - **B/W-point conversion no longer fails on macOS.** The .app launches with an ASCII console encoding, and a diagnostic log line crashed every conversion with `'ascii' codec can't encode character…` ("Convert All" silently produced un-inverted frames). Logging can no longer abort any operation.
+            - **Pakon / Nikon Coolscan TIFFs load correctly.** Planar TIFFs (Pakon `expRGB` exports) were silently decoded with scrambled channels; LZW/deflate-compressed scans could take minutes or never finish loading; float and wide-integer sample formats rendered black. All fixed.
+            - **Consistent film-base colour on import.** The un-converted preview's auto-brightness no longer shifts hue per frame — the film base reads the same colour on a mostly-blank frame as on an exposed one. (Display only; conversion and export are unchanged.)
 
             ## Install
 
