@@ -240,7 +240,7 @@ def test_hook_never_clobbers_saved_wb(backend, preset):
     assert img.adjustment_settings == preset
 
 
-def test_hook_off_by_default_and_inert_when_off(backend):
+def test_hook_inert_when_off(backend):
     backend.auto_awb = False
     img = _StubImage(_u16(_cast_scene(np.random.default_rng(8))))
     backend.maybe_auto_awb(img)
@@ -266,8 +266,8 @@ def test_algorithm_registry():
 
 def test_backend_defaults(backend):
     """Constructor defaults (the fixture restores any earlier mutation, so the
-    singleton still carries them here): auto-AWB opt-in, Gray World."""
-    assert backend.auto_awb is False
+    singleton still carries them here): auto-AWB ON, Gray World."""
+    assert backend.auto_awb is True
     assert backend.awb_algorithm == AWB_DEFAULT
 
 

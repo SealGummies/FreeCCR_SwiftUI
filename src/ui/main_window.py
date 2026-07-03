@@ -208,13 +208,13 @@ class MainWindow(QMainWindow):
         # midtone moves don't shift hue. See spec/gamma-luminance-mode.md.
         ccr_backend.gamma_luminance = self._settings.value(
             "adjust/gamma_luminance", False, type=bool)
-        # Restore the Auto WB toggle + algorithm (defaults OFF / Gray World).
+        # Restore the Auto WB toggle + algorithm (defaults ON / Gray World).
         # When on, a fresh conversion writes AWB-estimated temperature/tint into
         # the image's sliders — only when neither is already set. Affects only
         # FUTURE conversions and the AWB button. See spec/auto-white-balance.md.
         from core.awb import AWB_ALGORITHMS, AWB_DEFAULT
         ccr_backend.auto_awb = self._settings.value(
-            "adjust/auto_awb", False, type=bool)
+            "adjust/auto_awb", True, type=bool)
         stored_algo = self._settings.value("adjust/awb_algorithm", AWB_DEFAULT)
         ccr_backend.awb_algorithm = (
             stored_algo if any(a == stored_algo for a, _ in AWB_ALGORITHMS)
