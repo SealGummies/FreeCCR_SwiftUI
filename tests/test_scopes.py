@@ -212,6 +212,22 @@ def test_scope_widgets_accept_none():
     assert not p.vectorscope.grab().isNull()
 
 
+def test_parade_dots_are_dilated():
+    # A single lit bin must bleed into its 4 neighbors (soft dilation) so
+    # isolated waveform samples stay visible at screen scale.
+    p = _panel()
+    counts = np.zeros((3, 256, 9), np.float32)
+    counts[0, 128, 4] = 1.0
+    p.parade.set_data(counts)
+    buf = p.parade._img_buf            # (256, 3*9, 3), red cell = cols 0..8
+    row = 255 - 128                    # value 128, rows flipped (255 at top)
+    center = int(buf[row, 4, 0])
+    assert center > 0
+    for r, c in ((row - 1, 4), (row + 1, 4), (row, 3), (row, 5)):
+        neighbor = int(buf[r, c, 0])
+        assert 0 < neighbor < center   # lit, but dimmer than the sample
+
+
 def test_body_height_resize_clamps_and_keeps_vectorscope_square():
     p = _panel()
     p.set_body_height(300)

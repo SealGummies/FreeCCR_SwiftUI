@@ -30,6 +30,11 @@ _RADIUS = 10           # rounded scope backgrounds (matches HistogramWidget)
 _PAD = 6.0             # plot inset inside the rounded background
 _MARKER_R = 4.0        # probe circle radius
 _READOUT_EMPTY = "R --- G --- B ---"
+# Parade dot rendering: single-pixel waveform samples read too faint/thin at
+# screen scale, so each dot gets a soft 1px plus-shaped dilation (neighbors
+# lit at _DOT_SPREAD of the center) and the trace a brightness gain.
+_DOT_GAIN = 1.35
+_DOT_SPREAD = 0.55
 
 
 def _marker_pen_brush():
@@ -108,6 +113,15 @@ class ParadeScopeWidget(_ScopeWidgetBase):
             self._set_trace(None, None)
             return
         inten = scopes.scale_counts(counts)
+        # Bigger, brighter dots: soft-dilate each sample into its 4 neighbors
+        # and lift the overall trace intensity (see _DOT_GAIN/_DOT_SPREAD).
+        soft = inten * np.float32(_DOT_SPREAD)
+        grown = inten.copy()
+        grown[:, 1:, :] = np.maximum(grown[:, 1:, :], soft[:, :-1, :])
+        grown[:, :-1, :] = np.maximum(grown[:, :-1, :], soft[:, 1:, :])
+        grown[:, :, 1:] = np.maximum(grown[:, :, 1:], soft[:, :, :-1])
+        grown[:, :, :-1] = np.maximum(grown[:, :, :-1], soft[:, :, 1:])
+        inten = np.clip(grown * np.float32(_DOT_GAIN), 0.0, 1.0)
         w = inten.shape[2]
         img = np.zeros((256, 3 * w, 3), dtype=np.uint8)
         tints = (theme.Paint.HIST_R, theme.Paint.HIST_G, theme.Paint.HIST_B)

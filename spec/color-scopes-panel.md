@@ -163,8 +163,10 @@ traces.
 - Builds an RGB `QImage` from the scaled counts: three cells side by side
   (R, G, B), each `W` wide × 256 tall, cell pixels = channel theme color ×
   intensity; row 0 = value 255 (image is vertically flipped from the counts
-  array). The QImage is regenerated on `set_data` and drawn scaled to the
-  plot rect (smooth, cached) in `paintEvent`.
+  array). Each sample dot gets a soft 1px plus-shaped dilation and the trace
+  a brightness gain (`_DOT_SPREAD`/`_DOT_GAIN`) so single-pixel samples stay
+  readable at screen scale. The QImage is regenerated on `set_data` and
+  drawn scaled to the plot rect (smooth, cached) in `paintEvent`.
 - **10-bit axis** (display only — the data stays 8-bit/256 bins; 8-bit 255 ≡
   10-bit 1023, so trace geometry is unchanged): a left gutter carries
   DaVinci-style code labels, with a gridline every 128 codes
