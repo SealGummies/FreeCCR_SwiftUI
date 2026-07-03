@@ -1068,7 +1068,8 @@ class CCRImage:
             # snapshot only.
             black_point, white_point = ci["bw"]
             out = apply_bwpoint_normalization(img, black_point, white_point,
-                                              density=ci.get("density", False))
+                                              density=ci.get("density", False),
+                                              slopes_bgr=ci.get("slopes"))
         else:
             return None
         print(f"Hi-res convert: {time.time() - t0:.2f}s")
