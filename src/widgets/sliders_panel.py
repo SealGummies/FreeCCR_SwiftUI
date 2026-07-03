@@ -36,7 +36,10 @@ SYNC_GROUPS = [
         "ch_input_gain", "ch_master_shift", "ch_master_gain",
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
-        "ch_b_shift", "ch_b_gain", "ch_b_blackpoint")),
+        "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
+        # Non-slider flag (Cineon log → Rec.709 display conversion) — rides
+        # the Channel Levels sync group, preserved specially in the merge.
+        "cineon_log")),
     ("bands", "Subtractive Saturations (per color)",
      tuple(BAND_ADJUSTMENT_KEYS) + ("band_feather",)),
     # "curves" lives outside ADJUSTMENT_KEYS (it's a nested structure, not a
@@ -632,6 +635,21 @@ class SlidersPanel(QWidget):
         self.od_section.add_layout(self.create_slider("B Gain"))
         self.od_section.add_layout(self.create_slider("B Blackpoint"))
 
+        # Cineon film log → Rec.709 (γ 2.2) display conversion — a FINAL
+        # pipeline stage after every other adjustment (incl. curves/areas),
+        # identical for preview, zoom detail and export. Non-slider flag
+        # ("cineon_log" in adjustment_settings); whole-image only, so it is
+        # disabled while an area layer is the edit target. See
+        # spec/cineon-display-transform.md.
+        self.cineon_checkbox = QCheckBox("Cineon Log → Rec.709 (γ 2.2)")
+        self.cineon_checkbox.setToolTip(
+            "Interpret the adjusted image as Cineon film log (10-bit black at "
+            "code 95, 90% white at 685 — the levels the Scopes parade marks) "
+            "and convert to Rec.709 video with a 2.2 gamma, as the final step "
+            "before display/export.")
+        self.cineon_checkbox.toggled.connect(self._on_cineon_toggled)
+        self.od_section.add_widget(self.cineon_checkbox)
+
         # --- Populate Subtractive Saturations (per-color bands) ---
         # A swatch button per color selects which band's sliders are shown;
         # all 24 sliders exist (and feed adjustment_settings) regardless.
@@ -909,6 +927,15 @@ class SlidersPanel(QWidget):
                 self.sliders[i].setValue(val)
                 self.sliders[i].blockSignals(False)
                 self.slider_value_labels[i].setText(str(val))
+        # Cineon display conversion is whole-image: the checkbox always shows
+        # the GLOBAL flag and is only editable when the global layer is active.
+        img = ccr_backend.get_image_by_index(idx) if idx is not None else None
+        self.cineon_checkbox.blockSignals(True)
+        self.cineon_checkbox.setChecked(
+            bool(img is not None and img.adjustment_settings.get("cineon_log")))
+        self.cineon_checkbox.blockSignals(False)
+        self.cineon_checkbox.setEnabled(
+            img is not None and img.active_area_id is None)
 
     def set_current_idx(self, idx):
         # Clear any pending adjustments for the previous image
@@ -1119,6 +1146,7 @@ class SlidersPanel(QWidget):
         if self.current_idx is not None:
             adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
             self._attach_curves(adjustment)
+            self._attach_cineon(adjustment)
 
             # Immediate lightweight feedback - just store the adjustment settings
             if 0 <= self.current_idx < len(ccr_backend.images):
@@ -1145,6 +1173,37 @@ class SlidersPanel(QWidget):
             adjustment["curves"] = curves
         return adjustment
 
+    def _attach_cineon(self, adjustment: dict) -> dict:
+        """Re-attach the non-slider Cineon-log flag onto a freshly rebuilt
+        adjustment dict (sibling of _attach_curves) — but only when the GLOBAL
+        layer is the edit target: the final display transform is whole-image,
+        so area dicts never carry it."""
+        img = (ccr_backend.get_image_by_index(self.current_idx)
+               if self.current_idx is not None else None)
+        if (img is not None and img.active_area_id is None
+                and img.adjustment_settings.get("cineon_log")):
+            adjustment["cineon_log"] = True
+        return adjustment
+
+    def _on_cineon_toggled(self, checked):
+        """Cineon log → Rec.709 checkbox: a discrete, single-undo edit on the
+        GLOBAL settings dict. Mirrors _on_curve_edit_finished's settle path —
+        regenerate the preview first, then display it."""
+        if self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        self.end_undo_burst()
+        img.push_undo_state()
+        if checked:
+            img.adjustment_settings["cineon_log"] = True
+        else:
+            img.adjustment_settings.pop("cineon_log", None)
+        img.update_thumbnail_and_preview()
+        self.parent().parent().image_preview.update_preview(self.current_idx)
+        self._update_thumb()
+
     def _on_curve_changed(self):
         """Live tone-curve edit — mirror on_slider_changed's feedback +
         debounced heavy-processing path so a curve drag behaves like a slider
@@ -1153,6 +1212,7 @@ class SlidersPanel(QWidget):
             return
         adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
         self._attach_curves(adjustment)
+        self._attach_cineon(adjustment)
         if 0 <= self.current_idx < len(ccr_backend.images):
             self._begin_undo_burst(ccr_backend.images[self.current_idx])
             self._store_active_settings(self.current_idx, adjustment)
@@ -1388,6 +1448,12 @@ class SlidersPanel(QWidget):
                 existing_curves = img.adjustment_settings.get("curves")
                 if existing_curves is not None:
                     merged["curves"] = existing_curves
+                # Same for the Cineon flag when the channels group (which
+                # carries it) is NOT being synced — the rebuild from
+                # adjustment_keys would silently drop it otherwise.
+                if ("cineon_log" not in keys
+                        and img.adjustment_settings.get("cineon_log")):
+                    merged["cineon_log"] = True
                 img.adjustment_settings = merged
             if curves_changes:
                 if src_curves:
@@ -1748,6 +1814,7 @@ class SlidersPanel(QWidget):
             # Get the current adjustment settings from sliders
             self.copied_adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
             self._attach_curves(self.copied_adjustment)
+            self._attach_cineon(self.copied_adjustment)
             print(f"Copied adjustment settings: {self.copied_adjustment}")
             self.set_temporary_hint("Adjustments Copied!", duration=4000)
         else:
@@ -1778,9 +1845,14 @@ class SlidersPanel(QWidget):
 
             # Save the adjustment to the ACTIVE layer and update preview. Copy
             # the dict so the clipboard isn't aliased by the image's settings.
+            pasted = copy.deepcopy(self.copied_adjustment)
+            img = ccr_backend.get_image_by_index(self.current_idx)
+            if img is not None and img.active_area_id is not None:
+                # The Cineon display conversion is whole-image only — never
+                # paste it into an area layer's dict.
+                pasted.pop("cineon_log", None)
             ccr_backend.set_active_settings_by_index(
-                self.current_idx, copy.deepcopy(self.copied_adjustment),
-                reprocess=True)
+                self.current_idx, pasted, reprocess=True)
             self.parent().parent().image_preview.update_preview(self.current_idx)
             self.set_temporary_hint("Adjustments Pasted!", duration=2000)
             

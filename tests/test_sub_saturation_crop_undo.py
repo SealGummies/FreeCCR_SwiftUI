@@ -158,7 +158,11 @@ class TestSyncGroups:
     def test_groups_partition_adjustment_keys(self):
         from widgets.sliders_panel import SYNC_GROUPS, SlidersPanel
         keys = [k for _gid, _label, group_keys in SYNC_GROUPS for k in group_keys]
-        assert sorted(keys) == sorted(SlidersPanel.ADJUSTMENT_KEYS)
+        # The groups cover every slider key exactly once, plus the documented
+        # non-slider flag that rides the channels group (cineon_log — see
+        # spec/cineon-display-transform.md; curves sync separately, like crop).
+        assert sorted(keys) == sorted(
+            list(SlidersPanel.ADJUSTMENT_KEYS) + ["cineon_log"])
         assert len(keys) == len(set(keys))
 
     def test_expected_group_ids(self):

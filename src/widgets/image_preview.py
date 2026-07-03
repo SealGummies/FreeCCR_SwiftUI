@@ -12,7 +12,9 @@ from core.ccr_backend import ccr_backend
 from core.ccr_processor import apply_dust_removal
 from core import crop_aspect
 from widgets.export_dialog import ExportSettingsDialog
+from widgets.scopes_panel import ScopesPanel
 from ui import theme
+import numpy as np
 import math
 import copy
 import sys
@@ -205,6 +207,9 @@ class GraphicsImageView(QGraphicsView):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # Hover color probe (Scopes readout + scope markers). Before the mode
+        # dispatch below so it follows the cursor in every mode; O(1) sample.
+        self.parent_widget.probe_color_at(event.pos())
         if self._mid_pan and self._mid_pan_last is not None:
             # Pan by adjusting the (hidden) scrollbars — works even with
             # ScrollBarAlwaysOff, the same mechanism ScrollHandDrag uses.
@@ -588,6 +593,8 @@ class GraphicsImageView(QGraphicsView):
         pw = self.parent_widget
         if pw is not None and pw.slice_mode:
             pw._set_slice_ghost(None)
+        if pw is not None:
+            pw.clear_color_probe()
         super().leaveEvent(event)
 
 class CenteringSlider(QSlider):
@@ -751,6 +758,12 @@ class ImagePreview(QWidget):
         self.view.setScene(self.scene)
         self.layout.addWidget(self.view)
 
+        # Scopes (RGB parade + vectorscope) computed from the displayed image
+        # (zoom/pan-independent) — collapsible, below the canvas. See
+        # spec/color-scopes-panel.md.
+        self.scopes_panel = ScopesPanel()
+        self.layout.addWidget(self.scopes_panel)
+
         # Fine rotation slider
         self.rotation_slider = CenteringSlider(Qt.Horizontal)
         self.rotation_slider.setMinimum(-4500)
@@ -865,6 +878,20 @@ class ImagePreview(QWidget):
         # removed, so "same image?" must never be answered by index alone.
         self._current_image_ref = None
 
+        # --- Scopes state ---
+        # Debounced displayed-image capture → ScopesPanel. Zoom/pan do NOT
+        # affect the scopes, so no viewport hooks: update_preview (image
+        # switch / adjustments / crop / slice results) and
+        # apply_transformations (orientation, hi-res pixmap swaps) are the
+        # only schedule points.
+        self._scope_timer = QTimer(self)
+        self._scope_timer.setSingleShot(True)
+        self._scope_timer.timeout.connect(self._update_scopes_now)
+        self._scopes_dirty = False       # refresh deferred while collapsed
+        self._probe_qimage = None        # cached QImage of current_pixmap
+        self._probe_qimage_key = None    # its QPixmap.cacheKey()
+        self.scopes_panel.expanded_changed.connect(self._on_scopes_expanded)
+
         self._update_unconvert_action_state()
 
         # --- Add hotkey support ---
@@ -917,6 +944,11 @@ class ImagePreview(QWidget):
         self._zoom = 1.0
         self._item_prescale = 1.0
         self.rotation_slider.setEnabled(False)
+        self._scope_timer.stop()
+        self._scopes_dirty = False
+        self._probe_qimage = None
+        self._probe_qimage_key = None
+        self.scopes_panel.clear()
         self._sync_zoom_combo()
         self._update_unconvert_action_state()
 
@@ -1140,6 +1172,7 @@ class ImagePreview(QWidget):
 
         self._update_unconvert_action_state()
         self._sync_zoom_combo()
+        self._schedule_scope_update()
 
     def update_reference_rect(self, start, end):
         # Build the base (coarse) transform
@@ -1264,6 +1297,11 @@ class ImagePreview(QWidget):
         # rebuilds the crop overlay when crop mode is active, keeping the
         # dim region and handles aligned after rotates/flips.)
         self._fit_view_to_content()
+
+        # The displayed image content/orientation may have changed (rotate,
+        # flip, fine rotation, hi-res pixmap swap) — refresh the scopes.
+        # Zoom/pan paths never come through here, so they don't retrigger.
+        self._schedule_scope_update()
 
     def _end_fine_rot_burst(self):
         self._fine_rot_burst_active = False
@@ -1832,6 +1870,101 @@ class ImagePreview(QWidget):
         if had and refresh and self.pixmap_item is not None:
             self._refresh_item_pixmap()
             self.apply_transformations()
+
+    # --- Scopes (RGB parade + vectorscope) --------------------------------
+    # Computed from the DISPLAYED image: the pixmap item is re-rendered
+    # offscreen at reduced size through its scene transform, so display crop,
+    # orientation and the hi-res prescale are baked in while overlays
+    # (reference frame, crop chrome, ...) are excluded. Zoom/pan deliberately
+    # do NOT change the scopes — the item is captured whole, not through the
+    # viewport. See spec/color-scopes-panel.md.
+
+    SCOPE_CAPTURE_W = 360      # offscreen capture width (px, image aspect)
+    SCOPE_DEBOUNCE_MS = 120    # coalesce rotate/slider bursts
+
+    def _schedule_scope_update(self, *_):
+        """Debounced refresh request; deferred while the panel is collapsed
+        (the pending flag replays it on expand)."""
+        if not self.scopes_panel.is_expanded():
+            self._scopes_dirty = True
+            return
+        self._scope_timer.start(self.SCOPE_DEBOUNCE_MS)
+
+    def _on_scopes_expanded(self, expanded):
+        if expanded and (self._scopes_dirty or self.pixmap_item is not None):
+            self._scope_timer.start(0)
+
+    def _update_scopes_now(self):
+        self._scopes_dirty = False
+        frame = self._capture_display_image()
+        if frame is None:
+            self.scopes_panel.clear()
+        else:
+            self.scopes_panel.set_frame(*frame)
+
+    def _capture_display_image(self):
+        """Render the whole pixmap item (the displayed image: crop applied,
+        orientation as shown, hi-res prescale included — zoom/pan excluded)
+        into a small RGBA image; returns (rgb (h,w,3) uint8, mask (h,w) bool)
+        or None. Alpha stays 0 in the corner gaps a fine rotation leaves —
+        the mask excludes them (and the antialiased image edge, which is
+        blended toward transparent and would pollute the low end)."""
+        if self.pixmap_item is None or self.current_pixmap is None:
+            return None
+        br = self.pixmap_item.mapToScene(
+            self.pixmap_item.boundingRect()).boundingRect()
+        if br.width() <= 0 or br.height() <= 0:
+            return None
+        s = min(1.0, self.SCOPE_CAPTURE_W / br.width())
+        w = max(1, round(br.width() * s))
+        h = max(1, round(br.height() * s))
+        img = QImage(w, h, QImage.Format_RGBA8888)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setTransform(self.pixmap_item.sceneTransform()
+                       * QTransform.fromTranslate(-br.left(), -br.top())
+                       * QTransform.fromScale(s, s))
+        p.drawPixmap(0, 0, self.pixmap_item.pixmap())
+        p.end()
+        buf = np.frombuffer(img.constBits(), dtype=np.uint8)
+        rows = buf.reshape(h, img.bytesPerLine())[:, :w * 4].reshape(h, w, 4)
+        rgb = np.ascontiguousarray(rows[:, :, :3])
+        mask = rows[:, :, 3] >= 250
+        return rgb, mask
+
+    def probe_color_at(self, vp_pos):
+        """Hover probe: sample the displayed preview pixel under the cursor
+        and feed the Scopes readout/markers. Off-image → cleared."""
+        if self.pixmap_item is None or self.current_pixmap is None:
+            self.clear_color_probe()
+            return
+        t = self.view._display_transform()
+        if not t.isInvertible():
+            return
+        scene_pos = self.view.mapToScene(vp_pos)
+        local = t.inverted()[0].map(scene_pos)
+        x, y = int(local.x()), int(local.y())
+        pm = self.current_pixmap
+        if not (0 <= x < pm.width() and 0 <= y < pm.height()):
+            self.clear_color_probe()
+            return
+        # Sampling goes through a cached QImage of the preview pixmap, keyed
+        # on cacheKey() so any refresh that swaps the pixmap invalidates it.
+        if self._probe_qimage is None or self._probe_qimage_key != pm.cacheKey():
+            self._probe_qimage = pm.toImage()
+            self._probe_qimage_key = pm.cacheKey()
+        c = self._probe_qimage.pixelColor(x, y)
+        # Parade x = fraction across the DISPLAYED image (its scene bounds) —
+        # the same horizontal domain the capture renders, zoom/pan-independent.
+        br = self.pixmap_item.mapToScene(
+            self.pixmap_item.boundingRect()).boundingRect()
+        x_frac = ((scene_pos.x() - br.left()) / br.width()
+                  if br.width() > 0 else 0.0)
+        self.scopes_panel.set_probe(c.red(), c.green(), c.blue(), x_frac)
+
+    def clear_color_probe(self):
+        self.scopes_panel.clear_probe()
 
     # --- Slice mode ------------------------------------------------------
     # Splits one scan containing several photos into separate images. Moving
