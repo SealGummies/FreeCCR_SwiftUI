@@ -18,6 +18,7 @@ nuitka --msvc=latest --jobs=6 --standalone --assume-yes-for-downloads --include-
 --include-data-dir=src/icons=icons --include-data-dir=LICENSES=LICENSES --windows-icon-from-ico=src/icons/freeccr_logo.ico ^
 --windows-console-mode=attach --include-package=pyopencl --include-data-dir="%PYOPENCL_CL_DIR%=pyopencl/cl" ^
 --include-package=onnxruntime --include-package-data=onnxruntime ^
+--include-package=imagecodecs --include-package-data=imagecodecs ^
 --nofollow-import-to=doctest --nofollow-import-to=IPython ^
 --nofollow-import-to=PIL.PdfParser --nofollow-import-to=PIL.PdfImagePlugin ^
 --output-filename=freeccr.exe src/main.py

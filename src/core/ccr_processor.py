@@ -1403,8 +1403,10 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
         ccr_image.temperature_base = 0
         ccr_image._ws_windowed = ws
     if ws:
+        # ASCII only: this prints during EVERY B/W-point conversion, and an
+        # em dash here crashed converts on macOS (ASCII stdout, issue #86).
         print(f"[working-space] windowed base: ~{_WS_HEADROOM_STOPS:.1f} stops "
-              f"highlight headroom — recover with White Point (drag negative)")
+              f"highlight headroom - recover with White Point (drag negative)")
 
     # Auto-exposure (default-slope mode only): compute once from the preview and
     # store as a non-destructive uniform-gain base; export/zoom reuse it. With a

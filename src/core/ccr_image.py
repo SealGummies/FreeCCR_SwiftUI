@@ -34,6 +34,44 @@ except ImportError:
     PIL_AVAILABLE = False
     logging.warning("PIL/Pillow not available, some image formats may not be supported")
 
+
+def _read_tiff_bgr(file_path: str):
+    """Decode a TIFF with tifffile and return it in OpenCV's BGR channel
+    order (any dtype). Handles the layouts OpenCV chokes on with scanner
+    TIFFs (Pakon / Nikon Coolscan): planar storage (PlanarConfiguration=2,
+    which tifffile returns as (C, H, W)), alpha channels (dropped), and
+    exotic sample formats; compressed files decode via imagecodecs."""
+    arr = tifffile.imread(file_path)
+    if arr is None:
+        return None
+    arr = np.asarray(arr)
+    if (arr.ndim == 3 and arr.shape[0] in (3, 4)
+            and arr.shape[2] not in (3, 4)):
+        arr = np.moveaxis(arr, 0, -1)   # planar (C, H, W) -> (H, W, C)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[..., :3]              # drop alpha
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        arr = arr[..., ::-1]            # RGB -> BGR, dtype-agnostic
+    return np.ascontiguousarray(arr)
+
+
+def _to_uint16_full_range(img: np.ndarray) -> np.ndarray:
+    """Normalize a decoded image to the pipeline's uint16 full-range
+    contract. Scanner TIFFs arrive in many sample formats; float (0..1) and
+    wide/signed integer data previously passed through untouched and
+    rendered black or half-range downstream."""
+    if img.dtype == np.uint16:
+        return img
+    if img.dtype == np.uint8:
+        return img.astype(np.uint16) * 257
+    if np.issubdtype(img.dtype, np.floating):
+        return np.clip(img.astype(np.float32) * 65535.0 + 0.5,
+                       0, 65535).astype(np.uint16)
+    info = np.iinfo(img.dtype)
+    scale = 65535.0 / float(max(int(info.max), 1))
+    return np.clip(img.astype(np.float64) * scale, 0, 65535).astype(np.uint16)
+
+
 class CCRImage:
     def __init__(
         self,
@@ -650,26 +688,43 @@ class CCRImage:
         else:
             # Handle Unicode file paths and OpenCV TIFF issues properly
             img = None
-            
+            is_tiff = file_path.lower().endswith(('.tif', '.tiff'))
+
+            # Scanner TIFFs (Pakon, Nikon Coolscan) often use PLANAR storage
+            # (PlanarConfiguration=2, RRR..GGG..BBB). OpenCV misreads those
+            # into scrambled channels WITHOUT failing, so sniff the tag first
+            # and route them straight to tifffile (issues #86/#87). The sniff
+            # reads only the TIFF header, not the pixel data.
+            if is_tiff and TIFFFILE_AVAILABLE:
+                try:
+                    with tifffile.TiffFile(file_path) as tf:
+                        planar = getattr(tf.pages[0], "planarconfig", 1)
+                        planar = int(getattr(planar, "value", planar) or 1)
+                    if planar == 2:
+                        img = _read_tiff_bgr(file_path)
+                        print(f"Planar TIFF read via tifffile: "
+                              f"{os.path.basename(file_path)}")
+                except Exception as e:
+                    logging.warning(
+                        f"TIFF planar sniff failed for {file_path}: {e}")
+                    img = None
+
             # Try multiple reading methods for better compatibility
-            try:
-                # Method 1: Try OpenCV imread first (handles most formats)
-                img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
-                
-            except Exception as e:
-                logging.warning(f"OpenCV imread failed for {file_path}: {e}")
-                img = None
-            
+            if img is None:
+                try:
+                    # Method 1: Try OpenCV imread first (handles most formats)
+                    img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+
+                except Exception as e:
+                    logging.warning(f"OpenCV imread failed for {file_path}: {e}")
+                    img = None
+
             # Method 2: If OpenCV fails or returns None, try alternative methods
             if img is None:
                 try:
                     # For TIFF files, try using tifffile library which is more robust
-                    if file_path.lower().endswith(('.tif', '.tiff')) and TIFFFILE_AVAILABLE:
-                        img = tifffile.imread(file_path)
-                        # Convert to OpenCV format (BGR if color, grayscale if mono)
-                        if len(img.shape) == 3 and img.shape[2] == 3:
-                            # RGB to BGR conversion for OpenCV compatibility
-                            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    if is_tiff and TIFFFILE_AVAILABLE:
+                        img = _read_tiff_bgr(file_path)
                         print(f"Successfully read TIFF using tifffile: {os.path.basename(file_path)}")
                     else:
                         # For other formats, try binary reading with cv2.imdecode
@@ -713,6 +768,10 @@ class CCRImage:
             if img is None:
                 logging.error(f"All reading methods failed for: {file_path}")
                 return None
+            # Normalize the sample format FIRST (cvtColor can't take
+            # float64/int16 input, and float 0..1 data used to slip through
+            # unconverted and render black).
+            img = _to_uint16_full_range(img)
             # Convert grayscale to RGB
             if len(img.shape) == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
@@ -720,9 +779,6 @@ class CCRImage:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
             else:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            # Convert to 16-bit if needed
-            if img.dtype != np.uint16:
-                img = img.astype(np.uint16) * 257 if img.dtype == np.uint8 else img
             # Sliced images read only their region of the source
             img = self._apply_source_ops(img)
             # This branch always reads at full resolution regardless of `preview`
@@ -1167,29 +1223,31 @@ class CCRImage:
         """
         Display-only auto-brightness for the un-converted negative preview.
 
-        Linearly stretches the tonal range so the central 90% of pixel values
-        (5th-95th percentile) is spread across the full 0-65535 range. A single
-        global map is applied to all channels so the colour balance of the scan
-        is preserved (no per-channel white balancing).
+        Applies a pure GAIN that places the 95th-percentile value at full
+        scale. Gain-only on purpose: the previous version also subtracted a
+        per-frame black offset, and subtracting a constant from RGB shifts
+        hue — mostly-blank frames (lots of film base) rendered their base
+        orange/red while exposed frames stayed pink, which read as the app
+        corrupting scans on import (GitHub issue #86). A gain preserves
+        channel ratios, so the film base looks the same on every frame.
 
-        Returns a new array; the input (resized_raw) is never modified, so this
-        has no effect on conversion, export, or any other processing.
+        Returns a new array; the input (resized_raw) is never modified, so
+        this has no effect on conversion, export, or any other processing.
         """
         if image is None:
             return image
 
-        # Estimate percentiles on a 4x4-subsampled view (16x fewer pixels,
-        # visually identical anchors) and stretch in place — this runs on
-        # every preview refresh of an un-converted image.
+        # Estimate the anchor on a 4x4-subsampled view (16x fewer pixels,
+        # visually identical) — this runs on every preview refresh of an
+        # un-converted image.
         sample = image[::4, ::4]
-        lo, hi = (float(v) for v in np.percentile(sample, (5.0, 95.0)))
-        if hi <= lo:
-            # Degenerate (flat) image — nothing meaningful to stretch.
+        hi = float(np.percentile(sample, 95.0))
+        if hi <= 0:
+            # Degenerate (black) image — nothing meaningful to brighten.
             return image
 
         img = image.astype(np.float32)
-        np.subtract(img, lo, out=img)
-        np.multiply(img, 65535.0 / (hi - lo), out=img)
+        np.multiply(img, 65535.0 / hi, out=img)
         np.clip(img, 0, 65535, out=img)
         return img.astype(np.uint16)
 
