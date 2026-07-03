@@ -70,6 +70,12 @@ class CCRBackend:
         # (hue-preserving). Global display mode, persisted by MainWindow. See
         # spec/gamma-luminance-mode.md.
         self.gamma_luminance: bool = False
+        # Auto white balance: when True, a fresh conversion writes AWB-estimated
+        # temperature/tint into the image's sliders — only when neither is
+        # already set. The algorithm id selects the estimator (core/awb.py).
+        # Global, persisted by MainWindow. See spec/auto-white-balance.md.
+        self.auto_awb: bool = False
+        self.awb_algorithm: str = "gray_world"
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Selected film-stock preset for the black-point-only conversion:
@@ -795,6 +801,23 @@ class CCRBackend:
             img.update_thumbnail_and_preview()
         return True
 
+    def maybe_auto_awb(self, image_obj):
+        """One-shot auto white balance at conversion: writes the AWB-estimated
+        temperature/tint into the image's whole-image settings when the toggle
+        is on and neither is already set (never clobbers a saved value). Called
+        only from fresh-conversion sites, not replay/reconvert paths. Pure
+        numpy + a dict write, so it is safe from the auto-frame worker threads.
+        See spec/auto-white-balance.md."""
+        if not self.auto_awb or not image_obj.converted:
+            return
+        ci = image_obj.adjustment_settings
+        if ci.get("temperature", 0) or ci.get("tint", 0):
+            return
+        from core.awb import compute_awb_temp_tint
+        res = compute_awb_temp_tint(image_obj)
+        if res is not None and any(res):
+            ci["temperature"], ci["tint"] = res
+
     def convert_negative_by_index(self, idx: int):
         """
         Converts the negative image at the given index using CCR normalization with reference.
@@ -816,6 +839,7 @@ class CCRBackend:
                     "ref": tuple(image_obj.reference_frame),
                     "fine_rot": image_obj.fine_rotation_angle,
                 }
+                self.maybe_auto_awb(image_obj)
                 image_obj.update_thumbnail_and_preview()
             except Exception as e:
                 print(f"Failed to convert image at index {idx}: {e}")
@@ -1966,6 +1990,7 @@ class CCRBackend:
                     "density": bool(self.density_bwpoint),
                     "slopes": slopes,
                 }
+                self.maybe_auto_awb(img)
                 img.update_thumbnail_and_preview()
             except Exception as e:
                 print(f"B/W point conversion failed for image {i}: {e}")
