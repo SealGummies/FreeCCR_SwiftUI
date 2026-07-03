@@ -324,10 +324,16 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
   5. **Fallback**: a patch with no clean in-bounds source window (image
      border, dense dust) or a starved ring (< `_HEAL_MIN_RING_PX`) falls back
      to the old 8-bit `cv2.inpaint(..., inpaint_radius, INPAINT_TELEA)` fill.
-  6. **Feathered composite** (unchanged): alpha = dilate the mask ~1 px +
-     box-blur 5×5, normalized 0..1; `out = img16*(1-a) + filled*a`, computed
-     inside the halo's bounding box only. Away from any spot `out == img16`
-     bit-for-bit.
+  6. **Feathered composite**: alpha rises 0 → 1 from each hole's boundary
+     inward over a smoothstep ramp (`_feather_alpha`), `out = img16*(1-a) +
+     filled*a` computed inside the mask's bbox only. The ramp width is
+     **resolution-scaled** (`0.3%` of image width, min 2 px — a fixed few-px
+     blur read as a hard cut at export resolution) and **capped per hole by
+     its defect-free rim depth**: blending original rim pixels back must
+     never reintroduce the defect, so a tight trace (hole = defect wall to
+     wall) gets an essentially hard edge while a generous brush fades over
+     its clean margin. Outside the mask alpha is exactly 0 — away from any
+     spot `out == img16` bit-for-bit.
   - Identity fast-path: empty `spots` or all-zero mask → return `img16` unchanged.
   - Returns a new `uint16` RGB array; `img16` is never mutated (non-destructive).
   - The chosen source patch may differ between preview and export resolution

@@ -160,6 +160,22 @@ class TestApplyDustRemoval:
         err = np.abs(core.mean(axis=0) - sky)
         assert float(err.max()) < 5000   # fill stays sky-toned along the stroke
 
+    def test_feather_alpha_ramps_inward(self):
+        # The fill blends over a smooth inward ramp: 0 at the hole boundary,
+        # 1 in the core, exactly 0 outside the mask; a 1-px feather is an
+        # essentially hard (fully filled) edge for tight traces.
+        from core.ccr_processor import _feather_alpha
+        mask = np.zeros((60, 60), np.uint8)
+        cv2.circle(mask, (30, 30), 20, 255, -1)
+        a = _feather_alpha(mask, np.full((60, 60), 8, np.uint8))
+        assert a[30, 30] == 1.0                    # core fully filled
+        assert a[30, 51] == 0.0                    # outside untouched
+        edge, mid = a[30, 49], a[30, 45]
+        assert 0.0 < edge < 0.35                   # soft start at the rim
+        assert edge < mid < 1.0                    # monotone ramp
+        hard = _feather_alpha(mask, np.ones((60, 60), np.uint8))
+        assert hard[30, 49] > 0.9                  # 1px feather ~ hard fill
+
     def test_underscoped_dab_keeps_tone(self):
         # A click smaller than the speck (the small dot ghost): the speck's
         # edge leaks past the mask but must not lift the fill's tone.
