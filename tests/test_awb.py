@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Tests for Auto White Balance (spec/auto-white-balance.md).
+
+AWB estimates the neutral (cast) color of the converted base with a classical,
+learning-free algorithm and feeds it through compute_neutral_temp_tint — the
+same inverse the WB eyedropper uses — so the result lands on the
+Temperature/Tint sliders. Pure numpy core, runs headless.
+"""
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+from core.awb import (  # noqa: E402
+    AWB_ALGORITHMS, AWB_DEFAULT, AWB_LO, AWB_HI,
+    estimate_neutral_rgb, compute_awb_temp_tint,
+)
+from core.ccr_processor import (  # noqa: E402
+    _white_balance_gains, compute_neutral_temp_tint, encode_window,
+)
+
+CAST = (1.25, 1.0, 0.8)          # warm illuminant (R high, B low)
+
+
+def _u16(d):
+    """Full-range uint16 base from a display array in [0, 1]."""
+    return (np.clip(np.asarray(d, dtype=np.float32), 0, 1) * 65535).astype(np.uint16)
+
+
+def _cast_scene(rng, cast=CAST, shape=(64, 64), lo=0.15, hi=0.75):
+    """A neutral random scene tinted by `cast` (channel means ∝ cast)."""
+    g = rng.uniform(lo, hi, size=shape).astype(np.float32)
+    return np.stack([g * c for c in cast], axis=-1)
+
+
+def _ratios(triple):
+    r, g, b = triple
+    return r / g, b / g
+
+
+# --- the estimators ---------------------------------------------------------
+
+def test_gray_world_recovers_cast():
+    d = _cast_scene(np.random.default_rng(0))
+    est = estimate_neutral_rgb(_u16(d), ws_windowed=False, algorithm="gray_world")
+    rg, bg = _ratios(est)
+    assert rg == pytest.approx(CAST[0] / CAST[1], rel=0.01)
+    assert bg == pytest.approx(CAST[2] / CAST[1], rel=0.01)
+
+
+def test_white_patch_balances_on_brightest_content():
+    """A bright cast-colored patch drives white_patch, not the dim scene mean."""
+    cast = (1.1, 1.0, 0.85)
+    d = np.full((100, 100, 3), 0.3, dtype=np.float32)
+    d[..., 0] *= 0.9                                   # dim content: different cast
+    patch = np.array([0.85 * c for c in cast], dtype=np.float32)   # all <= 0.98
+    d[:5, :, :] = patch                                # 5% brightest rows
+    est = estimate_neutral_rgb(_u16(d), ws_windowed=False, algorithm="white_patch")
+    rg, bg = _ratios(est)
+    assert rg == pytest.approx(cast[0] / cast[1], rel=0.02)
+    assert bg == pytest.approx(cast[2] / cast[1], rel=0.02)
+
+
+def test_shades_of_gray_equals_gray_world_on_uniform():
+    d = np.full((32, 32, 3), 0.5, dtype=np.float32) * np.array(
+        [1.1, 1.0, 0.9], dtype=np.float32)
+    gw = estimate_neutral_rgb(_u16(d), algorithm="gray_world")
+    sog = estimate_neutral_rgb(_u16(d), algorithm="shades_of_gray")
+    assert np.allclose(gw, sog, rtol=1e-4)
+
+
+def test_gray_edge_recovers_cast_from_edges():
+    """Luminance stripes tinted by the cast: every edge gradient carries the
+    cast's channel ratios."""
+    stripes = np.tile(
+        np.repeat(np.array([0.3, 0.6], dtype=np.float32), 8), 4)   # 64 cols
+    d = np.stack([np.tile(stripes * c, (64, 1)) for c in CAST], axis=-1)
+    est = estimate_neutral_rgb(_u16(d), ws_windowed=False, algorithm="gray_edge")
+    rg, bg = _ratios(est)
+    assert rg == pytest.approx(CAST[0] / CAST[1], rel=0.03)
+    assert bg == pytest.approx(CAST[2] / CAST[1], rel=0.03)
+
+
+def test_unknown_algorithm_falls_back_to_gray_world():
+    d = _cast_scene(np.random.default_rng(1))
+    got = estimate_neutral_rgb(_u16(d), algorithm="not_a_real_algorithm")
+    gw = estimate_neutral_rgb(_u16(d), algorithm="gray_world")
+    assert got == gw
+
+
+# --- masking ----------------------------------------------------------------
+
+def test_out_of_bound_pixels_excluded():
+    """Near-clip and near-black pixels must not skew the estimate: the dirty
+    image's estimate equals the estimate over just its in-bound interior."""
+    d = _cast_scene(np.random.default_rng(2), shape=(80, 80))
+    dirty = d.copy()
+    dirty[:4, :, :] = 0.995        # blown row block (> AWB_HI)
+    dirty[-4:, :, :] = 0.005       # holder-black block (< AWB_LO)
+    interior = estimate_neutral_rgb(_u16(d[4:-4]), algorithm="gray_world")
+    got = estimate_neutral_rgb(_u16(dirty), algorithm="gray_world")
+    assert np.allclose(interior, got, rtol=1e-4)
+
+
+def test_insufficient_content_returns_none():
+    d = np.full((100, 100, 3), 0.995, dtype=np.float32)   # all above AWB_HI
+    assert estimate_neutral_rgb(_u16(d), algorithm="gray_world") is None
+
+
+def test_windowed_and_full_range_agree():
+    """The same display-domain scene, encoded windowed vs full-range, yields
+    the same channel ratios (de-windowing is correct)."""
+    d = _cast_scene(np.random.default_rng(3))
+    ws = estimate_neutral_rgb(encode_window(d.copy()), ws_windowed=True,
+                              algorithm="gray_world")
+    full = estimate_neutral_rgb(_u16(d), ws_windowed=False,
+                                algorithm="gray_world")
+    assert _ratios(ws) == pytest.approx(_ratios(full), rel=5e-3)
+
+
+# --- estimate → sliders → gains round-trip -----------------------------------
+
+def test_roundtrip_neutralizes_the_cast():
+    """Applying the AWB-computed temp/tint through the real WB gain stage makes
+    the scene's channel means meet (within int-slider quantization)."""
+    d = _cast_scene(np.random.default_rng(4))
+    est = estimate_neutral_rgb(_u16(d), algorithm="gray_world")
+    temp, tint = compute_neutral_temp_tint(*est)
+    gr, gg, gb = _white_balance_gains(temp, tint)
+    means = d.reshape(-1, 3).mean(axis=0) * (gr, gg, gb)
+    # one temp slider unit moves R/B by 0.4% each → ~1.6% worst-case spread
+    assert means.max() / means.min() == pytest.approx(1.0, abs=0.02)
+
+
+def test_estimate_is_scale_invariant():
+    """compute_neutral_temp_tint sees ratios only — the estimate's scale (0-1
+    vs 0-65535 domain) must not change the slider result."""
+    est = (0.55, 0.47, 0.40)
+    a = compute_neutral_temp_tint(*est)
+    b = compute_neutral_temp_tint(*(v * 65535.0 for v in est))
+    assert a == b
+
+
+# --- compute_awb_temp_tint on an image-like object ---------------------------
+
+class _StubImage:
+    def __init__(self, base, ws=False, converted=True, crop=None, angle=0.0):
+        self.resized_raw = base
+        self._ws_windowed = ws
+        self.converted = converted
+        self.tint_balance_factor = 1.0
+        self.adjustment_settings = {}
+        self.crop_rect = crop
+        self.crop_angle = angle
+
+
+def test_compute_awb_temp_tint_stub_image():
+    d = _cast_scene(np.random.default_rng(5))
+    res = compute_awb_temp_tint(_StubImage(_u16(d)), algorithm="gray_world")
+    assert res is not None
+    temp, tint = res
+    assert temp < -20            # warm cast → cool correction, well off zero
+    assert -100 <= temp <= 100 and -100 <= tint <= 100
+
+
+def test_compute_awb_temp_tint_no_base():
+    assert compute_awb_temp_tint(_StubImage(None), algorithm="gray_world") is None
+
+
+# --- crop awareness -----------------------------------------------------------
+
+def test_crop_region_drives_the_estimate():
+    """Cast-A content inside the crop, strongly different cast-B junk outside:
+    the cropped estimate matches the interior content, not the whole frame."""
+    rng = np.random.default_rng(10)
+    inside = _cast_scene(rng, cast=CAST, shape=(64, 64))
+    d = _cast_scene(rng, cast=(0.7, 1.0, 1.3), shape=(128, 128))   # cool junk
+    d[32:96, 32:96, :] = inside                                     # centered 50%
+    crop = (0.25, 0.25, 0.75, 0.75)
+    cropped = compute_awb_temp_tint(
+        _StubImage(_u16(d), crop=crop), algorithm="gray_world")
+    interior_only = compute_awb_temp_tint(
+        _StubImage(_u16(inside)), algorithm="gray_world")
+    full = compute_awb_temp_tint(_StubImage(_u16(d)), algorithm="gray_world")
+    assert cropped == interior_only
+    assert cropped != full
+
+
+def test_rotated_crop_black_fill_is_masked():
+    """An angled crop samples outside the source (black fill); those pixels
+    sit below AWB_LO and must not skew the estimate toward neutral-dark."""
+    d = _cast_scene(np.random.default_rng(11), shape=(96, 96))
+    straight = compute_awb_temp_tint(
+        _StubImage(_u16(d), crop=(0.1, 0.1, 0.9, 0.9)), algorithm="gray_world")
+    angled = compute_awb_temp_tint(
+        _StubImage(_u16(d), crop=(0.1, 0.1, 0.9, 0.9), angle=8.0),
+        algorithm="gray_world")
+    # same scene statistics → within a slider unit of the straight crop
+    assert abs(angled[0] - straight[0]) <= 1
+    assert abs(angled[1] - straight[1]) <= 1
+
+
+def test_stub_without_crop_attrs_still_works():
+    """The hook may see images predating the crop feature — getattr defaults."""
+    img = _StubImage(_u16(_cast_scene(np.random.default_rng(12))))
+    del img.crop_rect, img.crop_angle
+    assert compute_awb_temp_tint(img, algorithm="gray_world") is not None
+
+
+# --- the post-conversion hook (backend policy) --------------------------------
+
+@pytest.fixture
+def backend():
+    from core.ccr_backend import ccr_backend
+    saved = (ccr_backend.auto_awb, ccr_backend.awb_algorithm)
+    yield ccr_backend
+    ccr_backend.auto_awb, ccr_backend.awb_algorithm = saved
+
+
+def test_hook_writes_when_unset(backend):
+    backend.auto_awb = True
+    backend.awb_algorithm = "gray_world"
+    img = _StubImage(_u16(_cast_scene(np.random.default_rng(6))))
+    backend.maybe_auto_awb(img)
+    assert img.adjustment_settings.get("temperature", 0) != 0
+    assert "tint" in img.adjustment_settings
+
+
+@pytest.mark.parametrize("preset", [{"temperature": 5}, {"tint": -3},
+                                    {"temperature": 2, "tint": 1}])
+def test_hook_never_clobbers_saved_wb(backend, preset):
+    backend.auto_awb = True
+    img = _StubImage(_u16(_cast_scene(np.random.default_rng(7))))
+    img.adjustment_settings = dict(preset)
+    backend.maybe_auto_awb(img)
+    assert img.adjustment_settings == preset
+
+
+def test_hook_inert_when_off(backend):
+    backend.auto_awb = False
+    img = _StubImage(_u16(_cast_scene(np.random.default_rng(8))))
+    backend.maybe_auto_awb(img)
+    assert img.adjustment_settings == {}
+
+
+def test_hook_skips_unconverted(backend):
+    backend.auto_awb = True
+    img = _StubImage(_u16(_cast_scene(np.random.default_rng(9))),
+                     converted=False)
+    backend.maybe_auto_awb(img)
+    assert img.adjustment_settings == {}
+
+
+# --- registry / defaults -------------------------------------------------------
+
+def test_algorithm_registry():
+    ids = [a for a, _ in AWB_ALGORITHMS]
+    assert ids == ["gray_world", "white_patch", "shades_of_gray", "gray_edge"]
+    assert AWB_DEFAULT in ids
+    assert 0.0 < AWB_LO < AWB_HI < 1.0
+
+
+def test_backend_defaults(backend):
+    """Constructor defaults (the fixture restores any earlier mutation, so the
+    singleton still carries them here): auto-AWB ON, Gray World."""
+    assert backend.auto_awb is True
+    assert backend.awb_algorithm == AWB_DEFAULT
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -488,12 +488,19 @@ class SlidersPanel(QWidget):
         # Separator between B/W Point tools and the adjustment sliders
         scroll_layout.addWidget(theme.section_separator())
 
-        # Auto white balance: pick a neutral point with an eyedropper.
+        # White balance: pick a neutral point with an eyedropper.
         # Enabled only for converted images (same gating as the sliders).
-        self.wb_picker_btn = QPushButton("Auto WB Picker")
+        self.wb_picker_btn = QPushButton("WB Picker")
         self.wb_picker_btn.setToolTip(
             "Click, then pick a neutral gray/white point on the image "
             "to auto-set Temperature and Tint.")
+        # Fully automatic white balance: no picking — estimates the neutral
+        # from the whole image and sets the Temperature/Tint sliders.
+        self.auto_wb_btn = QPushButton("AWB")
+        self.auto_wb_btn.setToolTip(
+            "Automatic white balance — estimates the neutral color from the "
+            "whole image and sets Temperature and Tint. The algorithm is "
+            "chosen in Settings → General.")
         # Crop: non-destructive crop of the preview/export (same gating).
         self.crop_btn = QPushButton("Crop")
         self.crop_btn.setToolTip(
@@ -511,10 +518,12 @@ class SlidersPanel(QWidget):
             "drag to adjust, right-click to delete, Enter to slice, "
             "Esc to cancel.")
         self.wb_picker_btn.setFixedHeight(theme.CONTROL_H)
+        self.auto_wb_btn.setFixedHeight(theme.CONTROL_H)
         self.crop_btn.setFixedHeight(theme.CONTROL_H)
         self.slice_btn.setFixedHeight(theme.CONTROL_H)
         wb_crop_row = theme.apply_button_row(QHBoxLayout())
         wb_crop_row.addWidget(self.wb_picker_btn, 1)
+        wb_crop_row.addWidget(self.auto_wb_btn, 1)
         wb_crop_row.addWidget(self.crop_btn, 1)
         wb_crop_row.addWidget(self.slice_btn, 1)
         scroll_layout.addLayout(wb_crop_row)
@@ -717,6 +726,7 @@ class SlidersPanel(QWidget):
         self.compare_button.setCheckable(False)
         self.sync_to_all_button.clicked.connect(self.on_sync_to_all_clicked)
         self.wb_picker_btn.clicked.connect(self._on_pick_neutral_point)
+        self.auto_wb_btn.clicked.connect(self._on_auto_wb)
         self.crop_btn.clicked.connect(self._on_crop_clicked)
         self.slice_btn.clicked.connect(self._on_slice_clicked)
         self.white_point_btn.clicked.connect(self._on_set_white_point)
@@ -865,6 +875,7 @@ class SlidersPanel(QWidget):
     def set_sliders_enabled(self, enabled: bool):
         print(f"Setting sliders enabled: {enabled}")
         self.wb_picker_btn.setEnabled(enabled)
+        self.auto_wb_btn.setEnabled(enabled)
         self.crop_btn.setEnabled(enabled)
         self.color_profile_combo.setEnabled(enabled)
         self.curve_editor.setEnabled(enabled)
@@ -1524,6 +1535,21 @@ class SlidersPanel(QWidget):
                 "line, drag = adjust, right-click = delete, <b>Enter</b> = "
                 "slice, <b>Esc</b> = cancel.", duration=12000)
 
+    def _on_auto_wb(self):
+        """Fully automatic white balance: estimate the neutral from the whole
+        converted frame (Settings → General algorithm) and set the sliders via
+        the same path as an eyedropper pick."""
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None or not img.converted:
+            return
+        from core.awb import compute_awb_temp_tint
+        res = compute_awb_temp_tint(img)
+        if res is None:
+            self.set_temporary_hint(
+                "<b>AWB:</b> not enough usable image content.", duration=5000)
+            return
+        self.on_wb_sampled(*res)
+
     def on_wb_sampled(self, temp_value, tint_value):
         """Apply the auto-computed temperature/tint from the WB eyedropper."""
         # The WB pick is its own undo step — don't merge it into a slider burst
@@ -1772,6 +1798,7 @@ class SlidersPanel(QWidget):
                 "density": bool(ccr_backend.density_bwpoint),
                 "slopes": slopes,
             }
+            ccr_backend.maybe_auto_awb(img)
             img.update_thumbnail_and_preview()
             mw = self.parent().parent()
             mw.thumbnail_list.update_all_thumbnails()

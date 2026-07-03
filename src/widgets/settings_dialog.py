@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import color_management
+from core.awb import AWB_ALGORITHMS, AWB_DEFAULT
 from core.ccr_backend import ccr_backend
 from ui import theme
 
@@ -120,6 +121,31 @@ class SettingsDialog(QDialog):
             "little saturation as it brightens/darkens. Highlights that would "
             "exceed white still clip."))
         lay.addWidget(grp_gamma)
+
+        grp_wb = QGroupBox("White balance")
+        gw = QVBoxLayout(grp_wb)
+        gw.setSpacing(theme.GAP_ROW)
+        self._cb_auto_awb = QCheckBox("Auto white balance after conversion")
+        gw.addWidget(self._cb_auto_awb)
+        gw.addWidget(self._muted(
+            "When a negative is converted, automatically estimate the color "
+            "cast and set the Temperature/Tint sliders — only for images with "
+            "no white balance already set. The AWB button applies the same "
+            "estimate on demand."))
+        algo_row = QHBoxLayout()
+        algo_row.setSpacing(theme.GAP_ROW)
+        algo_row.addWidget(QLabel("Algorithm"))
+        self._combo_awb_algo = QComboBox()
+        for algo_id, label in AWB_ALGORITHMS:
+            self._combo_awb_algo.addItem(label, algo_id)
+        algo_row.addWidget(self._combo_awb_algo, 1)
+        gw.addLayout(algo_row)
+        gw.addWidget(self._muted(
+            "Gray World (default) assumes the scene averages to gray. White "
+            "Patch balances on the brightest content. Shades of Gray weights "
+            "bright areas more than Gray World. Gray Edge balances on edge "
+            "colors — robust when large areas share one color."))
+        lay.addWidget(grp_wb)
 
         lay.addStretch(1)
         return page
@@ -269,6 +295,7 @@ class SettingsDialog(QDialog):
                         (self._cb_rgb_merge, ccr_backend.rgb_merge_mode),
                         (self._cb_density, ccr_backend.density_bwpoint),
                         (self._cb_auto_gain, ccr_backend.auto_gain),
+                        (self._cb_auto_awb, ccr_backend.auto_awb),
                         (self._cb_gamma_lum, ccr_backend.gamma_luminance)):
             cb.blockSignals(True)
             cb.setChecked(bool(val))
@@ -278,6 +305,12 @@ class SettingsDialog(QDialog):
             self._combo_merge_detail.findData(
                 bool(getattr(ccr_backend, "rgb_merge_demosaic", True))))
         self._combo_merge_detail.blockSignals(False)
+        self._combo_awb_algo.blockSignals(True)
+        idx = self._combo_awb_algo.findData(
+            getattr(ccr_backend, "awb_algorithm", AWB_DEFAULT))
+        self._combo_awb_algo.setCurrentIndex(
+            idx if idx >= 0 else self._combo_awb_algo.findData(AWB_DEFAULT))
+        self._combo_awb_algo.blockSignals(False)
 
     def _apply_pending(self):
         """Apply only the toggles whose checkbox differs from the live backend
@@ -295,6 +328,11 @@ class SettingsDialog(QDialog):
             self._mw.on_density_bwpoint_toggled(bool(self._cb_density.isChecked()))
         if bool(self._cb_auto_gain.isChecked()) != bool(ccr_backend.auto_gain):
             self._mw.on_auto_gain_toggled(bool(self._cb_auto_gain.isChecked()))
+        if bool(self._cb_auto_awb.isChecked()) != bool(ccr_backend.auto_awb):
+            self._mw.on_auto_awb_toggled(bool(self._cb_auto_awb.isChecked()))
+        staged_algo = self._combo_awb_algo.currentData()
+        if staged_algo != getattr(ccr_backend, "awb_algorithm", AWB_DEFAULT):
+            self._mw.on_awb_algorithm_changed(staged_algo)
         if bool(self._cb_gamma_lum.isChecked()) != bool(ccr_backend.gamma_luminance):
             self._mw.on_gamma_mode_toggled(bool(self._cb_gamma_lum.isChecked()))
 

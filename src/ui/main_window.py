@@ -208,6 +208,17 @@ class MainWindow(QMainWindow):
         # midtone moves don't shift hue. See spec/gamma-luminance-mode.md.
         ccr_backend.gamma_luminance = self._settings.value(
             "adjust/gamma_luminance", False, type=bool)
+        # Restore the Auto WB toggle + algorithm (defaults ON / Gray World).
+        # When on, a fresh conversion writes AWB-estimated temperature/tint into
+        # the image's sliders — only when neither is already set. Affects only
+        # FUTURE conversions and the AWB button. See spec/auto-white-balance.md.
+        from core.awb import AWB_ALGORITHMS, AWB_DEFAULT
+        ccr_backend.auto_awb = self._settings.value(
+            "adjust/auto_awb", True, type=bool)
+        stored_algo = self._settings.value("adjust/awb_algorithm", AWB_DEFAULT)
+        ccr_backend.awb_algorithm = (
+            stored_algo if any(a == stored_algo for a, _ in AWB_ALGORITHMS)
+            else AWB_DEFAULT)
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
@@ -719,6 +730,23 @@ class MainWindow(QMainWindow):
         self.sliders_panel.set_temporary_hint(hint, duration=5000)
 
     # --- Gamma application mode (global, persistent) ----------------------
+    def on_auto_awb_toggled(self, checked: bool):
+        """Flip the global Auto WB flag and persist it. No re-render: the flag
+        only affects FUTURE conversions (and never images with a saved
+        temperature/tint). See spec/auto-white-balance.md."""
+        ccr_backend.auto_awb = bool(checked)
+        self._settings.setValue("adjust/auto_awb", bool(checked))
+        self.sliders_panel.set_temporary_hint(
+            "Auto white balance on — new conversions get an automatic "
+            "Temperature/Tint estimate." if checked else
+            "Auto white balance off.", duration=4000)
+
+    def on_awb_algorithm_changed(self, algorithm: str):
+        """Persist the AWB algorithm choice. Used by the AWB button and the
+        post-conversion hook; existing images are untouched."""
+        ccr_backend.awb_algorithm = str(algorithm)
+        self._settings.setValue("adjust/awb_algorithm", str(algorithm))
+
     def on_gamma_mode_toggled(self, checked: bool):
         """Flip the global Gamma mode (per-channel vs hue-preserving luminance),
         persist it, and re-render all loaded images. Gamma is a display-domain
