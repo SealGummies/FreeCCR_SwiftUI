@@ -75,10 +75,11 @@ class CCRBackend:
         # Selected film-stock preset for the black-point-only conversion:
         # per-channel density slopes (B, G, R), or None → the baked scalar
         # DEFAULT_DENSITY_SLOPE. A sampled white point always overrides it.
-        # Owned by the sliders panel (combo) and persisted there in QSettings;
-        # the name is kept for the mode label / hints only. Unlike the B/W
-        # points this survives a new batch — the preset is per stock, not per
-        # roll. See spec/film-stock-slopes.md.
+        # Owned by the sliders panel (combo); the name is kept for the mode
+        # label / hints only. Like the B/W points, the SELECTION is per
+        # roll/session: it resets to Default on every new batch (and at app
+        # start) so a stock chosen for one roll can't silently convert the
+        # next — only the saved PRESETS persist. See spec/film-stock-slopes.md.
         self.film_stock_slopes = None
         self.film_stock_name = None
         # Global input ICC profile (one app-wide setting; applied to every
@@ -118,6 +119,10 @@ class CCRBackend:
         # QSettings copy is intact and still restores at next app start.
         self.black_point_bgr = None
         self.white_point_bgr = None
+        # Same for the film-stock selection: every new batch starts on the
+        # default slope unless the user picks a stock for THIS roll (the
+        # panel's combo is reset by MainWindow when it kicks off the load).
+        self.clear_film_stock()
         # Per-load merge error: reset up front so a prior load's message can't
         # carry over and be shown after this (possibly successful) one.
         self.last_merge_error = None

@@ -889,6 +889,9 @@ class MainWindow(QMainWindow):
                         QMessageBox.warning(self, "3-way RGB merge", err)
                         return
                 self._stop_loader_if_running()
+                # New batch = new roll: the combo returns to "Default slope"
+                # (the backend loader clears its copy too).
+                self.sliders_panel.reset_film_stock_combo()
                 self.thumbnail_list.show_loading_dialog()
                 self._loader_thread = QThread()
                 self._loader_worker = ImageLoaderWorker(files=valid_files)
@@ -929,6 +932,9 @@ class MainWindow(QMainWindow):
                 return
                 
             self._stop_loader_if_running()
+            # New batch = new roll: the combo returns to "Default slope"
+            # (the backend loader clears its copy too).
+            self.sliders_panel.reset_film_stock_combo()
             self.thumbnail_list.show_loading_dialog()
             self._loader_thread = QThread()
             self._loader_worker = ImageLoaderWorker(normalized_folder)
@@ -1022,6 +1028,9 @@ class MainWindow(QMainWindow):
         # roll's point must not carry over.
         ccr_backend.black_point_bgr = None
         ccr_backend.white_point_bgr = None
+        # And the film-stock selection resets for the same reason (the combo
+        # sync also clears the backend copy).
+        self.sliders_panel.reset_film_stock_combo()
 
         # Long-lived worker on its own event-loop QThread (spec §9.1.7); work is
         # delivered by QMetaObject.invokeMethod (queued) so it runs off-GUI.

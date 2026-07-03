@@ -247,5 +247,24 @@ def test_remove_and_find():
     assert remove_film_stock(stocks, "PORTRA 400") == []
 
 
+# --- selection is per roll/session -------------------------------------------
+def test_new_batch_resets_film_stock_selection():
+    # A stock chosen for one roll must not silently convert the next: loading
+    # a new batch clears the backend selection (the panel combo is reset by
+    # MainWindow on the same load; see spec §4.4). Mirrors the B/W-point reset.
+    from core.ccr_backend import ccr_backend
+    saved = (ccr_backend.film_stock_name, ccr_backend.film_stock_slopes,
+             list(ccr_backend.images), list(ccr_backend.file_paths or []))
+    try:
+        ccr_backend.set_film_stock("Portra 400", (0.8, 0.7, 0.6))
+        assert ccr_backend.film_stock_slopes is not None
+        ccr_backend.load_images_from_files([])   # a fresh (empty) batch
+        assert ccr_backend.film_stock_name is None
+        assert ccr_backend.film_stock_slopes is None
+    finally:
+        (ccr_backend.film_stock_name, ccr_backend.film_stock_slopes,
+         ccr_backend.images, ccr_backend.file_paths) = saved
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

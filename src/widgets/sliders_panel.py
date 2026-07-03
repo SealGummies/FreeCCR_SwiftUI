@@ -458,8 +458,12 @@ class SlidersPanel(QWidget):
         self._settings = QSettings("FreeCCR", "FreeCCR")
         self._film_stocks = decode_film_stocks(
             self._settings.value("convert/film_stocks", "", type=str))
-        self._reload_film_stock_combo(
-            select=self._settings.value("convert/film_stock_selected", "", type=str))
+        # The PRESETS persist across sessions; the SELECTION does not — every
+        # session (and every new batch, see reset_film_stock_combo) starts on
+        # "Default slope" so a stock chosen for one roll can't silently apply
+        # to the next. Drop the legacy persisted-selection key.
+        self._settings.remove("convert/film_stock_selected")
+        self._reload_film_stock_combo(select="")
 
         # Shows which slope source the next conversion will use.
         self.bwp_mode_label = QLabel("")
@@ -1616,19 +1620,27 @@ class SlidersPanel(QWidget):
 
     def _apply_film_stock_selection(self):
         """Sync the combo's selection into the backend (the slopes the next
-        black-point-only conversion uses), persist it, refresh the label."""
+        black-point-only conversion uses) and refresh the label. The selection
+        is session/batch state — deliberately NOT persisted (see __init__)."""
         idx = self.film_stock_combo.currentIndex()
         if idx <= 0:
             ccr_backend.clear_film_stock()
-            self._settings.remove("convert/film_stock_selected")
         else:
             stock = self._film_stocks[idx - 1]
             ccr_backend.set_film_stock(stock["name"], stock["slopes_bgr"])
-            self._settings.setValue("convert/film_stock_selected", stock["name"])
         self._update_bwp_mode_label()
 
     def _on_film_stock_changed(self, _index):
         self._apply_film_stock_selection()
+
+    def reset_film_stock_combo(self):
+        """Back to "Default slope". Called when a new batch is loaded (and on
+        tether session start): a stock chosen for the previous roll must not
+        silently convert the next one — mirrors the B/W-point reset."""
+        if self.film_stock_combo.currentIndex() != 0:
+            self.film_stock_combo.setCurrentIndex(0)  # signal syncs the backend
+        else:
+            self._apply_film_stock_selection()
 
     def _save_film_stocks_to_settings(self):
         self._settings.setValue("convert/film_stocks",

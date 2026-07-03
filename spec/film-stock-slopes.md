@@ -44,7 +44,12 @@ Behaviours:
   so zoom/hi-res replay, export, slice children, catalog restore, re-grade and
   the density-toggle reprocess all reproduce the conversion even if the preset
   is later renamed/deleted.
-- Presets persist across sessions (QSettings); the selected stock persists too.
+- Presets persist across sessions (QSettings). The **selection does not**: it
+  resets to "Default slope" at app start, on every new batch load, and on
+  tether session start — a stock chosen for one roll must be re-chosen for the
+  next, never silently applied. (Originally the selection persisted too;
+  reversed by user request — new images always convert with the default slope
+  unless a stock is explicitly chosen for that roll.)
 - Tethered captures convert with the selected stock (black-point-only mode).
 
 ### Non-goals
@@ -125,11 +130,14 @@ The "Black Point sampled!" hint mentions the stock when one is selected
 ("…click <b>Convert</b> to use film stock \"Portra 400\"…"). The save action
 confirms with a hint ("Film stock \"Portra 400\" saved.").
 
-### 4.4 Startup
+### 4.4 Startup / new batch
 
-Presets and the selected name are restored from QSettings when the panel is
-built. A selected name that no longer exists (settings edited/corrupt) falls
-back to Default silently.
+Presets are restored from QSettings when the panel is built; the combo always
+starts on **Default slope** (the legacy `convert/film_stock_selected` key is
+removed on startup). When a new batch is loaded (Open Files / Open Folder /
+tether session start), `MainWindow` calls
+`sliders_panel.reset_film_stock_combo()` and the backend loader clears its own
+copy in `load_images_from_files` — mirroring the per-roll B/W-point reset.
 
 ## 5. Data model
 
@@ -157,7 +165,9 @@ FilmStock = {           # plain dict, JSON-safe
 
 QSettings keys (`FreeCCR/FreeCCR`, next to the existing `convert/*` keys):
 - `convert/film_stocks` — the JSON string.
-- `convert/film_stock_selected` — selected stock name; absent/"" = Default.
+- `convert/film_stock_selected` — LEGACY (selection persisted originally);
+  no longer written, and removed on panel startup so old installs also start
+  on Default.
 
 ### 5.2 Backend global state — `CCRBackend`
 
