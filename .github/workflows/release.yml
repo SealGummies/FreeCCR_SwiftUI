@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual runs build all platforms but skip the release upload (no tag).
+  # The Linux job uploads its output as a workflow artifact instead, so
+  # builds can be tested/shared without cutting a release.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -47,11 +51,12 @@ jobs:
         run: windows_build_scripts\build_inno_installer.bat
 
       - name: Upload installer to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: win_installer/FreeCCR_Install_*.exe
           # Release notes shown on every release page.
-          # KEEP IN SYNC with the macOS job's upload step below.
+          # KEEP IN SYNC with the macOS and Linux jobs' upload steps below.
           # The body is static. REPLACE "## What's New" with ONLY this release's
           # changes each time — do not append past versions (git history keeps them).
           body: |
@@ -80,6 +85,18 @@ jobs:
             Then open the app normally.
 
             *Alternative:* right-click the app → **Open** → **Open**. On macOS Sequoia (15), if no "Open" button appears, use the Terminal command above, or go to **System Settings → Privacy & Security → Open Anyway**.
+
+            ### Linux (x86_64)
+            **AppImage (recommended):** download `FreeCCR_Linux_*-x86_64.AppImage` from the **Assets**, make it executable, and run it:
+
+            ```
+            chmod +x FreeCCR_Linux_*-x86_64.AppImage
+            ./FreeCCR_Linux_*-x86_64.AppImage
+            ```
+
+            **Portable folder:** download `FreeCCR_Linux_*-x86_64.tar.gz`, extract it anywhere, and run `FreeCCR/FreeCCR`. Fully self-contained — no Python or packages to install.
+
+            Built on Ubuntu 22.04, so it runs on any x86_64 distro with glibc 2.35 or newer: Ubuntu 22.04+, Linux Mint 21+, Debian 12+, Fedora 36+, openSUSE, Arch, etc.
 
   build-macos:
     runs-on: macos-latest  # ARM64 (Apple Silicon)
@@ -150,11 +167,12 @@ jobs:
         run: zip -r "FreeCCR_macOS_${{ steps.version.outputs.version }}.zip" FreeCCR.app
 
       - name: Upload to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: FreeCCR_macOS_*.zip
           # Release notes shown on every release page.
-          # KEEP IN SYNC with the Windows job's upload step above.
+          # KEEP IN SYNC with the Windows and Linux jobs' upload steps.
           # The body is static. REPLACE "## What's New" with ONLY this release's
           # changes each time — do not append past versions (git history keeps them).
           body: |
@@ -183,3 +201,237 @@ jobs:
             Then open the app normally.
 
             *Alternative:* right-click the app → **Open** → **Open**. On macOS Sequoia (15), if no "Open" button appears, use the Terminal command above, or go to **System Settings → Privacy & Security → Open Anyway**.
+
+            ### Linux (x86_64)
+            **AppImage (recommended):** download `FreeCCR_Linux_*-x86_64.AppImage` from the **Assets**, make it executable, and run it:
+
+            ```
+            chmod +x FreeCCR_Linux_*-x86_64.AppImage
+            ./FreeCCR_Linux_*-x86_64.AppImage
+            ```
+
+            **Portable folder:** download `FreeCCR_Linux_*-x86_64.tar.gz`, extract it anywhere, and run `FreeCCR/FreeCCR`. Fully self-contained — no Python or packages to install.
+
+            Built on Ubuntu 22.04, so it runs on any x86_64 distro with glibc 2.35 or newer: Ubuntu 22.04+, Linux Mint 21+, Debian 12+, Fedora 36+, openSUSE, Arch, etc.
+
+  build-linux:
+    # Build on the OLDEST supported runner: binaries link against the build
+    # machine's glibc, and glibc is only forward-compatible. Ubuntu 22.04
+    # (glibc 2.35) covers Ubuntu 22.04+/Mint 21+/Debian 12+/Fedora 36+ etc.
+    # Do NOT bump to ubuntu-latest without accepting the compatibility cut.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout (full history for git describe)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11.0
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.0'
+
+      - name: Cache Nuitka compilation cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Nuitka
+          key: nuitka-${{ runner.os }}
+
+      - name: Install system build dependencies
+        # patchelf: required by Nuitka --standalone on Linux.
+        # libxcb-* / libxkbcommon: Qt xcb platform plugin runtime deps — they
+        # must be present at build time for Nuitka to find and bundle them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            patchelf ccache \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
+            libxkbcommon-x11-0 libegl1 libgl1 libopengl0 libfontconfig1 libdbus-1-3
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate version file
+        run: python write_version.py
+
+      - name: Get version
+        id: version
+        run: echo "version=$(python -c "import sys; sys.path.append('src'); from version import VERSION; print(VERSION)")" >> "$GITHUB_OUTPUT"
+
+      - name: Build executable with Nuitka
+        # onnxruntime is included like the Windows build (AI dust detection);
+        # see build_exe.bat for why --include-package-data is needed.
+        run: |
+          PYOPENCL_CL_DIR=$(python -c "import pyopencl, os; print(os.path.join(os.path.dirname(pyopencl.__file__), 'cl'))")
+          python -m nuitka \
+            --standalone \
+            --assume-yes-for-downloads \
+            --include-package=numpy \
+            --include-package=utils \
+            --include-package=pyopencl \
+            --include-package=imagecodecs \
+            --include-package-data=imagecodecs \
+            --include-data-dir="$PYOPENCL_CL_DIR=pyopencl/cl" \
+            --include-package=onnxruntime \
+            --include-package-data=onnxruntime \
+            --enable-plugin=pyside6 \
+            --include-data-dir=src/icons=icons \
+            --include-data-dir=LICENSES=LICENSES \
+            --nofollow-import-to=doctest \
+            --nofollow-import-to=IPython \
+            --output-filename=FreeCCR \
+            src/main.py
+
+      - name: Bundle xcb runtime libs stock distros are missing
+        # Qt >= 6.5 dlopens libxcb-cursor0, which most distros do NOT
+        # preinstall (the one package venv users must apt-install). Ship it
+        # inside the dist unless Nuitka already bundled it.
+        run: |
+          QT_QPA_LIB=$(find main.dist -name 'libQt6XcbQpa*' -print -quit)
+          echo "Qt xcb QPA library: $QT_QPA_LIB"
+          QT_LIB_DIR=$(dirname "$QT_QPA_LIB")
+          for lib in libxcb-cursor.so.0; do
+            if find main.dist -name "${lib}*" -print -quit | grep -q .; then
+              echo "$lib already bundled by Nuitka"
+            else
+              cp -Lv "/usr/lib/x86_64-linux-gnu/$lib" "$QT_LIB_DIR/"
+              cp -Lv "/usr/lib/x86_64-linux-gnu/$lib" main.dist/
+            fi
+          done
+          echo "--- unresolved deps of the xcb QPA plugin (informational) ---"
+          ldd "$QT_QPA_LIB" | grep 'not found' || echo "(none)"
+
+      - name: Smoke test in bare Ubuntu 22.04 container
+        # The container only gets libs every desktop distro ships by default —
+        # deliberately NOT libxcb-cursor0, which must come from our bundle.
+        # timeout exit 124 = the GUI ran for 25s without crashing.
+        run: |
+          docker run --rm -v "$PWD/main.dist:/opt/freeccr:ro" ubuntu:22.04 bash -c "
+            set -e
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+              xvfb libgl1 libegl1 libopengl0 libglib2.0-0 libdbus-1-3 fontconfig fonts-dejavu-core > /dev/null
+            Xvfb :99 -screen 0 1280x800x24 &
+            sleep 3
+            set +e
+            DISPLAY=:99 timeout 25 /opt/freeccr/FreeCCR
+            ec=\$?
+            set -e
+            if [ \"\$ec\" = \"124\" ]; then echo 'OK: app ran 25s without crashing'; exit 0; fi
+            echo \"FAIL: app exited with code \$ec\"
+            exit 1
+          "
+
+      - name: Smoke test in bare Fedora container
+        run: |
+          docker run --rm -v "$PWD/main.dist:/opt/freeccr:ro" fedora:latest bash -c "
+            set -e
+            dnf install -y -q xorg-x11-server-Xvfb mesa-libGL mesa-libEGL glib2 dbus-libs fontconfig dejavu-sans-fonts
+            Xvfb :99 -screen 0 1280x800x24 &
+            sleep 3
+            set +e
+            DISPLAY=:99 timeout 25 /opt/freeccr/FreeCCR
+            ec=\$?
+            set -e
+            if [ \"\$ec\" = \"124\" ]; then echo 'OK: app ran 25s without crashing'; exit 0; fi
+            echo \"FAIL: app exited with code \$ec\"
+            exit 1
+          "
+
+      - name: Package portable tar.gz
+        run: |
+          mv main.dist FreeCCR
+          tar -czf "FreeCCR_Linux_${{ steps.version.outputs.version }}-x86_64.tar.gz" FreeCCR
+
+      - name: Build AppImage
+        # appimagetool's current runtime is static (no libfuse2 needed on
+        # users' machines). --appimage-extract-and-run avoids FUSE on the runner.
+        run: |
+          APPDIR=FreeCCR.AppDir
+          mkdir -p "$APPDIR/usr/bin"
+          cp -a FreeCCR/. "$APPDIR/usr/bin/"
+          cp src/icons/freeccr_logo.png "$APPDIR/freeccr_logo.png"
+
+          cat > "$APPDIR/freeccr.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=FreeCCR
+          Comment=Negative film conversion and color correction
+          Exec=FreeCCR
+          Icon=freeccr_logo
+          Terminal=false
+          Categories=Graphics;Photography;
+          EOF
+
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/FreeCCR" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run "$APPDIR" \
+            "FreeCCR_Linux_${{ steps.version.outputs.version }}-x86_64.AppImage"
+
+      - name: Upload Linux builds as workflow artifacts (non-tag test runs)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeCCR_Linux_x86_64
+          path: |
+            FreeCCR_Linux_*.tar.gz
+            FreeCCR_Linux_*.AppImage
+
+      - name: Upload to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            FreeCCR_Linux_*.tar.gz
+            FreeCCR_Linux_*.AppImage
+          # Release notes shown on every release page.
+          # KEEP IN SYNC with the Windows and macOS jobs' upload steps above.
+          # The body is static. REPLACE "## What's New" with ONLY this release's
+          # changes each time — do not append past versions (git history keeps them).
+          body: |
+            ## What's New
+
+            **FreeCCR 1.1.1** — fixes for the macOS scanner-TIFF reports (issues #86 and #87). Thanks for the detailed reports!
+
+            - **B/W-point conversion no longer fails on macOS.** The .app launches with an ASCII console encoding, and a diagnostic log line crashed every conversion with `'ascii' codec can't encode character…` ("Convert All" silently produced un-inverted frames). Logging can no longer abort any operation.
+            - **Pakon / Nikon Coolscan TIFFs load correctly.** Planar TIFFs (Pakon `expRGB` exports) were silently decoded with scrambled channels; LZW/deflate-compressed scans could take minutes or never finish loading; float and wide-integer sample formats rendered black. All fixed.
+            - **Consistent film-base colour on import.** The un-converted preview's auto-brightness no longer shifts hue per frame — the film base reads the same colour on a mostly-blank frame as on an exposed one. (Display only; conversion and export are unchanged.)
+
+            ## Install
+
+            ### Windows
+            Download the installer (`FreeCCR_Install_*.exe`) from the **Assets** below and run it.
+
+            ### macOS (Apple Silicon)
+            Download `FreeCCR_macOS_*.zip` from the **Assets**, unzip it, and move `FreeCCR.app` into your **Applications** folder.
+
+            ⚠️ **macOS may say the app is "damaged and can't be opened" — it isn't.** FreeCCR isn't notarized by Apple, so Gatekeeper blocks unsigned downloads on first launch. Clear the quarantine flag once by running this in **Terminal**:
+
+            ```
+            xattr -d com.apple.quarantine /Applications/FreeCCR.app
+            ```
+
+            Then open the app normally.
+
+            *Alternative:* right-click the app → **Open** → **Open**. On macOS Sequoia (15), if no "Open" button appears, use the Terminal command above, or go to **System Settings → Privacy & Security → Open Anyway**.
+
+            ### Linux (x86_64)
+            **AppImage (recommended):** download `FreeCCR_Linux_*-x86_64.AppImage` from the **Assets**, make it executable, and run it:
+
+            ```
+            chmod +x FreeCCR_Linux_*-x86_64.AppImage
+            ./FreeCCR_Linux_*-x86_64.AppImage
+            ```
+
+            **Portable folder:** download `FreeCCR_Linux_*-x86_64.tar.gz`, extract it anywhere, and run `FreeCCR/FreeCCR`. Fully self-contained — no Python or packages to install.
+
+            Built on Ubuntu 22.04, so it runs on any x86_64 distro with glibc 2.35 or newer: Ubuntu 22.04+, Linux Mint 21+, Debian 12+, Fedora 36+, openSUSE, Arch, etc.
