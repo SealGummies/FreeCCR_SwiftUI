@@ -87,7 +87,10 @@ in the catalog, and undoable.
 ### 3.2 DustRemovalPanel layout (top → bottom)
 1. Header: **Dust Removal**.
 2. **Manual** group:
-   - **Brush size** slider (label shows size as a % of image width).
+   - **Brush size** slider, log-scaled over 0.05%–20% of image width so tiny
+     specks get fine steps (0.05% ≈ 3 px radius on a 6000 px scan) while big
+     scratch-covering sizes stay reachable; the label shows the size as a % of
+     image width. The canvas Ctrl+wheel resize clamps to the same range.
    - **Feather** slider (0–1.0% of image width, default 0.30%): the edge fade
      width of every heal on the image — manual and AI spots alike. A
      per-image render parameter stored as `CCRImage.dust_feather`; changes

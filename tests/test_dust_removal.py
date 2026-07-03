@@ -451,13 +451,33 @@ class TestPanelWiring:
         assert panel is not None
 
     def test_brush_slider_drives_canvas(self):
-        from widgets.dust_panel import DustRemovalPanel
+        from widgets.dust_panel import (DustRemovalPanel, brush_r_to_slider,
+                                        slider_to_brush_r)
         prev = _StubPreview()
         panel = DustRemovalPanel(_StubMain(), prev)
-        panel._on_brush_changed(30)            # 30 / 1000 = 0.030 of width
-        assert abs(prev.brush - 0.030) < 1e-9
+        panel._on_brush_changed(brush_r_to_slider(0.030))
+        # Log-step quantization: nearest step is within ~1% of the target r.
+        assert abs(prev.brush - 0.030) < 0.030 * 0.015
         panel.sync_brush_size(0.05)            # canvas -> slider, no feedback loop
-        assert abs(panel.brush_slider.value() - 50) <= 1
+        assert panel.brush_slider.value() == brush_r_to_slider(0.05)
+        # Mapping round-trips through the slider's integer steps.
+        v = brush_r_to_slider(0.012)
+        assert brush_r_to_slider(slider_to_brush_r(v)) == v
+
+    def test_brush_reaches_fine_sizes(self):
+        # The slider bottom is 0.05% of image width (~3 px radius on a 6000 px
+        # scan) — finer than the old 0.2% floor; the 20% top is unchanged.
+        from widgets.dust_panel import (DustRemovalPanel, BRUSH_STEPS,
+                                        DUST_BRUSH_R_MIN, DUST_BRUSH_R_MAX)
+        assert DUST_BRUSH_R_MIN <= 0.0005
+        prev = _StubPreview()
+        panel = DustRemovalPanel(_StubMain(), prev)
+        assert panel.brush_slider.minimum() == 0
+        assert panel.brush_slider.maximum() == BRUSH_STEPS
+        panel._on_brush_changed(0)
+        assert abs(prev.brush - DUST_BRUSH_R_MIN) < 1e-12
+        panel._on_brush_changed(BRUSH_STEPS)
+        assert abs(prev.brush - DUST_BRUSH_R_MAX) < 1e-12
 
     def test_done_button_exits_mode(self):
         from widgets.dust_panel import DustRemovalPanel
