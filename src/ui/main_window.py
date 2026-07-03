@@ -399,6 +399,13 @@ class MainWindow(QMainWindow):
     def undo_last_action(self):
         """Restore the current image's previous state (adjustments, crop,
         rotation, flips). Each Ctrl+Z press pops one more snapshot."""
+        # In dust mode, Ctrl+Z means "undo the last dust spot" (same as the
+        # panel's button) and must PRESERVE the viewport — the general undo
+        # below resets zoom (crop/rotation can move the displayed content),
+        # which read as "Ctrl+Z unzoomed" while spotting dust zoomed-in.
+        if getattr(self.image_preview, "dust_mode", False):
+            self.dust_panel._on_undo_last()
+            return
         # While Compare is held, the backend holds a temporary zeroed state
         # that the button release will overwrite — undoing now would be lost.
         if hasattr(self.sliders_panel, "_original_adjustment"):

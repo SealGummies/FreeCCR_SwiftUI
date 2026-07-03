@@ -88,6 +88,13 @@ in the catalog, and undoable.
 1. Header: **Dust Removal**.
 2. **Manual** group:
    - **Brush size** slider (label shows size as a % of image width).
+   - **Feather** slider (0–1.0% of image width, default 0.30%): the edge fade
+     width of every heal on the image — manual and AI spots alike. A
+     per-image render parameter stored as `CCRImage.dust_feather`; changes
+     re-heal live (debounced ~200 ms), persist in the catalog, and are NOT
+     part of undo snapshots (like brush size). Defect-like pixels are always
+     fully filled regardless of the feather (§5.2 step 6), so a wide fade
+     cannot blend the defect back in.
    - Hint: "Click or drag over dust to remove it."
    - **Undo last spot** button and **Clear all** button.
 3. Separator.
@@ -120,6 +127,11 @@ reference to `MainWindow` and `ImagePreview` passed at construction (it does
     `push_undo_state()` once for the stroke, re-render the image (inpaint
     applied), and refresh thumbnail + preview. The dust is now visibly gone.
   - **Ctrl + mouse wheel**: resize the brush (kept in sync with the slider).
+  - **Ctrl+Z**: undoes the last dust spot (identical to the panel's **Undo
+    last spot** button) and **preserves the viewport** — the general
+    MainWindow undo resets zoom (crop/rotation can move the displayed
+    content), which read as "Ctrl+Z unzoomed" while spotting zoomed-in, so
+    `undo_last_action` routes to the dust undo whenever `dust_mode` is on.
   - **Mouse wheel** (no modifier): zoom in/out for precise spotting.
     **Middle-button drag**: pan the zoomed view. (Both match the normal viewer;
     only the brush moves to Ctrl + wheel.)
@@ -186,6 +198,12 @@ a polyline):
   from the component's extent.
 - Empty list = "no dust removal"; the render fast-path leaves the image
   untouched (§5.2).
+- Alongside the spots, `CCRImage.dust_feather` (float, fraction of image
+  width, default 0.003) holds the image's heal edge-fade width — one value
+  for all spots, set by the panel's Feather slider, serialized in the catalog
+  (`dust_feather`, missing key → default), excluded from undo snapshots, and
+  part of the hi-res `dust_sig` so a feather change invalidates cached
+  renders.
 
 Rationale: mirrors openenlarge's normalized `DustStroke` model, serializes
 cleanly to JSON, deep-copies cleanly for undo, and is fully resolution
@@ -326,14 +344,16 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      to the old 8-bit `cv2.inpaint(..., inpaint_radius, INPAINT_TELEA)` fill.
   6. **Feathered composite**: alpha rises 0 → 1 from each hole's boundary
      inward over a smoothstep ramp (`_feather_alpha`), `out = img16*(1-a) +
-     filled*a` computed inside the mask's bbox only. The ramp width is
-     **resolution-scaled** (`0.3%` of image width, min 2 px — a fixed few-px
-     blur read as a hard cut at export resolution) and **capped per hole by
-     its defect-free rim depth**: blending original rim pixels back must
-     never reintroduce the defect, so a tight trace (hole = defect wall to
-     wall) gets an essentially hard edge while a generous brush fades over
-     its clean margin. Outside the mask alpha is exactly 0 — away from any
-     spot `out == img16` bit-for-bit.
+     filled*a` computed inside the mask's bbox only. The ramp width is the
+     image's **Feather** setting (`dust_feather`, a fraction of image width —
+     default 0.3%, so it covers the same image fraction at preview and
+     export), capped per hole by its depth so the core still reaches full
+     fill. **Defect-like hole pixels** (colored like the estimated defect)
+     are force-filled at alpha 1 regardless of the ramp (`dlike`, with a
+     light blurred lip), so a wide feather can never blend the defect back
+     in — the soft fade only happens across clean rim pixels. Outside the
+     mask alpha is exactly 0 — away from any spot `out == img16`
+     bit-for-bit.
   - Identity fast-path: empty `spots` or all-zero mask → return `img16` unchanged.
   - Returns a new `uint16` RGB array; `img16` is never mutated (non-destructive).
   - The chosen source patch may differ between preview and export resolution

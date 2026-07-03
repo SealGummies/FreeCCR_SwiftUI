@@ -14,7 +14,8 @@ from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
                                 apply_gamma_curve, apply_cineon_to_rec709,
                                 apply_area_layers, apply_crop_to_image,
-                                apply_dust_removal, _apply_working_space_recovery,
+                                apply_dust_removal, DUST_FEATHER_DEFAULT,
+                                _apply_working_space_recovery,
                                 compute_auto_gain_offset)
 from core import color_management
 
@@ -151,6 +152,10 @@ class CCRImage:
         # time (resolution-independent). [] = no dust removal. See
         # spec/dust-removal.md.
         self.dust_spots: List[Dict[str, Any]] = []
+        # Edge fade width for the dust heal, as a fraction of image width
+        # (user-set via the dust panel's Feather slider; render parameter,
+        # deliberately NOT in undo snapshots — like brush size).
+        self.dust_feather: float = DUST_FEATHER_DEFAULT
         # Which layer the adjustment panel currently edits: None = global
         # (whole image); otherwise the id of an area in area_layers. Session
         # state only — never persisted; always defaults to global on load.
@@ -861,7 +866,9 @@ class CCRImage:
         spots = getattr(self, "dust_spots", None)
         if not spots:
             return image
-        return apply_dust_removal(image, spots)
+        return apply_dust_removal(
+            image, spots,
+            feather=getattr(self, "dust_feather", DUST_FEATHER_DEFAULT))
 
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,

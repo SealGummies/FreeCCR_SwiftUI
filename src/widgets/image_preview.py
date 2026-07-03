@@ -1701,12 +1701,13 @@ class ImagePreview(QWidget):
             for a in getattr(img, "area_layers", []))
         # Dust spots are inpainted inside apply_adjustments, so a change to them
         # must invalidate the cached hi-res display (see spec/dust-removal.md §4.4).
-        dust_sig = tuple(
+        dust_sig = (tuple(
             (s.get("kind"),
              tuple((round(float(p[0]) * 10000), round(float(p[1]) * 10000))
                    for p in (s.get("pts") or [])),
              round(float(s.get("r", 0)) * 10000))
-            for s in getattr(img, "dust_spots", []))
+            for s in getattr(img, "dust_spots", [])),
+            round(float(getattr(img, "dust_feather", 0.003)) * 10000))
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "exposure_base", 0.0),
@@ -2501,7 +2502,8 @@ class ImagePreview(QWidget):
         if img is None or raw is None:
             return None
         brush = [s for s in getattr(img, "dust_spots", []) if s.get("kind") == "brush"]
-        return apply_dust_removal(raw, brush)
+        return apply_dust_removal(
+            raw, brush, feather=getattr(img, "dust_feather", 0.003))
 
     def dust_detect_source(self):
         """Detection source for the current image (see dust_detect_source_for)."""

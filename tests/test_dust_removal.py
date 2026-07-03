@@ -176,6 +176,39 @@ class TestApplyDustRemoval:
         hard = _feather_alpha(mask, np.ones((60, 60), np.uint8))
         assert hard[30, 49] > 0.9                  # 1px feather ~ hard fill
 
+    def test_feather_param_softens_rim(self):
+        # The user Feather setting widens the fill's cross-fade: with a wide
+        # feather the hole's clean rim stays close to the ORIGINAL pixels
+        # (low alpha), with feather 0 the rim is the clone (hard edge).
+        rng = np.random.default_rng(5)
+        img = np.clip(rng.normal(30000, 2000, (200, 200, 3)), 0,
+                      65535).astype(np.uint16)
+        cv2.circle(img, (100, 100), 6, (60000, 60000, 60000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}  # mask r=16
+        hard = apply_dust_removal(img, [spot], feather=0.0)
+        soft = apply_dust_removal(img, [spot], feather=0.08)
+        yy, xx = np.mgrid[0:200, 0:200]
+        rim = (np.hypot(yy - 100, xx - 100) > 13.5) & \
+              (np.hypot(yy - 100, xx - 100) < 15.5)
+        d_hard = np.abs(hard[rim].astype(np.float32) - img[rim]).mean()
+        d_soft = np.abs(soft[rim].astype(np.float32) - img[rim]).mean()
+        assert d_soft < 0.5 * d_hard
+        # The speck itself is gone in both.
+        assert int(hard[100, 100, 0]) < 40000
+        assert int(soft[100, 100, 0]) < 40000
+
+    def test_wide_feather_never_blends_defect_back(self):
+        # Defect-like pixels are force-filled whatever the feather: a tight
+        # hair trace with a huge feather must still remove the hair.
+        sky = np.array([20000, 25000, 40000], np.float32)
+        img = np.broadcast_to(sky.astype(np.uint16), (200, 200, 3)).copy()
+        cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
+        spot = {"kind": "brush",
+                "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 2.0 / 200}
+        out = apply_dust_removal(img, [spot], feather=0.02)
+        core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
+        assert float(np.abs(core.mean(axis=0) - sky).max()) < 5000
+
     def test_underscoped_dab_keeps_tone(self):
         # A click smaller than the speck (the small dot ghost): the speck's
         # edge leaks past the mask but must not lift the fill's tone.
@@ -345,6 +378,21 @@ class TestPersistence:
         state = catalog.serialize_image(img)
         assert catalog._is_pristine(state) is False
 
+    def test_dust_feather_round_trips_and_defaults(self, tmp_path):
+        cat = str(tmp_path / "catalog.json")
+        path = _scan_png(tmp_path)
+        img = CCRImage(path)
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.01}]
+        img.dust_feather = 0.007
+        catalog.update_for_images([img], path=cat)
+        restored = catalog.create_images_for_path(path, path=cat)
+        assert abs(restored[0].dust_feather - 0.007) < 1e-9
+        # Pre-feature catalog entries restore to the default.
+        state = catalog.serialize_image(img)
+        del state["dust_feather"]
+        old = catalog._restore_image(path, state)
+        assert abs(old.dust_feather - 0.003) < 1e-9
+
 
 # --- Undo -------------------------------------------------------------------
 class TestUndo:
@@ -424,6 +472,28 @@ class TestPanelWiring:
         panel.cancel_jobs()
         panel.shutdown()   # must not raise with no threads running
 
+    def test_feather_slider_writes_image_and_label(self):
+        from widgets.dust_panel import DustRemovalPanel
+        from core.ccr_backend import ccr_backend
+
+        class _Img:
+            dust_feather = 0.003
+            dust_spots = []
+
+        img = _Img()
+        saved = ccr_backend.images
+        ccr_backend.images = [img]
+        try:
+            prev = _StubPreview()
+            prev.current_idx = 0
+            panel = DustRemovalPanel(_StubMain(), prev)
+            panel.feather_slider.setValue(60)  # emits valueChanged
+            assert panel.feather_value.text() == "0.60%"
+            panel._apply_feather()             # bypass the debounce timer
+            assert abs(img.dust_feather - 0.006) < 1e-9
+        finally:
+            ccr_backend.images = saved
+
     def test_detect_all_no_targets_is_safe(self):
         from widgets.dust_panel import DustRemovalPanel, _DetectAllWorker  # noqa: F401
         from core.ccr_backend import ccr_backend
@@ -437,6 +507,35 @@ class TestPanelWiring:
             assert panel._detect_all_thread is None
         finally:
             ccr_backend.images = saved
+
+
+# --- Ctrl+Z routing in dust mode ---------------------------------------------
+class TestUndoRouting:
+    def test_ctrl_z_in_dust_mode_undoes_spot_and_keeps_view(self):
+        # In dust mode Ctrl+Z must behave like the panel's "Undo last spot"
+        # (view preserved), NOT the general undo whose _reset_zoom read as
+        # "Ctrl+Z unzoomed" while spotting dust zoomed-in.
+        from ui.main_window import MainWindow
+
+        class _Panel:
+            called = False
+
+            def _on_undo_last(self):
+                self.called = True
+
+        class _Prev:
+            dust_mode = True
+
+            def _reset_zoom(self):
+                raise AssertionError("dust-mode undo must preserve the view")
+
+        class _Stub:
+            image_preview = _Prev()
+            dust_panel = _Panel()
+
+        stub = _Stub()
+        MainWindow.undo_last_action(stub)
+        assert stub.dust_panel.called is True
 
 
 if __name__ == "__main__":

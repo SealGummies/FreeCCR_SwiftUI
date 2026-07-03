@@ -160,6 +160,7 @@ def serialize_image(img) -> dict:
         "adjustment_settings": dict(img.adjustment_settings),
         "areas": _areas_to_json(getattr(img, "area_layers", None)),
         "dust_spots": copy.deepcopy(getattr(img, "dust_spots", None) or []),
+        "dust_feather": float(getattr(img, "dust_feather", 0.003)),
         "color_profile": getattr(img, "color_profile", "color"),
         "crop_rect": list(img.crop_rect) if img.crop_rect else None,
         "crop_angle": float(img.crop_angle or 0.0),
@@ -380,6 +381,7 @@ def _restore_image(file_path: str, state: dict):
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
     img.dust_spots = copy.deepcopy(state.get("dust_spots") or [])
+    img.dust_feather = float(state.get("dust_feather", 0.003))
     img.color_profile = state.get("color_profile", "color")
     ref = state.get("reference_frame")
     img.reference_frame = tuple(ref) if ref else None

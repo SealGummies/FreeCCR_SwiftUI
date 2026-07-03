@@ -3224,8 +3224,8 @@ _HEAL_ANGLES = 16         # candidate source directions searched around a spot
 _HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
 _HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
 _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
-_HEAL_FEATHER_FRAC = 0.003  # feather ramp width as a fraction of image width
-_HEAL_FEATHER_MIN = 2       # px — even small previews get a soft lip
+DUST_FEATHER_DEFAULT = 0.003  # feather ramp width, fraction of image width
+                              # (user-adjustable per image via the dust panel)
 
 
 def _box_sum(integ: np.ndarray, y0: int, x0: int, y1: int, x1: int) -> int:
@@ -3246,7 +3246,8 @@ def _feather_alpha(mask: np.ndarray, fmap: np.ndarray) -> np.ndarray:
 
 def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
-                filled: np.ndarray, fmap: np.ndarray, feather: int) -> bool:
+                filled: np.ndarray, fmap: np.ndarray, feather_px: int,
+                dlike: np.ndarray) -> bool:
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
 
@@ -3376,23 +3377,30 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     filled[wy0:wy1, wx0:wx1][hole] = np.clip(
         np.rint(heal[hole]), 0, 65535).astype(np.uint16)
 
-    # Feather budget: the composite (see _feather_alpha) cross-fades the fill
-    # into the ORIGINAL rim pixels, which must never reintroduce the defect.
-    # Budget = how deep the hole's defect-free rim goes: a tight trace (hole =
-    # defect wall to wall) gets an essentially hard edge, a generous brush
-    # feathers up to its clean margin.
+    # Feather: the user-set ramp width, capped by the hole depth so the core
+    # still reaches full fill. Defect-like hole pixels (colored like the
+    # estimated defect) are force-filled via `dlike` regardless of the ramp,
+    # so a wide feather can never blend the defect back in — the soft fade
+    # only happens across clean rim pixels.
     inside = cv2.distanceTransform(hole.astype(np.uint8), cv2.DIST_L2, 3)
+    depth = max(1.0, float(inside.max()))
+    fmap[wy0:wy1, wx0:wx1][hole] = int(max(1.0, min(float(feather_px), depth)))
     like = np.abs(hole_px - defect).mean(axis=1) < thr
     if like.any():
-        margin = max(1.0, float(inside[hole][like].min()) - 1.0)
-    else:
-        margin = max(1.0, float(inside.max()))
-    fmap[wy0:wy1, wx0:wx1][hole] = int(min(float(feather), margin))
+        hy, hx = np.nonzero(hole)
+        dlike[wy0:wy1, wx0:wx1][hy[like], hx[like]] = 255
     return True
 
 
-def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.ndarray:
+def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
+                       feather: float = DUST_FEATHER_DEFAULT) -> np.ndarray:
     """Heal the dust spots out of a 16-bit RGB image, non-destructively.
+
+    `feather` is the edge fade width as a fraction of image width (the user's
+    per-image Feather setting): 0 = essentially hard edges, larger values
+    cross-fade the fill into the surrounding original over a wider ramp.
+    Defect-like pixels are always fully filled regardless of the feather, so
+    a wide fade cannot blend the defect back in.
 
     Each mask component is filled by CLONING the best-matching clean patch
     from its neighborhood (see _heal_patch) — real texture and grain,
@@ -3422,11 +3430,13 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.
     integ = cv2.integral((mask_pad > 0).astype(np.uint8))
     filled = img16.copy()
     fallback = np.zeros_like(mask)
-    # Per-pixel feather ramp width (px), resolution-scaled so the fade covers
-    # the same image fraction at preview and export; each patch caps its own
-    # value by its defect-free rim depth (see _heal_patch).
-    feather = max(_HEAL_FEATHER_MIN, int(round(w * _HEAL_FEATHER_FRAC)))
+    # Per-pixel feather ramp width (px). Normalized like the spots, so the
+    # fade covers the same image fraction at preview and export; each patch
+    # caps its own value by its hole depth (see _heal_patch). `dlike` marks
+    # defect-like hole pixels that must be fully filled regardless of feather.
+    feather_px = max(1, int(round(float(feather) * w)))
     fmap = np.ones((h, w), np.uint8)
+    dlike = np.zeros((h, w), np.uint8)
     for i in range(1, n):  # 0 is background
         x0 = int(stats[i, cv2.CC_STAT_LEFT])
         y0 = int(stats[i, cv2.CC_STAT_TOP])
@@ -3447,14 +3457,14 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.
                 ys, xs = np.nonzero(sub)
                 bbox = (tx + int(xs.min()), ty + int(ys.min()),
                         tx + int(xs.max()) + 1, ty + int(ys.max()) + 1)
-                if not _heal_patch(img16, labels, i, bbox, half_th,
-                                   mask_pad, integ, filled, fmap, feather):
+                if not _heal_patch(img16, labels, i, bbox, half_th, mask_pad,
+                                   integ, filled, fmap, feather_px, dlike):
                     fallback[ty:ty + sub.shape[0],
                              tx:tx + sub.shape[1]][sub] = 255
                     # No defect estimate on this path — cap the fade by the
                     # hole thickness so thin strokes stay near-hard.
                     fmap[ty:ty + sub.shape[0], tx:tx + sub.shape[1]][sub] = \
-                        max(1, min(feather, int(round(0.5 * half_th))))
+                        max(1, min(feather_px, int(round(0.5 * half_th))))
 
     if fallback.any():
         # Diffusion fallback (cv2.inpaint supports 8-bit only).
@@ -3475,7 +3485,13 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.
     bx, by, bwd, bhd = cv2.boundingRect(mask)
     ys = slice(max(0, by - 1), min(h, by + bhd + 1))
     xs = slice(max(0, bx - 1), min(w, bx + bwd + 1))
-    a = _feather_alpha(mask[ys, xs], fmap[ys, xs])[..., None]
+    a = _feather_alpha(mask[ys, xs], fmap[ys, xs])
+    # Defect-like pixels get the fill at full strength whatever the feather;
+    # the max with a light blur adds a soft lip around the forced region
+    # without weakening its interior.
+    dl = dlike[ys, xs]
+    forced = np.maximum(dl, cv2.blur(dl, (3, 3))).astype(np.float32) / 255.0
+    a = np.maximum(a, forced)[..., None]
     out = img16.copy()
     blend = (img16[ys, xs].astype(np.float32) * (1.0 - a)
              + filled[ys, xs].astype(np.float32) * a)

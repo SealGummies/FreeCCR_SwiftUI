@@ -15,7 +15,7 @@ See spec/dust-removal.md.
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                 QPushButton, QSlider, QFrame, QProgressBar,
                                 QMessageBox)
-from PySide6.QtCore import Qt, QObject, QThread, Signal
+from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
 
 from core import dust_detect
 from ui import theme
@@ -122,6 +122,12 @@ class DustRemovalPanel(QWidget):
         # The image a running detection was started on — results are discarded
         # if the user switches images before it finishes.
         self._detect_image_ref = None
+        # Debounce for the Feather slider: re-healing every spot on each drag
+        # tick would thrash; apply shortly after the value settles.
+        self._feather_timer = QTimer(self)
+        self._feather_timer.setSingleShot(True)
+        self._feather_timer.setInterval(200)
+        self._feather_timer.timeout.connect(self._apply_feather)
 
         self._build_ui()
         self._refresh_ai_section()
@@ -154,6 +160,25 @@ class DustRemovalPanel(QWidget):
         brush_row.addWidget(self.brush_slider)
         brush_row.addWidget(self.brush_value)
         layout.addLayout(brush_row)
+
+        # Edge feather: per-image render parameter (fraction of image width)
+        # applied to ALL of the image's spots — manual and AI — live.
+        feather_row = QHBoxLayout()
+        feather_row.setSpacing(theme.GAP_TIGHT)
+        feather_lbl = QLabel("Feather")
+        feather_lbl.setFixedWidth(theme.LABEL_COL_W)
+        self.feather_slider = QSlider(Qt.Horizontal)
+        self.feather_slider.setMinimum(0)    # f = value/10000 -> 0 .. 1.0% width
+        self.feather_slider.setMaximum(100)
+        self.feather_slider.setValue(30)     # 0.30% default
+        self.feather_slider.setFixedHeight(theme.CONTROL_H)
+        self.feather_value = QLabel("0.30%")
+        self.feather_value.setFixedWidth(theme.VALUE_COL_W)
+        self.feather_slider.valueChanged.connect(self._on_feather_changed)
+        feather_row.addWidget(feather_lbl)
+        feather_row.addWidget(self.feather_slider)
+        feather_row.addWidget(self.feather_value)
+        layout.addLayout(feather_row)
 
         hint = QLabel("Click or drag over dust to remove it.")
         hint.setWordWrap(True)
@@ -264,6 +289,12 @@ class DustRemovalPanel(QWidget):
             self._prob_image_ref = None
         # Push the current brush size to the canvas so they agree on entry.
         self.image_preview.set_dust_brush_size(self.brush_slider.value() / 1000.0)
+        # Reflect this image's feather without re-triggering a re-render.
+        f = getattr(img, "dust_feather", 0.003) if img is not None else 0.003
+        self.feather_slider.blockSignals(True)
+        self.feather_slider.setValue(int(round(f * 10000)))
+        self.feather_slider.blockSignals(False)
+        self.feather_value.setText(f"{f * 100.0:.2f}%")
         self._refresh_ai_section()
         self.status_label.setText("")
 
@@ -280,6 +311,23 @@ class DustRemovalPanel(QWidget):
     def _on_brush_changed(self, value):
         self.brush_value.setText(f"{value / 10.0:.1f}%")
         self.image_preview.set_dust_brush_size(value / 1000.0)
+
+    def _on_feather_changed(self, value):
+        self.feather_value.setText(f"{value / 100.0:.2f}%")
+        self._feather_timer.start()
+
+    def _apply_feather(self):
+        """Store the slider's feather on the current image and re-heal its
+        spots so the edge softness updates live."""
+        img = self._current_image()
+        if img is None:
+            return
+        f = self.feather_slider.value() / 10000.0
+        if abs(getattr(img, "dust_feather", -1.0) - f) < 1e-9:
+            return
+        img.dust_feather = f
+        if getattr(img, "dust_spots", None):
+            self.image_preview._commit_dust_change(img)
 
     def _on_undo_last(self):
         if not self.image_preview.dust_undo_last():
