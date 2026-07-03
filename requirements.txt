@@ -4,6 +4,7 @@ exifread
 opencv-python
 rawpy
 tifffile
+imagecodecs
 requests
 nuitka
 pyopencl

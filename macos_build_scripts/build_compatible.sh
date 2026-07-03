@@ -73,6 +73,8 @@ python -m nuitka \
     --standalone \
     --include-package=numpy \
     --include-package=pyopencl \
+    --include-package=imagecodecs \
+    --include-package-data=imagecodecs \
     --include-data-dir="$PYOPENCL_CL_DIR=pyopencl/cl" \
     --enable-plugin=pyside6 \
     --include-data-dir=src/icons=icons \

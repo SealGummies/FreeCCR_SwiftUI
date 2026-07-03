@@ -1,6 +1,12 @@
 import sys
 import os
 
+# FIRST: make print() unable to crash the app (a macOS .app launches with an
+# ASCII stdout; any logged non-ASCII character raised UnicodeEncodeError mid-
+# operation and aborted it — GitHub issue #86). Everything below prints.
+from utils.stream_hardening import harden_std_streams
+harden_std_streams()
+
 # Make onnxruntime usable for AI dust detection, then pre-load it BEFORE Qt.
 # Two Windows gotchas this handles (see spec/dust-removal.md §8):
 #  1) Nuitka standalone build: the bundled onnxruntime .pyd is loaded without
