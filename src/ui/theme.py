@@ -108,6 +108,13 @@ class Paint:
     HIST_G = (90, 200, 90)
     HIST_B = (100, 140, 235)
     HIST_PEAK = (235, 235, 235)       # where all channels overlap / clip-all wedge
+    # Scopes panel (widgets/scopes_panel.py): RGB parade + vectorscope under
+    # the canvas. Darker than HIST_BG — the additive traces need contrast.
+    SCOPE_BG = (26, 26, 26)
+    SCOPE_GRID = (255, 255, 255, 30)
+    SCOPE_LABEL = (255, 255, 255, 90)
+    SCOPE_MARKER = (255, 255, 255, 235)
+    SCOPE_MARKER_OUTLINE = (20, 20, 20, 220)
 
 
 class Overlay:
