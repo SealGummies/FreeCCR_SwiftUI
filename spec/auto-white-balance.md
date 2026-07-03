@@ -14,8 +14,13 @@ toggle + post-conversion hook pattern), `spec/settings-page.md`.
   buttons `WB Picker | AWB | Crop | Slice` share the row at equal stretch).
 - **Q2 — Auto-AWB default OFF.** A newly automatic behavior must not change
   existing users' conversions; the algorithm dropdown defaults to Gray World.
-- **Q3 — Full frame.** The estimate uses the whole converted frame; the in-bound
-  mask rejects holder/headroom extremes. Crop-aware sampling is a follow-up.
+- **Q3 — Crop-aware (revised per user).** With a crop set, only the kept region
+  drives the estimate: `compute_awb_temp_tint` passes the base through
+  `apply_crop_to_image(base, crop_rect, crop_angle)` (normalized rect in
+  resized_raw space; None → unchanged, so uncropped images are the full frame).
+  A rotated crop's black corner fill de-windows below `AWB_LO` and is discarded
+  by the in-bound mask — no special-casing. The content-fraction gate is
+  relative to the cropped pixel count, so small crops still estimate.
 - **Q4 — Active-image access**: `sliders_panel` already imports `ccr_backend`
   and reads the active image via `ccr_backend.get_image_by_index(self.current_idx)`
   throughout — the button handler does the same. No routing through
@@ -87,9 +92,6 @@ correct it.
   (`_white_balance_gains` / `compute_neutral_temp_tint`) are unchanged.
 - No per-channel gain channel separate from the sliders (unlike Auto Gain's
   invisible offset — AWB *must* be visible on the sliders per the requirement).
-- No crop-awareness in v1: the estimate uses the full converted frame (the
-  in-bound mask already rejects holder/border extremes). Crop-aware sampling is a
-  possible follow-up.
 - No AWB for un-converted negatives or positive-mode identity frames beyond the
   existing picker gate (button shares the picker's enable state).
 - No live "AWB mode" that re-estimates on every render (it writes sliders once).
@@ -185,7 +187,8 @@ def estimate_neutral_rgb(base_u16, ws_windowed: bool, algorithm: str
     Unknown algorithm ids fall back to gray_world (forward-compat settings)."""
 
 def compute_awb_temp_tint(ccr_image) -> tuple | None:
-    """estimate_neutral_rgb(ccr_image.resized_raw, ccr_image._ws_windowed,
+    """apply_crop_to_image(resized_raw, crop_rect, crop_angle) →
+    estimate_neutral_rgb(cropped, ccr_image._ws_windowed,
     ccr_backend.awb_algorithm) → compute_neutral_temp_tint(r, g, b,
     ccr_image.tint_balance_factor). Returns (temp:int, tint:int) or None."""
 ```
@@ -329,6 +332,9 @@ Wiring (the Auto Gain 4-point pattern):
   conversion itself.
 - **Stored algorithm id unknown** (future rename/downgrade): fall back to
   `gray_world` silently.
+- **Cropped image**: only the kept region is sampled (§0-Q3). A rotated crop's
+  out-of-source black fill is masked out by `AWB_LO`; a degenerate/absent rect
+  falls back to the full frame (`apply_crop_to_image` returns the input).
 - **Area layers**: AWB writes the whole-image layer (`adjustment_settings`),
   never an area layer — the button uses `on_wb_sampled`, which already targets
   the whole-image sliders; the hook writes `adjustment_settings` directly.
@@ -356,6 +362,9 @@ Wiring (the Auto Gain 4-point pattern):
 - **Hook guard**: fake image with `{"temperature": 5}` (or `{"tint": -3}`) →
   hook leaves settings unchanged; with both 0/absent → keys written; with
   `auto_awb=False` → untouched.
+- **Crop-aware**: cast-A content inside the crop rect, cast-B junk outside →
+  the estimate matches cast A (and differs from the uncropped estimate); a
+  rotated crop's black fill does not skew the estimate.
 - **Unknown algorithm id** → gray_world result.
 - **Settings round-trip** (GUI-light or mocked): backend defaults
   (False, "gray_world"); toggling handlers persist and update flags.

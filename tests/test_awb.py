@@ -148,12 +148,14 @@ def test_estimate_is_scale_invariant():
 # --- compute_awb_temp_tint on an image-like object ---------------------------
 
 class _StubImage:
-    def __init__(self, base, ws=False, converted=True):
+    def __init__(self, base, ws=False, converted=True, crop=None, angle=0.0):
         self.resized_raw = base
         self._ws_windowed = ws
         self.converted = converted
         self.tint_balance_factor = 1.0
         self.adjustment_settings = {}
+        self.crop_rect = crop
+        self.crop_angle = angle
 
 
 def test_compute_awb_temp_tint_stub_image():
@@ -167,6 +169,46 @@ def test_compute_awb_temp_tint_stub_image():
 
 def test_compute_awb_temp_tint_no_base():
     assert compute_awb_temp_tint(_StubImage(None), algorithm="gray_world") is None
+
+
+# --- crop awareness -----------------------------------------------------------
+
+def test_crop_region_drives_the_estimate():
+    """Cast-A content inside the crop, strongly different cast-B junk outside:
+    the cropped estimate matches the interior content, not the whole frame."""
+    rng = np.random.default_rng(10)
+    inside = _cast_scene(rng, cast=CAST, shape=(64, 64))
+    d = _cast_scene(rng, cast=(0.7, 1.0, 1.3), shape=(128, 128))   # cool junk
+    d[32:96, 32:96, :] = inside                                     # centered 50%
+    crop = (0.25, 0.25, 0.75, 0.75)
+    cropped = compute_awb_temp_tint(
+        _StubImage(_u16(d), crop=crop), algorithm="gray_world")
+    interior_only = compute_awb_temp_tint(
+        _StubImage(_u16(inside)), algorithm="gray_world")
+    full = compute_awb_temp_tint(_StubImage(_u16(d)), algorithm="gray_world")
+    assert cropped == interior_only
+    assert cropped != full
+
+
+def test_rotated_crop_black_fill_is_masked():
+    """An angled crop samples outside the source (black fill); those pixels
+    sit below AWB_LO and must not skew the estimate toward neutral-dark."""
+    d = _cast_scene(np.random.default_rng(11), shape=(96, 96))
+    straight = compute_awb_temp_tint(
+        _StubImage(_u16(d), crop=(0.1, 0.1, 0.9, 0.9)), algorithm="gray_world")
+    angled = compute_awb_temp_tint(
+        _StubImage(_u16(d), crop=(0.1, 0.1, 0.9, 0.9), angle=8.0),
+        algorithm="gray_world")
+    # same scene statistics → within a slider unit of the straight crop
+    assert abs(angled[0] - straight[0]) <= 1
+    assert abs(angled[1] - straight[1]) <= 1
+
+
+def test_stub_without_crop_attrs_still_works():
+    """The hook may see images predating the crop feature — getattr defaults."""
+    img = _StubImage(_u16(_cast_scene(np.random.default_rng(12))))
+    del img.crop_rect, img.crop_angle
+    assert compute_awb_temp_tint(img, algorithm="gray_world") is not None
 
 
 # --- the post-conversion hook (backend policy) --------------------------------

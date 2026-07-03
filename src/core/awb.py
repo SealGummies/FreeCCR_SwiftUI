@@ -10,7 +10,7 @@ through the same inverse the WB eyedropper uses.
 import numpy as np
 
 from core.ccr_processor import (MIN_CONTENT_FRACTION, WS_B, _WS_INV_WIDTH,
-                                compute_neutral_temp_tint)
+                                apply_crop_to_image, compute_neutral_temp_tint)
 
 # (id, UI label) — ordered as shown in the Settings dropdown.
 AWB_ALGORITHMS = [
@@ -75,14 +75,19 @@ def estimate_neutral_rgb(base_u16, ws_windowed=False, algorithm=AWB_DEFAULT):
 def compute_awb_temp_tint(ccr_image, algorithm=None):
     """(temperature, tint) slider ints that neutralize the image's estimated
     cast, or None. Runs on the converted base (resized_raw), so the result is
-    independent of the current slider values (idempotent). Uses the
+    independent of the current slider values (idempotent). Crop-aware: with a
+    crop set, only the kept region drives the estimate (a rotated crop's black
+    corner fill sits below AWB_LO, so the mask discards it). Uses the
     backend-selected algorithm when none is given."""
     if ccr_image is None or getattr(ccr_image, "resized_raw", None) is None:
         return None
     if algorithm is None:
         from core.ccr_backend import ccr_backend   # deferred: circular at load
         algorithm = getattr(ccr_backend, "awb_algorithm", AWB_DEFAULT)
-    est = estimate_neutral_rgb(ccr_image.resized_raw,
+    base = apply_crop_to_image(ccr_image.resized_raw,
+                               getattr(ccr_image, "crop_rect", None),
+                               getattr(ccr_image, "crop_angle", 0.0) or 0.0)
+    est = estimate_neutral_rgb(base,
                                getattr(ccr_image, "_ws_windowed", False),
                                algorithm)
     if est is None:
