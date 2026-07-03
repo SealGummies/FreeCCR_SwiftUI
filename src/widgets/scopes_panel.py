@@ -151,6 +151,13 @@ class ParadeScopeWidget(_ScopeWidgetBase):
             return (cells.bottom()
                     - code / float(scopes.PARADE_MAX_CODE) * cells.height())
 
+        # Trace FIRST — its pixmap is opaque (black where empty), so the
+        # graticule must go on top of it (like the vectorscope's), or loading
+        # an image wipes the grid from view.
+        trace = self._trace_pixmap(round(cells.width()), round(cells.height()))
+        if trace is not None:
+            p.drawPixmap(cells.topLeft(), trace)
+
         # DaVinci-style graticule: a labeled line every 128 codes + the top.
         grid = QColor(*theme.Paint.SCOPE_GRID)
         label = QColor(*theme.Paint.SCOPE_LABEL)
@@ -168,10 +175,6 @@ class ParadeScopeWidget(_ScopeWidgetBase):
         for k in range(1, 3):
             gx = cells.left() + cells.width() * k / 3.0
             p.drawLine(QPointF(gx, cells.top()), QPointF(gx, cells.bottom()))
-
-        trace = self._trace_pixmap(round(cells.width()), round(cells.height()))
-        if trace is not None:
-            p.drawPixmap(cells.topLeft(), trace)
 
         # Cineon reference levels (Dmin 95 / 90%-white 685), over the trace so
         # they stay readable; labels at the right edge, just above the line.
