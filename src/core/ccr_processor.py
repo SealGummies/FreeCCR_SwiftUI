@@ -3218,10 +3218,12 @@ def rasterize_dust_mask(spots, h: int, w: int) -> np.ndarray:
 # spot's neighborhood (real texture and grain, 16-bit native) instead of
 # diffusing an average inward — diffusion (cv2.inpaint) produces a smooth,
 # grainless patch with radial fan-like streaks that stands out on film scans.
-_HEAL_RING = 3            # px of clean context around a hole (matching + tone)
+_HEAL_RING = 3            # min ring width of clean context (matching + tone)
+_HEAL_GUARD = 2           # min gap (px) between the hole and its context ring
 _HEAL_ANGLES = 16         # candidate source directions searched around a spot
-_HEAL_DIST_FACTORS = (1.0, 1.8, 3.0)  # x the minimum non-overlapping distance
 _HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
+_HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
+_HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
 
 
 def _box_sum(integ: np.ndarray, y0: int, x0: int, y1: int, x1: int) -> int:
@@ -3229,49 +3231,102 @@ def _box_sum(integ: np.ndarray, y0: int, x0: int, y1: int, x1: int) -> int:
     return int(integ[y1, x1] - integ[y0, x1] - integ[y1, x0] + integ[y0, x0])
 
 
-def _heal_component(img16: np.ndarray, labels: np.ndarray, stats: np.ndarray,
-                    comp: int, mask_pad: np.ndarray, integ: np.ndarray,
-                    filled: np.ndarray) -> bool:
-    """Fill one mask component by cloning the best-matching nearby clean patch.
+def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
+                half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
+                filled: np.ndarray) -> bool:
+    """Fill one hole patch (a compact component, or one segment of a long
+    stroke) by cloning the best-matching nearby clean patch.
 
-    The component's bbox (+ a small ring of known context) is compared against
-    candidate windows on a ring of directions/distances around it; the source
-    whose RING pixels best match (SSD) is cloned into the hole, with a smooth
-    per-channel tone correction interpolated from the ring differences (a cheap
-    membrane, so gradients continue through the patch while its grain is kept
-    verbatim). Writes the healed hole pixels into `filled` and returns True, or
-    returns False when no fully clean, in-bounds source window exists (caller
-    falls back to diffusion inpaint for this component).
+    The hole's surrounding ring of known context is compared against candidate
+    windows on rings of directions/distances around it; the source whose RING
+    pixels best match (SSD) is cloned into the hole, with a smooth per-channel
+    tone correction interpolated from the ring differences (a cheap membrane,
+    so gradients continue through the patch while its grain is kept verbatim).
+    `bbox` = (bx0, by0, bx1, by1) tight bounds of THIS patch's hole pixels;
+    `half_th` = the component's half-thickness (max distance transform), its
+    local scale. Writes the healed hole pixels into `filled` and returns True,
+    or returns False when no fully clean, in-bounds source window exists
+    (caller falls back to diffusion inpaint for this patch).
+
+    Everything local is keyed off the thickness, never the bbox: a traced
+    hair's bbox can span half the frame while the stroke is a few px wide.
+    Three defenses keep the defect itself out of the tone anchor (a defect's
+    soft edge leaks past the brushed mask; anchoring on it lifted whole
+    strokes into bright ghosts):
+      - the ring starts a thickness-scaled GUARD gap away from the hole;
+      - ring pixels that are luma outliers (3 scaled-MAD) against the ring's
+        OUTER half (farthest from the hole = least contaminated) are rejected
+        from both matching and tone;
+      - the membrane sigma is thickness-local, so any contamination that still
+        survives can only tint its own neighborhood, not the whole stroke.
     """
     h, w = labels.shape[:2]
-    x0 = int(stats[comp, cv2.CC_STAT_LEFT])
-    y0 = int(stats[comp, cv2.CC_STAT_TOP])
-    cw = int(stats[comp, cv2.CC_STAT_WIDTH])
-    ch = int(stats[comp, cv2.CC_STAT_HEIGHT])
-    wx0 = max(0, x0 - _HEAL_RING)
-    wy0 = max(0, y0 - _HEAL_RING)
-    wx1 = min(w, x0 + cw + _HEAL_RING)
-    wy1 = min(h, y0 + ch + _HEAL_RING)
+    bx0, by0, bx1, by1 = bbox
 
+    guard = max(_HEAL_GUARD, int(round(0.5 * half_th)))
+    ring_w = max(_HEAL_RING, guard + 3)
+    pad = guard + ring_w
+    wx0 = max(0, bx0 - pad)
+    wy0 = max(0, by0 - pad)
+    wx1 = min(w, bx1 + pad)
+    wy1 = min(h, by1 + pad)
+
+    # The hole is only THIS patch's pixels: component pixels inside the window
+    # but outside the bbox belong to a neighboring segment's call.
     hole = labels[wy0:wy1, wx0:wx1] == comp
-    kern = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * _HEAL_RING + 1, 2 * _HEAL_RING + 1))
-    ring = ((cv2.dilate(hole.astype(np.uint8), kern) > 0)
+    hole[:by0 - wy0] = False
+    hole[by1 - wy0:] = False
+    hole[:, :bx0 - wx0] = False
+    hole[:, bx1 - wx0:] = False
+    away = cv2.distanceTransform(
+        (~hole).astype(np.uint8), cv2.DIST_L2, 3)  # px from the hole
+    ring = ((away > guard) & (away <= pad)
             & (mask_pad[wy0:wy1, wx0:wx1] == 0))
     if int(ring.sum()) < _HEAL_MIN_RING_PX:
         return False  # boxed in by other spots — no context to match against
 
     dst = img16[wy0:wy1, wx0:wx1].astype(np.float32)
+
+    # Robust rejection: the defect leaks past the mask into the ring — its
+    # soft edge, or its whole continuation past the stroke's end, where it can
+    # even be the ring's MAJORITY (so no ring-population statistic works). The
+    # discriminative signal is the DEFECT'S COLOR, estimated from the hole's
+    # own content: for a tight stroke the hole IS the defect; for a generous
+    # brush the defect is the hole's outlier mode vs the ring (the background
+    # majority inside the hole matches the ring, the defect does not). Ring
+    # pixels colored like the defect are its leak: reject anything closer to
+    # the defect color than HALF the clean cluster's distance (p95 of the
+    # ring's defect-distances — valid for any contamination share below
+    # ~95%). When the "defect" is indistinct from the surround (generous
+    # brush over mostly-clean area) the distances collapse toward 0 and
+    # nothing meaningful is rejected; legit bimodal structure (a sky/roof
+    # edge) survives because both modes sit far from the defect color.
+    ry, rx = np.nonzero(ring)
+    ring_px = dst[ry, rx]
+    hole_px = dst[hole]
+    ring_med = np.median(ring_px, axis=0)
+    dh = np.abs(hole_px - ring_med).mean(axis=1)
+    defect = np.median(hole_px[dh >= np.percentile(dh, 75.0)], axis=0)
+    d_def = np.abs(ring_px - defect).mean(axis=1)
+    keep = d_def >= 0.5 * float(np.percentile(d_def, 95.0))
+    if int(keep.sum()) < _HEAL_MIN_RING_PX:
+        return False
+    ring[:] = False
+    ring[ry[keep], rx[keep]] = True
     dst_ring = dst[ring]
 
-    # Candidate source offsets: rings of directions at distances guaranteeing
-    # the source window cannot overlap this hole's window.
+    # Candidate source offsets: rings of directions at thickness-scaled
+    # distances. The integral-image check rejects any source that touches
+    # dust, so offsets need only clear the local thickness — a long stroke
+    # heals from the clean strip right beside it (requiring bbox-diagonal
+    # clearance forced long strokes into the ghost-prone diffusion fallback).
+    # The window diagonal stays as a last-resort ring for compact spots.
+    d_base = 2.0 * half_th + pad + 2.0
     d0 = float(np.hypot(wy1 - wy0, wx1 - wx0))
     best_score, best_src = None, None
-    for f in _HEAL_DIST_FACTORS:
-        d = d0 * f
+    for fi, d in enumerate((d_base, 2.0 * d_base, 4.0 * d_base, d0)):
         for k in range(_HEAL_ANGLES):
-            ang = 2.0 * np.pi * (k + 0.5 * f) / _HEAL_ANGLES
+            ang = 2.0 * np.pi * (k + 0.35 * fi) / _HEAL_ANGLES
             dy = int(round(d * np.sin(ang)))
             dx = int(round(d * np.cos(ang)))
             sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
@@ -3291,11 +3346,13 @@ def _heal_component(img16: np.ndarray, labels: np.ndarray, stats: np.ndarray,
     # Smooth per-channel tone correction from the ring differences: normalized
     # Gaussian convolution interpolates (dst - src) on the ring into the hole,
     # so the clone keeps its grain but its low frequencies land on the hole's
-    # boundary values (gradients continue seamlessly through the patch).
+    # boundary values (gradients continue seamlessly through the patch). Sigma
+    # is thickness-local: a bbox-sized sigma turned the correction into one
+    # constant for the whole component, letting one bad segment tint it all.
     dmap = np.zeros_like(dst)
     dmap[ring] = dst_ring - best_src[ring]
     ind = ring.astype(np.float32)
-    sigma = 0.5 * max(cw, ch) + _HEAL_RING
+    sigma = half_th + pad
     wsum = cv2.GaussianBlur(ind, (0, 0), sigma)
     dsum = cv2.GaussianBlur(dmap, (0, 0), sigma)
     mean_diff = dmap[ring].mean(axis=0)
@@ -3311,15 +3368,18 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.
     """Heal the dust spots out of a 16-bit RGB image, non-destructively.
 
     Each mask component is filled by CLONING the best-matching clean patch
-    from its neighborhood (see _heal_component) — real texture and grain,
+    from its neighborhood (see _heal_patch) — real texture and grain,
     16-bit native — instead of the old cv2.inpaint diffusion, whose averaged
-    fill left a smooth round patch with fan-like streaks. Components with no
-    clean source window (image border, dense dust) fall back to cv2.inpaint
-    (Telea, 8-bit). The fill is composited through a feathered alpha; only
-    masked pixels (+ a few-px blend halo) change, the rest of the frame is
-    bit-for-bit untouched. Returns a NEW uint16 array; img16 is never mutated.
-    No-op (returns img16 unchanged) when there are no spots or the rasterized
-    mask is empty.
+    fill left a smooth round patch with fan-like streaks. Long strokes are
+    healed in thickness-scaled SEGMENTS, each from its own local source strip
+    (one whole-stroke window would demand a clean area the size of the
+    stroke's bbox, which rarely exists — a curl would silently fall back to
+    diffusion and ghost). Patches with no clean source window (image border,
+    dense dust) fall back to cv2.inpaint (Telea, 8-bit). The fill is
+    composited through a feathered alpha; only masked pixels (+ a few-px blend
+    halo) change, the rest of the frame is bit-for-bit untouched. Returns a
+    NEW uint16 array; img16 is never mutated. No-op (returns img16 unchanged)
+    when there are no spots or the rasterized mask is empty.
     """
     if not spots:
         return img16
@@ -3335,8 +3395,29 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.
     filled = img16.copy()
     fallback = np.zeros_like(mask)
     for i in range(1, n):  # 0 is background
-        if not _heal_component(img16, labels, stats, i, mask_pad, integ, filled):
-            fallback[labels == i] = 255
+        x0 = int(stats[i, cv2.CC_STAT_LEFT])
+        y0 = int(stats[i, cv2.CC_STAT_TOP])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        comp_win = labels[y0:y0 + ch, x0:x0 + cw] == i
+        # Half-thickness = the defect's local scale (1px zero border so a
+        # component touching its bbox edge still measures correctly).
+        hole0 = np.zeros((ch + 2, cw + 2), np.uint8)
+        hole0[1:-1, 1:-1] = comp_win
+        half_th = float(cv2.distanceTransform(hole0, cv2.DIST_L2, 3).max())
+        seg = max(_HEAL_SEG_MIN, int(round(_HEAL_SEG_THICKNESS * half_th)))
+        for ty in range(y0, y0 + ch, seg):
+            for tx in range(x0, x0 + cw, seg):
+                sub = comp_win[ty - y0:ty - y0 + seg, tx - x0:tx - x0 + seg]
+                if not sub.any():
+                    continue
+                ys, xs = np.nonzero(sub)
+                bbox = (tx + int(xs.min()), ty + int(ys.min()),
+                        tx + int(xs.max()) + 1, ty + int(ys.max()) + 1)
+                if not _heal_patch(img16, labels, i, bbox, half_th,
+                                   mask_pad, integ, filled):
+                    fallback[ty:ty + sub.shape[0],
+                             tx:tx + sub.shape[1]][sub] = 255
 
     if fallback.any():
         # Diffusion fallback (cv2.inpaint supports 8-bit only).

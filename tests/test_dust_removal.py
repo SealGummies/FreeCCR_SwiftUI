@@ -140,6 +140,37 @@ class TestApplyDustRemoval:
         out = apply_dust_removal(img, [spot])
         assert int(out[50, 50, 0]) < 45000  # moved toward the surround
 
+    def test_traced_hair_leaves_no_bright_ghost(self):
+        # THE reported artifact: tracing a bright warm hair with a brush about
+        # its own width left a yellow-green ghost of the whole stroke. The
+        # hair's edges leak past the mask; without the guard gap + robust ring
+        # rejection they poisoned the tone correction (R/G lifted, B dropped)
+        # across the entire stroke — and the bbox-diagonal source-search
+        # minimum forced long strokes into the diffusion fallback, which
+        # ghosts the same way.
+        sky = np.array([20000, 25000, 40000], np.float32)
+        img = np.broadcast_to(sky.astype(np.uint16), (200, 200, 3)).copy()
+        # A "hair" much wider than the brush: bright/warm vs the blue sky.
+        cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
+        # Brush stroke tracing the hair core, narrower than the hair.
+        spot = {"kind": "brush",
+                "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 2.0 / 200}
+        out = apply_dust_removal(img, [spot])
+        core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
+        err = np.abs(core.mean(axis=0) - sky)
+        assert float(err.max()) < 5000   # fill stays sky-toned along the stroke
+
+    def test_underscoped_dab_keeps_tone(self):
+        # A click smaller than the speck (the small dot ghost): the speck's
+        # edge leaks past the mask but must not lift the fill's tone.
+        sky = np.array([20000, 25000, 40000], np.float32)
+        img = np.broadcast_to(sky.astype(np.uint16), (100, 100, 3)).copy()
+        cv2.circle(img, (50, 50), 6, (62000, 60000, 30000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.04}  # mask r=4 < speck r=6
+        out = apply_dust_removal(img, [spot])
+        center = out[49:52, 49:52].astype(np.float32).reshape(-1, 3).mean(axis=0)
+        assert float(np.abs(center - sky).max()) < 6000
+
 
 # --- apply_adjustments integration (dust runs before the early-return guard) -
 class TestApplyAdjustmentsIntegration:

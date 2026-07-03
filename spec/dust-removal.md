@@ -284,27 +284,47 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
   original `cv2.inpaint` (Telea) fill. Telea diffuses a distance/direction
   weighted **average** of the surrounding ring inward, which produced a smooth,
   grainless round patch with radial fan-like streaks — obvious on grainy film.
-  The heal instead copies real neighboring texture, per mask component
-  (`cv2.connectedComponentsWithStats`):
-  1. **Window**: component bbox padded by `_HEAL_RING` (3 px); `ring` = the
-     clean known pixels around the hole (dilate minus every spot's 1-px-padded
-     mask) — the matching/tone context.
-  2. **Search**: candidate source windows on `_HEAL_ANGLES` (16) directions ×
-     `_HEAL_DIST_FACTORS` (1.0/1.8/3.0 × the window diagonal, so a source can
-     never overlap its own hole). A candidate must be in-bounds and fully clean
-     (checked O(1) against `cv2.integral` of the padded mask). Score = SSD
-     between source and destination **ring** pixels; best wins.
-  3. **Clone + membrane tone correction**: hole pixels are copied from the best
-     source, plus a smooth per-channel correction field interpolated from the
-     ring differences (normalized Gaussian convolution, σ ~ half the component
-     size; plain ring-mean where the ring weight underflows). Grain is kept
-     verbatim while low frequencies land on the hole's boundary values, so
-     gradients continue through the patch. All in float32 from the uint16
-     source — the fill is **16-bit native** (no 8-bit quantization).
-  4. **Fallback**: a component with no clean in-bounds source window (image
+  The heal instead copies real neighboring texture. All locality decisions key
+  off the hole's **half-thickness** (max distance transform), never its bbox —
+  a traced hair's bbox can span half the frame while the stroke is a few px
+  wide. Per mask component (`cv2.connectedComponentsWithStats`):
+  0. **Segmenting**: components larger than ~6× their thickness (min 32 px)
+     are healed in thickness-scaled segments, each from its own local source
+     strip — one whole-stroke window would demand a clean area the size of the
+     stroke's bbox, which rarely exists (a traced curl would silently fall
+     back to diffusion and ghost).
+  1. **Window + guarded ring**: patch bbox padded by `guard + ring_w`; `ring`
+     = clean known pixels at distance `(guard, guard+ring_w]` from the hole
+     (`guard` ≥ 2 px, scaled to half the thickness). The gap matters: the
+     defect's soft edge leaks past the brushed mask, and pixels hugging the
+     hole are the most likely to be the defect itself.
+  2. **Defect-color rejection**: the defect's color is estimated from the
+     hole's own content (a tight stroke's hole IS the defect; a generous
+     brush's defect is the hole's outlier mode vs the ring). Ring pixels
+     closer to that color than half the clean cluster's distance (p95 of the
+     ring's defect-distances) are rejected from matching AND tone — a leaked
+     hair edge, or the hair's continuation past the stroke's end (which can
+     be the ring's *majority*), cannot lift the fill into a bright ghost of
+     the stroke. Legit bimodal structure survives (both modes sit far from
+     the defect color).
+  3. **Search**: candidate source windows on `_HEAL_ANGLES` (16) directions ×
+     thickness-scaled distances (`2·half_th + pad + 2`, ×1/2/4, plus the
+     window diagonal as a last resort). A candidate must be in-bounds and
+     fully clean (checked O(1) against `cv2.integral` of the padded mask), so
+     a long stroke heals from the clean strip right beside it. Score = SSD
+     between source and destination **kept ring** pixels; best wins.
+  4. **Clone + membrane tone correction**: hole pixels are copied from the
+     best source, plus a smooth per-channel correction field interpolated
+     from the kept-ring differences (normalized Gaussian convolution,
+     σ = thickness + pad, so any surviving contamination only tints its own
+     neighborhood; plain ring-mean where the ring weight underflows). Grain
+     is kept verbatim while low frequencies land on the hole's boundary
+     values, so gradients continue through the patch. All in float32 from the
+     uint16 source — the fill is **16-bit native** (no 8-bit quantization).
+  5. **Fallback**: a patch with no clean in-bounds source window (image
      border, dense dust) or a starved ring (< `_HEAL_MIN_RING_PX`) falls back
      to the old 8-bit `cv2.inpaint(..., inpaint_radius, INPAINT_TELEA)` fill.
-  5. **Feathered composite** (unchanged): alpha = dilate the mask ~1 px +
+  6. **Feathered composite** (unchanged): alpha = dilate the mask ~1 px +
      box-blur 5×5, normalized 0..1; `out = img16*(1-a) + filled*a`, computed
      inside the halo's bounding box only. Away from any spot `out == img16`
      bit-for-bit.
