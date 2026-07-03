@@ -19,7 +19,7 @@ from datetime import date
 
 # First combo entry of the film-stock selector: the baked scalar
 # DEFAULT_DENSITY_SLOPE (no preset). See spec/film-stock-slopes.md.
-FILM_STOCK_DEFAULT_LABEL = "Default slope"
+FILM_STOCK_DEFAULT_LABEL = "Default"
 
 # Setting groups offered by the "Sync to All" dialog. The adjustment-key
 # groups partition SlidersPanel.ADJUSTMENT_KEYS exactly; "crop" syncs the
@@ -460,7 +460,7 @@ class SlidersPanel(QWidget):
             self._settings.value("convert/film_stocks", "", type=str))
         # The PRESETS persist across sessions; the SELECTION does not — every
         # session (and every new batch, see reset_film_stock_combo) starts on
-        # "Default slope" so a stock chosen for one roll can't silently apply
+        # "Default" so a stock chosen for one roll can't silently apply
         # to the next. Drop the legacy persisted-selection key.
         self._settings.remove("convert/film_stock_selected")
         self._reload_film_stock_combo(select="")
@@ -1575,11 +1575,11 @@ class SlidersPanel(QWidget):
         if not bp_set:
             text = ""
         elif wp_set:
-            text = "Slope source: white point (two-point)"
+            text = "Anchor source: white point (two-point)"
         elif stock:
-            text = f'Slope source: film stock "{stock}" (black point only)'
+            text = f'Anchor source: film stock "{stock}" (black point only)'
         else:
-            text = "Slope source: default slope (black point only)"
+            text = "Anchor source: default slope (black point only)"
         self.bwp_mode_label.setText(text)
         # Hide when empty so it reserves no vertical space — keeps the Set-point
         # row and the Convert row tight together (no gap) until a point is set.
@@ -1634,7 +1634,7 @@ class SlidersPanel(QWidget):
         self._apply_film_stock_selection()
 
     def reset_film_stock_combo(self):
-        """Back to "Default slope". Called when a new batch is loaded (and on
+        """Back to "Default". Called when a new batch is loaded (and on
         tether session start): a stock chosen for the previous roll must not
         silently convert the next one — mirrors the B/W-point reset."""
         if self.film_stock_combo.currentIndex() != 0:
@@ -1709,7 +1709,7 @@ class SlidersPanel(QWidget):
             return
         self._film_stocks = remove_film_stock(self._film_stocks, name)
         self._save_film_stocks_to_settings()
-        self._reload_film_stock_combo()   # falls back to Default slope
+        self._reload_film_stock_combo()   # falls back to Default
         self.set_temporary_hint(f'Film stock "{name}" deleted.', duration=5000)
 
     def on_bwpoint_sampled(self, mode):
