@@ -1,7 +1,7 @@
 """
 AI dust detection (hybrid) — ONNX BOPBTL U-Net detector + classical fill.
 
-The neural net only *detects* dust; the actual removal is `cv2.inpaint`
+The neural net only *detects* dust; the actual removal is a clone-heal fill
 (see ccr_processor.apply_dust_removal). This module is deliberately
 self-contained and imports `onnxruntime` ONLY inside functions, so importing it
 (and the dust panel that uses it) never fails when onnxruntime is absent — the

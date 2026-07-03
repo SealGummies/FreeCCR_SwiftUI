@@ -3214,12 +3214,206 @@ def rasterize_dust_mask(spots, h: int, w: int) -> np.ndarray:
     return mask
 
 
-def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.ndarray:
-    """Inpaint the dust spots out of a 16-bit RGB image, non-destructively.
+# Clone-heal tuning. The fill copies the best-matching CLEAN patch from the
+# spot's neighborhood (real texture and grain, 16-bit native) instead of
+# diffusing an average inward — diffusion (cv2.inpaint) produces a smooth,
+# grainless patch with radial fan-like streaks that stands out on film scans.
+_HEAL_RING = 3            # min ring width of clean context (matching + tone)
+_HEAL_GUARD = 2           # min gap (px) between the hole and its context ring
+_HEAL_ANGLES = 16         # candidate source directions searched around a spot
+_HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
+_HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
+_HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
+DUST_FEATHER_DEFAULT = 0.003  # feather ramp width, fraction of image width
+                              # (user-adjustable per image via the dust panel)
 
-    Only the masked pixels are replaced (the rest of the frame keeps full
-    16-bit precision); the fill is computed by cv2.inpaint (Telea) in 8-bit and
-    composited back through a feathered alpha so the patch blends seamlessly.
+
+def _box_sum(integ: np.ndarray, y0: int, x0: int, y1: int, x1: int) -> int:
+    """Sum of a uint8 map over [y0:y1, x0:x1] via its cv2.integral image."""
+    return int(integ[y1, x1] - integ[y0, x1] - integ[y1, x0] + integ[y0, x0])
+
+
+def _feather_alpha(mask: np.ndarray, fmap: np.ndarray) -> np.ndarray:
+    """Per-pixel blend alpha for the fill: 0 at each hole's boundary rising to
+    1 over `fmap` px inward (smoothstep ramp); exactly 0 outside the mask.
+    `fmap` holds each hole's feather ramp width in px (uint8; 1 = essentially
+    hard). The +1 lift keeps a 1-px-feather rim nearly fully filled while wide
+    feathers still start near 0 at the very edge."""
+    inside = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 3)
+    f = np.maximum(fmap.astype(np.float32), 1.0)
+    return _smoothstep((inside + 1.0) / (f + 1.0)) * (mask > 0)
+
+
+def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
+                half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
+                filled: np.ndarray, fmap: np.ndarray, feather_px: int,
+                dlike: np.ndarray) -> bool:
+    """Fill one hole patch (a compact component, or one segment of a long
+    stroke) by cloning the best-matching nearby clean patch.
+
+    The hole's surrounding ring of known context is compared against candidate
+    windows on rings of directions/distances around it; the source whose RING
+    pixels best match (SSD) is cloned into the hole, with a smooth per-channel
+    tone correction interpolated from the ring differences (a cheap membrane,
+    so gradients continue through the patch while its grain is kept verbatim).
+    `bbox` = (bx0, by0, bx1, by1) tight bounds of THIS patch's hole pixels;
+    `half_th` = the component's half-thickness (max distance transform), its
+    local scale. Writes the healed hole pixels into `filled` and returns True,
+    or returns False when no fully clean, in-bounds source window exists
+    (caller falls back to diffusion inpaint for this patch).
+
+    Everything local is keyed off the thickness, never the bbox: a traced
+    hair's bbox can span half the frame while the stroke is a few px wide.
+    Three defenses keep the defect itself out of the tone anchor (a defect's
+    soft edge leaks past the brushed mask; anchoring on it lifted whole
+    strokes into bright ghosts):
+      - the ring starts a thickness-scaled GUARD gap away from the hole;
+      - ring pixels that are luma outliers (3 scaled-MAD) against the ring's
+        OUTER half (farthest from the hole = least contaminated) are rejected
+        from both matching and tone;
+      - the membrane sigma is thickness-local, so any contamination that still
+        survives can only tint its own neighborhood, not the whole stroke.
+    """
+    h, w = labels.shape[:2]
+    bx0, by0, bx1, by1 = bbox
+
+    guard = max(_HEAL_GUARD, int(round(0.5 * half_th)))
+    ring_w = max(_HEAL_RING, guard + 3)
+    pad = guard + ring_w
+    wx0 = max(0, bx0 - pad)
+    wy0 = max(0, by0 - pad)
+    wx1 = min(w, bx1 + pad)
+    wy1 = min(h, by1 + pad)
+
+    # The hole is only THIS patch's pixels: component pixels inside the window
+    # but outside the bbox belong to a neighboring segment's call.
+    hole = labels[wy0:wy1, wx0:wx1] == comp
+    hole[:by0 - wy0] = False
+    hole[by1 - wy0:] = False
+    hole[:, :bx0 - wx0] = False
+    hole[:, bx1 - wx0:] = False
+    away = cv2.distanceTransform(
+        (~hole).astype(np.uint8), cv2.DIST_L2, 3)  # px from the hole
+    ring = ((away > guard) & (away <= pad)
+            & (mask_pad[wy0:wy1, wx0:wx1] == 0))
+    if int(ring.sum()) < _HEAL_MIN_RING_PX:
+        return False  # boxed in by other spots — no context to match against
+
+    dst = img16[wy0:wy1, wx0:wx1].astype(np.float32)
+
+    # Robust rejection: the defect leaks past the mask into the ring — its
+    # soft edge, or its whole continuation past the stroke's end, where it can
+    # even be the ring's MAJORITY (so no ring-population statistic works). The
+    # discriminative signal is the DEFECT'S COLOR, estimated from the hole's
+    # own content: for a tight stroke the hole IS the defect; for a generous
+    # brush the defect is the hole's outlier mode vs the ring (the background
+    # majority inside the hole matches the ring, the defect does not). Ring
+    # pixels colored like the defect are its leak: reject anything closer to
+    # the defect color than HALF the clean cluster's distance (p95 of the
+    # ring's defect-distances — valid for any contamination share below
+    # ~95%). When the "defect" is indistinct from the surround (generous
+    # brush over mostly-clean area) the distances collapse toward 0 and
+    # nothing meaningful is rejected; legit bimodal structure (a sky/roof
+    # edge) survives because both modes sit far from the defect color.
+    ry, rx = np.nonzero(ring)
+    ring_px = dst[ry, rx]
+    hole_px = dst[hole]
+    ring_med = np.median(ring_px, axis=0)
+    dh = np.abs(hole_px - ring_med).mean(axis=1)
+    defect = np.median(hole_px[dh >= np.percentile(dh, 75.0)], axis=0)
+    d_def = np.abs(ring_px - defect).mean(axis=1)
+    thr = 0.5 * float(np.percentile(d_def, 95.0))
+    keep = d_def >= thr
+    if int(keep.sum()) < _HEAL_MIN_RING_PX:
+        return False
+    ring[:] = False
+    ring[ry[keep], rx[keep]] = True
+    dst_ring = dst[ring]
+
+    # Candidate source offsets: rings of directions at thickness-scaled
+    # distances. The integral-image check rejects any source that touches
+    # dust, so offsets need only clear the local thickness — a long stroke
+    # heals from the clean strip right beside it (requiring bbox-diagonal
+    # clearance forced long strokes into the ghost-prone diffusion fallback).
+    # The window diagonal stays as a last-resort ring for compact spots.
+    d_base = 2.0 * half_th + pad + 2.0
+    d0 = float(np.hypot(wy1 - wy0, wx1 - wx0))
+    best_score, best_src = None, None
+    for fi, d in enumerate((d_base, 2.0 * d_base, 4.0 * d_base, d0)):
+        for k in range(_HEAL_ANGLES):
+            ang = 2.0 * np.pi * (k + 0.35 * fi) / _HEAL_ANGLES
+            dy = int(round(d * np.sin(ang)))
+            dx = int(round(d * np.cos(ang)))
+            sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
+            if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
+                continue
+            if _box_sum(integ, sy0, sx0, sy1, sx1) != 0:
+                continue  # source window touches dust (this or another spot)
+            src = img16[sy0:sy1, sx0:sx1].astype(np.float32)
+            diff = src[ring] - dst_ring
+            score = float(np.mean(diff * diff))
+            if best_score is None or score < best_score:
+                best_score, best_src = score, src
+
+    if best_src is None:
+        return False
+
+    # Smooth per-channel tone correction from the ring differences: normalized
+    # Gaussian convolution interpolates (dst - src) on the ring into the hole,
+    # so the clone keeps its grain but its low frequencies land on the hole's
+    # boundary values (gradients continue seamlessly through the patch). Sigma
+    # is thickness-local: a bbox-sized sigma turned the correction into one
+    # constant for the whole component, letting one bad segment tint it all.
+    dmap = np.zeros_like(dst)
+    dmap[ring] = dst_ring - best_src[ring]
+    ind = ring.astype(np.float32)
+    sigma = half_th + pad
+    wsum = cv2.GaussianBlur(ind, (0, 0), sigma)
+    dsum = cv2.GaussianBlur(dmap, (0, 0), sigma)
+    mean_diff = dmap[ring].mean(axis=0)
+    corr = np.where(wsum[..., None] > 1e-4,
+                    dsum / np.maximum(wsum, 1e-6)[..., None], mean_diff)
+    heal = best_src + corr
+    filled[wy0:wy1, wx0:wx1][hole] = np.clip(
+        np.rint(heal[hole]), 0, 65535).astype(np.uint16)
+
+    # Feather: the user-set ramp width, capped by the hole depth so the core
+    # still reaches full fill. Defect-like hole pixels (colored like the
+    # estimated defect) are force-filled via `dlike` regardless of the ramp,
+    # so a wide feather can never blend the defect back in — the soft fade
+    # only happens across clean rim pixels.
+    inside = cv2.distanceTransform(hole.astype(np.uint8), cv2.DIST_L2, 3)
+    depth = max(1.0, float(inside.max()))
+    fmap[wy0:wy1, wx0:wx1][hole] = int(max(1.0, min(float(feather_px), depth)))
+    like = np.abs(hole_px - defect).mean(axis=1) < thr
+    if like.any():
+        hy, hx = np.nonzero(hole)
+        dlike[wy0:wy1, wx0:wx1][hy[like], hx[like]] = 255
+    return True
+
+
+def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
+                       feather: float = DUST_FEATHER_DEFAULT) -> np.ndarray:
+    """Heal the dust spots out of a 16-bit RGB image, non-destructively.
+
+    `feather` is the edge fade width as a fraction of image width (the user's
+    per-image Feather setting): 0 = essentially hard edges, larger values
+    cross-fade the fill into the surrounding original over a wider ramp.
+    Defect-like pixels are always fully filled regardless of the feather, so
+    a wide fade cannot blend the defect back in.
+
+    Each mask component is filled by CLONING the best-matching clean patch
+    from its neighborhood (see _heal_patch) — real texture and grain,
+    16-bit native — instead of the old cv2.inpaint diffusion, whose averaged
+    fill left a smooth round patch with fan-like streaks. Long strokes are
+    healed in thickness-scaled SEGMENTS, each from its own local source strip
+    (one whole-stroke window would demand a clean area the size of the
+    stroke's bbox, which rarely exists — a curl would silently fall back to
+    diffusion and ghost). Patches with no clean source window (image border,
+    dense dust) fall back to cv2.inpaint (Telea, 8-bit). The fill is
+    composited through a feathered alpha that ramps inward from each hole's
+    boundary (resolution-scaled, capped by the hole's defect-free rim); ONLY
+    masked pixels change, the rest of the frame is bit-for-bit untouched.
     Returns a NEW uint16 array; img16 is never mutated. No-op (returns img16
     unchanged) when there are no spots or the rasterized mask is empty.
     """
@@ -3230,24 +3424,79 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.
     if not mask.any():
         return img16
 
-    # Inpaint in 8-bit BGR (what cv2.inpaint supports).
-    bgr8 = cv2.cvtColor(cv2.convertScaleAbs(img16, alpha=255.0 / 65535.0),
-                        cv2.COLOR_RGB2BGR)
-    filled8 = cv2.inpaint(bgr8, mask, inpaint_radius, cv2.INPAINT_TELEA)
-    filled16 = cv2.cvtColor(filled8, cv2.COLOR_BGR2RGB).astype(np.uint16) * 257
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    # "Clean" excludes every spot plus 1 px (buries antialiased speck edges).
+    mask_pad = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    integ = cv2.integral((mask_pad > 0).astype(np.uint8))
+    filled = img16.copy()
+    fallback = np.zeros_like(mask)
+    # Per-pixel feather ramp width (px). Normalized like the spots, so the
+    # fade covers the same image fraction at preview and export; each patch
+    # caps its own value by its hole depth (see _heal_patch). `dlike` marks
+    # defect-like hole pixels that must be fully filled regardless of feather.
+    feather_px = max(1, int(round(float(feather) * w)))
+    fmap = np.ones((h, w), np.uint8)
+    dlike = np.zeros((h, w), np.uint8)
+    for i in range(1, n):  # 0 is background
+        x0 = int(stats[i, cv2.CC_STAT_LEFT])
+        y0 = int(stats[i, cv2.CC_STAT_TOP])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        comp_win = labels[y0:y0 + ch, x0:x0 + cw] == i
+        # Half-thickness = the defect's local scale (1px zero border so a
+        # component touching its bbox edge still measures correctly).
+        hole0 = np.zeros((ch + 2, cw + 2), np.uint8)
+        hole0[1:-1, 1:-1] = comp_win
+        half_th = float(cv2.distanceTransform(hole0, cv2.DIST_L2, 3).max())
+        seg = max(_HEAL_SEG_MIN, int(round(_HEAL_SEG_THICKNESS * half_th)))
+        for ty in range(y0, y0 + ch, seg):
+            for tx in range(x0, x0 + cw, seg):
+                sub = comp_win[ty - y0:ty - y0 + seg, tx - x0:tx - x0 + seg]
+                if not sub.any():
+                    continue
+                ys, xs = np.nonzero(sub)
+                bbox = (tx + int(xs.min()), ty + int(ys.min()),
+                        tx + int(xs.max()) + 1, ty + int(ys.max()) + 1)
+                if not _heal_patch(img16, labels, i, bbox, half_th, mask_pad,
+                                   integ, filled, fmap, feather_px, dlike):
+                    fallback[ty:ty + sub.shape[0],
+                             tx:tx + sub.shape[1]][sub] = 255
+                    # No defect estimate on this path — cap the fade by the
+                    # hole thickness so thin strokes stay near-hard.
+                    fmap[ty:ty + sub.shape[0], tx:tx + sub.shape[1]][sub] = \
+                        max(1, min(feather_px, int(round(0.5 * half_th))))
 
-    # Feathered alpha: dilate a touch to bury the speck's antialiased edge,
-    # then box-blur to a soft 0..1 ramp so the fill has no visible seam. Inside
-    # the dilate+blur halo (a few px around the mask) pixels blend toward the
-    # fill; OUTSIDE the halo alpha is exactly 0, so those pixels are kept
-    # bit-for-bit. The halo is the intended seamless-blend region.
-    k = np.ones((3, 3), np.uint8)
-    a = cv2.dilate(mask, k, iterations=1)
-    a = (cv2.blur(a, (5, 5)).astype(np.float32) / 255.0)[..., None]
+    if fallback.any():
+        # Diffusion fallback (cv2.inpaint supports 8-bit only).
+        bgr8 = cv2.cvtColor(cv2.convertScaleAbs(img16, alpha=255.0 / 65535.0),
+                            cv2.COLOR_RGB2BGR)
+        telea8 = cv2.inpaint(bgr8, fallback, inpaint_radius, cv2.INPAINT_TELEA)
+        telea16 = cv2.cvtColor(telea8, cv2.COLOR_BGR2RGB).astype(np.uint16) * 257
+        fb = fallback > 0
+        filled[fb] = telea16[fb]
 
-    out = (img16.astype(np.float32) * (1.0 - a)
-           + filled16.astype(np.float32) * a)
-    return np.clip(out, 0, 65535).astype(np.uint16)
+    # Feathered composite: alpha rises 0 -> 1 from each hole's boundary inward
+    # over its feather ramp (resolution-scaled, capped by the hole's
+    # defect-free rim), so the fill cross-fades into the original instead of
+    # cutting hard at the mask edge. OUTSIDE the mask alpha is exactly 0 —
+    # those pixels are kept bit-for-bit. The float blend only runs inside the
+    # mask's bounding box (padded 1 px so the cropped distance transform still
+    # sees the zeros surrounding boundary pixels).
+    bx, by, bwd, bhd = cv2.boundingRect(mask)
+    ys = slice(max(0, by - 1), min(h, by + bhd + 1))
+    xs = slice(max(0, bx - 1), min(w, bx + bwd + 1))
+    a = _feather_alpha(mask[ys, xs], fmap[ys, xs])
+    # Defect-like pixels get the fill at full strength whatever the feather;
+    # the max with a light blur adds a soft lip around the forced region
+    # without weakening its interior.
+    dl = dlike[ys, xs]
+    forced = np.maximum(dl, cv2.blur(dl, (3, 3))).astype(np.float32) / 255.0
+    a = np.maximum(a, forced)[..., None]
+    out = img16.copy()
+    blend = (img16[ys, xs].astype(np.float32) * (1.0 - a)
+             + filled[ys, xs].astype(np.float32) * a)
+    out[ys, xs] = np.clip(np.rint(blend), 0, 65535).astype(np.uint16)
+    return out
 
 
 # --- Area editing (local masked adjustment layers) -------------------------

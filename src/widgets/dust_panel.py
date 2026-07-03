@@ -12,13 +12,38 @@ build even when onnxruntime is absent — the AI section then shows an
 unavailable/needs-download state and the manual brush is unaffected.
 See spec/dust-removal.md.
 """
+import math
+
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                 QPushButton, QSlider, QFrame, QProgressBar,
                                 QMessageBox)
-from PySide6.QtCore import Qt, QObject, QThread, Signal
+from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
 
 from core import dust_detect
 from ui import theme
+
+# Brush radius limits as a fraction of image width (the canvas clamps to the
+# same range). The slider maps its integer steps onto this range LOG-scaled:
+# dust spotting needs fine steps at the small end (0.05% is ~3 px radius on a
+# 6000 px scan) without giving up the big scratch-covering sizes at the top —
+# linearly, everything below 1% would sit in the first pixels of travel.
+DUST_BRUSH_R_MIN = 0.0005
+DUST_BRUSH_R_MAX = 0.2
+BRUSH_STEPS = 300
+_BRUSH_LOG_SPAN = math.log(DUST_BRUSH_R_MAX / DUST_BRUSH_R_MIN)
+
+
+def slider_to_brush_r(value: int) -> float:
+    """Slider step (0..BRUSH_STEPS) -> normalized brush radius, log-scaled."""
+    v = max(0, min(BRUSH_STEPS, int(value)))
+    return DUST_BRUSH_R_MIN * math.exp(_BRUSH_LOG_SPAN * v / BRUSH_STEPS)
+
+
+def brush_r_to_slider(r_norm: float) -> int:
+    """Normalized brush radius -> nearest slider step (inverse of the above)."""
+    r = max(DUST_BRUSH_R_MIN, min(DUST_BRUSH_R_MAX, float(r_norm)))
+    return int(round(BRUSH_STEPS * math.log(r / DUST_BRUSH_R_MIN)
+                     / _BRUSH_LOG_SPAN))
 
 
 class _DetectWorker(QObject):
@@ -122,6 +147,12 @@ class DustRemovalPanel(QWidget):
         # The image a running detection was started on — results are discarded
         # if the user switches images before it finishes.
         self._detect_image_ref = None
+        # Debounce for the Feather slider: re-healing every spot on each drag
+        # tick would thrash; apply shortly after the value settles.
+        self._feather_timer = QTimer(self)
+        self._feather_timer.setSingleShot(True)
+        self._feather_timer.setInterval(200)
+        self._feather_timer.timeout.connect(self._apply_feather)
 
         self._build_ui()
         self._refresh_ai_section()
@@ -143,17 +174,36 @@ class DustRemovalPanel(QWidget):
         brush_lbl = QLabel("Brush size")
         brush_lbl.setFixedWidth(theme.LABEL_COL_W)
         self.brush_slider = QSlider(Qt.Horizontal)
-        self.brush_slider.setMinimum(2)     # r = value/1000  ->  0.002 .. 0.200
-        self.brush_slider.setMaximum(200)
-        self.brush_slider.setValue(12)      # 0.012 (1.2% of image width)
+        self.brush_slider.setMinimum(0)     # log scale: see slider_to_brush_r
+        self.brush_slider.setMaximum(BRUSH_STEPS)
+        self.brush_slider.setValue(brush_r_to_slider(0.012))  # 1.2% default
         self.brush_slider.setFixedHeight(theme.CONTROL_H)
-        self.brush_value = QLabel("1.2%")
+        self.brush_value = QLabel("1.20%")
         self.brush_value.setFixedWidth(theme.VALUE_COL_W)
         self.brush_slider.valueChanged.connect(self._on_brush_changed)
         brush_row.addWidget(brush_lbl)
         brush_row.addWidget(self.brush_slider)
         brush_row.addWidget(self.brush_value)
         layout.addLayout(brush_row)
+
+        # Edge feather: per-image render parameter (fraction of image width)
+        # applied to ALL of the image's spots — manual and AI — live.
+        feather_row = QHBoxLayout()
+        feather_row.setSpacing(theme.GAP_TIGHT)
+        feather_lbl = QLabel("Feather")
+        feather_lbl.setFixedWidth(theme.LABEL_COL_W)
+        self.feather_slider = QSlider(Qt.Horizontal)
+        self.feather_slider.setMinimum(0)    # f = value/10000 -> 0 .. 1.0% width
+        self.feather_slider.setMaximum(100)
+        self.feather_slider.setValue(30)     # 0.30% default
+        self.feather_slider.setFixedHeight(theme.CONTROL_H)
+        self.feather_value = QLabel("0.30%")
+        self.feather_value.setFixedWidth(theme.VALUE_COL_W)
+        self.feather_slider.valueChanged.connect(self._on_feather_changed)
+        feather_row.addWidget(feather_lbl)
+        feather_row.addWidget(self.feather_slider)
+        feather_row.addWidget(self.feather_value)
+        layout.addLayout(feather_row)
 
         hint = QLabel("Click or drag over dust to remove it.")
         hint.setWordWrap(True)
@@ -263,23 +313,49 @@ class DustRemovalPanel(QWidget):
             self._luma = None
             self._prob_image_ref = None
         # Push the current brush size to the canvas so they agree on entry.
-        self.image_preview.set_dust_brush_size(self.brush_slider.value() / 1000.0)
+        self.image_preview.set_dust_brush_size(
+            slider_to_brush_r(self.brush_slider.value()))
+        # Reflect this image's feather without re-triggering a re-render.
+        f = getattr(img, "dust_feather", 0.003) if img is not None else 0.003
+        self.feather_slider.blockSignals(True)
+        self.feather_slider.setValue(int(round(f * 10000)))
+        self.feather_slider.blockSignals(False)
+        self.feather_value.setText(f"{f * 100.0:.2f}%")
         self._refresh_ai_section()
         self.status_label.setText("")
 
     def sync_brush_size(self, r_norm: float):
         """Reflect a wheel-driven brush change from the canvas without
-        re-emitting back to the canvas."""
-        v = max(2, min(200, int(round(r_norm * 1000))))
+        re-emitting back to the canvas. The label shows the canvas's exact
+        radius (the slider is quantized to its nearest log step)."""
         self.brush_slider.blockSignals(True)
-        self.brush_slider.setValue(v)
+        self.brush_slider.setValue(brush_r_to_slider(r_norm))
         self.brush_slider.blockSignals(False)
-        self.brush_value.setText(f"{v / 10.0:.1f}%")
+        r = max(DUST_BRUSH_R_MIN, min(DUST_BRUSH_R_MAX, float(r_norm)))
+        self.brush_value.setText(f"{r * 100.0:.2f}%")
 
     # --- Manual handlers --------------------------------------------------
     def _on_brush_changed(self, value):
-        self.brush_value.setText(f"{value / 10.0:.1f}%")
-        self.image_preview.set_dust_brush_size(value / 1000.0)
+        r = slider_to_brush_r(value)
+        self.brush_value.setText(f"{r * 100.0:.2f}%")
+        self.image_preview.set_dust_brush_size(r)
+
+    def _on_feather_changed(self, value):
+        self.feather_value.setText(f"{value / 100.0:.2f}%")
+        self._feather_timer.start()
+
+    def _apply_feather(self):
+        """Store the slider's feather on the current image and re-heal its
+        spots so the edge softness updates live."""
+        img = self._current_image()
+        if img is None:
+            return
+        f = self.feather_slider.value() / 10000.0
+        if abs(getattr(img, "dust_feather", -1.0) - f) < 1e-9:
+            return
+        img.dust_feather = f
+        if getattr(img, "dust_spots", None):
+            self.image_preview._commit_dust_change(img)
 
     def _on_undo_last(self):
         if not self.image_preview.dust_undo_last():

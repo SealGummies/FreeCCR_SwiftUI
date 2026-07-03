@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, Q
 from core.ccr_backend import ccr_backend
 from core.ccr_processor import apply_dust_removal
 from core import crop_aspect
+from widgets.dust_panel import DUST_BRUSH_R_MIN, DUST_BRUSH_R_MAX
 from widgets.export_dialog import ExportSettingsDialog
 from widgets.scopes_panel import ScopesPanel
 from ui import theme
@@ -1701,12 +1702,13 @@ class ImagePreview(QWidget):
             for a in getattr(img, "area_layers", []))
         # Dust spots are inpainted inside apply_adjustments, so a change to them
         # must invalidate the cached hi-res display (see spec/dust-removal.md §4.4).
-        dust_sig = tuple(
+        dust_sig = (tuple(
             (s.get("kind"),
              tuple((round(float(p[0]) * 10000), round(float(p[1]) * 10000))
                    for p in (s.get("pts") or [])),
              round(float(s.get("r", 0)) * 10000))
-            for s in getattr(img, "dust_spots", []))
+            for s in getattr(img, "dust_spots", [])),
+            round(float(getattr(img, "dust_feather", 0.003)) * 10000))
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "exposure_base", 0.0),
@@ -2407,13 +2409,16 @@ class ImagePreview(QWidget):
         self.dust_panel = panel
 
     def set_dust_brush_size(self, r_norm: float):
-        self._dust_brush_r = max(0.002, min(0.2, float(r_norm)))
+        self._dust_brush_r = max(DUST_BRUSH_R_MIN,
+                                 min(DUST_BRUSH_R_MAX, float(r_norm)))
 
     def adjust_dust_brush(self, step: int, anchor_scene=None):
         """Wheel-resize the brush (exponential); keep the panel slider + the
         on-canvas brush ring in sync."""
         factor = 1.15 if step > 0 else (1.0 / 1.15)
-        self._dust_brush_r = max(0.002, min(0.2, self._dust_brush_r * factor))
+        self._dust_brush_r = max(DUST_BRUSH_R_MIN,
+                                 min(DUST_BRUSH_R_MAX,
+                                     self._dust_brush_r * factor))
         if getattr(self, "dust_panel", None) is not None:
             self.dust_panel.sync_brush_size(self._dust_brush_r)
         self._update_dust_cursor(anchor_scene)
@@ -2501,7 +2506,8 @@ class ImagePreview(QWidget):
         if img is None or raw is None:
             return None
         brush = [s for s in getattr(img, "dust_spots", []) if s.get("kind") == "brush"]
-        return apply_dust_removal(raw, brush)
+        return apply_dust_removal(
+            raw, brush, feather=getattr(img, "dust_feather", 0.003))
 
     def dust_detect_source(self):
         """Detection source for the current image (see dust_detect_source_for)."""
