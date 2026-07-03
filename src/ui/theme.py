@@ -115,6 +115,8 @@ class Paint:
     SCOPE_LABEL = (255, 255, 255, 90)
     SCOPE_MARKER = (255, 255, 255, 235)
     SCOPE_MARKER_OUTLINE = (20, 20, 20, 220)
+    SCOPE_REF = (225, 175, 80, 180)   # Cineon 95/685 reference lines (amber)
+    SCOPE_SKIN = (230, 165, 145, 150)  # vectorscope skin-tone line
 
 
 class Overlay:

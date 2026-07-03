@@ -1,13 +1,16 @@
 """Collapsible Scopes panel under the canvas: RGB parade + vectorscope.
 
-Both scopes are computed from the VISIBLE canvas window — zoom, pan, display
-crop and orientation exactly as shown. ImagePreview captures the viewport
-pixels (image only, no overlays; letterbox masked out) and feeds them in via
+Both scopes are computed from the DISPLAYED image — display crop and
+orientation exactly as shown; zoom/pan deliberately do not affect them.
+ImagePreview captures the pixmap item offscreen (image only, no overlays;
+fine-rotation corner gaps masked out) and feeds it in via
 :meth:`ScopesPanel.set_frame`; all math lives in ``core/scopes.py`` and all
-presentation here. A hover probe (RGB readout in the header + marker circles
-on both scopes) follows the cursor on the canvas via :meth:`set_probe`.
-Collapsed by default; the expanded state persists in QSettings. See
-spec/color-scopes-panel.md.
+presentation here. The parade uses a DaVinci-style 10-bit axis (0–1023, a
+line every 128 codes) plus the Cineon reference levels 95/685; the
+vectorscope carries the 75% targets and the skin-tone line. A hover probe
+(RGB readout in the header + marker circles on both scopes) follows the
+cursor on the canvas via :meth:`set_probe`. Collapsed by default; the
+expanded state persists in QSettings. See spec/color-scopes-panel.md.
 """
 
 import numpy as np
@@ -94,7 +97,8 @@ class _ScopeWidgetBase(QWidget):
 
 class ParadeScopeWidget(_ScopeWidgetBase):
     """Three side-by-side per-channel waveforms: x = position across the
-    visible window, y = value (0 bottom … 255 top), brightness = count."""
+    displayed image, y = value on a 10-bit axis (0 bottom … 1023 top),
+    brightness = count. Cineon reference lines at codes 95 and 685."""
 
     def set_data(self, counts):
         """counts (3, 256, W) raw parade counts, or None to clear."""
@@ -116,26 +120,62 @@ class ParadeScopeWidget(_ScopeWidgetBase):
 
     def paintEvent(self, event):
         p, plot = self._begin_paint()
-        # Quarter-tone gridlines + separators between the three cells.
-        p.setPen(QPen(QColor(*theme.Paint.SCOPE_GRID), 1))
-        for k in range(1, 4):
-            gy = plot.top() + plot.height() * k / 4.0
-            p.drawLine(QPointF(plot.left(), gy), QPointF(plot.right(), gy))
+        font = p.font()
+        font.setPixelSize(9)
+        p.setFont(font)
+        fm = p.fontMetrics()
+        # Left gutter for the 10-bit code labels; the waveform cells fill the
+        # rest. The axis is display-only: 8-bit 255 ≡ 10-bit 1023, so the
+        # trace/probe geometry is untouched.
+        gutter = fm.horizontalAdvance("1023") + 6
+        cells = QRectF(plot.left() + gutter, plot.top(),
+                       plot.width() - gutter, plot.height())
+
+        def code_y(code):
+            return (cells.bottom()
+                    - code / float(scopes.PARADE_MAX_CODE) * cells.height())
+
+        # DaVinci-style graticule: a labeled line every 128 codes + the top.
+        grid = QColor(*theme.Paint.SCOPE_GRID)
+        label = QColor(*theme.Paint.SCOPE_LABEL)
+        codes = list(range(0, scopes.PARADE_MAX_CODE, scopes.PARADE_GRID_STEP))
+        codes.append(scopes.PARADE_MAX_CODE)
+        for code in codes:
+            y = code_y(code)
+            p.setPen(QPen(grid, 1))
+            p.drawLine(QPointF(cells.left(), y), QPointF(cells.right(), y))
+            p.setPen(label)
+            p.drawText(QRectF(plot.left(), y - fm.height() / 2.0,
+                              gutter - 5, fm.height()),
+                       Qt.AlignRight | Qt.AlignVCenter, str(code))
+        p.setPen(QPen(grid, 1))
         for k in range(1, 3):
-            gx = plot.left() + plot.width() * k / 3.0
-            p.drawLine(QPointF(gx, plot.top()), QPointF(gx, plot.bottom()))
-        trace = self._trace_pixmap(round(plot.width()), round(plot.height()))
+            gx = cells.left() + cells.width() * k / 3.0
+            p.drawLine(QPointF(gx, cells.top()), QPointF(gx, cells.bottom()))
+
+        trace = self._trace_pixmap(round(cells.width()), round(cells.height()))
         if trace is not None:
-            p.drawPixmap(plot.topLeft(), trace)
+            p.drawPixmap(cells.topLeft(), trace)
+
+        # Cineon reference levels (Dmin 95 / 90%-white 685), over the trace so
+        # they stay readable; labels at the right edge, just above the line.
+        ref = QColor(*theme.Paint.SCOPE_REF)
+        for code in scopes.CINEON_REF_CODES:
+            y = code_y(code)
+            p.setPen(QPen(ref, 1, Qt.DashLine))
+            p.drawLine(QPointF(cells.left(), y), QPointF(cells.right(), y))
+            p.drawText(QPointF(cells.right() - fm.horizontalAdvance(str(code)) - 3,
+                               y - 3), str(code))
+
         if self._probe is not None:
             r, g, b, x_frac = self._probe
             pen, brush = _marker_pen_brush()
             p.setPen(pen)
             p.setBrush(brush)
-            cell_w = plot.width() / 3.0
+            cell_w = cells.width() / 3.0
             for c, v in enumerate((r, g, b)):
-                x = plot.left() + (c + x_frac) * cell_w
-                y = plot.top() + (1.0 - v / 255.0) * plot.height()
+                x = cells.left() + (c + x_frac) * cell_w
+                y = cells.top() + (1.0 - v / 255.0) * cells.height()
                 p.drawEllipse(QPointF(x, y), _MARKER_R, _MARKER_R)
         self._end_paint(p)
 
@@ -191,6 +231,11 @@ class VectorscopeWidget(_ScopeWidgetBase):
                    QPointF(sq.right(), sq.center().y()))
         p.drawLine(QPointF(sq.center().x(), sq.top()),
                    QPointF(sq.center().x(), sq.bottom()))
+        # Skin-tone indicator: center → 100% circle along the +I axis.
+        ucb, ucr = scopes.skin_tone_direction()
+        p.setPen(QPen(QColor(*theme.Paint.SCOPE_SKIN), 1))
+        p.drawLine(sq.center(),
+                   self._chroma_point(sq, ucb * 128.0, ucr * 128.0))
         # 75% targets, derived from the same RGB→CbCr mapping as the trace.
         label = QColor(*theme.Paint.SCOPE_LABEL)
         font = p.font()
@@ -300,8 +345,9 @@ class ScopesPanel(QWidget):
 
     # -- data -------------------------------------------------------------
     def set_frame(self, rgb, mask):
-        """Feed the visible-window pixels: rgb (H, W, 3) uint8 + mask (H, W)
-        bool (False = letterbox pixels, excluded from the statistics)."""
+        """Feed the displayed-image pixels: rgb (H, W, 3) uint8 + mask (H, W)
+        bool (False = uncovered pixels, e.g. fine-rotation corner gaps,
+        excluded from the statistics)."""
         self.parade.set_data(scopes.compute_parade(rgb, mask))
         self.vectorscope.set_data(scopes.compute_vectorscope(rgb, mask))
 

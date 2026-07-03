@@ -493,9 +493,6 @@ class GraphicsImageView(QGraphicsView):
         # Let the parent widget handle the fitting to avoid conflicts
         if self.parent_widget and self.parent_widget.pixmap_item:
             self.parent_widget._fit_view_to_content()
-        elif self.parent_widget is not None:
-            # No refit (e.g. zoomed in): the viewport still changed shape.
-            self.parent_widget._schedule_scope_update()
 
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
@@ -761,8 +758,9 @@ class ImagePreview(QWidget):
         self.view.setScene(self.scene)
         self.layout.addWidget(self.view)
 
-        # Scopes (RGB parade + vectorscope) computed from the visible canvas
-        # window — collapsible, below the canvas. See spec/color-scopes-panel.md.
+        # Scopes (RGB parade + vectorscope) computed from the displayed image
+        # (zoom/pan-independent) — collapsible, below the canvas. See
+        # spec/color-scopes-panel.md.
         self.scopes_panel = ScopesPanel()
         self.layout.addWidget(self.scopes_panel)
 
@@ -881,19 +879,17 @@ class ImagePreview(QWidget):
         self._current_image_ref = None
 
         # --- Scopes state ---
-        # Debounced viewport capture → ScopesPanel. The scrollbars cover every
-        # pan path (middle-drag and space-drag both move them); zoom, fit,
-        # image refresh and hi-res swaps schedule from their own choke points.
+        # Debounced displayed-image capture → ScopesPanel. Zoom/pan do NOT
+        # affect the scopes, so no viewport hooks: update_preview (image
+        # switch / adjustments / crop / slice results) and
+        # apply_transformations (orientation, hi-res pixmap swaps) are the
+        # only schedule points.
         self._scope_timer = QTimer(self)
         self._scope_timer.setSingleShot(True)
         self._scope_timer.timeout.connect(self._update_scopes_now)
         self._scopes_dirty = False       # refresh deferred while collapsed
         self._probe_qimage = None        # cached QImage of current_pixmap
         self._probe_qimage_key = None    # its QPixmap.cacheKey()
-        self.view.horizontalScrollBar().valueChanged.connect(
-            self._schedule_scope_update)
-        self.view.verticalScrollBar().valueChanged.connect(
-            self._schedule_scope_update)
         self.scopes_panel.expanded_changed.connect(self._on_scopes_expanded)
 
         self._update_unconvert_action_state()
@@ -1240,9 +1236,6 @@ class ImagePreview(QWidget):
             self._draw_slice_dim()
             if self._slice_lines:
                 self._redraw_slice_lines()
-        # Fit/refit changes what the viewport shows (covers rotate/flip, the
-        # zoom snap-back-to-fit paths, and window resizes with a pixmap).
-        self._schedule_scope_update()
 
     def apply_transformations(self):
         if not self.pixmap_item:
@@ -1304,6 +1297,11 @@ class ImagePreview(QWidget):
         # rebuilds the crop overlay when crop mode is active, keeping the
         # dim region and handles aligned after rotates/flips.)
         self._fit_view_to_content()
+
+        # The displayed image content/orientation may have changed (rotate,
+        # flip, fine rotation, hi-res pixmap swap) — refresh the scopes.
+        # Zoom/pan paths never come through here, so they don't retrigger.
+        self._schedule_scope_update()
 
     def _end_fine_rot_burst(self):
         self._fine_rot_burst_active = False
@@ -1544,7 +1542,6 @@ class ImagePreview(QWidget):
             self._draw_crop_overlay()  # handle sizes track the view scale
         if self.area_mode:
             self._draw_area_overlay()  # area handle sizes track the view scale too
-        self._schedule_scope_update()
 
     def zoom_to_percent(self, pct):
         """Zoom to an absolute percentage of the source's ACTUAL size (1.0 =
@@ -1862,8 +1859,6 @@ class ImagePreview(QWidget):
         else:
             self._item_prescale = 1.0
             self.pixmap_item.setPixmap(self.current_pixmap)
-        # The displayed pixels just swapped (preview ↔ hi-res detail).
-        self._schedule_scope_update()
 
     def _release_hires(self, refresh=True):
         """Free hi-res detail memory (zoomed out / image switched). In-flight
@@ -1877,14 +1872,15 @@ class ImagePreview(QWidget):
             self.apply_transformations()
 
     # --- Scopes (RGB parade + vectorscope) --------------------------------
-    # Computed from the VISIBLE canvas window: only the pixmap item is
-    # re-rendered offscreen at reduced size through the live item→viewport
-    # transform, so zoom/pan/crop/orientation/hi-res are all baked in and
-    # overlays (reference frame, crop chrome, ...) are excluded. See
-    # spec/color-scopes-panel.md.
+    # Computed from the DISPLAYED image: the pixmap item is re-rendered
+    # offscreen at reduced size through its scene transform, so display crop,
+    # orientation and the hi-res prescale are baked in while overlays
+    # (reference frame, crop chrome, ...) are excluded. Zoom/pan deliberately
+    # do NOT change the scopes — the item is captured whole, not through the
+    # viewport. See spec/color-scopes-panel.md.
 
-    SCOPE_CAPTURE_W = 360      # offscreen capture width (px, viewport aspect)
-    SCOPE_DEBOUNCE_MS = 120    # coalesce zoom/pan/slider bursts
+    SCOPE_CAPTURE_W = 360      # offscreen capture width (px, image aspect)
+    SCOPE_DEBOUNCE_MS = 120    # coalesce rotate/slider bursts
 
     def _schedule_scope_update(self, *_):
         """Debounced refresh request; deferred while the panel is collapsed
@@ -1900,32 +1896,34 @@ class ImagePreview(QWidget):
 
     def _update_scopes_now(self):
         self._scopes_dirty = False
-        frame = self._capture_visible_region()
+        frame = self._capture_display_image()
         if frame is None:
             self.scopes_panel.clear()
         else:
             self.scopes_panel.set_frame(*frame)
 
-    def _capture_visible_region(self):
-        """Render only the pixmap item over the viewport into a small RGBA
-        image; returns (rgb (h,w,3) uint8, mask (h,w) bool) or None. Alpha
-        stays 0 wherever the image doesn't cover the viewport — the mask
-        excludes that letterbox (and the antialiased image edge, which is
+    def _capture_display_image(self):
+        """Render the whole pixmap item (the displayed image: crop applied,
+        orientation as shown, hi-res prescale included — zoom/pan excluded)
+        into a small RGBA image; returns (rgb (h,w,3) uint8, mask (h,w) bool)
+        or None. Alpha stays 0 in the corner gaps a fine rotation leaves —
+        the mask excludes them (and the antialiased image edge, which is
         blended toward transparent and would pollute the low end)."""
         if self.pixmap_item is None or self.current_pixmap is None:
             return None
-        vp = self.view.viewport().rect()
-        if vp.width() <= 0 or vp.height() <= 0:
+        br = self.pixmap_item.mapToScene(
+            self.pixmap_item.boundingRect()).boundingRect()
+        if br.width() <= 0 or br.height() <= 0:
             return None
-        s = min(1.0, self.SCOPE_CAPTURE_W / float(vp.width()))
-        w = max(1, round(vp.width() * s))
-        h = max(1, round(vp.height() * s))
+        s = min(1.0, self.SCOPE_CAPTURE_W / br.width())
+        w = max(1, round(br.width() * s))
+        h = max(1, round(br.height() * s))
         img = QImage(w, h, QImage.Format_RGBA8888)
         img.fill(0)
         p = QPainter(img)
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         p.setTransform(self.pixmap_item.sceneTransform()
-                       * self.view.viewportTransform()
+                       * QTransform.fromTranslate(-br.left(), -br.top())
                        * QTransform.fromScale(s, s))
         p.drawPixmap(0, 0, self.pixmap_item.pixmap())
         p.end()
@@ -1944,7 +1942,8 @@ class ImagePreview(QWidget):
         t = self.view._display_transform()
         if not t.isInvertible():
             return
-        local = t.inverted()[0].map(self.view.mapToScene(vp_pos))
+        scene_pos = self.view.mapToScene(vp_pos)
+        local = t.inverted()[0].map(scene_pos)
         x, y = int(local.x()), int(local.y())
         pm = self.current_pixmap
         if not (0 <= x < pm.width() and 0 <= y < pm.height()):
@@ -1956,8 +1955,12 @@ class ImagePreview(QWidget):
             self._probe_qimage = pm.toImage()
             self._probe_qimage_key = pm.cacheKey()
         c = self._probe_qimage.pixelColor(x, y)
-        vpw = self.view.viewport().width()
-        x_frac = vp_pos.x() / vpw if vpw > 0 else 0.0
+        # Parade x = fraction across the DISPLAYED image (its scene bounds) —
+        # the same horizontal domain the capture renders, zoom/pan-independent.
+        br = self.pixmap_item.mapToScene(
+            self.pixmap_item.boundingRect()).boundingRect()
+        x_frac = ((scene_pos.x() - br.left()) / br.width()
+                  if br.width() > 0 else 0.0)
         self.scopes_panel.set_probe(c.red(), c.green(), c.blue(), x_frac)
 
     def clear_color_probe(self):

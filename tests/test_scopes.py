@@ -144,6 +144,20 @@ def test_vector_color_lut_center_is_neutral():
     assert r > g and r > b
 
 
+def test_skin_tone_direction_between_red_and_yellow():
+    ucb, ucr = scopes.skin_tone_direction()
+    assert abs((ucb * ucb + ucr * ucr) ** 0.5 - 1.0) < 1e-5   # unit vector
+    import math
+    skin = math.atan2(ucr, ucb)
+    r_cb, r_cr = scopes.rgb_to_cbcr(np.array([255, 0, 0], np.float32))
+    y_cb, y_cr = scopes.rgb_to_cbcr(np.array([255, 255, 0], np.float32))
+    red = math.atan2(float(r_cr), float(r_cb))
+    yellow = math.atan2(float(y_cr), float(y_cb))
+    # The classic skin line sits between the R and Yl targets (10:30-11
+    # o'clock), i.e. between their angles in the upper-left quadrant.
+    assert red < skin < yellow
+
+
 def test_vector_targets():
     targets = dict((n, (cb, cr)) for n, cb, cr in scopes.vector_targets())
     assert set(targets) == {"R", "Mg", "B", "Cy", "G", "Yl"}
@@ -200,7 +214,7 @@ def test_scope_widgets_accept_none():
 
 # --- ImagePreview capture helper ---------------------------------------------
 
-def test_capture_visible_region():
+def test_capture_display_image():
     from PySide6.QtWidgets import (QGraphicsPixmapItem, QWidget, QVBoxLayout)
     from PySide6.QtGui import QPixmap, QColor
     from widgets.image_preview import ImagePreview
@@ -217,7 +231,7 @@ def test_capture_visible_region():
     host.show()                        # offscreen: activates the layout so the
     _app.processEvents()               # view gets its real viewport geometry
 
-    assert ip._capture_visible_region() is None   # no image → None
+    assert ip._capture_display_image() is None   # no image → None
 
     pm = QPixmap(120, 80)
     pm.fill(QColor(200, 50, 25))
@@ -225,14 +239,26 @@ def test_capture_visible_region():
     ip.pixmap_item = QGraphicsPixmapItem(pm)
     ip.scene.addItem(ip.pixmap_item)
     ip._fit_view_to_content()
-    frame = ip._capture_visible_region()
+    frame = ip._capture_display_image()
     assert frame is not None
     rgb, mask = frame
     assert rgb.shape[2] == 3 and mask.shape == rgb.shape[:2]
-    assert mask.any()
+    # The whole (un-rotated) image is covered — no letterbox in the capture.
+    assert mask.all()
+    # Uncropped, unrotated: the capture keeps the image aspect (120:80).
+    assert abs(rgb.shape[1] / rgb.shape[0] - 1.5) < 0.05
     inside = rgb[mask]
     # The solid color survives the round-trip (smooth scaling tolerance).
     assert abs(int(np.median(inside[:, 0])) - 200) <= 2
     assert abs(int(np.median(inside[:, 1])) - 50) <= 2
     assert abs(int(np.median(inside[:, 2])) - 25) <= 2
+
+    # Zoom/pan must NOT change the scopes: an aggressive zoom-in + pan leaves
+    # the capture bit-identical (it never looks through the view transform).
+    ip.view.scale(4.0, 4.0)
+    ip.view.translate(37.0, -21.0)
+    _app.processEvents()
+    rgb2, mask2 = ip._capture_display_image()
+    assert rgb2.shape == rgb.shape
+    assert np.array_equal(rgb2, rgb) and np.array_equal(mask2, mask)
     host.hide()

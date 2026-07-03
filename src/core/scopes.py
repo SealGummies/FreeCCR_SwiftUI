@@ -2,7 +2,7 @@
 
 No Qt imports — everything here is unit-testable headless. The Qt side
 (widgets/scopes_panel.py) turns these count arrays into images; the capture of
-the visible canvas window lives in widgets/image_preview.py. See
+the displayed image lives in widgets/image_preview.py. See
 spec/color-scopes-panel.md.
 """
 
@@ -15,6 +15,12 @@ _CB_W = np.array([-0.168736, -0.331264, 0.5], dtype=np.float32)
 _CR_W = np.array([0.5, -0.418688, -0.081312], dtype=np.float32)
 
 VECTOR_SIZE = 128           # vectorscope histogram bins per side
+
+# Parade display axis (DaVinci-style 10-bit code values). The data stays
+# 8-bit/256 bins — 8-bit 255 ≡ 10-bit 1023, so only labels/graticule change.
+PARADE_MAX_CODE = 1023
+PARADE_GRID_STEP = 128      # a graticule line every 128 codes (+ the 1023 top)
+CINEON_REF_CODES = (95, 685)  # Cineon printing-density refs: Dmin / 90% white
 
 
 def rgb_to_cbcr(rgb):
@@ -101,6 +107,17 @@ def vector_color_lut(size=VECTOR_SIZE, luma=140.0):
         lut = np.clip(np.stack([r, g, b], axis=-1) / 255.0, 0.0, 1.0)
         _VECTOR_LUT_CACHE[key] = lut
     return lut
+
+
+def skin_tone_direction():
+    """Unit (cb, cr) direction of the vectorscope skin-tone line: the +I axis
+    of YIQ, mapped through the same RGB→CbCr conversion as the trace. The RGB
+    direction of pure +I (Y=0, Q=0) comes from the NTSC YIQ inverse matrix;
+    in our plane it lands at ≈132° — between the R and Yl targets, closer to
+    R, the classic 10:30–11 o'clock skin line."""
+    cb, cr = rgb_to_cbcr(np.array([0.9563, -0.2721, -1.1070], dtype=np.float32))
+    norm = float(np.hypot(cb, cr))
+    return float(cb) / norm, float(cr) / norm
 
 
 def vector_targets(frac=0.75):
