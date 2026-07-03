@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, Q
 from core.ccr_backend import ccr_backend
 from core.ccr_processor import apply_dust_removal
 from core import crop_aspect
+from widgets.dust_panel import DUST_BRUSH_R_MIN, DUST_BRUSH_R_MAX
 from widgets.export_dialog import ExportSettingsDialog
 from widgets.scopes_panel import ScopesPanel
 from ui import theme
@@ -2407,13 +2408,16 @@ class ImagePreview(QWidget):
         self.dust_panel = panel
 
     def set_dust_brush_size(self, r_norm: float):
-        self._dust_brush_r = max(0.002, min(0.2, float(r_norm)))
+        self._dust_brush_r = max(DUST_BRUSH_R_MIN,
+                                 min(DUST_BRUSH_R_MAX, float(r_norm)))
 
     def adjust_dust_brush(self, step: int, anchor_scene=None):
         """Wheel-resize the brush (exponential); keep the panel slider + the
         on-canvas brush ring in sync."""
         factor = 1.15 if step > 0 else (1.0 / 1.15)
-        self._dust_brush_r = max(0.002, min(0.2, self._dust_brush_r * factor))
+        self._dust_brush_r = max(DUST_BRUSH_R_MIN,
+                                 min(DUST_BRUSH_R_MAX,
+                                     self._dust_brush_r * factor))
         if getattr(self, "dust_panel", None) is not None:
             self.dust_panel.sync_brush_size(self._dust_brush_r)
         self._update_dust_cursor(anchor_scene)
