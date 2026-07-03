@@ -72,14 +72,14 @@ def test_black_only_states_and_label(panel):
     panel._update_bwp_mode_label()
     assert ccr_backend.film_stock_slopes == (0.85, 0.65, 0.56)
     assert panel.bwp_mode_label.text() == \
-        'Slope source: film stock "Portra 400" (black point only)'
+        'Anchor source: film stock "Portra 400" (black point only)'
     assert not panel.save_film_stock_btn.isEnabled()
     assert panel.delete_film_stock_btn.isEnabled()
     # Back to Default: backend cleared, label reverts, delete gated off.
     panel.film_stock_combo.setCurrentIndex(0)
     assert ccr_backend.film_stock_slopes is None
     assert panel.bwp_mode_label.text() == \
-        "Slope source: default slope (black point only)"
+        "Anchor source: default slope (black point only)"
     assert not panel.delete_film_stock_btn.isEnabled()
 
 
@@ -88,7 +88,7 @@ def test_white_point_overrides_and_disables_selector(panel):
     ccr_backend.set_black_point(BASE_BGR)
     ccr_backend.set_white_point(WHITE_BGR)
     panel._update_bwp_mode_label()
-    assert panel.bwp_mode_label.text() == "Slope source: white point (two-point)"
+    assert panel.bwp_mode_label.text() == "Anchor source: white point (two-point)"
     assert not panel.film_stock_combo.isEnabled()
     assert panel.save_film_stock_btn.isEnabled()       # both points → can save
     assert not panel.delete_film_stock_btn.isEnabled()
@@ -122,8 +122,10 @@ def test_save_flow_persists_and_selects(panel, monkeypatch):
     assert [s["name"] for s in stored] == ["Portra 400"]
     assert stored[0]["black_bgr"] == list(BASE_BGR)    # provenance kept
     assert panel.film_stock_combo.currentText() == "Portra 400"
+    # The SELECTION is session-only (per roll) — never persisted; only the
+    # preset list is. See spec §2 goals / §4.4.
     assert panel._settings.value("convert/film_stock_selected", "", type=str) \
-        == "Portra 400"
+        == ""
     # The saved slopes reproduce the pair (S = 1/log10(base/dense)).
     from core.ccr_processor import compute_density_slopes
     assert tuple(stored[0]["slopes_bgr"]) == \
@@ -162,7 +164,7 @@ def test_delete_falls_back_to_default(panel, monkeypatch):
     assert decode_film_stocks(
         panel._settings.value("convert/film_stocks", "", type=str)) == []
     assert panel.bwp_mode_label.text() == \
-        "Slope source: default slope (black point only)"
+        "Anchor source: default slope (black point only)"
 
 
 if __name__ == "__main__":

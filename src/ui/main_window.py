@@ -889,7 +889,7 @@ class MainWindow(QMainWindow):
                         QMessageBox.warning(self, "3-way RGB merge", err)
                         return
                 self._stop_loader_if_running()
-                # New batch = new roll: the combo returns to "Default slope"
+                # New batch = new roll: the combo returns to "Default"
                 # (the backend loader clears its copy too).
                 self.sliders_panel.reset_film_stock_combo()
                 self.thumbnail_list.show_loading_dialog()
@@ -932,7 +932,7 @@ class MainWindow(QMainWindow):
                 return
                 
             self._stop_loader_if_running()
-            # New batch = new roll: the combo returns to "Default slope"
+            # New batch = new roll: the combo returns to "Default"
             # (the backend loader clears its copy too).
             self.sliders_panel.reset_film_stock_combo()
             self.thumbnail_list.show_loading_dialog()

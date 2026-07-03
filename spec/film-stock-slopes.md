@@ -45,7 +45,7 @@ Behaviours:
   the density-toggle reprocess all reproduce the conversion even if the preset
   is later renamed/deleted.
 - Presets persist across sessions (QSettings). The **selection does not**: it
-  resets to "Default slope" at app start, on every new batch load, and on
+  resets to "Default" at app start, on every new batch load, and on
   tether session start — a stock chosen for one roll must be re-chosen for the
   next, never silently applied. (Originally the selection persisted too;
   reversed by user request — new images always convert with the default slope
@@ -93,12 +93,12 @@ A new row directly under the Set-point buttons, above the mode label:
 ```
 Film B/W Point
 [Set Black Point] [Set White Point] [✕]
-Film Stock  [ Default slope      ▾ ] [＋] [🗑]
-Slope source: film stock "Portra 400" (black point only)
+Film Stock  [ Default            ▾ ] [＋] [🗑]
+Anchor source: film stock "Portra 400" (black point only)
 [Convert Current] [Convert All]
 ```
 
-- **Combo** (`film_stock_combo`): first entry **"Default slope"**, then saved
+- **Combo** (`film_stock_combo`): first entry **"Default"**, then saved
   stocks sorted case-insensitively by name. Laid out like the Color Profile
   row (label column + combo) so it aligns with the section.
 - **Save button** (`＋`, glyph width, tooltip "Save the current B/W-point pair
@@ -118,11 +118,12 @@ Slope source: film stock "Portra 400" (black point only)
 
 ### 4.2 Mode label
 
-`_update_bwp_mode_label` gains a third case:
+`_update_bwp_mode_label` gains a third case (prefix renamed "Slope source" →
+"Anchor source" by user request):
 - no black point → hidden (unchanged)
-- white point set → "Slope source: white point (two-point)" (unchanged)
-- black only, Default → "Slope source: default slope (black point only)" (unchanged)
-- black only, stock selected → `Slope source: film stock "<name>" (black point only)`
+- white point set → "Anchor source: white point (two-point)"
+- black only, Default → "Anchor source: default slope (black point only)"
+- black only, stock selected → `Anchor source: film stock "<name>" (black point only)`
 
 ### 4.3 Hints
 
@@ -133,7 +134,7 @@ confirms with a hint ("Film stock \"Portra 400\" saved.").
 ### 4.4 Startup / new batch
 
 Presets are restored from QSettings when the panel is built; the combo always
-starts on **Default slope** (the legacy `convert/film_stock_selected` key is
+starts on **Default** (the legacy `convert/film_stock_selected` key is
 removed on startup). When a new batch is loaded (Open Files / Open Folder /
 tether session start), `MainWindow` calls
 `sliders_panel.reset_film_stock_combo()` and the backend loader clears its own
