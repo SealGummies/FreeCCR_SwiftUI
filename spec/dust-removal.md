@@ -11,11 +11,11 @@ Add a **Dust Removal** feature for spotting out dust, hair, and small scratches 
 scanned film. It has two paths that share one non-destructive data model:
 
 - **Manual** — the user paints over dust on the canvas with a sized brush; the
-  painted region is inpainted (`cv2.inpaint`, Telea) so the speck is filled from
-  its surroundings.
+  painted region is healed by cloning the best-matching clean patch from its
+  neighborhood (§5.2), so the speck is filled with real surrounding texture.
 - **AI (hybrid)** — an ONNX neural detector (BOPBTL U-Net, downloaded on first
-  use) finds dust automatically; the detected blobs are inpainted with the same
-  `cv2.inpaint` fill. A sensitivity slider tunes how aggressive detection is.
+  use) finds dust automatically; the detected blobs are healed with the same
+  clone fill. A sensitivity slider tunes how aggressive detection is.
 
 A single **Dust Removal** button on the image toolbar enters "dust mode": the
 right-hand sliders panel is covered by a Dust Removal panel exposing the manual
@@ -41,15 +41,16 @@ in the catalog, and undoable.
 - Dust edits **persist** in the catalog, **participate in Undo** (Ctrl+Z), and
   survive image switch / app restart.
 - Manual dust removal works with **no new runtime dependencies** and **fully
-  offline** (`cv2.inpaint` ships with the already-required `opencv-python`).
+  offline** (the clone heal is pure numpy/OpenCV; `cv2` ships with the
+  already-required `opencv-python`).
 - The AI detector is **optional and degrades gracefully**: if `onnxruntime` or
   the model is unavailable, the manual path is unaffected and the AI section
   shows an unavailable/needs-download state instead of erroring.
 
 ### Non-goals
 - No MI-GAN / neural *inpainting* fill (openenlarge's second ONNX model). Fill is
-  `cv2.inpaint` only. The detection backend is abstracted so a neural inpainter
-  could be added later.
+  the classical clone heal (+ `cv2.inpaint` fallback) only. The detection backend
+  is abstracted so a neural inpainter could be added later.
 - No IR-channel ("infrared cleaning") dust removal — FreeCCR has no IR plane.
 - No per-spot re-editing handles (move/resize an existing spot). Edits are
   add-only with Undo-last and Clear-all. (Future enhancement.)
@@ -266,8 +267,8 @@ neutral) is still inpainted. For un-converted negatives, dust runs before the
 display-only `_auto_brightness_for_preview` (ccr_image.py:548) — acceptable: the
 normalized spots replay correctly at export regardless of preview auto-brightness.
 
-### 5.2 Mask rasterization + inpaint (`ccr_processor.py`)
-New functions:
+### 5.2 Mask rasterization + clone-heal fill (`ccr_processor.py`)
+Functions:
 
 ```python
 def rasterize_dust_mask(spots, h, w) -> np.ndarray:                  # uint8 {0,255}, (h,w)
@@ -279,21 +280,41 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
   and a `cv2.line(..., thickness=2*r_px)` between consecutive points of a stroke
   so a fast drag leaves no gaps. (`r_px` is width-based in **both** axes → a true
   pixel circle at any resolution; pixels are square so it reads as a circle.)
-- `apply_dust_removal`:
+- `apply_dust_removal` — **clone heal** (healing-brush style), replacing the
+  original `cv2.inpaint` (Telea) fill. Telea diffuses a distance/direction
+  weighted **average** of the surrounding ring inward, which produced a smooth,
+  grainless round patch with radial fan-like streaks — obvious on grainy film.
+  The heal instead copies real neighboring texture, per mask component
+  (`cv2.connectedComponentsWithStats`):
+  1. **Window**: component bbox padded by `_HEAL_RING` (3 px); `ring` = the
+     clean known pixels around the hole (dilate minus every spot's 1-px-padded
+     mask) — the matching/tone context.
+  2. **Search**: candidate source windows on `_HEAL_ANGLES` (16) directions ×
+     `_HEAL_DIST_FACTORS` (1.0/1.8/3.0 × the window diagonal, so a source can
+     never overlap its own hole). A candidate must be in-bounds and fully clean
+     (checked O(1) against `cv2.integral` of the padded mask). Score = SSD
+     between source and destination **ring** pixels; best wins.
+  3. **Clone + membrane tone correction**: hole pixels are copied from the best
+     source, plus a smooth per-channel correction field interpolated from the
+     ring differences (normalized Gaussian convolution, σ ~ half the component
+     size; plain ring-mean where the ring weight underflows). Grain is kept
+     verbatim while low frequencies land on the hole's boundary values, so
+     gradients continue through the patch. All in float32 from the uint16
+     source — the fill is **16-bit native** (no 8-bit quantization).
+  4. **Fallback**: a component with no clean in-bounds source window (image
+     border, dense dust) or a starved ring (< `_HEAL_MIN_RING_PX`) falls back
+     to the old 8-bit `cv2.inpaint(..., inpaint_radius, INPAINT_TELEA)` fill.
+  5. **Feathered composite** (unchanged): alpha = dilate the mask ~1 px +
+     box-blur 5×5, normalized 0..1; `out = img16*(1-a) + filled*a`, computed
+     inside the halo's bounding box only. Away from any spot `out == img16`
+     bit-for-bit.
   - Identity fast-path: empty `spots` or all-zero mask → return `img16` unchanged.
-  - Inpaint in 8-bit (what `cv2.inpaint` supports); only **masked** pixels are
-    replaced so the unmasked image keeps full 16-bit precision:
-    1. `bgr8 = cv2.cvtColor(cv2.convertScaleAbs(img16, alpha=255/65535), RGB2BGR)`.
-    2. `filled8 = cv2.inpaint(bgr8, mask, inpaint_radius, cv2.INPAINT_TELEA)`.
-    3. `filled16 = cv2.cvtColor(filled8, BGR2RGB).astype(uint16) * 257`.
-    4. Build a **feathered alpha** `a` (dilate the mask ~2 px, box-blur ~3 px,
-       normalize to 0..1) and composite `out = img16*(1-a) + filled16*a`, so the
-       fill blends seamlessly and `out == img16` away from any spot.
   - Returns a new `uint16` RGB array; `img16` is never mutated (non-destructive).
-  - Precision note: only the **synthetic fill** pixels inside the mask carry 8-bit
-    quantization; the rest of the frame is bit-for-bit unchanged. Acceptable for
-    small specks. (A future 16-bit-native inpaint could remove even that.)
-  - Cost is dominated by the inpaint over the mask bbox; a few ms on ~1080 px.
+  - The chosen source patch may differ between preview and export resolution
+    (scoring at different scales); both are plausible clean fills, and tone is
+    anchored to the same ring either way.
+  - Cost: per-component window work only (no full-frame 8-bit convert unless a
+    fallback fires); ≤ the old Telea path even at export res with 100 spots.
 
 ### 5.3 AI detection (`src/core/dust_detect.py`)
 A self-contained module wrapping the ONNX BOPBTL detector. **`onnxruntime` is
@@ -469,9 +490,12 @@ The lazy in-function import still means a build *without* onnxruntime runs fine
 5. **Single-funnel verified** against the real export paths (§5.1 line refs); a
    single insertion at the top of `apply_adjustments` covers preview, zoom, and
    all export modes.
-6. **Inpaint** = `cv2.INPAINT_TELEA`, radius 3, masked-only feathered composite to
-   preserve 16-bit precision outside the fill (§5.2). NS is a possible future
-   toggle.
+6. **Fill** = per-component clone heal (best-patch match + membrane tone
+   correction, 16-bit native), with `cv2.INPAINT_TELEA` radius 3 as the
+   fallback when no clean source window exists; masked-only feathered composite
+   (§5.2). Considered and rejected: `cv2.xphoto.inpaint` SHIFTMAP (exemplar
+   based, but requires swapping `opencv-python` → `opencv-contrib-python` and
+   re-validating the Nuitka build for no quality win over the custom heal).
 7. **`dust_spots` is global** image state and independent of Compare/Reset; both
    leave it untouched (with clarifying comments).
 8. **Catalog**: `_is_pristine` must include `dust_spots` so dust-only images

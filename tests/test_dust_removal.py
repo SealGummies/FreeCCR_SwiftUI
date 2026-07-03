@@ -3,9 +3,10 @@
 Tests for the Dust Removal feature.
 
 Dust edits are stored as NORMALIZED spots on the image
-({kind, pts:[[x,y],...], r}) and inpainted at render time by
-ccr_processor.apply_dust_removal (cv2.inpaint, masked-only feathered composite).
-The AI detector (dust_detect) only finds dust; the fill is the same cv2 path.
+({kind, pts:[[x,y],...], r}) and healed at render time by
+ccr_processor.apply_dust_removal (clone-heal patch fill, 16-bit native, with a
+cv2.inpaint diffusion fallback; masked-only feathered composite). The AI
+detector (dust_detect) only finds dust; the fill is the same path.
 See spec/dust-removal.md.
 """
 import os
@@ -85,6 +86,59 @@ class TestApplyDustRemoval:
         before = img.copy()
         apply_dust_removal(img, [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}])
         assert np.array_equal(img, before)
+
+    def test_fill_is_16bit_native_on_flat_field(self):
+        # 30000 is NOT representable through an 8-bit round trip (the old
+        # cv2.inpaint path quantized the fill to multiples of 257 -> 30069).
+        # The clone heal copies real 16-bit pixels, so a flat field heals to
+        # exactly the surrounding value.
+        img = _flat_with_speck(base=30000, speck=60000, cx=50, cy=50, r=4)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}
+        out = apply_dust_removal(img, [spot])
+        core = out[47:54, 47:54]  # deep inside the healed hole (alpha == 1)
+        assert int(np.abs(core.astype(np.int32) - 30000).max()) <= 1
+
+    def test_heal_preserves_grain(self):
+        # On a grainy background the fill must carry real texture, not the
+        # smooth averaged patch diffusion inpainting produces (the round,
+        # fan-like artifact). Healed-region noise must stay comparable to the
+        # surround's.
+        rng = np.random.default_rng(7)
+        img = np.clip(rng.normal(30000, 3000, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        cv2.circle(img, (50, 50), 4, (60000, 60000, 60000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}
+        out = apply_dust_removal(img, [spot])
+        healed = out[46:55, 46:55].astype(np.float32)
+        yy, xx = np.mgrid[0:100, 0:100]
+        ann = (np.hypot(yy - 50, xx - 50) > 15) & (np.hypot(yy - 50, xx - 50) < 30)
+        surround = out[ann].astype(np.float32)
+        # Tone lands on the surround; grain survives (Telea gives ~0 std here).
+        assert abs(float(healed.mean()) - float(surround.mean())) < 2000
+        assert float(healed.std()) > 0.4 * float(surround.std())
+
+    def test_heal_continues_gradient(self):
+        # A linear gradient must continue through the patch (the tone
+        # correction interpolates the ring differences), not flatten into a
+        # single-toned blob.
+        ramp = (10000 + np.arange(100, dtype=np.float32) * 400)
+        img = np.broadcast_to(ramp[None, :, None], (100, 100, 3)).astype(np.uint16).copy()
+        expected = img.copy()
+        cv2.circle(img, (50, 50), 4, (60000, 60000, 60000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}
+        out = apply_dust_removal(img, [spot])
+        yy, xx = np.mgrid[0:100, 0:100]
+        hole = np.hypot(yy - 50, xx - 50) <= 8
+        err = np.abs(out[hole].astype(np.float32) - expected[hole].astype(np.float32))
+        assert float(err.max()) < 2500
+
+    def test_fallback_still_fills_when_no_clean_source(self):
+        # A spot so large no clean source window exists anywhere must fall
+        # back to diffusion inpainting rather than leaving the speck.
+        img = _flat_with_speck(base=30000, speck=60000, cx=50, cy=50, r=30)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.4}
+        out = apply_dust_removal(img, [spot])
+        assert int(out[50, 50, 0]) < 45000  # moved toward the surround
 
 
 # --- apply_adjustments integration (dust runs before the early-return guard) -

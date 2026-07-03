@@ -3214,14 +3214,112 @@ def rasterize_dust_mask(spots, h: int, w: int) -> np.ndarray:
     return mask
 
 
-def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.ndarray:
-    """Inpaint the dust spots out of a 16-bit RGB image, non-destructively.
+# Clone-heal tuning. The fill copies the best-matching CLEAN patch from the
+# spot's neighborhood (real texture and grain, 16-bit native) instead of
+# diffusing an average inward — diffusion (cv2.inpaint) produces a smooth,
+# grainless patch with radial fan-like streaks that stands out on film scans.
+_HEAL_RING = 3            # px of clean context around a hole (matching + tone)
+_HEAL_ANGLES = 16         # candidate source directions searched around a spot
+_HEAL_DIST_FACTORS = (1.0, 1.8, 3.0)  # x the minimum non-overlapping distance
+_HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
 
-    Only the masked pixels are replaced (the rest of the frame keeps full
-    16-bit precision); the fill is computed by cv2.inpaint (Telea) in 8-bit and
-    composited back through a feathered alpha so the patch blends seamlessly.
-    Returns a NEW uint16 array; img16 is never mutated. No-op (returns img16
-    unchanged) when there are no spots or the rasterized mask is empty.
+
+def _box_sum(integ: np.ndarray, y0: int, x0: int, y1: int, x1: int) -> int:
+    """Sum of a uint8 map over [y0:y1, x0:x1] via its cv2.integral image."""
+    return int(integ[y1, x1] - integ[y0, x1] - integ[y1, x0] + integ[y0, x0])
+
+
+def _heal_component(img16: np.ndarray, labels: np.ndarray, stats: np.ndarray,
+                    comp: int, mask_pad: np.ndarray, integ: np.ndarray,
+                    filled: np.ndarray) -> bool:
+    """Fill one mask component by cloning the best-matching nearby clean patch.
+
+    The component's bbox (+ a small ring of known context) is compared against
+    candidate windows on a ring of directions/distances around it; the source
+    whose RING pixels best match (SSD) is cloned into the hole, with a smooth
+    per-channel tone correction interpolated from the ring differences (a cheap
+    membrane, so gradients continue through the patch while its grain is kept
+    verbatim). Writes the healed hole pixels into `filled` and returns True, or
+    returns False when no fully clean, in-bounds source window exists (caller
+    falls back to diffusion inpaint for this component).
+    """
+    h, w = labels.shape[:2]
+    x0 = int(stats[comp, cv2.CC_STAT_LEFT])
+    y0 = int(stats[comp, cv2.CC_STAT_TOP])
+    cw = int(stats[comp, cv2.CC_STAT_WIDTH])
+    ch = int(stats[comp, cv2.CC_STAT_HEIGHT])
+    wx0 = max(0, x0 - _HEAL_RING)
+    wy0 = max(0, y0 - _HEAL_RING)
+    wx1 = min(w, x0 + cw + _HEAL_RING)
+    wy1 = min(h, y0 + ch + _HEAL_RING)
+
+    hole = labels[wy0:wy1, wx0:wx1] == comp
+    kern = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * _HEAL_RING + 1, 2 * _HEAL_RING + 1))
+    ring = ((cv2.dilate(hole.astype(np.uint8), kern) > 0)
+            & (mask_pad[wy0:wy1, wx0:wx1] == 0))
+    if int(ring.sum()) < _HEAL_MIN_RING_PX:
+        return False  # boxed in by other spots — no context to match against
+
+    dst = img16[wy0:wy1, wx0:wx1].astype(np.float32)
+    dst_ring = dst[ring]
+
+    # Candidate source offsets: rings of directions at distances guaranteeing
+    # the source window cannot overlap this hole's window.
+    d0 = float(np.hypot(wy1 - wy0, wx1 - wx0))
+    best_score, best_src = None, None
+    for f in _HEAL_DIST_FACTORS:
+        d = d0 * f
+        for k in range(_HEAL_ANGLES):
+            ang = 2.0 * np.pi * (k + 0.5 * f) / _HEAL_ANGLES
+            dy = int(round(d * np.sin(ang)))
+            dx = int(round(d * np.cos(ang)))
+            sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
+            if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
+                continue
+            if _box_sum(integ, sy0, sx0, sy1, sx1) != 0:
+                continue  # source window touches dust (this or another spot)
+            src = img16[sy0:sy1, sx0:sx1].astype(np.float32)
+            diff = src[ring] - dst_ring
+            score = float(np.mean(diff * diff))
+            if best_score is None or score < best_score:
+                best_score, best_src = score, src
+
+    if best_src is None:
+        return False
+
+    # Smooth per-channel tone correction from the ring differences: normalized
+    # Gaussian convolution interpolates (dst - src) on the ring into the hole,
+    # so the clone keeps its grain but its low frequencies land on the hole's
+    # boundary values (gradients continue seamlessly through the patch).
+    dmap = np.zeros_like(dst)
+    dmap[ring] = dst_ring - best_src[ring]
+    ind = ring.astype(np.float32)
+    sigma = 0.5 * max(cw, ch) + _HEAL_RING
+    wsum = cv2.GaussianBlur(ind, (0, 0), sigma)
+    dsum = cv2.GaussianBlur(dmap, (0, 0), sigma)
+    mean_diff = dmap[ring].mean(axis=0)
+    corr = np.where(wsum[..., None] > 1e-4,
+                    dsum / np.maximum(wsum, 1e-6)[..., None], mean_diff)
+    heal = best_src + corr
+    filled[wy0:wy1, wx0:wx1][hole] = np.clip(
+        np.rint(heal[hole]), 0, 65535).astype(np.uint16)
+    return True
+
+
+def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.ndarray:
+    """Heal the dust spots out of a 16-bit RGB image, non-destructively.
+
+    Each mask component is filled by CLONING the best-matching clean patch
+    from its neighborhood (see _heal_component) — real texture and grain,
+    16-bit native — instead of the old cv2.inpaint diffusion, whose averaged
+    fill left a smooth round patch with fan-like streaks. Components with no
+    clean source window (image border, dense dust) fall back to cv2.inpaint
+    (Telea, 8-bit). The fill is composited through a feathered alpha; only
+    masked pixels (+ a few-px blend halo) change, the rest of the frame is
+    bit-for-bit untouched. Returns a NEW uint16 array; img16 is never mutated.
+    No-op (returns img16 unchanged) when there are no spots or the rasterized
+    mask is empty.
     """
     if not spots:
         return img16
@@ -3230,24 +3328,41 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3) -> np.
     if not mask.any():
         return img16
 
-    # Inpaint in 8-bit BGR (what cv2.inpaint supports).
-    bgr8 = cv2.cvtColor(cv2.convertScaleAbs(img16, alpha=255.0 / 65535.0),
-                        cv2.COLOR_RGB2BGR)
-    filled8 = cv2.inpaint(bgr8, mask, inpaint_radius, cv2.INPAINT_TELEA)
-    filled16 = cv2.cvtColor(filled8, cv2.COLOR_BGR2RGB).astype(np.uint16) * 257
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    # "Clean" excludes every spot plus 1 px (buries antialiased speck edges).
+    mask_pad = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    integ = cv2.integral((mask_pad > 0).astype(np.uint8))
+    filled = img16.copy()
+    fallback = np.zeros_like(mask)
+    for i in range(1, n):  # 0 is background
+        if not _heal_component(img16, labels, stats, i, mask_pad, integ, filled):
+            fallback[labels == i] = 255
+
+    if fallback.any():
+        # Diffusion fallback (cv2.inpaint supports 8-bit only).
+        bgr8 = cv2.cvtColor(cv2.convertScaleAbs(img16, alpha=255.0 / 65535.0),
+                            cv2.COLOR_RGB2BGR)
+        telea8 = cv2.inpaint(bgr8, fallback, inpaint_radius, cv2.INPAINT_TELEA)
+        telea16 = cv2.cvtColor(telea8, cv2.COLOR_BGR2RGB).astype(np.uint16) * 257
+        fb = fallback > 0
+        filled[fb] = telea16[fb]
 
     # Feathered alpha: dilate a touch to bury the speck's antialiased edge,
     # then box-blur to a soft 0..1 ramp so the fill has no visible seam. Inside
     # the dilate+blur halo (a few px around the mask) pixels blend toward the
     # fill; OUTSIDE the halo alpha is exactly 0, so those pixels are kept
-    # bit-for-bit. The halo is the intended seamless-blend region.
+    # bit-for-bit. The halo is the intended seamless-blend region. The float
+    # blend only runs inside the halo's bounding box.
     k = np.ones((3, 3), np.uint8)
-    a = cv2.dilate(mask, k, iterations=1)
-    a = (cv2.blur(a, (5, 5)).astype(np.float32) / 255.0)[..., None]
-
-    out = (img16.astype(np.float32) * (1.0 - a)
-           + filled16.astype(np.float32) * a)
-    return np.clip(out, 0, 65535).astype(np.uint16)
+    a_full = cv2.blur(cv2.dilate(mask, k, iterations=1), (5, 5))
+    bx, by, bw, bh = cv2.boundingRect(a_full)
+    out = img16.copy()
+    ys, xs = slice(by, by + bh), slice(bx, bx + bw)
+    a = (a_full[ys, xs].astype(np.float32) / 255.0)[..., None]
+    blend = (img16[ys, xs].astype(np.float32) * (1.0 - a)
+             + filled[ys, xs].astype(np.float32) * a)
+    out[ys, xs] = np.clip(np.rint(blend), 0, 65535).astype(np.uint16)
+    return out
 
 
 # --- Area editing (local masked adjustment layers) -------------------------
