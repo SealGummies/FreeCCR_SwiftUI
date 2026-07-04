@@ -71,8 +71,7 @@ Then open it normally. (Alternatively: right-click the app → **Open** → **Op
 The recommended path is the **B/W Point** workflow — you anchor the whole roll to two physical reference points on the film, so every frame converts consistently:
 
 1. **Load a roll** — *File → Load Images from Folder* (work one roll at a time).
-2. **Frame each image** — draw a box around the image plus a little film base, steering clear of sprocket holes, the film holder, and any backlight.
-3. **Set White Point** — find the fully exposed leader (the bright, washed-out strip) and sample it.
+3. **Set White Point** (optional) — find the fully exposed leader (the bright, washed-out strip) and sample it.
 4. **Set Black Point** — sample a patch of clear film base.
 5. **Convert All (B/W Point)** — every frame inverts from those two anchors.
 6. **Fine-tune** with the right-hand sliders, then **Sync to All** (or `Ctrl/Cmd+C` / `Ctrl/Cmd+V`) to carry adjustments across the roll.
