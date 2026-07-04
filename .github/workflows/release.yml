@@ -248,7 +248,9 @@ jobs:
             patchelf ccache \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
-            libxkbcommon-x11-0 libegl1 libgl1 libopengl0 libfontconfig1 libdbus-1-3
+            libxcb-util1 libxcb-render0 libxcb-shm0 libxcb-randr0 \
+            libxcb-sync1 libxcb-xfixes0 libxkbcommon0 libxkbcommon-x11-0 \
+            libegl1 libgl1 libopengl0 libfontconfig1 libdbus-1-3
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -284,35 +286,45 @@ jobs:
             --output-filename=FreeCCR \
             src/main.py
 
-      - name: Bundle xcb runtime libs stock distros are missing
-        # Qt >= 6.5 dlopens libxcb-cursor0, which most distros do NOT
-        # preinstall (the one package venv users must apt-install). Ship it
-        # inside the dist unless Nuitka already bundled it.
+      - name: Bundle xcb/xkb runtime libs stock distros may be missing
+        # Nuitka excludes the whole system X11/xkb stack from the dist (it
+        # must match the host X server), but the xcb *extension/util* libs and
+        # libxkbcommon are NOT reliably preinstalled — e.g. Qt >= 6.5 needs
+        # libxcb-cursor0, the one package venv users must apt-install, and a
+        # GTK-based desktop may lack the xcb-util family entirely. They're
+        # tiny and self-contained against libxcb.so.1's stable ABI, so ship
+        # them in the dist (Qt libs sit flat in main.dist root, RUNPATH
+        # $ORIGIN, so copies dropped there are found first). We still rely on
+        # the host only for the truly universal stack: libc, libX11/libxcb
+        # core, libSM/libICE, GL/EGL, fontconfig, glib, dbus.
         run: |
-          QT_QPA_LIB=$(find main.dist -name 'libQt6XcbQpa*' -print -quit)
-          echo "Qt xcb QPA library: $QT_QPA_LIB"
-          QT_LIB_DIR=$(dirname "$QT_QPA_LIB")
-          for lib in libxcb-cursor.so.0; do
+          for lib in \
+            libxcb-cursor.so.0 libxcb-icccm.so.4 libxcb-image.so.0 \
+            libxcb-keysyms.so.1 libxcb-randr.so.0 libxcb-render.so.0 \
+            libxcb-render-util.so.0 libxcb-shape.so.0 libxcb-shm.so.0 \
+            libxcb-sync.so.1 libxcb-util.so.1 libxcb-xfixes.so.0 \
+            libxcb-xinerama.so.0 libxcb-xkb.so.1 \
+            libxkbcommon.so.0 libxkbcommon-x11.so.0; do
             if find main.dist -name "${lib}*" -print -quit | grep -q .; then
               echo "$lib already bundled by Nuitka"
             else
-              cp -Lv "/usr/lib/x86_64-linux-gnu/$lib" "$QT_LIB_DIR/"
               cp -Lv "/usr/lib/x86_64-linux-gnu/$lib" main.dist/
             fi
           done
           echo "--- unresolved deps of the xcb QPA plugin (informational) ---"
-          ldd "$QT_QPA_LIB" | grep 'not found' || echo "(none)"
+          ldd main.dist/libQt6XcbQpa.so.6 | grep 'not found' || echo "(none)"
 
       - name: Smoke test in bare Ubuntu 22.04 container
         # The container only gets libs every desktop distro ships by default —
-        # deliberately NOT libxcb-cursor0, which must come from our bundle.
-        # timeout exit 124 = the GUI ran for 25s without crashing.
+        # deliberately NOT libxcb-cursor0/xcb-util/libxkbcommon, which must
+        # come from our bundle. timeout exit 124 = GUI ran 25s without crashing.
         run: |
           docker run --rm -v "$PWD/main.dist:/opt/freeccr:ro" ubuntu:22.04 bash -c "
             set -e
             apt-get update -qq
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-              xvfb libgl1 libegl1 libopengl0 libglib2.0-0 libdbus-1-3 fontconfig fonts-dejavu-core > /dev/null
+              xvfb libgl1 libegl1 libopengl0 libglib2.0-0 libdbus-1-3 fontconfig fonts-dejavu-core \
+              libsm6 libice6 libx11-xcb1 > /dev/null
             Xvfb :99 -screen 0 1280x800x24 &
             sleep 3
             set +e
@@ -328,7 +340,8 @@ jobs:
         run: |
           docker run --rm -v "$PWD/main.dist:/opt/freeccr:ro" fedora:latest bash -c "
             set -e
-            dnf install -y -q xorg-x11-server-Xvfb mesa-libGL mesa-libEGL glib2 dbus-libs fontconfig dejavu-sans-fonts
+            dnf install -y -q xorg-x11-server-Xvfb mesa-libGL mesa-libEGL glib2 dbus-libs fontconfig dejavu-sans-fonts \
+              libxcb libX11-xcb libSM libICE
             Xvfb :99 -screen 0 1280x800x24 &
             sleep 3
             set +e
