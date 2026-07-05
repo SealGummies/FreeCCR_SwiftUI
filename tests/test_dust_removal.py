@@ -779,18 +779,50 @@ class TestPanelWiring:
 
     def test_dust_debug_geometry_maps_plan_to_arrows(self):
         # Full-frame pixel geometry for the 'Show heal sources' overlay:
-        # spot outlines, one arrow per cloned segment (source -> segment,
+        # union borders, one arrow per cloned segment (source -> segment,
         # source = centroid + planned offset), a marker per Telea fallback.
         from widgets.image_preview import dust_debug_geometry
         spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.05}]
         plan = [(0.5, 0.5, (0.1, -0.2), True, False),
                 (0.3, 0.4, None, None, None)]
         geo = dust_debug_geometry(spots, plan, 1000, 500)
-        assert geo["strokes"] == [([(500.0, 250.0)], 100.0)]
+        # One border: the dab's circle contour (r = 0.05 * 1000 = 50 px).
+        assert len(geo["borders"]) == 1
+        pts = np.array(geo["borders"][0])
+        d = np.hypot(pts[:, 0] - 500, pts[:, 1] - 250)
+        assert float(np.abs(d - 50).max()) < 3
         (sx, sy, dx, dy), = geo["arrows"]
         assert (dx, dy) == (500.0, 250.0)
         assert (sx, sy) == (500.0 - 0.2 * 1000, 250.0 + 0.1 * 500)
         assert geo["fallbacks"] == [(0.4 * 1000, 0.3 * 500)]
+
+    def test_connected_strokes_outline_as_one_border(self):
+        # Overlapping strokes read as ONE region: a single union border,
+        # not per-spot outlines crossing through the interior.
+        from widgets.image_preview import dust_debug_geometry
+        merged = [{"kind": "brush", "pts": [[0.50, 0.5]], "r": 0.05},
+                  {"kind": "brush", "pts": [[0.56, 0.5]], "r": 0.05}]
+        assert len(dust_debug_geometry(merged, None, 1000, 1000)["borders"]) == 1
+        apart = [{"kind": "brush", "pts": [[0.3, 0.3]], "r": 0.03},
+                 {"kind": "brush", "pts": [[0.7, 0.7]], "r": 0.03}]
+        assert len(dust_debug_geometry(apart, None, 1000, 1000)["borders"]) == 2
+
+    def test_dust_spot_hit_and_plan_translation(self):
+        # Hit-testing for the right-button stroke editing, and the plan
+        # translation that keeps a dragged stroke's ABSOLUTE source.
+        from widgets.image_preview import dust_spot_hit, translate_dust_plan
+        spot = {"kind": "brush", "pts": [[0.2, 0.2], [0.4, 0.2]], "r": 0.02}
+        assert dust_spot_hit(spot, 0.3, 0.2, 1000, 1000)       # on the line
+        assert dust_spot_hit(spot, 0.3, 0.218, 1000, 1000)     # within r=20px
+        assert not dust_spot_hit(spot, 0.3, 0.25, 1000, 1000)  # 30 px off
+        plan = [(0.2, 0.3, (0.05, 0.10), True, False),  # rides the stroke
+                (0.8, 0.8, (0.01, 0.02), True, True)]   # elsewhere
+        out = translate_dust_plan(plan, spot, 0.1, -0.05, 1000, 1000)
+        cy, cx, off = out[0][0], out[0][1], out[0][2]
+        assert (cy, cx) == pytest.approx((0.15, 0.4))
+        # The record's ABSOLUTE source position is unchanged by the move.
+        assert (cy + off[0], cx + off[1]) == pytest.approx((0.25, 0.40))
+        assert out[1] == plan[1]
 
     def test_detect_all_no_targets_is_safe(self):
         from widgets.dust_panel import DustRemovalPanel, _DetectAllWorker  # noqa: F401

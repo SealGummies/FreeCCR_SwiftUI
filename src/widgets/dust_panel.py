@@ -220,7 +220,11 @@ class DustRemovalPanel(QWidget):
             lambda on: self.image_preview.set_dust_source_overlay(on))
         layout.addWidget(self.show_sources_cb)
 
-        hint = QLabel("Click or drag over dust to remove it.")
+        hint = QLabel(
+            "Click or drag over dust to remove it. Ctrl+wheel resizes the "
+            "brush.\n"
+            "With heal sources shown: right-drag a stroke to move it (it "
+            "keeps sampling the same patch); double right-click deletes it.")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(hint)

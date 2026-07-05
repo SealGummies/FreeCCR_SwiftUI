@@ -105,7 +105,10 @@ in the catalog, and undoable.
      and the brush edge (a tight trace heals hard by design; brush generously
      to get a soft blend).
    - **Show heal sources** checkbox: diagnostic overlay on the canvas —
-     every stroke's border outlined (yellow), and for each heal segment a
+     stroke borders outlined (yellow) as the contours of the UNION of the
+     rasterized strokes (connected/overlapping strokes read as ONE region;
+     per-spot outlines drew noise lines through the interior), and for each
+     heal segment a
      green arrow drawn FROM the patch it sampled TO the healed segment
      (ring at the source), or an orange ring where the segment fell back to
      diffusion (nothing was sampled). Geometry comes from the cached
@@ -113,7 +116,18 @@ in the catalog, and undoable.
      through the same crop-display transform as the brush, so it shows
      exactly what exports will replay. Refreshes on every dust edit /
      feather change; cleared on exit.
-   - Hint: "Click or drag over dust to remove it."
+   - **Right-button stroke editing** (only while the sources overlay is
+     shown): right-press on a stroke and drag to MOVE it (live border while
+     dragging; the re-heal lands on release, one undo step). The stroke's
+     plan records travel with it with their offsets compensated
+     (`translate_dust_plan`), so a moved stroke still samples the very same
+     patch of film — the reference location never changes. Double
+     right-click on a stroke DELETES it (one undo step). Hit-testing is
+     against the brush footprint (`dust_spot_hit`, topmost/newest stroke
+     first); a right-click on empty canvas does nothing.
+   - Hint: "Click or drag over dust to remove it. Ctrl+wheel resizes the
+     brush. With heal sources shown: right-drag a stroke to move it (it
+     keeps sampling the same patch); double right-click deletes it."
    - **Undo last spot** button and **Clear all** button.
 3. Separator.
 4. **AI** group:
