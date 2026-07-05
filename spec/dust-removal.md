@@ -99,13 +99,16 @@ in the catalog, and undoable.
      stays tight. A per-image render parameter stored as
      `CCRImage.dust_feather`; changes re-heal live (debounced ~200 ms),
      persist in the catalog, and are NOT part of undo snapshots (like brush
-     size). Defect-like pixels are always fully filled regardless of the
-     feather (§5.2 step 6), so a wide fade cannot blend the defect back in —
-     which also means the fade only shows on the clean rim between the defect
-     and the brush edge (a tight trace heals hard by design; brush generously
-     to get a soft blend).
+     size). The feather governs EVERYTHING (maintainer rule: every pixel
+     gets the effect, opacity rolled off from the stroke center — no
+     exceptions, §5.2 step 6): at wide settings the heal fades out even
+     across the defect itself, by explicit user choice; feather 0 is a
+     hard, complete removal.
    - **Show heal sources** checkbox: diagnostic overlay on the canvas —
-     every stroke's border outlined (yellow), and for each heal segment a
+     stroke borders outlined (yellow) as the contours of the UNION of the
+     rasterized strokes (connected/overlapping strokes read as ONE region;
+     per-spot outlines drew noise lines through the interior), and for each
+     heal segment a
      green arrow drawn FROM the patch it sampled TO the healed segment
      (ring at the source), or an orange ring where the segment fell back to
      diffusion (nothing was sampled). Geometry comes from the cached
@@ -113,7 +116,30 @@ in the catalog, and undoable.
      through the same crop-display transform as the brush, so it shows
      exactly what exports will replay. Refreshes on every dust edit /
      feather change; cleared on exit.
-   - Hint: "Click or drag over dust to remove it."
+   - **Right-button stroke editing** (only while the sources overlay is
+     shown): right-press on a stroke and drag to MOVE it (live border while
+     dragging; the re-heal lands on release, one undo step). The stroke's
+     plan records travel with it with their offsets compensated
+     (`translate_dust_plan`), so a moved stroke still samples the very same
+     patch of film — the reference location never changes. Right-press on a
+     SOURCE ring and drag to RE-PICK where that segment samples from: the
+     arrow follows live, the release re-heal binds the segment at its
+     unchanged centroid and pins the chosen offset verbatim — the user's
+     pick becomes the sticky reference (replayed by hi-res/export,
+     persisted in the catalog; a plan-only edit, not an undo step). A
+     re-picked source is marked `manual` in its plan record and cloned
+     with CLONE-STAMP semantics: copied verbatim — color and texture —
+     blended only by the feather at the rim. The membrane re-toning
+     (§5.2 step 4) applies to automatic picks only; applied to a manual
+     pick it fought the user, keeping the destination's old color and
+     toning away the picked look. Double
+     right-click on a stroke DELETES it (one undo step). Hit-testing tries
+     source markers first (9 px), then the brush footprint
+     (`dust_spot_hit`, topmost/newest stroke first); a right-click on empty
+     canvas does nothing.
+   - Hint: "Click or drag over dust to remove it. Ctrl+wheel resizes the
+     brush. With heal sources shown: right-drag a stroke to move it (it
+     keeps sampling the same patch); double right-click deletes it."
    - **Undo last spot** button and **Clear all** button.
 3. Separator.
 4. **AI** group:
@@ -218,9 +244,10 @@ a polyline):
 - Empty list = "no dust removal"; the render fast-path leaves the image
   untouched (§5.2).
 - Alongside the spots, the catalog stores `dust_plan` — the cached heal
-  plan's records (`[cy, cx, [oy, ox] | null, genuine, dlike_on]`), written
-  only when they match the current spots — so a reload reseeds
-  `_dust_plan_cache` and keeps the exact sources the user saw.
+  plan's records (`[cy, cx, [oy, ox] | null, genuine, dlike_on, manual]`),
+  written only when they match the current spots — so a reload reseeds
+  `_dust_plan_cache` and keeps the exact sources the user saw (including
+  manual clone-stamp picks).
 - Alongside the spots, `CCRImage.dust_feather` (float, fraction of each
   hole's own half-thickness, 0..1, default 0.25) holds the image's heal
   edge-fade width — one value for all spots, set by the panel's Feather
@@ -416,22 +443,18 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      setting (`dust_feather`) as a fraction of **each hole's own depth**
      (its half-thickness) — the fade scales with the brush size, and with
      resolution, since the rasterized hole does — capped by that depth so
-     the core still reaches full fill. **Defect-like hole pixels** (colored
-     like the estimated defect) are force-filled at alpha 1 regardless of
-     the ramp (`dlike`, with a blurred lip as wide as the component's ramp,
-     confined to the component so it can't bleed into a neighboring hole's
-     blend), so a wide feather can never blend the defect back in — the
-     soft fade only happens across clean rim pixels. The classification
-     only engages for a `genuine` estimate (step 2) whose defect color is
-     separated from the cleaned ring's median by > `_DLIKE_SEP_MADS`
-     ring-grain MADs **and brighter than the surround** (film dust inverts
-     WHITE; a darker "defect" is content), and then marks the hole pixels
-     closer to the defect than to the surround (nearest centroid): a
-     generous brush over mostly-clean content estimates a "defect" that
-     collapses onto the background mode, and thresholding grain against it
-     force-filled a random salt-and-pepper subset of the hole (dithered
-     rims, no rolloff at wide feathers) — gated off, such a brush blends as
-     a pure opacity dome rolling off from the stroke's center. Outside the
+     the core still reaches full fill. The dome is the WHOLE story
+     (maintainer rule: every pixel gets the effect, opacity rolled off
+     from the stroke center — no exceptions): there is no defect
+     force-fill floor, so a wide feather fades the heal out even across
+     the defect itself, and the slider has visible authority on every
+     heal — the old `dlike` floor (alpha pinned to 1 on defect-colored
+     pixels, with a ramp-wide lip) made the feather do nothing exactly
+     where users reach for it, on real dust. The `dlike_on` verdict (a
+     `genuine` estimate whose defect color is > `_DLIKE_SEP_MADS`
+     ring-grain MADs from the cleaned ring's median and brighter than the
+     surround — film dust inverts WHITE) is still computed and carried in
+     the plan as metadata. Outside the
      mask alpha is exactly 0 — away from any spot `out == img16`
      bit-for-bit.
   7. **Resolution-stable plan**: the heal's content-adaptive decisions —

@@ -1,12 +1,12 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QToolBar, QMessageBox, QSlider, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsPathItem, QGraphicsEllipseItem,
-    QGraphicsLineItem, QStyleOptionSlider, QDialog,
+    QGraphicsLineItem, QGraphicsPolygonItem, QStyleOptionSlider, QDialog,
     QLabel, QPushButton, QStyle, QSizePolicy, QApplication, QComboBox
 )
 from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter,
                            QCursor, QDesktopServices, QPainterPath,
-                           QPainterPathStroker, QBrush, QPolygonF,
+                           QBrush, QPolygonF,
                            QImage)
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
@@ -49,18 +49,27 @@ def dust_debug_geometry(spots, plan, w, h):
     """Geometry for the dust panel's 'Show heal sources' overlay, in FULL
     un-cropped frame pixel coords (the caller maps to scene coords).
 
-    Returns {"strokes": [(points_px, brush_width_px)], "arrows":
-    [(src_x, src_y, dst_x, dst_y)], "fallbacks": [(x, y)]}: one outline per
-    stored spot, one arrow per planned clone segment drawn FROM the sampled
-    source patch TO the healed segment's centroid, and one marker per
-    diffusion-fallback segment (nothing was sampled there — Telea). `plan`
-    records are (cy, cx, off, ...) with `off` the destination→source window
-    displacement normalized over (h, w), or None for a fallback (see
-    _heal_impl); pass plan=None for stroke outlines only."""
-    strokes = [([(float(p[0]) * w, float(p[1]) * h)
-                 for p in (s.get("pts") or [])],
-                2.0 * float(s.get("r", 0.0)) * w)
-               for s in (spots or [])]
+    Returns {"borders": [closed polygons [(x, y), ...]], "arrows":
+    [(src_x, src_y, dst_x, dst_y)], "fallbacks": [(x, y)]}. Borders are the
+    contours of the UNION of the rasterized strokes (holes included), so
+    connected/overlapping strokes read as ONE region — per-spot outlines
+    drew noise lines through the interior. One arrow per planned clone
+    segment, drawn FROM the sampled source patch TO the healed segment's
+    centroid; one marker per diffusion-fallback segment (nothing was
+    sampled there — Telea). `plan` records are (cy, cx, off, ...) with
+    `off` the destination→source window displacement normalized over
+    (h, w), or None for a fallback (see _heal_impl); pass plan=None for
+    borders only."""
+    import cv2
+    from core.ccr_processor import rasterize_dust_mask
+    borders = []
+    if spots:
+        m = rasterize_dust_mask(spots, int(h), int(w))
+        if m.any():
+            contours, _ = cv2.findContours(m, cv2.RETR_CCOMP,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            borders = [[(float(p[0][0]), float(p[0][1])) for p in c]
+                       for c in contours if len(c) >= 3]
     arrows, fallbacks = [], []
     for rec in (plan or []):
         cy, cx, off = rec[0], rec[1], rec[2]
@@ -69,7 +78,52 @@ def dust_debug_geometry(spots, plan, w, h):
             fallbacks.append((dx, dy))
         else:
             arrows.append((dx + off[1] * w, dy + off[0] * h, dx, dy))
-    return {"strokes": strokes, "arrows": arrows, "fallbacks": fallbacks}
+    return {"borders": borders, "arrows": arrows, "fallbacks": fallbacks}
+
+
+def dust_spot_hit(spot, x_norm, y_norm, w, h, slack_px=0.0):
+    """True when the full-frame-normalized point lies on the spot's brush
+    footprint: within `r` (+slack) of its polyline, in pixels (`r` is a
+    fraction of width, like the rasterizer)."""
+    pts = spot.get("pts") or []
+    if not pts:
+        return False
+    r = float(spot.get("r", 0.0)) * w + slack_px
+    px, py = x_norm * w, y_norm * h
+    best = None
+    prev = None
+    for p in pts:
+        ax, ay = float(p[0]) * w, float(p[1]) * h
+        if prev is None:
+            qx, qy = ax, ay
+        else:
+            bx, by = prev
+            vx, vy = ax - bx, ay - by
+            L2 = vx * vx + vy * vy
+            t = 0.0 if L2 <= 0 else max(0.0, min(1.0, ((px - bx) * vx
+                                                       + (py - by) * vy) / L2))
+            qx, qy = bx + t * vx, by + t * vy
+        d = ((px - qx) ** 2 + (py - qy) ** 2) ** 0.5
+        best = d if best is None else min(best, d)
+        prev = (ax, ay)
+    return best is not None and best <= r
+
+
+def translate_dust_plan(plan, spot, dx, dy, w, h):
+    """Move the plan records riding on `spot` by (dx, dy) normalized while
+    KEEPING each record's ABSOLUTE source position — the offset compensates
+    the move, so a dragged stroke still samples the very same patch of film
+    (the reference location never changes, see spec). Records not on the
+    spot are untouched. Returns a new list."""
+    out = []
+    for rec in (plan or []):
+        if dust_spot_hit(spot, rec[1], rec[0], w, h, slack_px=2.0):
+            off = rec[2]
+            off2 = None if off is None else (off[0] - dy, off[1] - dx)
+            out.append((rec[0] + dy, rec[1] + dx, off2) + tuple(rec[3:]))
+        else:
+            out.append(rec)
+    return out
 
 
 _rotate_cursor_cache = None
@@ -187,6 +241,9 @@ class GraphicsImageView(QGraphicsView):
         if self.parent_widget.dust_mode and self.parent_widget.pixmap_item is not None:
             if event.button() == Qt.LeftButton:
                 self.parent_widget.dust_press(self.mapToScene(event.pos()))
+            elif event.button() == Qt.RightButton:
+                # With the sources overlay shown: right-drag moves a stroke.
+                self.parent_widget.dust_right_press(self.mapToScene(event.pos()))
             return
         if self.parent_widget.crop_mode and self.parent_widget.pixmap_item is not None:
             if event.button() == Qt.LeftButton:
@@ -253,7 +310,11 @@ class GraphicsImageView(QGraphicsView):
         if self._space_pan:
             return super().mouseMoveEvent(event)
         if self.parent_widget.dust_mode:
-            self.parent_widget.dust_move(self.mapToScene(event.pos()))
+            if (self.parent_widget._dust_drag is not None
+                    or self.parent_widget._dust_src_drag is not None):
+                self.parent_widget.dust_right_move(self.mapToScene(event.pos()))
+            else:
+                self.parent_widget.dust_move(self.mapToScene(event.pos()))
             return
         if self.parent_widget.crop_mode:
             scene_pos = self.mapToScene(event.pos())
@@ -385,6 +446,8 @@ class GraphicsImageView(QGraphicsView):
         if self.parent_widget.dust_mode:
             if event.button() == Qt.LeftButton:
                 self.parent_widget.dust_release()
+            elif event.button() == Qt.RightButton:
+                self.parent_widget.dust_right_release()
             return
         if self.parent_widget.crop_mode:
             if event.button() == Qt.LeftButton:
@@ -516,6 +579,17 @@ class GraphicsImageView(QGraphicsView):
                 pw.reference_rect_item = None
                 ccr_backend.set_reference_frame_by_index(pw.current_idx, None)
         self.parent_widget.update_preview(self.parent_widget.current_idx)
+
+    def mouseDoubleClickEvent(self, event):
+        if (self.parent_widget.dust_mode
+                and self.parent_widget.pixmap_item is not None
+                and event.button() == Qt.RightButton):
+            # With the sources overlay shown: double right-click deletes the
+            # stroke under the cursor.
+            self.parent_widget.dust_right_double(self.mapToScene(event.pos()))
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -887,6 +961,8 @@ class ImagePreview(QWidget):
         self.dust_panel = None           # set by MainWindow (brush-slider sync)
         self._dust_debug = False         # 'Show heal sources' diagnostic overlay
         self._dust_debug_items = []      # its scene items (outlines/arrows)
+        self._dust_drag = None           # right-drag state (move a stroke)
+        self._dust_src_drag = None       # right-drag state (re-pick a source)
 
         # Coalesce a fine-rotation drag into a single undo step
         self._fine_rot_burst_active = False
@@ -1270,6 +1346,9 @@ class ImagePreview(QWidget):
         if self.slice_mode:
             self._set_slice_ghost(None)
             self._draw_slice_dim()
+        # Dust source markers are sized from the view scale too.
+        if self.dust_mode:
+            self._draw_dust_debug()
             if self._slice_lines:
                 self._redraw_slice_lines()
 
@@ -1578,6 +1657,8 @@ class ImagePreview(QWidget):
             self._draw_crop_overlay()  # handle sizes track the view scale
         if self.area_mode:
             self._draw_area_overlay()  # area handle sizes track the view scale too
+        if self.dust_mode:
+            self._draw_dust_debug()  # source markers track the view scale too
 
     def zoom_to_percent(self, pct):
         """Zoom to an absolute percentage of the source's ACTUAL size (1.0 =
@@ -1737,14 +1818,27 @@ class ImagePreview(QWidget):
             for a in getattr(img, "area_layers", []))
         # Dust spots are inpainted inside apply_adjustments, so a change to them
         # must invalidate the cached hi-res display (see spec/dust-removal.md §4.4).
+        # The heal PLAN is part of that identity too: dragging a source ring
+        # rewrites only the plan (spots untouched), and without it here the
+        # zoomed display kept showing the old fill after a re-pick.
+        spots = getattr(img, "dust_spots", [])
+        cached = getattr(img, "_dust_plan_cache", None)
+        plan_sig = ()
+        if cached is not None and cached[0] == repr(spots):
+            plan_sig = tuple(
+                (round(r[0] * 10000), round(r[1] * 10000),
+                 None if r[2] is None else (round(r[2][0] * 10000),
+                                            round(r[2][1] * 10000)))
+                for r in cached[1])
         dust_sig = (tuple(
             (s.get("kind"),
              tuple((round(float(p[0]) * 10000), round(float(p[1]) * 10000))
                    for p in (s.get("pts") or [])),
              round(float(s.get("r", 0)) * 10000))
-            for s in getattr(img, "dust_spots", [])),
+            for s in spots),
             round(float(getattr(img, "dust_feather",
-                                DUST_FEATHER_DEFAULT)) * 10000))
+                                DUST_FEATHER_DEFAULT)) * 10000),
+            plan_sig)
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "exposure_base", 0.0),
@@ -2540,6 +2634,173 @@ class ImagePreview(QWidget):
             {"kind": "brush", "pts": pts, "r": float(self._dust_brush_r)})
         self._commit_dust_change(img)
 
+    # --- Right-button stroke editing (with the sources overlay shown) ------
+    def _dust_spot_index_at(self, scene_pos):
+        """Index of the topmost (newest) stroke under the cursor, or None."""
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        n = self._dust_scene_to_norm(scene_pos)
+        size = self._dust_full_frame_size()
+        if img is None or n is None or size is None:
+            return None
+        w, h = size
+        spots = getattr(img, "dust_spots", []) or []
+        for i in range(len(spots) - 1, -1, -1):
+            if dust_spot_hit(spots[i], n[0], n[1], w, h, slack_px=2.0):
+                return i
+        return None
+
+    def _dust_source_index_at(self, n):
+        """Index (into the cached plan) of the source marker under the
+        cursor, or None. Markers exist only while the cache matches the
+        spots — the same condition under which they are drawn."""
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        size = self._dust_full_frame_size()
+        if img is None or size is None:
+            return None
+        cached = getattr(img, "_dust_plan_cache", None)
+        spots = getattr(img, "dust_spots", []) or []
+        if cached is None or cached[0] != repr(spots):
+            return None
+        w, h = size
+        # Hit radius matches the drawn reticle: a constant SCREEN size, so
+        # divide by the view scale to get scene/full-frame pixels — capped,
+        # or a degenerate scale would let the marker swallow every click.
+        hit = min(24.0, 10.0 / max(self._view_scale() or 0.0, 1e-6))
+        for i, rec in enumerate(cached[1]):
+            if rec[2] is None:
+                continue
+            sx, sy = rec[1] + rec[2][1], rec[0] + rec[2][0]
+            if math.hypot((n[0] - sx) * w, (n[1] - sy) * h) <= hit:
+                return i
+        return None
+
+    def dust_right_press(self, scene_pos):
+        """Right-press (sources overlay shown): grab the source marker under
+        the cursor to re-pick where that segment samples from, else grab the
+        stroke to move it."""
+        if not (self.dust_mode and self._dust_debug):
+            return
+        n = self._dust_scene_to_norm(scene_pos)
+        if n is None:
+            return
+        si = self._dust_source_index_at(n)
+        if si is not None:
+            img = ccr_backend.get_image_by_index(self.current_idx)
+            self._dust_src_drag = {"idx": si, "start": n,
+                                   "rec": img._dust_plan_cache[1][si],
+                                   "moved": False}
+            return
+        idx = self._dust_spot_index_at(scene_pos)
+        if idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        self._dust_drag = {"idx": idx, "start": n, "delta": (0.0, 0.0),
+                           "orig": copy.deepcopy(img.dust_spots[idx]),
+                           "moved": False}
+
+    def _dust_source_move(self, scene_pos):
+        """Live-update a dragged source marker: rewrite that plan record's
+        offset so the segment samples where the user drops it. The re-heal
+        (on release) binds the segment at its unchanged centroid and pins
+        the chosen offset verbatim — the user's pick becomes the sticky
+        reference, replayed by hi-res/export and persisted in the catalog."""
+        drag = self._dust_src_drag
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        n = self._dust_scene_to_norm(scene_pos)
+        if drag is None or img is None or n is None:
+            return
+        cached = getattr(img, "_dust_plan_cache", None)
+        if cached is None:
+            return
+        rec = drag["rec"]
+        dy = n[1] - drag["start"][1]
+        dx = n[0] - drag["start"][0]
+        # Keep the source center inside the frame.
+        oy = min(max(rec[2][0] + dy, -rec[0]), 1.0 - rec[0])
+        ox = min(max(rec[2][1] + dx, -rec[1]), 1.0 - rec[1])
+        recs = list(cached[1])
+        # manual=True: a user-picked source is cloned VERBATIM (color and
+        # texture) — the membrane re-toning is for automatic picks only.
+        recs[drag["idx"]] = (rec[0], rec[1], (oy, ox)) \
+            + tuple(rec[3:5]) + (True,)
+        img._dust_plan_cache = (cached[0], recs)
+        drag["moved"] = abs(dy) > 1e-6 or abs(dx) > 1e-6
+        self._draw_dust_debug()  # arrow follows; the re-heal lands on release
+
+    def dust_right_move(self, scene_pos):
+        if self._dust_src_drag is not None:
+            self._dust_source_move(scene_pos)
+            return
+        drag = self._dust_drag
+        if drag is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        n = self._dust_scene_to_norm(scene_pos)
+        if img is None or n is None:
+            return
+        pts0 = drag["orig"]["pts"]
+        dx = n[0] - drag["start"][0]
+        dy = n[1] - drag["start"][1]
+        # Clamp so the whole stroke stays inside the frame.
+        dx = max(-min(p[0] for p in pts0),
+                 min(1.0 - max(p[0] for p in pts0), dx))
+        dy = max(-min(p[1] for p in pts0),
+                 min(1.0 - max(p[1] for p in pts0), dy))
+        img.dust_spots[drag["idx"]] = dict(
+            drag["orig"], pts=[[p[0] + dx, p[1] + dy] for p in pts0])
+        drag["delta"] = (dx, dy)
+        drag["moved"] = abs(dx) > 1e-6 or abs(dy) > 1e-6
+        self._draw_dust_debug()  # live border; the re-heal lands on release
+
+    def dust_right_release(self):
+        src = self._dust_src_drag
+        self._dust_src_drag = None
+        if src is not None:
+            if src.get("moved"):
+                img = ccr_backend.get_image_by_index(self.current_idx)
+                if img is not None:
+                    # Re-heal: the segment binds at its centroid and pins
+                    # the user-chosen offset verbatim — the new reference.
+                    self._commit_dust_change(img)
+            return
+        drag = self._dust_drag
+        self._dust_drag = None
+        if drag is None or not drag.get("moved"):
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None:
+            return
+        dx, dy = drag["delta"]
+        # Snapshot the PRE-drag state for undo, then re-apply the move.
+        img.dust_spots[drag["idx"]] = copy.deepcopy(drag["orig"])
+        img.push_undo_state()
+        img.dust_spots[drag["idx"]] = dict(
+            drag["orig"],
+            pts=[[p[0] + dx, p[1] + dy] for p in drag["orig"]["pts"]])
+        # Carry the stroke's plan records along, keeping each one's ABSOLUTE
+        # source position — a moved stroke still samples the same patch of
+        # film (the reference never changes).
+        cached = getattr(img, "_dust_plan_cache", None)
+        size = self._dust_full_frame_size()
+        if cached is not None and size is not None:
+            img._dust_plan_cache = (cached[0], translate_dust_plan(
+                cached[1], drag["orig"], dx, dy, size[0], size[1]))
+        self._commit_dust_change(img)
+
+    def dust_right_double(self, scene_pos):
+        """Double right-click on a stroke (sources overlay shown): delete it."""
+        if not (self.dust_mode and self._dust_debug):
+            return
+        self._dust_drag = None
+        self._dust_src_drag = None
+        idx = self._dust_spot_index_at(scene_pos)
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if idx is None or img is None:
+            return
+        img.push_undo_state()
+        del img.dust_spots[idx]
+        self._commit_dust_change(img)
+
     def dust_undo_last(self) -> bool:
         img = ccr_backend.get_image_by_index(self.current_idx)
         if img is None or not img.dust_spots:
@@ -2688,52 +2949,76 @@ class ImagePreview(QWidget):
                 pt = to_display.map(pt)
             return t.map(pt)
 
-        def add(item, color, width=1.5):
-            pen = QPen(color, width)
-            pen.setCosmetic(True)  # constant screen width at any zoom
-            item.setPen(pen)
+        # Marker geometry holds a constant SCREEN size (divided by the view
+        # scale, and redrawn on zoom); pen widths are cosmetic already.
+        vs = max(self._view_scale() or 0.0, 1e-6)
+
+        def px(v):
+            return v / vs
+
+        def pen(color, width, dash=None):
+            p = QPen(color, width)
+            p.setCosmetic(True)
+            p.setCapStyle(Qt.RoundCap)
+            p.setJoinStyle(Qt.RoundJoin)
+            if dash:
+                p.setDashPattern(dash)
+            return p
+
+        def add(item, p, brush=None):
+            item.setPen(p)
+            item.setBrush(brush if brush is not None else Qt.NoBrush)
             self.scene.addItem(item)
             self._dust_debug_items.append(item)
 
-        yellow = QColor(255, 220, 60, 230)   # stroke borders
-        green = QColor(80, 255, 140, 230)    # sampled patch + arrow
-        orange = QColor(255, 150, 40, 230)   # diffusion fallback marker
-        for pts, width in geo["strokes"]:
-            if not pts:
-                continue
+        def ellipse(c, r):
+            return QGraphicsEllipseItem(c.x() - r, c.y() - r, 2 * r, 2 * r)
+
+        halo = QColor(12, 16, 20, 150)       # soft dark underlay: everything
+        amber = QColor(255, 200, 80, 235)    # stroke borders (marquee)
+        mint = QColor(105, 232, 165, 245)    # sampled patch + arrow
+        orange = QColor(255, 156, 66, 245)   # diffusion fallback marker
+        for poly in geo["borders"]:
             path = QPainterPath()
-            path.moveTo(scene_pt(*pts[0]))
-            for p in pts[1:]:
+            path.moveTo(scene_pt(*poly[0]))
+            for p in poly[1:]:
                 path.lineTo(scene_pt(*p))
-            if len(pts) == 1:  # single dab: zero-length stroke + round cap
-                path.lineTo(scene_pt(pts[0][0] + 1e-3, pts[0][1]))
-            stroker = QPainterPathStroker()
-            # Crop extraction is isometric, so full-frame px == display px.
-            stroker.setWidth(max(1.0, width))
-            stroker.setCapStyle(Qt.RoundCap)
-            stroker.setJoinStyle(Qt.RoundJoin)
-            item = QGraphicsPathItem(stroker.createStroke(path))
-            item.setBrush(Qt.NoBrush)
-            add(item, yellow)
+            path.closeSubpath()
+            add(QGraphicsPathItem(path), pen(halo, 3.4))
+            add(QGraphicsPathItem(path), pen(amber, 1.4, [5.0, 4.0]))
         for sx, sy, dx, dy in geo["arrows"]:
             p1, p2 = scene_pt(sx, sy), scene_pt(dx, dy)
-            add(QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y()), green)
-            r = 6.0
-            e = QGraphicsEllipseItem(p1.x() - r, p1.y() - r, 2 * r, 2 * r)
-            e.setBrush(Qt.NoBrush)
-            add(e, green)
-            ang = math.atan2(p2.y() - p1.y(), p2.x() - p1.x())
-            for da in (math.pi * 5 / 6, -math.pi * 5 / 6):  # arrowhead barbs
-                add(QGraphicsLineItem(
-                    p2.x(), p2.y(),
-                    p2.x() + 9.0 * math.cos(ang + da),
-                    p2.y() + 9.0 * math.sin(ang + da)), green)
+            r_ring, head = px(7.0), px(10.0)
+            vx, vy = p2.x() - p1.x(), p2.y() - p1.y()
+            length = math.hypot(vx, vy)
+            if length > r_ring + head:
+                # Shaft from the reticle's rim to the arrowhead's base.
+                ux, uy = vx / length, vy / length
+                shaft = QPainterPath(
+                    QPointF(p1.x() + ux * r_ring, p1.y() + uy * r_ring))
+                shaft.lineTo(QPointF(p2.x() - ux * head * 0.7,
+                                     p2.y() - uy * head * 0.7))
+                add(QGraphicsPathItem(shaft), pen(halo, 3.4))
+                add(QGraphicsPathItem(shaft), pen(mint, 1.6))
+                ang = math.atan2(vy, vx)
+                tri = QPolygonF([
+                    p2,
+                    QPointF(p2.x() - head * math.cos(ang - 0.42),
+                            p2.y() - head * math.sin(ang - 0.42)),
+                    QPointF(p2.x() - head * math.cos(ang + 0.42),
+                            p2.y() - head * math.sin(ang + 0.42))])
+                add(QGraphicsPolygonItem(tri), pen(halo, 1.6), QBrush(mint))
+            # Source reticle: halo ring, mint ring with a faint fill, dot.
+            add(ellipse(p1, r_ring), pen(halo, 3.4))
+            fill = QColor(mint)
+            fill.setAlpha(34)
+            add(ellipse(p1, r_ring), pen(mint, 1.6), QBrush(fill))
+            add(ellipse(p1, px(1.5)), pen(mint, 1.0), QBrush(mint))
         for x, y in geo["fallbacks"]:
             p = scene_pt(x, y)
-            r = 7.0
-            e = QGraphicsEllipseItem(p.x() - r, p.y() - r, 2 * r, 2 * r)
-            e.setBrush(Qt.NoBrush)
-            add(e, orange, 2.0)
+            add(ellipse(p, px(8.0)), pen(halo, 3.4))
+            add(ellipse(p, px(8.0)), pen(orange, 1.6, [3.0, 2.6]))
+            add(ellipse(p, px(1.5)), pen(orange, 1.0), QBrush(orange))
 
     def _draw_dust_stroke(self):
         """Draw/refresh the live red overlay for the in-progress stroke.

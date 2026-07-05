@@ -138,6 +138,98 @@ class TestHealSourceOverlay:
         assert ip._dust_debug_items == []
 
 
+class TestRightButtonStrokeEditing:
+    def test_right_drag_moves_stroke_and_keeps_absolute_source(self, tmp_path):
+        ip, img = _converted_preview(tmp_path, crop_rect=None)
+        ip.enter_dust_mode()
+        ip._maybe_request_hires = lambda: None   # keep the test in-thread
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}]
+        img.update_thumbnail_and_preview()
+        (cy, cx, off, *_), = img._dust_plan_cache[1]
+        assert off is not None
+        abs_src = (cy + off[0], cx + off[1])
+        ip.set_dust_source_overlay(True)
+        # Right-drag the stroke 60 px right (no crop: scene == full coords).
+        ip.dust_right_press(QPointF(300, 200))
+        assert ip._dust_drag is not None
+        ip.dust_right_move(QPointF(360, 200))
+        ip.dust_right_release()
+        assert img.dust_spots[0]["pts"][0] == pytest.approx([0.6, 0.5])
+        # The re-heal bound the translated record: the segment moved but its
+        # ABSOLUTE source position did not (the offset compensated).
+        (cy2, cx2, off2, *_), = img._dust_plan_cache[1]
+        assert cx2 == pytest.approx(0.6, abs=0.01)
+        assert (cy2 + off2[0], cx2 + off2[1]) == pytest.approx(abs_src,
+                                                               abs=0.01)
+        # The drag is one undo step back to the pre-drag stroke.
+        assert img.pop_undo_state()
+        assert img.dust_spots[0]["pts"][0] == pytest.approx([0.5, 0.5])
+
+    def test_double_right_click_deletes_stroke(self, tmp_path):
+        ip, img = _converted_preview(tmp_path, crop_rect=None)
+        ip.enter_dust_mode()
+        ip._maybe_request_hires = lambda: None
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}]
+        img.update_thumbnail_and_preview()
+        ip.set_dust_source_overlay(True)
+        ip.dust_right_double(QPointF(100, 50))   # miss: nothing happens
+        assert len(img.dust_spots) == 1
+        ip.dust_right_double(QPointF(300, 200))  # on the stroke: deleted
+        assert img.dust_spots == []
+        assert img.pop_undo_state()
+        assert len(img.dust_spots) == 1
+
+    def test_right_drag_on_source_marker_repicks_the_sample(self, tmp_path):
+        # Dragging the SOURCE ring changes where that segment samples from:
+        # the plan record's offset follows the drop point, the re-heal pins
+        # it verbatim, and the user's pick becomes the sticky reference.
+        ip, img = _converted_preview(tmp_path, crop_rect=None)
+        ip.enter_dust_mode()
+        ip._maybe_request_hires = lambda: None
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}]
+        img.update_thumbnail_and_preview()
+        (cy, cx, off, *_), = img._dust_plan_cache[1]
+        assert off is not None
+        ip.set_dust_source_overlay(True)
+        # Grab the marker at the source position (no crop: scene == full px).
+        sx, sy = (cx + off[1]) * 600, (cy + off[0]) * 400
+        ip.dust_right_press(QPointF(sx, sy))
+        assert ip._dust_src_drag is not None and ip._dust_drag is None
+        # Drop it 80 px below (clean area) and release.
+        ip.dust_right_move(QPointF(sx, sy + 80))
+        ip.dust_right_release()
+        (cy2, cx2, off2, *rest), = img._dust_plan_cache[1]
+        assert (cy2, cx2) == pytest.approx((cy, cx), abs=1e-6)
+        assert cx2 + off2[1] == pytest.approx((sx) / 600.0, abs=0.01)
+        assert cy2 + off2[0] == pytest.approx((sy + 80) / 400.0, abs=0.01)
+        # The pick is marked manual (verbatim clone) and survives the
+        # re-heal's plan collection.
+        assert rest[2] is True
+
+    def test_adj_sig_tracks_source_repick(self, tmp_path):
+        # Dragging a source ring rewrites only the PLAN (spots untouched);
+        # the hi-res display signature must change with it, or the zoomed
+        # display keeps showing the old fill after a re-pick.
+        ip, img = _converted_preview(tmp_path, crop_rect=None)
+        ip.enter_dust_mode()
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}]
+        img.update_thumbnail_and_preview()
+        sig1 = ip._current_adj_sig()
+        key, plan = img._dust_plan_cache
+        (cy, cx, off, *rest), = plan
+        assert off is not None
+        img._dust_plan_cache = (key, [(cy, cx, (off[0] + 0.05, off[1]),
+                                       *rest)])
+        assert ip._current_adj_sig() != sig1
+
+    def test_right_press_needs_overlay_shown(self, tmp_path):
+        ip, img = _converted_preview(tmp_path, crop_rect=None)
+        ip.enter_dust_mode()
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}]
+        ip.dust_right_press(QPointF(300, 200))   # overlay off: no drag
+        assert ip._dust_drag is None
+
+
 class TestSceneToNormThroughCrop:
     def test_center_of_crop_maps_to_crop_center(self, tmp_path):
         ip, img = _converted_preview(tmp_path)
