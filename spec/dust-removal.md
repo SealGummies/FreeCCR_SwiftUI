@@ -449,14 +449,18 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      render caches its plan (`_dust_plan_cache`, keyed by the spots'
      content; feather excluded — it shapes the blend, not the plan), and
      hi-res/export renders replay THAT plan via `apply_dust_removal(plan=)`.
-     **Sticky sources**: once a segment's source is set, nothing may move
+     **Sticky sources**: once a segment's source is set, NOTHING may move
      it — every preview-scale re-heal is seeded with the previous plan
      (`prior_plan`, bound tightly by `_DUST_EDIT_TOL` so a NEW stroke's
      segments never inherit a neighbor's source unscored), and segments at
      unchanged centroids reuse their prior offset/verdicts verbatim instead
      of re-searching. Painting a new stroke therefore cannot re-sample the
-     strokes already on screen; only a stroke landing ON a prior source
-     (making it dust) forces that one segment to re-search. The plan
+     strokes already on screen. A pinned offset is never re-searched, only
+     clamped into bounds (scale rounding); even a stroke landing ON a prior
+     source keeps the reference — that segment defers to a second pass
+     (after the clone/Telea fills) and clones the HEALED content at the
+     very same location, so no dust is copied and the arrow never moves.
+     The plan
      persists in the catalog (`dust_plan`, dropped when stale) and reseeds
      the cache on restore, so reloads keep the exact sources the user saw —
      a from-scratch replan of an incrementally-built plan could differ

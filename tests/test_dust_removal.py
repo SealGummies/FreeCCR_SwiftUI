@@ -333,6 +333,39 @@ class TestApplyDustRemoval:
         assert recs, "first stroke's segment disappeared"
         assert recs[0][2] == off, "first stroke's source moved"
 
+    def test_stroke_on_prior_source_keeps_reference_samples_healed(self):
+        # NO exceptions: even a stroke painted directly ON a segment's
+        # source patch must not move the reference. The segment defers to a
+        # second pass and clones the HEALED content at the very same
+        # location — same offset in the plan, no dust cloned into the fill.
+        rng = np.random.default_rng(23)
+        img = np.clip(rng.normal(30000, 2500, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
+        plan1 = []
+        apply_dust_removal(img, [spot], collect_plan=plan1)
+        (cy, cx, off, _, _), = plan1
+        assert off is not None
+        # A bright defect appears at the chosen source and the user paints
+        # over it — the source patch is now under dust.
+        sy, sx = cy + off[0], cx + off[1]
+        img2 = img.copy()
+        cv2.circle(img2, (int(sx * 400), int(sy * 400)), 5,
+                   (62000, 62000, 62000), -1)
+        b = {"kind": "brush", "pts": [[sx, sy]], "r": 0.03}
+        plan2 = []
+        out = apply_dust_removal(img2, [spot, b], collect_plan=plan2,
+                                 prior_plan=plan1)
+        rec = [r for r in plan2
+               if abs(r[0] - cy) < 1e-9 and abs(r[1] - cx) < 1e-9]
+        assert rec, "first stroke's segment disappeared"
+        assert rec[0][2] == off, "reference moved"
+        # The fill sampled the HEALED source, not the new bright defect.
+        m = rasterize_dust_mask([spot], 400, 400) > 0
+        healed = out[m].astype(np.float32)
+        assert float(healed.mean()) < 40000
+        assert float(healed.max()) < 55000
+
     def test_new_stroke_keeps_far_samples_stable(self):
         # Adding a dab must only re-sample segments near the edit. Tiles
         # used to anchor to the component bbox and scale their windows by

@@ -3283,7 +3283,8 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 comp: int, bbox: tuple,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
                 filled: np.ndarray, fmap: np.ndarray, feather: float,
-                dlike: np.ndarray, src_off=None, forced_flags=None):
+                dlike: np.ndarray, src_off=None, forced_flags=None,
+                sample=None):
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
 
@@ -3301,10 +3302,13 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
     force-fill engaged), which the plan records so replays reproduce them —
     or None when no fully clean, in-bounds source window exists (caller
     falls back to diffusion inpaint for this patch).
-    `src_off`: a pre-planned offset to REUSE (the resolution-stable replay,
-    see apply_dust_removal); taken verbatim when it still lands on a clean
-    in-bounds window, otherwise the normal search runs (plan drift from
-    mask-raster rounding — rare). `forced_flags`: the plan's
+    `src_off`: a pre-planned offset to REUSE (scale replay / a prior edit's
+    plan) — always taken verbatim (clamped into bounds), never re-searched:
+    once a patch's reference is set, nothing may move it. When dust has
+    landed on the pinned source and `sample` is None, the patch returns a
+    4th element "defer" instead of filling — the caller re-runs it after
+    the Telea pass with `sample` = the healed buffer, so it clones healed
+    content at the SAME location. `forced_flags`: the plan's
     (genuine, dlike_on) verdicts to reuse instead of re-deriving them from
     this buffer's pixels (grain statistics shift with resampling, and a
     flipped verdict is a visible preview/export difference). `img16_c`:
@@ -3417,27 +3421,27 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
 
     best_score, best_src, best_off = None, None, None
     if src_off is not None:
-        # Resolution-stable replay: reuse the offset the plan chose at the
-        # canonical scale instead of re-searching on this buffer's pixels.
-        # If scaling rounded the offset onto dust or out of bounds, rescue
-        # with the nearest clean offset (Chebyshev spiral, <= 4 px) — still
-        # essentially the SAME source patch. Only when that fails too does
-        # the local search run below (it may pick a visibly different patch,
-        # so it is the last resort).
-        base_dy, base_dx = int(src_off[0]), int(src_off[1])
-        for rad in range(0, 5):
-            ring_offs = [(jy, jx)
-                         for jy in range(-rad, rad + 1)
-                         for jx in range(-rad, rad + 1)
-                         if max(abs(jy), abs(jx)) == rad]
-            for jy, jx in ring_offs:
-                src = _source_at(base_dy + jy, base_dx + jx)
-                if src is not None:
-                    best_src = src
-                    best_off = (base_dy + jy, base_dx + jx)
-                    break
-            if best_src is not None:
-                break
+        # Pinned source (scale replay, or a prior edit's plan): the offset
+        # is taken VERBATIM — once a patch's reference is set, NOTHING may
+        # move it. It is only clamped into bounds (scale rounding can push
+        # the window a pixel past the frame). If dust has landed on it
+        # since (a new stroke painted over the sampled patch), the segment
+        # is DEFERRED and re-run after the Telea pass with `sample` = the
+        # healed buffer: it clones the healed content at the very same
+        # location instead of re-searching elsewhere.
+        dy = min(max(int(src_off[0]), -wy0), h - wy1)
+        dx = min(max(int(src_off[1]), -wx0), w - wx1)
+        best_off = (dy, dx)
+        if _box_sum(integ, wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx) == 0:
+            best_src = img16[wy0 + dy:wy1 + dy,
+                             wx0 + dx:wx1 + dx].astype(np.float32)
+        elif sample is not None:
+            best_src = sample[wy0 + dy:wy1 + dy,
+                              wx0 + dx:wx1 + dx].astype(np.float32)
+        else:
+            g0, d0 = forced_flags if forced_flags is not None else (True,
+                                                                    False)
+            return best_off, g0, d0, "defer"
     if best_src is None:
         # Candidate source offsets: rings of directions at thickness-scaled
         # distances. The integral-image check rejects any source that touches
@@ -3616,9 +3620,10 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     source/verdicts VERBATIM instead of re-searching, so painting a new
     stroke cannot re-sample the strokes already on screen (a fresh search
     with the new mask in place flipped near-tie sources for any segment
-    whose context ring the new stroke grazed). Only a stroke that lands ON
-    a prior source (making it dust) forces that one segment to re-search;
-    new segments match no prior record and search normally.
+    whose context ring the new stroke grazed). Even a stroke that lands ON
+    a prior source does not move it: that segment defers to a second pass
+    and clones the HEALED content at the same location (see _heal_patch).
+    New segments match no prior record and search normally.
     """
     if not spots:
         return img16
@@ -3696,6 +3701,9 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     kb = int(round(max(1.0, scale_up)))
     kb += 1 - (kb % 2)  # nearest odd
     img16_c = img16 if kb <= 1 else cv2.blur(img16, (kb, kb))
+    # Segments whose PINNED source is under newer dust: re-run after the
+    # fills below so they clone the healed content at the same location.
+    deferred = []
     t_setup = time.time() - t0
     t0 = time.time()
     n_segs = 0
@@ -3755,6 +3763,11 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                                       loc_th, mask_pad, integ, filled, fmap,
                                       feather, dlike, src_off=src_off,
                                       forced_flags=flags)
+                if res is not None and len(res) == 4:
+                    # Pinned source now under new dust: fill in a SECOND
+                    # pass from the healed buffer (after Telea), so the
+                    # reference location stays — no exceptions.
+                    deferred.append((i, bbox, loc_th, res[0], flags))
                 off = None if res is None else res[0]
                 if collect is not None:
                     collect.append(
@@ -3789,6 +3802,14 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
         fb = fallback > 0
         filled[fb] = telea16[fb]
     t_telea = time.time() - t0
+
+    # Second pass for deferred segments: every hole now has SOME fill in
+    # `filled` (clone or Telea), so a pinned source that sat under new dust
+    # clones the healed content at its unchanged reference location.
+    for i, bbox_d, loc_d, off_d, flags_d in deferred:
+        _heal_patch(img16, img16_c, labels, i, bbox_d, loc_d, mask_pad,
+                    integ, filled, fmap, feather, dlike,
+                    src_off=off_d, forced_flags=flags_d, sample=filled)
 
     # Feathered composite: alpha rises 0 -> 1 from each hole's boundary inward
     # over its feather ramp (a fraction of the hole's own thickness, so it
