@@ -3826,6 +3826,16 @@ class ImagePreview(QWidget):
             lines.append(f"Skipped (already exist): {plan.skipped}")
         if result.get("failed"):
             lines.append(f"Failed: {result['failed']}")
+            # Show the first few real reasons — without them a failure is
+            # undiagnosable from the bundled app (no visible console).
+            for idx, msg in result.get("failures", [])[:5]:
+                img = (ccr_backend.images[idx]
+                       if 0 <= idx < len(ccr_backend.images) else None)
+                name = (os.path.basename(getattr(img, "file_path", ""))
+                        if img is not None else f"image {idx}")
+                lines.append(f"  {name}: {msg}")
+            if len(result.get("failures", [])) > 5:
+                lines.append(f"  … and {len(result['failures']) - 5} more")
         if result.get("cancelled"):
             lines.append("Export was stopped before completion.")
         lines.append(f"\nFolder: {plan.destination}")

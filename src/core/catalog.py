@@ -421,18 +421,11 @@ def _replay_conversion(img, ci) -> None:
                                     apply_reference_normalization)
     mode = ci.get("mode")
     if mode == "ref":
-        saved_fine = img.fine_rotation_angle
-        saved_ref = img.reference_frame
-        img.fine_rotation_angle = ci.get("fine_rot", 0)
-        img.reference_frame = ci["ref"]
-        try:
-            processed = ccr_normalize_with_reference(img)
-        finally:
-            img.fine_rotation_angle = saved_fine
-            # Unconditionally: the user may have deleted the frame after
-            # converting, and a restore must reproduce exactly that state.
-            img.reference_frame = saved_ref
-        img.resized_raw = processed
+        # Snapshot passed as parameters — the live reference_frame /
+        # fine_rotation_angle stay whatever the stored state restored them
+        # to (the user may have deleted the frame after converting).
+        img.resized_raw = ccr_normalize_with_reference(
+            img, reference_rect=ci["ref"], fine_rot=ci.get("fine_rot", 0))
     elif mode == "ref_params":
         img.resized_raw = apply_reference_normalization(
             img.resized_raw, ci["p_lo"], ci["p_hi"], ci["od"])
