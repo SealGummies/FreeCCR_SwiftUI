@@ -198,10 +198,13 @@ class TestRightButtonStrokeEditing:
         # Drop it 80 px below (clean area) and release.
         ip.dust_right_move(QPointF(sx, sy + 80))
         ip.dust_right_release()
-        (cy2, cx2, off2, *_), = img._dust_plan_cache[1]
+        (cy2, cx2, off2, *rest), = img._dust_plan_cache[1]
         assert (cy2, cx2) == pytest.approx((cy, cx), abs=1e-6)
         assert cx2 + off2[1] == pytest.approx((sx) / 600.0, abs=0.01)
         assert cy2 + off2[0] == pytest.approx((sy + 80) / 400.0, abs=0.01)
+        # The pick is marked manual (verbatim clone) and survives the
+        # re-heal's plan collection.
+        assert rest[2] is True
 
     def test_adj_sig_tracks_source_repick(self, tmp_path):
         # Dragging a source ring rewrites only the PLAN (spots untouched);

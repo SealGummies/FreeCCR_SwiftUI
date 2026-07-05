@@ -300,7 +300,7 @@ class TestApplyDustRemoval:
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
         plan1 = []
         apply_dust_removal(img, [spot], collect_plan=plan1)
-        (cy, cx, off, g, d), = plan1
+        (cy, cx, off, g, d, *_), = plan1
         assert off is not None
         tampered = [(cy, cx, (off[0], off[1] + 20.0 / 400.0), g, d)]
         plan2 = []
@@ -320,7 +320,7 @@ class TestApplyDustRemoval:
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
         plan1 = []
         apply_dust_removal(img, [spot], collect_plan=plan1)
-        (cy, cx, off, _, _), = plan1
+        (cy, cx, off, _, _, *_), = plan1
         # Perturb the ring on the side OPPOSITE the chosen source, so the
         # prior source window stays clean.
         bx = 0.44 if (cx + off[1]) >= 0.5 else 0.56
@@ -332,6 +332,31 @@ class TestApplyDustRemoval:
                 if abs(r[0] - cy) < 1e-9 and abs(r[1] - cx) < 1e-9]
         assert recs, "first stroke's segment disappeared"
         assert recs[0][2] == off, "first stroke's source moved"
+
+    def test_manual_source_pick_clones_verbatim(self):
+        # A USER-PICKED source (overlay ring drag, manual=True in the plan)
+        # is cloned verbatim — color AND texture. The membrane re-toning is
+        # for automatic picks only: applied to a manual re-pick it kept the
+        # destination's old color and toned away the picked look ("texture
+        # is gone but color remains").
+        rng = np.random.default_rng(41)
+        img = np.clip(rng.normal(30000, 3000, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        img[150:260, 100:300] = np.clip(
+            rng.normal(12000, 500, (110, 200, 3)), 0, 65535)  # dark region
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.075}  # inside it
+        plan1 = []
+        apply_dust_removal(img, [spot], collect_plan=plan1)
+        # Re-pick every segment's source to the bright grain 120 px above.
+        manual = [(cy, cx, (-120.0 / 400.0, 0.0), g, d, True)
+                  for cy, cx, off, g, d, *_ in plan1]
+        out = apply_dust_removal(img, [spot], prior_plan=manual)
+        m = rasterize_dust_mask([spot], 400, 400) > 0
+        core = cv2.erode(m.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
+        healed = out[core].astype(np.float32)
+        # The fill carries the SOURCE's tone and grain, not the dark ring's.
+        assert abs(float(healed.mean()) - 30000) < 2500
+        assert float(healed.std()) > 1500
 
     def test_sources_stay_inside_the_crop(self):
         # Content outside the confirmed crop (film holder, rebate, junk the
@@ -366,7 +391,7 @@ class TestApplyDustRemoval:
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
         plan1 = []
         apply_dust_removal(img, [spot], collect_plan=plan1)
-        (cy, cx, off, _, _), = plan1
+        (cy, cx, off, _, _, *_), = plan1
         assert off is not None
         # A bright defect appears at the chosen source and the user paints
         # over it — the source patch is now under dust.

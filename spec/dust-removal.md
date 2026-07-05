@@ -126,7 +126,13 @@ in the catalog, and undoable.
      arrow follows live, the release re-heal binds the segment at its
      unchanged centroid and pins the chosen offset verbatim — the user's
      pick becomes the sticky reference (replayed by hi-res/export,
-     persisted in the catalog; a plan-only edit, not an undo step). Double
+     persisted in the catalog; a plan-only edit, not an undo step). A
+     re-picked source is marked `manual` in its plan record and cloned
+     with CLONE-STAMP semantics: copied verbatim — color and texture —
+     blended only by the feather at the rim. The membrane re-toning
+     (§5.2 step 4) applies to automatic picks only; applied to a manual
+     pick it fought the user, keeping the destination's old color and
+     toning away the picked look. Double
      right-click on a stroke DELETES it (one undo step). Hit-testing tries
      source markers first (9 px), then the brush footprint
      (`dust_spot_hit`, topmost/newest stroke first); a right-click on empty
@@ -238,9 +244,10 @@ a polyline):
 - Empty list = "no dust removal"; the render fast-path leaves the image
   untouched (§5.2).
 - Alongside the spots, the catalog stores `dust_plan` — the cached heal
-  plan's records (`[cy, cx, [oy, ox] | null, genuine, dlike_on]`), written
-  only when they match the current spots — so a reload reseeds
-  `_dust_plan_cache` and keeps the exact sources the user saw.
+  plan's records (`[cy, cx, [oy, ox] | null, genuine, dlike_on, manual]`),
+  written only when they match the current spots — so a reload reseeds
+  `_dust_plan_cache` and keeps the exact sources the user saw (including
+  manual clone-stamp picks).
 - Alongside the spots, `CCRImage.dust_feather` (float, fraction of each
   hole's own half-thickness, 0..1, default 0.25) holds the image's heal
   edge-fade width — one value for all spots, set by the panel's Feather

@@ -3305,7 +3305,7 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
                 filled: np.ndarray, fmap: np.ndarray, feather: float,
                 dlike: np.ndarray, src_off=None, forced_flags=None,
-                sample=None):
+                sample=None, manual=False):
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
 
@@ -3502,22 +3502,33 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
     if best_src is None:
         return None
 
-    # Smooth per-channel tone correction from the ring differences: normalized
-    # Gaussian convolution interpolates (dst - src) on the ring into the hole,
-    # so the clone keeps its grain but its low frequencies land on the hole's
-    # boundary values (gradients continue seamlessly through the patch). Sigma
-    # is thickness-local: a bbox-sized sigma turned the correction into one
-    # constant for the whole component, letting one bad segment tint it all.
-    dmap = np.zeros_like(dst)
-    dmap[ring] = dst_ring - best_src[ring]
-    ind = ring.astype(np.float32)
-    sigma = half_th + pad
-    wsum = cv2.GaussianBlur(ind, (0, 0), sigma)
-    dsum = cv2.GaussianBlur(dmap, (0, 0), sigma)
-    mean_diff = dmap[ring].mean(axis=0)
-    corr = np.where(wsum[..., None] > 1e-4,
-                    dsum / np.maximum(wsum, 1e-6)[..., None], mean_diff)
-    heal = best_src + corr
+    if manual:
+        # USER-PICKED source (the dragged reticle): clone-stamp semantics —
+        # the patch is copied VERBATIM, color and texture alike, blended
+        # only by the feather at the rim. The membrane below exists to make
+        # AUTOMATIC picks seamless (texture from the source, low
+        # frequencies from the destination); applied to an explicit re-pick
+        # it fought the user — the old color stayed and the picked look
+        # was toned away.
+        heal = best_src
+    else:
+        # Smooth per-channel tone correction from the ring differences:
+        # normalized Gaussian convolution interpolates (dst - src) on the
+        # ring into the hole, so the clone keeps its grain but its low
+        # frequencies land on the hole's boundary values (gradients continue
+        # seamlessly through the patch). Sigma is thickness-local: a
+        # bbox-sized sigma turned the correction into one constant for the
+        # whole component, letting one bad segment tint it all.
+        dmap = np.zeros_like(dst)
+        dmap[ring] = dst_ring - best_src[ring]
+        ind = ring.astype(np.float32)
+        sigma = half_th + pad
+        wsum = cv2.GaussianBlur(ind, (0, 0), sigma)
+        dsum = cv2.GaussianBlur(dmap, (0, 0), sigma)
+        mean_diff = dmap[ring].mean(axis=0)
+        corr = np.where(wsum[..., None] > 1e-4,
+                        dsum / np.maximum(wsum, 1e-6)[..., None], mean_diff)
+        heal = best_src + corr
     filled[wy0:wy1, wx0:wx1][hole] = np.clip(
         np.rint(heal[hole]), 0, 65535).astype(np.uint16)
 
@@ -3682,10 +3693,12 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                plan_tol: float = 0.06, crop=None) -> np.ndarray:
     """apply_dust_removal's engine at ONE resolution. With `collect` (a list),
     appends a plan record per heal segment:
-    (cy_norm, cx_norm, offset, genuine, dlike_on) where offset is the chosen
-    source displacement normalized over (h, w) — None for a diffusion
-    fallback — and genuine/dlike_on are the patch's content-adaptive
-    verdicts (see _heal_patch). With `plan` (+ `scale_up` = this buffer's
+    (cy_norm, cx_norm, offset, genuine, dlike_on, manual) where offset is
+    the chosen source displacement normalized over (h, w) — None for a
+    diffusion fallback — genuine/dlike_on are the patch's content-adaptive
+    verdicts (see _heal_patch), and manual marks a USER-PICKED source
+    (cloned verbatim, no membrane re-toning; set by the overlay's
+    source-ring drag and carried through every replay). With `plan` (+ `scale_up` = this buffer's
     size over the plan scale), segments reuse the planned
     offsets/fallbacks/verdicts instead of re-deriving them, and the
     pixel-based geometry (segment size, Telea radius) scales by `scale_up`
@@ -3783,7 +3796,7 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                         bx + int(xs.max()) + 1, by + int(ys.max()) + 1)
                 cyn = (by + float(ys.mean())) / h
                 cxn = (bx + float(xs.mean())) / w
-                src_off, forced_fb, flags = None, False, None
+                src_off, forced_fb, flags, manual = None, False, None, False
                 if plan is not None:
                     rec = _nearest_plan_record(plan, cyn, cxn, tol=plan_tol)
                     if rec is not None:
@@ -3794,23 +3807,25 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                                        int(round(rec[2][1] * w)))
                             if len(rec) >= 5:
                                 flags = (rec[3], rec[4])
+                            if len(rec) >= 6:
+                                manual = bool(rec[5])  # user-picked source
                 res = None
                 if not forced_fb:
                     res = _heal_patch(img16, img16_c, labels, i, bbox,
                                       loc_th, mask_pad, integ, filled, fmap,
                                       feather, dlike, src_off=src_off,
-                                      forced_flags=flags)
+                                      forced_flags=flags, manual=manual)
                 if res is not None and len(res) == 4:
                     # Pinned source now under new dust: fill in a SECOND
                     # pass from the healed buffer (after Telea), so the
                     # reference location stays — no exceptions.
-                    deferred.append((i, bbox, loc_th, res[0], flags))
+                    deferred.append((i, bbox, loc_th, res[0], flags, manual))
                 off = None if res is None else res[0]
                 if collect is not None:
                     collect.append(
-                        (cyn, cxn, None, None, None) if res is None
+                        (cyn, cxn, None, None, None, False) if res is None
                         else (cyn, cxn, (off[0] / h, off[1] / w),
-                              res[1], res[2]))
+                              res[1], res[2], manual))
                 if off is None:
                     fallback[by:by + sub.shape[0],
                              bx:bx + sub.shape[1]][sub] = 255
@@ -3843,10 +3858,11 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     # Second pass for deferred segments: every hole now has SOME fill in
     # `filled` (clone or Telea), so a pinned source that sat under new dust
     # clones the healed content at its unchanged reference location.
-    for i, bbox_d, loc_d, off_d, flags_d in deferred:
+    for i, bbox_d, loc_d, off_d, flags_d, man_d in deferred:
         _heal_patch(img16, img16_c, labels, i, bbox_d, loc_d, mask_pad,
                     integ, filled, fmap, feather, dlike,
-                    src_off=off_d, forced_flags=flags_d, sample=filled)
+                    src_off=off_d, forced_flags=flags_d, sample=filled,
+                    manual=man_d)
 
     # Feathered composite: alpha rises 0 -> 1 from each hole's boundary inward
     # over its feather ramp (a fraction of the hole's own thickness, so it

@@ -2719,7 +2719,10 @@ class ImagePreview(QWidget):
         oy = min(max(rec[2][0] + dy, -rec[0]), 1.0 - rec[0])
         ox = min(max(rec[2][1] + dx, -rec[1]), 1.0 - rec[1])
         recs = list(cached[1])
-        recs[drag["idx"]] = (rec[0], rec[1], (oy, ox)) + tuple(rec[3:])
+        # manual=True: a user-picked source is cloned VERBATIM (color and
+        # texture) — the membrane re-toning is for automatic picks only.
+        recs[drag["idx"]] = (rec[0], rec[1], (oy, ox)) \
+            + tuple(rec[3:5]) + (True,)
         img._dust_plan_cache = (cached[0], recs)
         drag["moved"] = abs(dy) > 1e-6 or abs(dx) > 1e-6
         self._draw_dust_debug()  # arrow follows; the re-heal lands on release
