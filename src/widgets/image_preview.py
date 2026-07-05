@@ -2568,9 +2568,13 @@ class ImagePreview(QWidget):
         if img is None or raw is None:
             return None
         brush = [s for s in getattr(img, "dust_spots", []) if s.get("kind") == "brush"]
+        rect = getattr(img, "crop_rect", None)
+        crop = ((tuple(rect), float(getattr(img, "crop_angle", 0.0) or 0.0))
+                if rect else None)
         return apply_dust_removal(
             raw, brush,
-            feather=getattr(img, "dust_feather", DUST_FEATHER_DEFAULT))
+            feather=getattr(img, "dust_feather", DUST_FEATHER_DEFAULT),
+            crop=crop)
 
     def dust_detect_source(self):
         """Detection source for the current image (see dust_detect_source_for)."""

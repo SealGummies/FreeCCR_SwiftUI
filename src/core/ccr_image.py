@@ -943,6 +943,11 @@ class CCRImage:
             return image
         t0 = time.time()
         feather = getattr(self, "dust_feather", DUST_FEATHER_DEFAULT)
+        # Sources must come from INSIDE the confirmed crop — outside is the
+        # holder/rebate/junk the user cut away, not scene content.
+        rect = getattr(self, "crop_rect", None)
+        crop = ((tuple(rect), float(getattr(self, "crop_angle", 0.0) or 0.0))
+                if rect else None)
         key = repr(spots)
         h, w = image.shape[:2]
         if max(h, w) <= _DUST_PLAN_LONG:
@@ -950,14 +955,16 @@ class CCRImage:
             cached = getattr(self, "_dust_plan_cache", None)
             prior = cached[1] if cached is not None else None
             out = apply_dust_removal(image, spots, feather=feather,
-                                     collect_plan=plan_out, prior_plan=prior)
+                                     collect_plan=plan_out, prior_plan=prior,
+                                     crop=crop)
             self._dust_plan_cache = (key, plan_out)
             print(f"Dust heal total ({len(spots)} spots, preview scale, "
                   f"plan cached): {time.time() - t0:.3f}s")
             return out
         cached = getattr(self, "_dust_plan_cache", None)
         plan = cached[1] if (cached is not None and cached[0] == key) else None
-        out = apply_dust_removal(image, spots, feather=feather, plan=plan)
+        out = apply_dust_removal(image, spots, feather=feather, plan=plan,
+                                 crop=crop)
         print(f"Dust heal total ({len(spots)} spots, "
               f"preview plan {'reused' if plan is not None else 'MISSING'}): "
               f"{time.time() - t0:.3f}s")

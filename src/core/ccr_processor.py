@@ -3230,6 +3230,27 @@ def rasterize_dust_mask(spots, h: int, w: int) -> np.ndarray:
     return mask
 
 
+def _crop_keep_mask(rect, angle, h: int, w: int):
+    """uint8 {0,1} mask of the pixels a confirmed crop KEEPS — the crop
+    rectangle (normalized x1, y1, x2, y2 over width/height), rotated by
+    `angle` about its center (Qt clockwise convention; the raster twin of
+    _extract_rotated_crop / apply_crop_to_image). None when degenerate."""
+    x1, y1, x2, y2 = [float(v) for v in rect]
+    bw, bh = (x2 - x1) * w, (y2 - y1) * h
+    if bw <= 1 or bh <= 1:
+        return None
+    cx, cy = (x1 + x2) / 2.0 * w, (y1 + y2) / 2.0 * h
+    a = np.deg2rad(float(angle or 0.0))
+    ca, sa = float(np.cos(a)), float(np.sin(a))
+    corners = np.array(
+        [(cx + ca * ux - sa * uy, cy + sa * ux + ca * uy)
+         for ux, uy in ((-bw / 2, -bh / 2), (bw / 2, -bh / 2),
+                        (bw / 2, bh / 2), (-bw / 2, bh / 2))], np.int32)
+    keep = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(keep, [corners], 1)
+    return keep
+
+
 # Clone-heal tuning. The fill copies the best-matching CLEAN patch from the
 # spot's neighborhood (real texture and grain, 16-bit native) instead of
 # diffusing an average inward — diffusion (cv2.inpaint) produces a smooth,
@@ -3570,7 +3591,7 @@ def _nearest_plan_record(plan, cyn, cxn, tol=0.06):
 def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
                        feather: float = DUST_FEATHER_DEFAULT,
                        plan=None, collect_plan=None,
-                       prior_plan=None) -> np.ndarray:
+                       prior_plan=None, crop=None) -> np.ndarray:
     """Heal the dust spots out of a 16-bit RGB image, non-destructively.
 
     `feather` is the edge fade width as a fraction of each hole's own
@@ -3624,6 +3645,12 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     a prior source does not move it: that segment defers to a second pass
     and clones the HEALED content at the same location (see _heal_patch).
     New segments match no prior record and search normally.
+    `crop`: ((x1, y1, x2, y2) normalized, angle_deg) — the image's confirmed
+    crop. Content OUTSIDE it (film holder, rebate, whatever the user cut
+    away) is not scene: it is treated like dust for context purposes, so
+    rings never anchor on it and fresh searches never sample it. Pinned
+    sources keep their reference regardless (sticky) — one outside a newer
+    crop just routes through the deferred pass onto the same pixels.
     """
     if not spots:
         return img16
@@ -3632,7 +3659,7 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     if long_side <= _DUST_PLAN_LONG:
         return _heal_impl(img16, spots, inpaint_radius, feather,
                           collect=collect_plan, plan=prior_plan,
-                          plan_tol=_DUST_EDIT_TOL)
+                          plan_tol=_DUST_EDIT_TOL, crop=crop)
     scale = long_side / float(_DUST_PLAN_LONG)
     if plan is None:
         # No preview plan supplied — derive one from this buffer's own
@@ -3643,16 +3670,16 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
         small = cv2.resize(img16, (pw, ph), interpolation=cv2.INTER_AREA)
         plan = []
         _heal_impl(small, spots, inpaint_radius, feather, collect=plan,
-                   plan_only=True)
+                   plan_only=True, crop=crop)
         print(f"Dust plan (no cached preview plan): {time.time() - t0:.3f}s")
     return _heal_impl(img16, spots, inpaint_radius, feather,
-                      plan=plan, scale_up=scale)
+                      plan=plan, scale_up=scale, crop=crop)
 
 
 def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                feather: float, plan=None, collect=None,
                scale_up: float = 1.0, plan_only: bool = False,
-               plan_tol: float = 0.06) -> np.ndarray:
+               plan_tol: float = 0.06, crop=None) -> np.ndarray:
     """apply_dust_removal's engine at ONE resolution. With `collect` (a list),
     appends a plan record per heal segment:
     (cy_norm, cx_norm, offset, genuine, dlike_on) where offset is the chosen
@@ -3678,6 +3705,16 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     # "Clean" excludes every spot plus 1 px (buries antialiased speck edges).
     mask_pad = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    if crop is not None and crop[0]:
+        keep = _crop_keep_mask(crop[0], crop[1], h, w)
+        if keep is not None and not keep.all():
+            # Outside-crop content (holder/rebate/junk the user cut away) is
+            # not scene: treat it like dust for context purposes — rings
+            # never anchor on it and fresh searches never sample it. Pinned
+            # sources keep their reference (sticky): one poking outside just
+            # routes through the deferred pass onto the same pixels.
+            mask_pad = np.maximum(
+                mask_pad, np.where(keep > 0, 0, 255).astype(np.uint8))
     integ = cv2.integral((mask_pad > 0).astype(np.uint8))
     filled = img16.copy()
     fallback = np.zeros_like(mask)

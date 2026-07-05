@@ -333,6 +333,28 @@ class TestApplyDustRemoval:
         assert recs, "first stroke's segment disappeared"
         assert recs[0][2] == off, "first stroke's source moved"
 
+    def test_sources_stay_inside_the_crop(self):
+        # Content outside the confirmed crop (film holder, rebate, junk the
+        # user cut away) is not scene: fresh searches must never sample it,
+        # and the context ring must not anchor on it.
+        rng = np.random.default_rng(29)
+        img = np.clip(rng.normal(30000, 2500, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        img[:, 260:] = 62000  # junk strip the crop removes
+        crop = ((0.0, 0.0, 0.65, 1.0), 0.0)  # keeps x < 260 px
+        spot = {"kind": "brush", "pts": [[0.60, 0.5]], "r": 0.03}
+        plan = []
+        out = apply_dust_removal(img, [spot], collect_plan=plan, crop=crop)
+        assert plan
+        # Every sampled window lies inside the crop: source-window center +
+        # its half extent (hole r 12 + guard/ring pad 15 = 27 px) fits.
+        for cy, cx, off, *_ in plan:
+            if off is not None:
+                assert (cx + off[1]) * 400 + 27 <= 260 + 1e-6
+        # The fill is sky, not the junk strip.
+        m = rasterize_dust_mask([spot], 400, 400) > 0
+        assert float(out[m].astype(np.float32).mean()) < 40000
+
     def test_stroke_on_prior_source_keeps_reference_samples_healed(self):
         # NO exceptions: even a stroke painted directly ON a segment's
         # source patch must not move the reference. The segment defers to a

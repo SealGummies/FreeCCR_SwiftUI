@@ -356,7 +356,13 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      they are its minority — the film holder / rebate inverts to near-black
      and is not scene context; letting it anchor tone painted a dark smudge
      on strokes near the frame edge. (If dark dominates, the stroke really
-     is in dark content and the ring stays.)
+     is in dark content and the ring stays.) Content OUTSIDE the image's
+     confirmed crop (`CCRImage.crop_rect`/`crop_angle`, rasterized by
+     `_crop_keep_mask` incl. rotation) is not scene either: it is merged
+     into `mask_pad` like dust, so rings never anchor on it and fresh
+     source searches never sample it — pinned sources keep their reference
+     regardless (sticky), routing through the deferred pass onto the same
+     pixels if they poke outside a newer crop.
   2. **Defect-color rejection**: the defect's color is estimated from the
      hole's own content (a tight stroke's hole IS the defect; a generous
      brush's defect is the hole's outlier mode vs the ring). Ring pixels
