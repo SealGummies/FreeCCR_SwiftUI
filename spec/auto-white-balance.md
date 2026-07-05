@@ -12,10 +12,8 @@ toggle + post-conversion hook pattern), `spec/settings-page.md`.
 - **Q1 — Button label**: "AWB"; the eyedropper's label is shortened
   "Auto WB Picker" → **"WB Picker"** ("Auto" now belongs to the new button; four
   buttons `WB Picker | AWB | Crop | Slice` share the row at equal stretch).
-- **Q2 — Auto-AWB default ON (revised per user).** Auto-AWB is an on-by-default
-  convenience like Auto Gain; the already-saved guard keeps it from touching any
-  image with an existing temperature/tint, and Settings → General turns it off.
-  The algorithm dropdown defaults to Gray World.
+- **Q2 — Auto-AWB default OFF.** A newly automatic behavior must not change
+  existing users' conversions; the algorithm dropdown defaults to Gray World.
 - **Q3 — Crop-aware (revised per user).** With a crop set, only the kept region
   drives the estimate: `compute_awb_temp_tint` passes the base through
   `apply_crop_to_image(base, crop_rect, crop_angle)` (normalized rect in
@@ -80,7 +78,7 @@ correct it.
   (`resized_raw`), not the adjusted preview, so clicking AWB twice yields the same
   slider values.
 - Settings → General: "Auto white balance after conversion" checkbox
-  (default **ON**) + "AWB algorithm" dropdown (default **Gray World**), both
+  (default **OFF**) + "AWB algorithm" dropdown (default **Gray World**), both
   QSettings-persisted, staged-and-applied-on-Done like the other General toggles.
 - The post-conversion hook fires only on **fresh conversions**
   (`convert_negative_by_index`, the B/W-point batch), never on replay/reconvert
@@ -277,9 +275,9 @@ New `QGroupBox("White balance")` in `_build_general_page`
   `userData`), muted help naming the default.
 
 Wiring (the Auto Gain 4-point pattern):
-- Backend flags (`ccr_backend.py` flag block): `self.auto_awb: bool = True`,
+- Backend flags (`ccr_backend.py` flag block): `self.auto_awb: bool = False`,
   `self.awb_algorithm: str = "gray_world"`.
-- QSettings: `adjust/auto_awb` (bool, default True), `adjust/awb_algorithm`
+- QSettings: `adjust/auto_awb` (bool, default False), `adjust/awb_algorithm`
   (string id, default `"gray_world"`), restored in `main_window.__init__`
   alongside `adjust/auto_gain`. Unknown stored ids fall back to the default.
 - `main_window.on_auto_awb_toggled(checked)` / `on_awb_algorithm_changed(algo)`:
