@@ -368,8 +368,17 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      the ramp (`dlike`, with a blurred lip as wide as the component's ramp,
      confined to the component so it can't bleed into a neighboring hole's
      blend), so a wide feather can never blend the defect back in — the
-     soft fade only happens across clean rim pixels. Outside the mask alpha
-     is exactly 0 — away from any spot `out == img16` bit-for-bit.
+     soft fade only happens across clean rim pixels. The classification
+     only engages when the estimated defect color is separated from the
+     cleaned ring's median by > `_DLIKE_SEP_MADS` ring-grain MADs, and then
+     marks the hole pixels closer to the defect than to the surround
+     (nearest centroid): a generous brush over mostly-clean content
+     estimates a "defect" that collapses onto the background mode, and
+     thresholding grain against it force-filled a random salt-and-pepper
+     subset of the hole (dithered rims, no rolloff at wide feathers) —
+     gated off, such a brush blends as a pure opacity dome rolling off
+     from the stroke's center. Outside the mask alpha is exactly 0 — away
+     from any spot `out == img16` bit-for-bit.
   7. **Resolution-stable plan**: the heal's content-adaptive decisions —
      stroke segmentation, each segment's chosen source offset, and the
      diffusion-fallback verdicts — are computed ONCE at the canonical

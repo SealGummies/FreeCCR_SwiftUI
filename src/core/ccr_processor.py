@@ -3240,6 +3240,8 @@ _HEAL_ANGLES = 16         # candidate source directions searched around a spot
 _HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
 _HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
 _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
+_DLIKE_SEP_MADS = 6.0     # defect-vs-surround separation (in ring-grain MADs)
+                          # required before pixels are force-filled as defect
 DUST_FEATHER_DEFAULT = 0.25   # feather ramp width, fraction of each hole's
                               # own half-thickness (its local radius), so the
                               # fade scales with the brush size (user-adjustable
@@ -3440,10 +3442,25 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     depth = max(1.0, float(inside.max()))
     fmap[wy0:wy1, wx0:wx1][hole] = int(
         max(1.0, min(round(float(feather) * depth), depth)))
-    like = np.abs(hole_px - defect).mean(axis=1) < thr
-    if like.any():
-        hy, hx = np.nonzero(hole)
-        dlike[wy0:wy1, wx0:wx1][hy[like], hx[like]] = 255
+    # Mark defect-like pixels ONLY when the estimated defect color is
+    # DISTINCT from the clean surround. With a generous brush over mostly
+    # clean content the top-quartile "defect" collapses onto the background
+    # mode, and thresholding grain against it marked a random salt-and-pepper
+    # subset of the hole — dithered full-opacity pixels inside an otherwise
+    # feathered fill, with no rolloff at wide feathers. Gate on the
+    # defect/surround separation in units of the surround's own grain
+    # (median abs deviation of the cleaned ring), then mark the hole pixels
+    # CLOSER to the defect color than to the surround (nearest centroid) —
+    # grain never is, so the marking is coherent, not speckled.
+    ring_bg = np.median(dst_ring, axis=0)
+    mad = float(np.median(np.abs(dst_ring - ring_bg).mean(axis=1)))
+    sep = float(np.abs(defect - ring_bg).mean())
+    if sep > _DLIKE_SEP_MADS * (mad + 1e-3):
+        like = (np.abs(hole_px - defect).mean(axis=1)
+                < np.abs(hole_px - ring_bg).mean(axis=1))
+        if like.any():
+            hy, hx = np.nonzero(hole)
+            dlike[wy0:wy1, wx0:wx1][hy[like], hx[like]] = 255
     return best_off
 
 
@@ -3475,9 +3492,11 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     half-thickness (the user's per-image Feather setting, 0..1): 0 =
     essentially hard edges, 1 = the cross-fade spans the hole's full depth.
     Keyed to the hole's local radius, the fade scales with the brush size —
-    and with resolution, since the rasterized hole does. Defect-like pixels
-    are always fully filled regardless of the feather, so a wide fade cannot
-    blend the defect back in.
+    and with resolution, since the rasterized hole does. Pixels colored like
+    the defect (when one is color-separable from its surround) are always
+    fully filled regardless of the feather, so a wide fade cannot blend the
+    defect back in; on a mostly-clean brushed area no pixels qualify and the
+    blend is a pure opacity dome rolling off from the stroke's center.
 
     Each mask component is filled by CLONING the best-matching clean patch
     from its neighborhood (see _heal_patch) — real texture and grain,

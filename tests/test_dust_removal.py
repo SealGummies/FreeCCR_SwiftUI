@@ -198,6 +198,29 @@ class TestApplyDustRemoval:
         assert int(hard[100, 100, 0]) < 40000
         assert int(soft[100, 100, 0]) < 40000
 
+    def test_full_feather_is_smooth_dome_no_speckle(self):
+        # 100% feather on a mostly-clean brushed area must blend as a smooth
+        # opacity dome rolling off from the stroke center — not a random
+        # per-pixel subset healed at full strength (the defect classifier
+        # collapsing onto the background used to force-fill a salt-and-pepper
+        # subset of grain pixels, dithering the rim).
+        rng = np.random.default_rng(3)
+        img = np.clip(rng.normal(30000, 3000, (200, 200, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}  # r_px = 30
+        out = apply_dust_removal(img, [spot], feather=1.0)
+        diff = np.abs(out.astype(np.float32) - img.astype(np.float32)).mean(axis=2)
+        yy, xx = np.mgrid[0:200, 0:200]
+        d = np.hypot(yy - 100, xx - 100)
+        # Mean deviation decreases monotonically outward (a dome)...
+        rings = [float(diff[(d >= a) & (d < b)].mean())
+                 for a, b in ((0, 6), (6, 12), (12, 18), (18, 24), (24, 30))]
+        assert all(rings[i] > rings[i + 1] for i in range(len(rings) - 1))
+        # ...and the outer rim has no isolated full-strength pixels: even its
+        # 99th-percentile deviation stays well below the core's mean.
+        outer = diff[(d >= 24) & (d < 29)]
+        assert float(np.percentile(outer, 99)) < 0.8 * (rings[0] + 1e-6)
+
     def test_feather_ramp_scales_with_brush_size(self):
         # The feather is a fraction of the hole's own radius: at the SAME
         # setting, ~6 px inside the boundary is still soft rim for a big
