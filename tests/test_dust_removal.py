@@ -289,6 +289,31 @@ class TestApplyDustRemoval:
         assert abs(float(healed.mean()) - float(surround.mean())) < 2000
         assert float(healed.std()) > 0.5 * float(surround.std())
 
+    def test_new_stroke_keeps_far_samples_stable(self):
+        # Adding a dab must only re-sample segments near the edit. Tiles
+        # used to anchor to the component bbox and scale their windows by
+        # the component's thickness, so a dab merging at a blob's top-left
+        # shifted EVERY tile of the blob and re-sampled its far side too.
+        rng = np.random.default_rng(31)
+        img = np.clip(rng.normal(32000, 3000, (640, 640, 3)), 0,
+                      65535).astype(np.uint16)
+        base = [{"kind": "brush", "pts": [[0.45, 0.45]], "r": 0.075},
+                {"kind": "brush", "pts": [[0.58, 0.45]], "r": 0.075}]
+        plan1, plan2 = [], []
+        apply_dust_removal(img, base, collect_plan=plan1)
+        # A small dab overlapping the blob's top-left corner: extends the
+        # component bbox origin (0.38*640-19 px < the blob's old 240 px
+        # edge) and its thickness, touches nothing on the far (right) side.
+        added = base + [{"kind": "brush", "pts": [[0.38, 0.38]], "r": 0.03}]
+        apply_dust_removal(img, added, collect_plan=plan2)
+        far1 = [r for r in plan1 if r[1] > 0.55]
+        assert far1
+        for rec in far1:
+            match = [r for r in plan2
+                     if abs(r[0] - rec[0]) < 1e-9 and abs(r[1] - rec[1]) < 1e-9]
+            assert match, f"far segment moved: {rec[:2]}"
+            assert match[0][2] == rec[2], "far segment re-sampled"
+
     def test_clean_stroke_near_black_border_stays_sky(self):
         # THE black-blob artifact: a generous brush over clean sky near the
         # frame's black holder border. The defect estimate collapses onto

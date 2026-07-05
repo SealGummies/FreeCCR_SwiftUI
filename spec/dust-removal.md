@@ -335,7 +335,14 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      is thickness-scaled to one giant segment whose window rarely has a
      clean home anywhere, dumping the whole blob into the flat, grainless
      diffusion fallback — a visible smooth disc on film grain. Tiles keep
-     cloning real texture from beside the blob.
+     cloning real texture from beside the blob. **Edit locality**: for
+     components spanning multiple tiles the grid anchors to the IMAGE
+     (absolute multiples of `seg`), not the component bbox, and each tile's
+     guard/ring/search geometry keys off the tile-bounded local scale
+     `min(half_th, seg/2)` (inert for uncapped components) — otherwise a
+     new dab merging into a blob shifted every tile and resized every
+     window, re-sampling segments far from the edit on each stroke.
+     Compact single-tile components keep one un-split tile at their bbox.
   1. **Window + guarded ring**: patch bbox padded by `guard + ring_w`; `ring`
      = clean known pixels at distance `(guard, guard+ring_w]` from the hole
      (`guard` ≥ 2 px, scaled to half the thickness). The gap matters: the

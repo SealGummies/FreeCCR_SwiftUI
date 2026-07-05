@@ -3691,17 +3691,31 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
         seg_max = max(seg_min, int(round(_HEAL_SEG_MAX * max(1.0, scale_up))))
         seg = max(seg_min, min(int(round(_HEAL_SEG_THICKNESS * half_th)),
                                seg_max))
-        for ty in range(y0, y0 + ch, seg):
-            for tx in range(x0, x0 + cw, seg):
-                sub = comp_win[ty - y0:ty - y0 + seg, tx - x0:tx - x0 + seg]
+        # Local scale for the guard/ring/search geometry: bounded by the
+        # tile, so a merged blob's growing thickness cannot resize EVERY
+        # tile's window (a new dab used to re-sample segments far from the
+        # edit). Inert for uncapped components (seg = 6·half_th there).
+        loc_th = min(half_th, 0.5 * seg)
+        # Components spanning multiple tiles anchor the grid to the IMAGE,
+        # not the bbox: a dab extending the bbox origin used to shift every
+        # tile of the blob, re-sampling segments the edit never touched.
+        # Compact components keep the single un-split tile.
+        if cw <= seg and ch <= seg:
+            gy, gx = y0, x0
+        else:
+            gy, gx = (y0 // seg) * seg, (x0 // seg) * seg
+        for ty in range(gy, y0 + ch, seg):
+            for tx in range(gx, x0 + cw, seg):
+                by, bx = max(ty, y0), max(tx, x0)
+                sub = comp_win[by - y0:ty - y0 + seg, bx - x0:tx - x0 + seg]
                 if not sub.any():
                     continue
                 n_segs += 1
                 ys, xs = np.nonzero(sub)
-                bbox = (tx + int(xs.min()), ty + int(ys.min()),
-                        tx + int(xs.max()) + 1, ty + int(ys.max()) + 1)
-                cyn = (ty + float(ys.mean())) / h
-                cxn = (tx + float(xs.mean())) / w
+                bbox = (bx + int(xs.min()), by + int(ys.min()),
+                        bx + int(xs.max()) + 1, by + int(ys.max()) + 1)
+                cyn = (by + float(ys.mean())) / h
+                cxn = (bx + float(xs.mean())) / w
                 src_off, forced_fb, flags = None, False, None
                 if plan is not None:
                     rec = _nearest_plan_record(plan, cyn, cxn)
@@ -3716,7 +3730,7 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                 res = None
                 if not forced_fb:
                     res = _heal_patch(img16, img16_c, labels, i, bbox,
-                                      half_th, mask_pad, integ, filled, fmap,
+                                      loc_th, mask_pad, integ, filled, fmap,
                                       feather, dlike, src_off=src_off,
                                       forced_flags=flags)
                 off = None if res is None else res[0]
@@ -3726,12 +3740,12 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                         else (cyn, cxn, (off[0] / h, off[1] / w),
                               res[1], res[2]))
                 if off is None:
-                    fallback[ty:ty + sub.shape[0],
-                             tx:tx + sub.shape[1]][sub] = 255
+                    fallback[by:by + sub.shape[0],
+                             bx:bx + sub.shape[1]][sub] = 255
                     # Same radius-relative ramp as the clone path, using the
-                    # component's half-thickness as the local radius.
-                    fmap[ty:ty + sub.shape[0], tx:tx + sub.shape[1]][sub] = \
-                        max(0.5, min(float(feather) * half_th, half_th))
+                    # tile-bounded half-thickness as the local radius.
+                    fmap[by:by + sub.shape[0], bx:bx + sub.shape[1]][sub] = \
+                        max(0.5, min(float(feather) * loc_th, loc_th))
 
     t_segs = time.time() - t0
     mode = (" [plan-only]" if plan_only
