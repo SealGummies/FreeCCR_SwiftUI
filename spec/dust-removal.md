@@ -73,15 +73,16 @@ in the catalog, and undoable.
 - **Entering** dust mode (`ImagePreview.enter_dust_mode()`):
   1. Exit any other canvas mode (crop / slice / area / bw-point / wb-pick).
   2. Set `self.dust_mode = True`; reset zoom to fit and `_release_hires`.
-  3. `update_preview(idx)` now shows the **full, un-cropped** working positive
-     with **coarse rotation/flip only** (no fine rotation, no displayed crop) —
-     mirroring crop mode — so canvas pixels map 1:1 to `resized_raw` (§5.5).
+  3. `update_preview(idx)` keeps the **normal display framing** — the confirmed
+     crop (when one is set) with **coarse rotation/flip only** (no fine
+     rotation) — so the brush works on exactly the frame the user keeps;
+     strokes are mapped back to full-frame coords (§5.5).
   4. Set a brush-circle cursor and draw the red mask overlay for the image's
      stored spots.
   5. Call `self.window().toggle_dust_removal(True)` so `MainWindow` swaps panels.
 - **Exiting** dust mode (the **Done** button, the toggled-off toolbar action, or
   `Esc`): hide the red mask overlay, clear `dust_mode`, restore the normal
-  (cropped, fine-rotated) preview, restore the sliders panel, and re-enable the
+  (fine-rotated) preview, restore the sliders panel, and re-enable the
   toolbar actions. **Previously applied dust edits remain on the image.**
 
 ### 3.2 DustRemovalPanel layout (top → bottom)
@@ -140,8 +141,9 @@ reference to `MainWindow` and `ImagePreview` passed at construction (it does
     only the brush moves to Ctrl + wheel.)
   - **Hi-res detail loads on entry** (and refines on zoom) so dust is visible at
     full sharpness. The hi-res render reproduces `resized_raw`'s orientation and
-    goes through `apply_adjustments` (so it shows the dust-removed result); the
-    dust-mode display stays full / un-fine-rotated, so spots stay aligned.
+    goes through `apply_adjustments` (so it shows the dust-removed result); its
+    display layer is crop-matched exactly like the preview, so spots stay
+    aligned.
   - A **brush-circle cursor** tracks the pointer; its on-screen radius is
     `r_norm * W * view_scale` display pixels (§5.5).
 - Coordinate mapping reuses the existing inverse-`base_transform` +
@@ -418,22 +420,26 @@ manual brush (a stroke = many dabs) is the tool for those. Keeps the stored mode
 uniform and resolution-independent. (Future: component polygons / multi-circle.)
 
 ### 5.5 Coordinate mapping (canvas → normalized spot)
-Dust mode shows the working positive with **coarse rotation/flip only** — no
-displayed crop (the `not self.dust_mode` guard is added to update_preview's
-crop-display branch, image_preview.py:951) and no fine rotation (mirroring crop
-mode's `apply_transformations`). Therefore canvas pixels map **exactly** to
-`resized_raw` pixels via:
+Dust mode shows the working positive with the **normal display framing** — the
+confirmed crop (when one is set) with **coarse rotation/flip only**, no fine
+rotation (mirroring crop mode's `apply_transformations`). Spots are stored
+normalized against the **full un-cropped frame** — they are healed in
+`apply_adjustments` **before** crop and fine rotation (§5.1) — so canvas points
+map back via:
 1. `scene = view.mapToScene(event.pos())` (auto-accounts for zoom/pan).
 2. Invert the display `base_transform` (coarse 90°/180°/270° + H/V flips) → local
-   pixmap coords.
-3. `map_displayed_to_full(x, y)` — **identity** in dust mode (no crop shown).
+   (possibly cropped) pixmap coords.
+3. `map_displayed_to_full(x, y)` — identity with no crop displayed; under a
+   confirmed crop it applies `_crop_display_transform` (a translation, plus a
+   rotation for an angled crop) into full-frame pixel coords.
 4. Normalize: `H, W = resized_raw.shape[:2]`; `x_n = px/W`, `y_n = py/H`,
    `r_n = r_px/W`.
 
-Because spots are applied in `apply_adjustments` **before** crop and fine rotation
-(§5.1), and dust mode shows the image **without** those, mapping is exact — no
-sub-pixel fine-rotation error. The on-canvas brush radius is `r_n*W*view_scale`
-display pixels.
+No fine rotation is displayed, and the crop extraction is isometric
+(translate/rotate only) so lengths are preserved: the on-canvas brush radius is
+`r_n*W*view_scale` display pixels with `W` the **full-frame** width, and the
+live stroke overlay maps its stored full-frame points back through the inverse
+crop transform for drawing (`_draw_dust_stroke`).
 
 ## 6. Integration points
 
@@ -443,7 +449,7 @@ display pixels.
 | `src/core/ccr_processor.py` | `rasterize_dust_mask`, `apply_dust_removal`, feathered-composite helper. |
 | `src/core/dust_detect.py` (new) | ONNX detector: availability, model path/download/verify, `detect`, `prob_to_spots`, constants. `onnxruntime` imported only inside functions. |
 | `src/core/catalog.py` | Serialize/restore `dust_spots`; add `not state.get("dust_spots")` to `_is_pristine`. |
-| `src/widgets/image_preview.py` | Toolbar **Dust Removal** checkable action (after Gradient, with separator) + gating in `_update_unconvert_action_state`; `dust_mode` flag; `enter_dust_mode`/`exit_dust_mode`; canvas press/move/release + brush cursor + red mask overlay; `_scene_to_norm_spot()`; `and not self.dust_mode` in the crop-display branch + clear_preview/Esc routing; `dust_sig` in `_current_adj_sig`. |
+| `src/widgets/image_preview.py` | Toolbar **Dust Removal** checkable action (after Gradient, with separator) + gating in `_update_unconvert_action_state`; `dust_mode` flag; `enter_dust_mode`/`exit_dust_mode`; canvas press/move/release + brush cursor + red mask overlay; crop-aware stroke mapping (`_dust_scene_to_norm` via `map_displayed_to_full`, normalized by the full frame) + clear_preview/Esc routing; `dust_sig` in `_current_adj_sig`. |
 | `src/widgets/dust_panel.py` (new) | `DustRemovalPanel(QWidget)` (manual + AI sections, Done); QThread workers for model download and detection; explicit MainWindow/ImagePreview refs. |
 | `src/ui/main_window.py` | Add `dust_panel` as a **direct child** of `central_widget`'s layout (fixed 300 px, hidden); `toggle_dust_removal(on)` toggles `sliders_panel`/`dust_panel` visibility (no `QStackedWidget` — preserves `SlidersPanel`'s `parent().parent()` chains) and drives canvas enter/exit + toolbar action state. |
 | `requirements.txt` | Add `onnxruntime` (CPU). Manual path needs nothing new (`cv2`, `requests` already present). |
@@ -533,9 +539,10 @@ The lazy in-function import still means a build *without* onnxruntime runs fine
 3. **Esc / exit** routes through `_on_escape_key` (`elif self.dust_mode:
    self.exit_dust_mode()`) and `clear_preview` also exits dust mode, alongside
    the existing crop/slice/area handling.
-4. **Exact rendering in dust mode**: full image, coarse rotation/flip only, no
-   crop, no fine rotation → exact 1:1 canvas↔`resized_raw` mapping (§5.5). This
-   removes the fine-rotation sub-pixel error entirely.
+4. **Exact rendering in dust mode**: the normal display framing (incl. the
+   confirmed crop), coarse rotation/flip only, no fine rotation → exact
+   canvas↔`resized_raw` mapping through the isometric crop transform (§5.5).
+   This removes the fine-rotation sub-pixel error entirely.
 5. **Single-funnel verified** against the real export paths (§5.1 line refs); a
    single insertion at the top of `apply_adjustments` covers preview, zoom, and
    all export modes.
