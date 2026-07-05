@@ -99,11 +99,11 @@ in the catalog, and undoable.
      stays tight. A per-image render parameter stored as
      `CCRImage.dust_feather`; changes re-heal live (debounced ~200 ms),
      persist in the catalog, and are NOT part of undo snapshots (like brush
-     size). Defect-like pixels are always fully filled regardless of the
-     feather (§5.2 step 6), so a wide fade cannot blend the defect back in —
-     which also means the fade only shows on the clean rim between the defect
-     and the brush edge (a tight trace heals hard by design; brush generously
-     to get a soft blend).
+     size). The feather governs EVERYTHING (maintainer rule: every pixel
+     gets the effect, opacity rolled off from the stroke center — no
+     exceptions, §5.2 step 6): at wide settings the heal fades out even
+     across the defect itself, by explicit user choice; feather 0 is a
+     hard, complete removal.
    - **Show heal sources** checkbox: diagnostic overlay on the canvas —
      stroke borders outlined (yellow) as the contours of the UNION of the
      rasterized strokes (connected/overlapping strokes read as ONE region;
@@ -443,22 +443,18 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      setting (`dust_feather`) as a fraction of **each hole's own depth**
      (its half-thickness) — the fade scales with the brush size, and with
      resolution, since the rasterized hole does — capped by that depth so
-     the core still reaches full fill. **Defect-like hole pixels** (colored
-     like the estimated defect) are force-filled at alpha 1 regardless of
-     the ramp (`dlike`, with a blurred lip as wide as the component's ramp,
-     confined to the component so it can't bleed into a neighboring hole's
-     blend), so a wide feather can never blend the defect back in — the
-     soft fade only happens across clean rim pixels. The classification
-     only engages for a `genuine` estimate (step 2) whose defect color is
-     separated from the cleaned ring's median by > `_DLIKE_SEP_MADS`
-     ring-grain MADs **and brighter than the surround** (film dust inverts
-     WHITE; a darker "defect" is content), and then marks the hole pixels
-     closer to the defect than to the surround (nearest centroid): a
-     generous brush over mostly-clean content estimates a "defect" that
-     collapses onto the background mode, and thresholding grain against it
-     force-filled a random salt-and-pepper subset of the hole (dithered
-     rims, no rolloff at wide feathers) — gated off, such a brush blends as
-     a pure opacity dome rolling off from the stroke's center. Outside the
+     the core still reaches full fill. The dome is the WHOLE story
+     (maintainer rule: every pixel gets the effect, opacity rolled off
+     from the stroke center — no exceptions): there is no defect
+     force-fill floor, so a wide feather fades the heal out even across
+     the defect itself, and the slider has visible authority on every
+     heal — the old `dlike` floor (alpha pinned to 1 on defect-colored
+     pixels, with a ramp-wide lip) made the feather do nothing exactly
+     where users reach for it, on real dust. The `dlike_on` verdict (a
+     `genuine` estimate whose defect color is > `_DLIKE_SEP_MADS`
+     ring-grain MADs from the cleaned ring's median and brighter than the
+     surround — film dust inverts WHITE) is still computed and carried in
+     the plan as metadata. Outside the
      mask alpha is exactly 0 — away from any spot `out == img16`
      bit-for-bit.
   7. **Resolution-stable plan**: the heal's content-adaptive decisions —

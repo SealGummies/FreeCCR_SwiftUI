@@ -251,17 +251,29 @@ class TestApplyDustRemoval:
         assert rim_ratio(0.12) < 0.5   # big brush: 6 px in is still soft rim
         assert rim_ratio(0.04) > 0.5   # small brush: 6 px in is nearly core
 
-    def test_wide_feather_never_blends_defect_back(self):
-        # Defect-like pixels are force-filled whatever the feather: a tight
-        # hair trace with the feather at its maximum must still remove the
-        # hair.
+    def test_feather_rolls_off_even_over_defects(self):
+        # The feather governs EVERYTHING (maintainer rule: every pixel gets
+        # the effect, opacity rolled off from the stroke center — no
+        # exceptions). The old defect force-fill pinned alpha to 1 on
+        # defect-colored pixels, so on real dust the slider did nothing. At
+        # 100% the heal's effect must fade from the center outward even
+        # across the defect itself.
         sky = np.array([20000, 25000, 40000], np.float32)
         img = np.broadcast_to(sky.astype(np.uint16), (200, 200, 3)).copy()
-        cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
-        spot = {"kind": "brush",
-                "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 2.0 / 200}
+        cv2.circle(img, (100, 100), 10, (62000, 60000, 30000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.06}  # r = 12 px
         out = apply_dust_removal(img, [spot], feather=1.0)
-        core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
+        diff = np.abs(out.astype(np.float32)
+                      - img.astype(np.float32)).mean(axis=2)
+        yy, xx = np.mgrid[0:200, 0:200]
+        d = np.hypot(yy - 100, xx - 100)
+        inner = float(diff[d < 4].mean())
+        outer = float(diff[(d > 8) & (d < 10)].mean())  # defect rim, in-hole
+        assert inner > 10000            # the heal bites at the center
+        assert outer < 0.7 * inner      # ...and rolls off over the defect
+        # At feather 0 the same trace removes the defect completely.
+        hard = apply_dust_removal(img, [spot], feather=0.0)
+        core = hard[92:109, 92:109].astype(np.float32).reshape(-1, 3)
         assert float(np.abs(core.mean(axis=0) - sky).max()) < 5000
 
     def test_big_merged_dabs_clone_texture_not_smear(self):
@@ -939,11 +951,14 @@ class TestResolutionConsistency:
         b8 = cv2.convertScaleAbs(big_ds, alpha=255.0 / 65535.0)
         # Windows around the healed hair and the edge speck (1080x720 space).
         # Calibrated: re-planning per resolution measures p99 = 14 / 10 and
-        # mean = 0.64 / 0.42 here; the replayed plan sits at 4 / 4 (grain +
-        # resampling + the 1-px rim registration inherent to mask rounding).
+        # mean = 0.64 / 0.42 here; the replayed plan sits at 4 / 8 (grain +
+        # resampling + the 1-px rim registration inherent to mask rounding —
+        # the speck's rim rides the feather dome over a high-contrast defect
+        # since the force-fill floor was removed, so a 1-px raster shift is
+        # worth more diff there; the sources themselves are identical).
         for (y0, y1, x0, x1), p99_lim, mean_lim in (
                 ((390, 510, 490, 590), 6.0, 0.40),   # hair
-                ((270, 350, 390, 480), 6.0, 0.40)):  # edge speck
+                ((270, 350, 390, 480), 9.0, 0.40)):  # edge speck
             d = np.abs(a8[y0:y1, x0:x1].astype(np.float32)
                        - b8[y0:y1, x0:x1].astype(np.float32))
             assert np.percentile(d, 99) <= p99_lim
