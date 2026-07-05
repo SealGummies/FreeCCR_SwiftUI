@@ -92,13 +92,27 @@ in the catalog, and undoable.
      specks get fine steps (0.05% ≈ 3 px radius on a 6000 px scan) while big
      scratch-covering sizes stay reachable; the label shows the size as a % of
      image width. The canvas Ctrl+wheel resize clamps to the same range.
-   - **Feather** slider (0–1.0% of image width, default 0.30%): the edge fade
-     width of every heal on the image — manual and AI spots alike. A
-     per-image render parameter stored as `CCRImage.dust_feather`; changes
-     re-heal live (debounced ~200 ms), persist in the catalog, and are NOT
-     part of undo snapshots (like brush size). Defect-like pixels are always
-     fully filled regardless of the feather (§5.2 step 6), so a wide fade
-     cannot blend the defect back in.
+   - **Feather** slider (0–100% of each spot's own radius, default 25%): the
+     edge fade width of every heal on the image — manual and AI spots alike.
+     Radius-relative, so the fade **grows with the brush size** — a big
+     scratch patch fades over a proportionally wide rim while a tiny speck
+     stays tight. A per-image render parameter stored as
+     `CCRImage.dust_feather`; changes re-heal live (debounced ~200 ms),
+     persist in the catalog, and are NOT part of undo snapshots (like brush
+     size). Defect-like pixels are always fully filled regardless of the
+     feather (§5.2 step 6), so a wide fade cannot blend the defect back in —
+     which also means the fade only shows on the clean rim between the defect
+     and the brush edge (a tight trace heals hard by design; brush generously
+     to get a soft blend).
+   - **Show heal sources** checkbox: diagnostic overlay on the canvas —
+     every stroke's border outlined (yellow), and for each heal segment a
+     green arrow drawn FROM the patch it sampled TO the healed segment
+     (ring at the source), or an orange ring where the segment fell back to
+     diffusion (nothing was sampled). Geometry comes from the cached
+     preview heal plan (`dust_debug_geometry` + `_dust_plan_cache`), mapped
+     through the same crop-display transform as the brush, so it shows
+     exactly what exports will replay. Refreshes on every dust edit /
+     feather change; cleared on exit.
    - Hint: "Click or drag over dust to remove it."
    - **Undo last spot** button and **Clear all** button.
 3. Separator.
@@ -203,12 +217,17 @@ a polyline):
   from the component's extent.
 - Empty list = "no dust removal"; the render fast-path leaves the image
   untouched (§5.2).
-- Alongside the spots, `CCRImage.dust_feather` (float, fraction of image
-  width, default 0.003) holds the image's heal edge-fade width — one value
-  for all spots, set by the panel's Feather slider, serialized in the catalog
-  (`dust_feather`, missing key → default), excluded from undo snapshots, and
-  part of the hi-res `dust_sig` so a feather change invalidates cached
-  renders.
+- Alongside the spots, the catalog stores `dust_plan` — the cached heal
+  plan's records (`[cy, cx, [oy, ox] | null, genuine, dlike_on]`), written
+  only when they match the current spots — so a reload reseeds
+  `_dust_plan_cache` and keeps the exact sources the user saw.
+- Alongside the spots, `CCRImage.dust_feather` (float, fraction of each
+  hole's own half-thickness, 0..1, default 0.25) holds the image's heal
+  edge-fade width — one value for all spots, set by the panel's Feather
+  slider, serialized in the catalog under `dust_feather_r` (missing key →
+  legacy width-fraction `dust_feather` migrated by slider position ×100,
+  else default), excluded from undo snapshots, and part of the hi-res
+  `dust_sig` so a feather change invalidates cached renders.
 
 Rationale: mirrors openenlarge's normalized `DustStroke` model, serializes
 cleanly to JSON, deep-copies cleanly for undo, and is fully resolution
@@ -315,12 +334,35 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      are healed in thickness-scaled segments, each from its own local source
      strip — one whole-stroke window would demand a clean area the size of the
      stroke's bbox, which rarely exists (a traced curl would silently fall
-     back to diffusion and ghost).
+     back to diffusion and ghost). Segments are also CAPPED at
+     `_HEAL_SEG_MAX` (96 px at plan scale, ×`scale_up`): a big compact dab
+     is thickness-scaled to one giant segment whose window rarely has a
+     clean home anywhere, dumping the whole blob into the flat, grainless
+     diffusion fallback — a visible smooth disc on film grain. Tiles keep
+     cloning real texture from beside the blob. **Edit locality**: for
+     components spanning multiple tiles the grid anchors to the IMAGE
+     (absolute multiples of `seg`), not the component bbox, and each tile's
+     guard/ring/search geometry keys off the tile-bounded local scale
+     `min(half_th, seg/2)` (inert for uncapped components) — otherwise a
+     new dab merging into a blob shifted every tile and resized every
+     window, re-sampling segments far from the edit on each stroke.
+     Compact single-tile components keep one un-split tile at their bbox.
   1. **Window + guarded ring**: patch bbox padded by `guard + ring_w`; `ring`
      = clean known pixels at distance `(guard, guard+ring_w]` from the hole
      (`guard` ≥ 2 px, scaled to half the thickness). The gap matters: the
      defect's soft edge leaks past the brushed mask, and pixels hugging the
-     hole are the most likely to be the defect itself.
+     hole are the most likely to be the defect itself. Near-black pixels
+     (`_HEAL_BLACK_FLOOR`, ~3% of white) are dropped from the ring while
+     they are its minority — the film holder / rebate inverts to near-black
+     and is not scene context; letting it anchor tone painted a dark smudge
+     on strokes near the frame edge. (If dark dominates, the stroke really
+     is in dark content and the ring stays.) Content OUTSIDE the image's
+     confirmed crop (`CCRImage.crop_rect`/`crop_angle`, rasterized by
+     `_crop_keep_mask` incl. rotation) is not scene either: it is merged
+     into `mask_pad` like dust, so rings never anchor on it and fresh
+     source searches never sample it — pinned sources keep their reference
+     regardless (sticky), routing through the deferred pass onto the same
+     pixels if they poke outside a newer crop.
   2. **Defect-color rejection**: the defect's color is estimated from the
      hole's own content (a tight stroke's hole IS the defect; a generous
      brush's defect is the hole's outlier mode vs the ring). Ring pixels
@@ -329,13 +371,26 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      hair edge, or the hair's continuation past the stroke's end (which can
      be the ring's *majority*), cannot lift the fill into a bright ghost of
      the stroke. Legit bimodal structure survives (both modes sit far from
-     the defect color).
+     the defect color). **Sanity cap** (`_HEAL_MIN_KEEP_FRAC`): if the
+     rejection would keep < 20% of the ring, the "defect" was estimated as
+     the ring's own majority (a clean generous brush, whose top-quartile
+     estimate collapses onto the background) and whatever survives is some
+     small foreign mode — a black border, a dark roofline — that would
+     become the entire anchor (clean sky strokes healed to solid black,
+     cloned from the border). The estimate is distrusted (`genuine=False`):
+     full ring, no defect force-fill.
   3. **Search**: candidate source windows on `_HEAL_ANGLES` (16) directions ×
      thickness-scaled distances (`2·half_th + pad + 2`, ×1/2/4, plus the
      window diagonal as a last resort). A candidate must be in-bounds and
      fully clean (checked O(1) against `cv2.integral` of the padded mask), so
      a long stroke heals from the clean strip right beside it. Score = SSD
-     between source and destination **kept ring** pixels; best wins.
+     between source and destination **kept ring** pixels — plus, only past a
+     ring-MAD-scaled tolerance, the candidate's interior-tone excess vs the
+     ring background (the ring SSD never looks inside the window: a source
+     whose ring matches but whose hole area holds a black border edge clones
+     the border into the fill; within tolerance the ring SSD alone ranks, an
+     always-on interior term re-ranked near-ties by texture phase and made
+     preview/export tone drift). Best wins.
   4. **Clone + membrane tone correction**: hole pixels are copied from the
      best source, plus a smooth per-channel correction field interpolated
      from the kept-ring differences (normalized Gaussian convolution,
@@ -347,28 +402,50 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
   5. **Fallback**: a patch with no clean in-bounds source window (image
      border, dense dust) or a starved ring (< `_HEAL_MIN_RING_PX`) falls back
      to the old 8-bit `cv2.inpaint(..., inpaint_radius, INPAINT_TELEA)` fill.
-  6. **Feathered composite**: alpha rises 0 → 1 from each hole's boundary
-     inward over a smoothstep ramp (`_feather_alpha`), `out = img16*(1-a) +
+  6. **Feathered composite**: alpha rises ~0 → 1 from each hole's boundary
+     inward over a smoothstep ramp (`_feather_alpha`, evaluated at
+     pixel-center depths `inside − 0.5` with FLOAT ramp widths, so the
+     relative profile is identical at every resolution — an integer ramp
+     with a boundary lift made thin-stroke rims visibly harder at preview
+     than at export), `out = img16*(1-a) +
      filled*a` computed inside each **component's own padded window** (one
      global mask bbox degenerates to nearly the whole frame when spots are
      scattered, and the full-frame float blend then dominates the heal —
      ~0.9 s at 6000 px; components never touch, so per-component alpha is
      exactly the global answer). The ramp width is the image's **Feather**
-     setting (`dust_feather`, a fraction of image width — default 0.3%, so
-     it covers the same image fraction at preview and export), capped per
-     hole by its depth so the core still reaches full fill. **Defect-like hole pixels** (colored like the estimated defect)
-     are force-filled at alpha 1 regardless of the ramp (`dlike`, with a
-     light blurred lip), so a wide feather can never blend the defect back
-     in — the soft fade only happens across clean rim pixels. Outside the
+     setting (`dust_feather`) as a fraction of **each hole's own depth**
+     (its half-thickness) — the fade scales with the brush size, and with
+     resolution, since the rasterized hole does — capped by that depth so
+     the core still reaches full fill. **Defect-like hole pixels** (colored
+     like the estimated defect) are force-filled at alpha 1 regardless of
+     the ramp (`dlike`, with a blurred lip as wide as the component's ramp,
+     confined to the component so it can't bleed into a neighboring hole's
+     blend), so a wide feather can never blend the defect back in — the
+     soft fade only happens across clean rim pixels. The classification
+     only engages for a `genuine` estimate (step 2) whose defect color is
+     separated from the cleaned ring's median by > `_DLIKE_SEP_MADS`
+     ring-grain MADs **and brighter than the surround** (film dust inverts
+     WHITE; a darker "defect" is content), and then marks the hole pixels
+     closer to the defect than to the surround (nearest centroid): a
+     generous brush over mostly-clean content estimates a "defect" that
+     collapses onto the background mode, and thresholding grain against it
+     force-filled a random salt-and-pepper subset of the hole (dithered
+     rims, no rolloff at wide feathers) — gated off, such a brush blends as
+     a pure opacity dome rolling off from the stroke's center. Outside the
      mask alpha is exactly 0 — away from any spot `out == img16`
      bit-for-bit.
   7. **Resolution-stable plan**: the heal's content-adaptive decisions —
-     stroke segmentation, each segment's chosen source offset, and the
-     diffusion-fallback verdicts — are computed ONCE at the canonical
+     stroke segmentation, each segment's chosen source offset, the
+     diffusion-fallback verdicts, and the per-segment `genuine`/`dlike_on`
+     verdicts — are computed ONCE at the canonical
      preview scale (`_DUST_PLAN_LONG` = 1080 long side) and REPLAYED on
      larger buffers with all pixel geometry scaled (segment size, Telea
      radius, offsets normalized over width/height; segments matched by
-     nearest normalized centroid). Re-deriving the plan per resolution let
+     nearest normalized centroid). Per-pixel threshold classifications
+     (holder-black, defect-like) read a luma smoothed to the plan scale
+     (`img16_c`, box = the scale factor; identity on canonical buffers), so
+     full-res grain crosses those thresholds no more often than the
+     preview's area-averaged pixels did. Re-deriving the plan per resolution let
      the SSD argmin flip between scales, so the export healed from visibly
      different patches than the preview the user approved ("the preview and
      the final don't look the same"). Buffers at or below the canonical
@@ -377,7 +454,22 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      **The preview's plan is the source of truth**: `CCRImage`'s preview
      render caches its plan (`_dust_plan_cache`, keyed by the spots'
      content; feather excluded — it shapes the blend, not the plan), and
-     hi-res/export renders replay THAT plan via `apply_dust_removal(plan=)`
+     hi-res/export renders replay THAT plan via `apply_dust_removal(plan=)`.
+     **Sticky sources**: once a segment's source is set, NOTHING may move
+     it — every preview-scale re-heal is seeded with the previous plan
+     (`prior_plan`, bound tightly by `_DUST_EDIT_TOL` so a NEW stroke's
+     segments never inherit a neighbor's source unscored), and segments at
+     unchanged centroids reuse their prior offset/verdicts verbatim instead
+     of re-searching. Painting a new stroke therefore cannot re-sample the
+     strokes already on screen. A pinned offset is never re-searched, only
+     clamped into bounds (scale rounding); even a stroke landing ON a prior
+     source keeps the reference — that segment defers to a second pass
+     (after the clone/Telea fills) and clones the HEALED content at the
+     very same location, so no dust is copied and the arrow never moves.
+     The plan
+     persists in the catalog (`dust_plan`, dropped when stale) and reseeds
+     the cache on restore, so reloads keep the exact sources the user saw —
+     a from-scratch replan of an incrementally-built plan could differ
      — a fresh plan from the export's own re-decoded/downscaled pixels can
      still flip near-tie source choices ("it sampled different spots than
      the preview"). A replayed offset that lands on dust or out of bounds

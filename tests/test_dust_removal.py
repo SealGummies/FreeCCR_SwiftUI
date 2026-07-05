@@ -28,7 +28,7 @@ import cv2  # noqa: E402
 from core import catalog, dust_detect  # noqa: E402
 from core.ccr_image import CCRImage  # noqa: E402
 from core.ccr_processor import (apply_dust_removal,  # noqa: E402
-                                rasterize_dust_mask)
+                                rasterize_dust_mask, DUST_FEATHER_DEFAULT)
 
 
 def _flat_with_speck(h=100, w=100, base=30000, speck=60000, cx=50, cy=50, r=4):
@@ -161,32 +161,33 @@ class TestApplyDustRemoval:
         assert float(err.max()) < 5000   # fill stays sky-toned along the stroke
 
     def test_feather_alpha_ramps_inward(self):
-        # The fill blends over a smooth inward ramp: 0 at the hole boundary,
-        # 1 in the core, exactly 0 outside the mask; a 1-px feather is an
-        # essentially hard (fully filled) edge for tight traces.
+        # The fill blends over a smooth inward ramp: ~0 at the hole boundary,
+        # 1 in the core, exactly 0 outside the mask; a ramp of 0.5 px (the
+        # feather-0 convention) is a hard, fully filled edge.
         from core.ccr_processor import _feather_alpha
         mask = np.zeros((60, 60), np.uint8)
         cv2.circle(mask, (30, 30), 20, 255, -1)
-        a = _feather_alpha(mask, np.full((60, 60), 8, np.uint8))
+        a = _feather_alpha(mask, np.full((60, 60), 8.0, np.float32))
         assert a[30, 30] == 1.0                    # core fully filled
         assert a[30, 51] == 0.0                    # outside untouched
         edge, mid = a[30, 49], a[30, 45]
         assert 0.0 < edge < 0.35                   # soft start at the rim
         assert edge < mid < 1.0                    # monotone ramp
-        hard = _feather_alpha(mask, np.ones((60, 60), np.uint8))
-        assert hard[30, 49] > 0.9                  # 1px feather ~ hard fill
+        hard = _feather_alpha(mask, np.full((60, 60), 0.5, np.float32))
+        assert hard[30, 49] > 0.9                  # hard fill at the rim
 
     def test_feather_param_softens_rim(self):
         # The user Feather setting widens the fill's cross-fade: with a wide
         # feather the hole's clean rim stays close to the ORIGINAL pixels
         # (low alpha), with feather 0 the rim is the clone (hard edge).
+        # feather is a fraction of the hole's own radius (1.0 = full depth).
         rng = np.random.default_rng(5)
         img = np.clip(rng.normal(30000, 2000, (200, 200, 3)), 0,
                       65535).astype(np.uint16)
         cv2.circle(img, (100, 100), 6, (60000, 60000, 60000), -1)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}  # mask r=16
         hard = apply_dust_removal(img, [spot], feather=0.0)
-        soft = apply_dust_removal(img, [spot], feather=0.08)
+        soft = apply_dust_removal(img, [spot], feather=1.0)
         yy, xx = np.mgrid[0:200, 0:200]
         rim = (np.hypot(yy - 100, xx - 100) > 13.5) & \
               (np.hypot(yy - 100, xx - 100) < 15.5)
@@ -197,17 +198,241 @@ class TestApplyDustRemoval:
         assert int(hard[100, 100, 0]) < 40000
         assert int(soft[100, 100, 0]) < 40000
 
+    def test_full_feather_is_smooth_dome_no_speckle(self):
+        # 100% feather on a mostly-clean brushed area must blend as a smooth
+        # opacity dome rolling off from the stroke center — not a random
+        # per-pixel subset healed at full strength (the defect classifier
+        # collapsing onto the background used to force-fill a salt-and-pepper
+        # subset of grain pixels, dithering the rim).
+        rng = np.random.default_rng(3)
+        img = np.clip(rng.normal(30000, 3000, (200, 200, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}  # r_px = 30
+        out = apply_dust_removal(img, [spot], feather=1.0)
+        diff = np.abs(out.astype(np.float32) - img.astype(np.float32)).mean(axis=2)
+        yy, xx = np.mgrid[0:200, 0:200]
+        d = np.hypot(yy - 100, xx - 100)
+        # Mean deviation decreases monotonically outward (a dome)...
+        rings = [float(diff[(d >= a) & (d < b)].mean())
+                 for a, b in ((0, 6), (6, 12), (12, 18), (18, 24), (24, 30))]
+        assert all(rings[i] > rings[i + 1] for i in range(len(rings) - 1))
+        # ...and the outer rim has no isolated full-strength pixels: even its
+        # 99th-percentile deviation stays well below the core's mean.
+        outer = diff[(d >= 24) & (d < 29)]
+        assert float(np.percentile(outer, 99)) < 0.8 * (rings[0] + 1e-6)
+
+    def test_feather_ramp_scales_with_brush_size(self):
+        # The feather is a fraction of the hole's own radius: at the SAME
+        # setting, ~6 px inside the boundary is still soft rim for a big
+        # brush but near-full fill for a small one. A fixed-width ramp (the
+        # old fraction-of-image-width feather) would give the same alpha at
+        # the same absolute inset for both sizes.
+        rng = np.random.default_rng(11)
+        base = np.clip(rng.normal(30000, 3000, (300, 300, 3)), 0,
+                       65535).astype(np.uint16)
+
+        def rim_ratio(r_norm):
+            r_px = r_norm * 300
+            img = base.copy()
+            cv2.circle(img, (150, 150), max(3, int(r_px / 4)),
+                       (60000, 60000, 60000), -1)
+            spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": r_norm}
+            hard = apply_dust_removal(img, [spot], feather=0.0)
+            soft = apply_dust_removal(img, [spot], feather=0.75)
+            yy, xx = np.mgrid[0:300, 0:300]
+            d = np.hypot(yy - 150, xx - 150)
+            probe = (d > r_px - 7) & (d < r_px - 5)  # ~6 px inside the rim
+            d_hard = np.abs(hard[probe].astype(np.float32)
+                            - img[probe]).mean()
+            d_soft = np.abs(soft[probe].astype(np.float32)
+                            - img[probe]).mean()
+            return float(d_soft) / max(float(d_hard), 1e-6)
+
+        assert rim_ratio(0.12) < 0.5   # big brush: 6 px in is still soft rim
+        assert rim_ratio(0.04) > 0.5   # small brush: 6 px in is nearly core
+
     def test_wide_feather_never_blends_defect_back(self):
         # Defect-like pixels are force-filled whatever the feather: a tight
-        # hair trace with a huge feather must still remove the hair.
+        # hair trace with the feather at its maximum must still remove the
+        # hair.
         sky = np.array([20000, 25000, 40000], np.float32)
         img = np.broadcast_to(sky.astype(np.uint16), (200, 200, 3)).copy()
         cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
         spot = {"kind": "brush",
                 "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 2.0 / 200}
-        out = apply_dust_removal(img, [spot], feather=0.02)
+        out = apply_dust_removal(img, [spot], feather=1.0)
         core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
         assert float(np.abs(core.mean(axis=0) - sky).max()) < 5000
+
+    def test_big_merged_dabs_clone_texture_not_smear(self):
+        # Big overlapping dabs used to become ONE segment whose source
+        # window (bbox + thickness-scaled pad) could not fit anywhere clean,
+        # dumping the whole blob into the flat diffusion fallback — a
+        # visible grainless disc on film. The segment-size cap tiles the
+        # blob so each tile clones real texture from beside it.
+        rng = np.random.default_rng(21)
+        img = np.clip(rng.normal(32000, 3000, (640, 640, 3)), 0,
+                      65535).astype(np.uint16)
+        # A merged blob whose ONE-segment window has no clean in-bounds home
+        # in this frame, while per-tile windows do.
+        spots = [{"kind": "brush", "pts": [[0.42, 0.40]], "r": 0.075},
+                 {"kind": "brush", "pts": [[0.55, 0.38]], "r": 0.075},
+                 {"kind": "brush", "pts": [[0.48, 0.52]], "r": 0.07}]
+        out = apply_dust_removal(img, spots)
+        mask = rasterize_dust_mask(spots, 640, 640) > 0
+        core = cv2.erode(mask.astype(np.uint8), np.ones((25, 25), np.uint8)) > 0
+        healed = out[core].astype(np.float32)
+        ann = (~mask) & (cv2.dilate(mask.astype(np.uint8),
+                                    np.ones((41, 41), np.uint8)) > 0)
+        surround = out[ann].astype(np.float32)
+        # Tone lands on the surround AND grain survives (Telea ~ 0 std).
+        assert abs(float(healed.mean()) - float(surround.mean())) < 2000
+        assert float(healed.std()) > 0.5 * float(surround.std())
+
+    def test_prior_plan_pins_sources_verbatim(self):
+        # Once a patch's source is set, nothing may move it: the previous
+        # plan seeds every re-heal and matching segments reuse its offset
+        # VERBATIM (no re-scoring). Proof by tampering: a shifted-but-clean
+        # prior offset must drive the heal and be carried into the new plan.
+        rng = np.random.default_rng(17)
+        img = np.clip(rng.normal(30000, 3000, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
+        plan1 = []
+        apply_dust_removal(img, [spot], collect_plan=plan1)
+        (cy, cx, off, g, d), = plan1
+        assert off is not None
+        tampered = [(cy, cx, (off[0], off[1] + 20.0 / 400.0), g, d)]
+        plan2 = []
+        apply_dust_removal(img, [spot], collect_plan=plan2,
+                           prior_plan=tampered)
+        assert plan2[0][2][1] == pytest.approx(tampered[0][2][1])
+
+    def test_new_stroke_keeps_prior_sources_even_in_its_ring(self):
+        # A stroke painted inside an existing segment's context ring used to
+        # change that segment's matching inputs and could flip its source;
+        # with the prior plan pinning sources, the first stroke's sample
+        # stays bit-identical (only a stroke ON the source itself may force
+        # a re-search).
+        rng = np.random.default_rng(17)
+        img = np.clip(rng.normal(30000, 3000, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
+        plan1 = []
+        apply_dust_removal(img, [spot], collect_plan=plan1)
+        (cy, cx, off, _, _), = plan1
+        # Perturb the ring on the side OPPOSITE the chosen source, so the
+        # prior source window stays clean.
+        bx = 0.44 if (cx + off[1]) >= 0.5 else 0.56
+        b = {"kind": "brush", "pts": [[bx, 0.5]], "r": 0.01}
+        plan2 = []
+        apply_dust_removal(img, [spot, b], collect_plan=plan2,
+                           prior_plan=plan1)
+        recs = [r for r in plan2
+                if abs(r[0] - cy) < 1e-9 and abs(r[1] - cx) < 1e-9]
+        assert recs, "first stroke's segment disappeared"
+        assert recs[0][2] == off, "first stroke's source moved"
+
+    def test_sources_stay_inside_the_crop(self):
+        # Content outside the confirmed crop (film holder, rebate, junk the
+        # user cut away) is not scene: fresh searches must never sample it,
+        # and the context ring must not anchor on it.
+        rng = np.random.default_rng(29)
+        img = np.clip(rng.normal(30000, 2500, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        img[:, 260:] = 62000  # junk strip the crop removes
+        crop = ((0.0, 0.0, 0.65, 1.0), 0.0)  # keeps x < 260 px
+        spot = {"kind": "brush", "pts": [[0.60, 0.5]], "r": 0.03}
+        plan = []
+        out = apply_dust_removal(img, [spot], collect_plan=plan, crop=crop)
+        assert plan
+        # Every sampled window lies inside the crop: source-window center +
+        # its half extent (hole r 12 + guard/ring pad 15 = 27 px) fits.
+        for cy, cx, off, *_ in plan:
+            if off is not None:
+                assert (cx + off[1]) * 400 + 27 <= 260 + 1e-6
+        # The fill is sky, not the junk strip.
+        m = rasterize_dust_mask([spot], 400, 400) > 0
+        assert float(out[m].astype(np.float32).mean()) < 40000
+
+    def test_stroke_on_prior_source_keeps_reference_samples_healed(self):
+        # NO exceptions: even a stroke painted directly ON a segment's
+        # source patch must not move the reference. The segment defers to a
+        # second pass and clones the HEALED content at the very same
+        # location — same offset in the plan, no dust cloned into the fill.
+        rng = np.random.default_rng(23)
+        img = np.clip(rng.normal(30000, 2500, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
+        plan1 = []
+        apply_dust_removal(img, [spot], collect_plan=plan1)
+        (cy, cx, off, _, _), = plan1
+        assert off is not None
+        # A bright defect appears at the chosen source and the user paints
+        # over it — the source patch is now under dust.
+        sy, sx = cy + off[0], cx + off[1]
+        img2 = img.copy()
+        cv2.circle(img2, (int(sx * 400), int(sy * 400)), 5,
+                   (62000, 62000, 62000), -1)
+        b = {"kind": "brush", "pts": [[sx, sy]], "r": 0.03}
+        plan2 = []
+        out = apply_dust_removal(img2, [spot, b], collect_plan=plan2,
+                                 prior_plan=plan1)
+        rec = [r for r in plan2
+               if abs(r[0] - cy) < 1e-9 and abs(r[1] - cx) < 1e-9]
+        assert rec, "first stroke's segment disappeared"
+        assert rec[0][2] == off, "reference moved"
+        # The fill sampled the HEALED source, not the new bright defect.
+        m = rasterize_dust_mask([spot], 400, 400) > 0
+        healed = out[m].astype(np.float32)
+        assert float(healed.mean()) < 40000
+        assert float(healed.max()) < 55000
+
+    def test_new_stroke_keeps_far_samples_stable(self):
+        # Adding a dab must only re-sample segments near the edit. Tiles
+        # used to anchor to the component bbox and scale their windows by
+        # the component's thickness, so a dab merging at a blob's top-left
+        # shifted EVERY tile of the blob and re-sampled its far side too.
+        rng = np.random.default_rng(31)
+        img = np.clip(rng.normal(32000, 3000, (640, 640, 3)), 0,
+                      65535).astype(np.uint16)
+        base = [{"kind": "brush", "pts": [[0.45, 0.45]], "r": 0.075},
+                {"kind": "brush", "pts": [[0.58, 0.45]], "r": 0.075}]
+        plan1, plan2 = [], []
+        apply_dust_removal(img, base, collect_plan=plan1)
+        # A small dab overlapping the blob's top-left corner: extends the
+        # component bbox origin (0.38*640-19 px < the blob's old 240 px
+        # edge) and its thickness, touches nothing on the far (right) side.
+        added = base + [{"kind": "brush", "pts": [[0.38, 0.38]], "r": 0.03}]
+        apply_dust_removal(img, added, collect_plan=plan2)
+        far1 = [r for r in plan1 if r[1] > 0.55]
+        assert far1
+        for rec in far1:
+            match = [r for r in plan2
+                     if abs(r[0] - rec[0]) < 1e-9 and abs(r[1] - rec[1]) < 1e-9]
+            assert match, f"far segment moved: {rec[:2]}"
+            assert match[0][2] == rec[2], "far segment re-sampled"
+
+    def test_clean_stroke_near_black_border_stays_sky(self):
+        # THE black-blob artifact: a generous brush over clean sky near the
+        # frame's black holder border. The defect estimate collapses onto
+        # the sky itself, the ring rejection then discarded the whole sky
+        # ring as "leak" and kept the black border as the only matching and
+        # tone anchor — the stroke healed to solid black, cloned from a
+        # window overlapping the border.
+        rng = np.random.default_rng(9)
+        img = np.clip(rng.normal(34000, 2500, (200, 300, 3)), 0,
+                      65535).astype(np.uint16)
+        img[:14] = np.clip(rng.normal(900, 300, (14, 300, 3)), 0, 65535)
+        spot = {"kind": "brush",
+                "pts": [[0.30, 0.22], [0.40, 0.20], [0.50, 0.22]],
+                "r": 0.055}  # ~17 px dabs, ~30 px below the border
+        out = apply_dust_removal(img, [spot], feather=0.25)
+        mask = rasterize_dust_mask([spot], 200, 300) > 0
+        healed = out[mask].astype(np.float32).mean(axis=1)
+        # Nothing near black anywhere in the fill; tone stays sky-like.
+        assert float(np.percentile(healed, 1)) > 20000
+        assert abs(float(healed.mean()) - 34000) < 4000
 
     def test_underscoped_dab_keeps_tone(self):
         # A click smaller than the speck (the small dot ghost): the speck's
@@ -378,20 +603,45 @@ class TestPersistence:
         state = catalog.serialize_image(img)
         assert catalog._is_pristine(state) is False
 
+    def test_dust_plan_round_trips_in_catalog(self, tmp_path):
+        # The heal plan persists with the spots and reseeds the cache on
+        # restore, so a reload keeps the exact sources the user saw (a
+        # from-scratch replan of an incrementally-built plan could differ).
+        cat = str(tmp_path / "catalog.json")
+        path = _scan_png(tmp_path)
+        img = CCRImage(path)
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.02}]
+        img.update_thumbnail_and_preview()   # preview heal caches the plan
+        cached = img._dust_plan_cache
+        assert cached is not None and cached[0] == repr(img.dust_spots)
+        assert cached[1]
+        catalog.update_for_images([img], path=cat)
+        restored = catalog.create_images_for_path(path, path=cat)[0]
+        rc = getattr(restored, "_dust_plan_cache", None)
+        assert rc is not None
+        assert rc[0] == repr(restored.dust_spots)
+        assert rc[1] == cached[1]
+
     def test_dust_feather_round_trips_and_defaults(self, tmp_path):
         cat = str(tmp_path / "catalog.json")
         path = _scan_png(tmp_path)
         img = CCRImage(path)
         img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.01}]
-        img.dust_feather = 0.007
+        img.dust_feather = 0.7
         catalog.update_for_images([img], path=cat)
         restored = catalog.create_images_for_path(path, path=cat)
-        assert abs(restored[0].dust_feather - 0.007) < 1e-9
+        assert abs(restored[0].dust_feather - 0.7) < 1e-9
         # Pre-feature catalog entries restore to the default.
         state = catalog.serialize_image(img)
-        del state["dust_feather"]
+        del state["dust_feather_r"]
         old = catalog._restore_image(path, state)
-        assert abs(old.dust_feather - 0.003) < 1e-9
+        assert abs(old.dust_feather - DUST_FEATHER_DEFAULT) < 1e-9
+        # Legacy width-fraction entries (old "dust_feather" key, 0..1% of
+        # width) migrate by slider position onto the radius-fraction scale:
+        # 0.30% of width -> 30% of radius.
+        state["dust_feather"] = 0.003
+        legacy = catalog._restore_image(path, state)
+        assert abs(legacy.dust_feather - 0.3) < 1e-9
 
 
 # --- Undo -------------------------------------------------------------------
@@ -424,9 +674,13 @@ class _StubPreview:
         self.dust_mode = True
         self.current_idx = None
         self.brush = None
+        self.source_overlay = None
 
     def set_dust_brush_size(self, r):
         self.brush = r
+
+    def set_dust_source_overlay(self, on):
+        self.source_overlay = on
 
     def dust_undo_last(self):
         return False
@@ -497,7 +751,7 @@ class TestPanelWiring:
         from core.ccr_backend import ccr_backend
 
         class _Img:
-            dust_feather = 0.003
+            dust_feather = 0.25
             dust_spots = []
 
         img = _Img()
@@ -508,11 +762,35 @@ class TestPanelWiring:
             prev.current_idx = 0
             panel = DustRemovalPanel(_StubMain(), prev)
             panel.feather_slider.setValue(60)  # emits valueChanged
-            assert panel.feather_value.text() == "0.60%"
+            assert panel.feather_value.text() == "60%"
             panel._apply_feather()             # bypass the debounce timer
-            assert abs(img.dust_feather - 0.006) < 1e-9
+            assert abs(img.dust_feather - 0.6) < 1e-9
         finally:
             ccr_backend.images = saved
+
+    def test_show_sources_checkbox_drives_canvas_overlay(self):
+        from widgets.dust_panel import DustRemovalPanel
+        prev = _StubPreview()
+        panel = DustRemovalPanel(_StubMain(), prev)
+        panel.show_sources_cb.setChecked(True)
+        assert prev.source_overlay is True
+        panel.show_sources_cb.setChecked(False)
+        assert prev.source_overlay is False
+
+    def test_dust_debug_geometry_maps_plan_to_arrows(self):
+        # Full-frame pixel geometry for the 'Show heal sources' overlay:
+        # spot outlines, one arrow per cloned segment (source -> segment,
+        # source = centroid + planned offset), a marker per Telea fallback.
+        from widgets.image_preview import dust_debug_geometry
+        spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.05}]
+        plan = [(0.5, 0.5, (0.1, -0.2), True, False),
+                (0.3, 0.4, None, None, None)]
+        geo = dust_debug_geometry(spots, plan, 1000, 500)
+        assert geo["strokes"] == [([(500.0, 250.0)], 100.0)]
+        (sx, sy, dx, dy), = geo["arrows"]
+        assert (dx, dy) == (500.0, 250.0)
+        assert (sx, sy) == (500.0 - 0.2 * 1000, 250.0 + 0.1 * 500)
+        assert geo["fallbacks"] == [(0.4 * 1000, 0.3 * 500)]
 
     def test_detect_all_no_targets_is_safe(self):
         from widgets.dust_panel import DustRemovalPanel, _DetectAllWorker  # noqa: F401
@@ -634,7 +912,7 @@ class TestResolutionConsistency:
         no file decode, so the plan-cache plumbing is tested hermetically."""
         img = CCRImage.__new__(CCRImage)
         img.dust_spots = spots
-        img.dust_feather = 0.003
+        img.dust_feather = 0.25
         img._dust_plan_cache = None
         return img
 
@@ -650,15 +928,16 @@ class TestResolutionConsistency:
         img._apply_dust_removal(small)                # preview render
         key, plan = img._dust_plan_cache
         assert key == repr(img.dust_spots)
-        assert any(off is not None for _, _, off in plan)
+        assert any(rec[2] is not None for rec in plan)
 
         out_cached = img._apply_dust_removal(big)     # export render
         # Tamper with the cached plan (shift the source offsets): the export
         # output must follow the cache — proof it replays the preview's plan
         # rather than planning for itself.
         img._dust_plan_cache = (key, [
-            (cy, cx, None if off is None else (off[0] + 0.02, off[1]))
-            for cy, cx, off in plan])
+            rec if rec[2] is None
+            else (rec[0], rec[1], (rec[2][0] + 0.02, rec[2][1])) + rec[3:]
+            for rec in plan])
         out_tampered = img._apply_dust_removal(big)
         assert not np.array_equal(out_cached, out_tampered)
 

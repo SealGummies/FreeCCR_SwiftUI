@@ -5,11 +5,12 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QStyle, QSizePolicy, QApplication, QComboBox
 )
 from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter,
-                           QCursor, QDesktopServices, QPainterPath, QBrush, QPolygonF,
+                           QCursor, QDesktopServices, QPainterPath,
+                           QPainterPathStroker, QBrush, QPolygonF,
                            QImage)
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
-from core.ccr_processor import apply_dust_removal
+from core.ccr_processor import apply_dust_removal, DUST_FEATHER_DEFAULT
 from core import crop_aspect
 from widgets.dust_panel import DUST_BRUSH_R_MIN, DUST_BRUSH_R_MAX
 from widgets.export_dialog import ExportSettingsDialog
@@ -43,6 +44,33 @@ def _eyedropper_cursor():
         p.end()
         _eyedropper_cursor_cache = QCursor(pm, 3, 21)
     return _eyedropper_cursor_cache
+
+def dust_debug_geometry(spots, plan, w, h):
+    """Geometry for the dust panel's 'Show heal sources' overlay, in FULL
+    un-cropped frame pixel coords (the caller maps to scene coords).
+
+    Returns {"strokes": [(points_px, brush_width_px)], "arrows":
+    [(src_x, src_y, dst_x, dst_y)], "fallbacks": [(x, y)]}: one outline per
+    stored spot, one arrow per planned clone segment drawn FROM the sampled
+    source patch TO the healed segment's centroid, and one marker per
+    diffusion-fallback segment (nothing was sampled there — Telea). `plan`
+    records are (cy, cx, off, ...) with `off` the destination→source window
+    displacement normalized over (h, w), or None for a fallback (see
+    _heal_impl); pass plan=None for stroke outlines only."""
+    strokes = [([(float(p[0]) * w, float(p[1]) * h)
+                 for p in (s.get("pts") or [])],
+                2.0 * float(s.get("r", 0.0)) * w)
+               for s in (spots or [])]
+    arrows, fallbacks = [], []
+    for rec in (plan or []):
+        cy, cx, off = rec[0], rec[1], rec[2]
+        dx, dy = cx * w, cy * h
+        if off is None:
+            fallbacks.append((dx, dy))
+        else:
+            arrows.append((dx + off[1] * w, dy + off[0] * h, dx, dy))
+    return {"strokes": strokes, "arrows": arrows, "fallbacks": fallbacks}
+
 
 _rotate_cursor_cache = None
 
@@ -857,6 +885,8 @@ class ImagePreview(QWidget):
         self._dust_stroke_item = None    # live red stroke overlay (in-progress)
         self._dust_cursor_item = None    # brush-circle cursor following the pointer
         self.dust_panel = None           # set by MainWindow (brush-slider sync)
+        self._dust_debug = False         # 'Show heal sources' diagnostic overlay
+        self._dust_debug_items = []      # its scene items (outlines/arrows)
 
         # Coalesce a fine-rotation drag into a single undo step
         self._fine_rot_burst_active = False
@@ -1713,7 +1743,8 @@ class ImagePreview(QWidget):
                    for p in (s.get("pts") or [])),
              round(float(s.get("r", 0)) * 10000))
             for s in getattr(img, "dust_spots", [])),
-            round(float(getattr(img, "dust_feather", 0.003)) * 10000))
+            round(float(getattr(img, "dust_feather",
+                                DUST_FEATHER_DEFAULT)) * 10000))
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "exposure_base", 0.0),
@@ -2399,6 +2430,7 @@ class ImagePreview(QWidget):
         # brush works on exactly the framing the user keeps.
         self.update_preview(self.current_idx)
         self._sync_zoom_combo()
+        self._draw_dust_debug()
         self.view.setCursor(Qt.CrossCursor)
         return True
 
@@ -2536,8 +2568,13 @@ class ImagePreview(QWidget):
         if img is None or raw is None:
             return None
         brush = [s for s in getattr(img, "dust_spots", []) if s.get("kind") == "brush"]
+        rect = getattr(img, "crop_rect", None)
+        crop = ((tuple(rect), float(getattr(img, "crop_angle", 0.0) or 0.0))
+                if rect else None)
         return apply_dust_removal(
-            raw, brush, feather=getattr(img, "dust_feather", 0.003))
+            raw, brush,
+            feather=getattr(img, "dust_feather", DUST_FEATHER_DEFAULT),
+            crop=crop)
 
     def dust_detect_source(self):
         """Detection source for the current image (see dust_detect_source_for)."""
@@ -2579,6 +2616,9 @@ class ImagePreview(QWidget):
         """Re-bake the preview/thumbnail after a dust edit and refresh the UI."""
         img.update_thumbnail_and_preview()
         self.update_preview(self.current_idx)
+        # The preview re-heal above refreshed the plan cache — sync the
+        # 'Show heal sources' overlay with what was actually sampled.
+        self._draw_dust_debug()
         # Kick the hi-res re-render right away (instead of the debounce) so the
         # inpainted spot resolves promptly; the in-flight guard dedups it. The
         # previous sharp render stays on screen until this lands (no blur flash).
@@ -2597,6 +2637,103 @@ class ImagePreview(QWidget):
                 except (RuntimeError, ValueError):
                     pass
                 setattr(self, attr, None)
+        self._clear_dust_debug_items()
+
+    def _clear_dust_debug_items(self):
+        for item in self._dust_debug_items:
+            try:
+                self.scene.removeItem(item)
+            except (RuntimeError, ValueError):
+                pass
+        self._dust_debug_items = []
+
+    def set_dust_source_overlay(self, on: bool):
+        """Dust panel's 'Show heal sources' checkbox: outline every stroke and
+        mark where each heal segment sampled its patch from (arrow source →
+        segment; ring only = diffusion fallback, nothing was sampled)."""
+        self._dust_debug = bool(on)
+        self._draw_dust_debug()
+
+    def _draw_dust_debug(self):
+        self._clear_dust_debug_items()
+        if not (self.dust_mode and self._dust_debug):
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None or self.current_pixmap is None:
+            return
+        t = self._base_transform()
+        size = self._dust_full_frame_size()
+        if t is None or size is None:
+            return
+        w, h = size
+        spots = getattr(img, "dust_spots", []) or []
+        if not spots:
+            return
+        # The plan cache holds what the last preview-scale heal actually did
+        # (and what exports will replay): per segment, the sampled source
+        # offset or a diffusion-fallback verdict. Stale key (spots changed,
+        # preview not re-rendered yet) → outlines only.
+        cached = getattr(img, "_dust_plan_cache", None)
+        plan = cached[1] if (cached and cached[0] == repr(spots)) else None
+        geo = dust_debug_geometry(spots, plan, w, h)
+        to_display = None
+        if self._crop_display_transform is not None:
+            to_display, ok = self._crop_display_transform.inverted()
+            if not ok:
+                return
+
+        def scene_pt(x, y):
+            pt = QPointF(x, y)
+            if to_display is not None:
+                pt = to_display.map(pt)
+            return t.map(pt)
+
+        def add(item, color, width=1.5):
+            pen = QPen(color, width)
+            pen.setCosmetic(True)  # constant screen width at any zoom
+            item.setPen(pen)
+            self.scene.addItem(item)
+            self._dust_debug_items.append(item)
+
+        yellow = QColor(255, 220, 60, 230)   # stroke borders
+        green = QColor(80, 255, 140, 230)    # sampled patch + arrow
+        orange = QColor(255, 150, 40, 230)   # diffusion fallback marker
+        for pts, width in geo["strokes"]:
+            if not pts:
+                continue
+            path = QPainterPath()
+            path.moveTo(scene_pt(*pts[0]))
+            for p in pts[1:]:
+                path.lineTo(scene_pt(*p))
+            if len(pts) == 1:  # single dab: zero-length stroke + round cap
+                path.lineTo(scene_pt(pts[0][0] + 1e-3, pts[0][1]))
+            stroker = QPainterPathStroker()
+            # Crop extraction is isometric, so full-frame px == display px.
+            stroker.setWidth(max(1.0, width))
+            stroker.setCapStyle(Qt.RoundCap)
+            stroker.setJoinStyle(Qt.RoundJoin)
+            item = QGraphicsPathItem(stroker.createStroke(path))
+            item.setBrush(Qt.NoBrush)
+            add(item, yellow)
+        for sx, sy, dx, dy in geo["arrows"]:
+            p1, p2 = scene_pt(sx, sy), scene_pt(dx, dy)
+            add(QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y()), green)
+            r = 6.0
+            e = QGraphicsEllipseItem(p1.x() - r, p1.y() - r, 2 * r, 2 * r)
+            e.setBrush(Qt.NoBrush)
+            add(e, green)
+            ang = math.atan2(p2.y() - p1.y(), p2.x() - p1.x())
+            for da in (math.pi * 5 / 6, -math.pi * 5 / 6):  # arrowhead barbs
+                add(QGraphicsLineItem(
+                    p2.x(), p2.y(),
+                    p2.x() + 9.0 * math.cos(ang + da),
+                    p2.y() + 9.0 * math.sin(ang + da)), green)
+        for x, y in geo["fallbacks"]:
+            p = scene_pt(x, y)
+            r = 7.0
+            e = QGraphicsEllipseItem(p.x() - r, p.y() - r, 2 * r, 2 * r)
+            e.setBrush(Qt.NoBrush)
+            add(e, orange, 2.0)
 
     def _draw_dust_stroke(self):
         """Draw/refresh the live red overlay for the in-progress stroke.
