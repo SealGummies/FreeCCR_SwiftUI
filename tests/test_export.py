@@ -92,6 +92,74 @@ class TestExportDimensions:
         assert arr is not None and max(arr.shape[:2]) == 800
 
 
+class TestRefExportSnapshotReplay:
+    """Issue #94: the reference-frame export must replay the frame BAKED at
+    convert time (conversion_inputs["ref"]), not the live reference_frame —
+    a stray right-click clears the live frame while the converted preview
+    stays intact, and every export then failed."""
+
+    def test_export_survives_cleared_reference_frame(self, tmp_path):
+        img, _ = _converted(tmp_path)
+        img.reference_frame = None      # right-click without a drag clears it
+        out = str(tmp_path / "cleared.tiff")
+        assert ccr_backend.export_image_by_index(0, out, max_long_side=1080)
+        long_side, arr = _long_side(out)
+        assert long_side == 1080
+        assert int(arr.max()) > 0
+
+    def test_full_export_survives_cleared_reference_frame(self, tmp_path):
+        img, _ = _converted(tmp_path)
+        img.reference_frame = None
+        out = str(tmp_path / "cleared_full.tiff")
+        assert ccr_backend.export_image_by_index(0, out, max_long_side=None)
+        long_side, _ = _long_side(out)
+        assert long_side == 2400
+
+    def test_cleared_frame_with_black_point_still_uses_ref_recipe(self, tmp_path):
+        # A sampled global black point must NOT hijack a reference-converted
+        # image's export onto the B/W-point pipeline when the live frame is
+        # gone — the snapshot branch matches first.
+        img, _ = _converted(tmp_path)
+        baseline = str(tmp_path / "ref_baseline.tiff")
+        assert ccr_backend.export_image_by_index(0, baseline, max_long_side=800)
+        img.reference_frame = None
+        ccr_backend.black_point_bgr = (40000.0, 40000.0, 40000.0)
+        try:
+            out = str(tmp_path / "cleared_bp.tiff")
+            assert ccr_backend.export_image_by_index(0, out, max_long_side=800)
+            _, base_arr = _long_side(baseline)
+            _, arr = _long_side(out)
+            assert np.array_equal(base_arr, arr)
+        finally:
+            ccr_backend.black_point_bgr = None
+
+    def test_export_uses_convert_time_frame_not_redrawn_one(self, tmp_path):
+        # Redrawing the frame AFTER converting must not change the export —
+        # the file must match the conversion the preview shows.
+        img, _ = _converted(tmp_path)
+        baseline = str(tmp_path / "frame_baseline.tiff")
+        assert ccr_backend.export_image_by_index(0, baseline, max_long_side=800)
+        img.reference_frame = (10, 10, 200, 150)   # new frame, not converted yet
+        out = str(tmp_path / "frame_redrawn.tiff")
+        assert ccr_backend.export_image_by_index(0, out, max_long_side=800)
+        _, base_arr = _long_side(baseline)
+        _, arr = _long_side(out)
+        assert np.array_equal(base_arr, arr)
+
+    def test_export_items_reports_real_failure_reason(self, tmp_path):
+        # The failures list must carry the actual exception text — the bundled
+        # app has no visible console, so this is the only diagnostic channel.
+        img, _ = _converted(tmp_path)
+        img.conversion_inputs = None    # un-snapshotted legacy state
+        img.reference_frame = None      # → live-frame replay must raise
+        result = ccr_backend.export_items([(0, str(tmp_path / "fail.tiff"))])
+        assert result["failed"] == 1
+        assert result["failures"], "failure reason missing"
+        idx, msg = result["failures"][0]
+        assert idx == 0
+        assert "reference_frame is None" in msg
+
+
 class TestLoadExportSource:
     def test_processing_path_uses_resized_raw(self, tmp_path):
         img, _ = _converted(tmp_path)

@@ -769,6 +769,12 @@ class CCRBackend:
             elif ci is not None and ci.get("mode") == "ref_params":
                 processed = ccr_normalize_with_refparams(
                     image_obj, ci["p_lo"], ci["p_hi"], ci["od"])
+            elif ci is not None and ci.get("mode") == "ref":
+                # Convert-time frame snapshot — survives a cleared/redrawn
+                # live reference_frame (issue #94).
+                processed = ccr_normalize_with_reference(
+                    image_obj, reference_rect=ci["ref"],
+                    fine_rot=ci.get("fine_rot", 0))
             elif image_obj.reference_frame is not None:
                 processed = ccr_normalize_with_reference(image_obj)
             else:
@@ -1309,6 +1315,21 @@ class CCRBackend:
                                                output_colorspace=output_colorspace,
                                                density=ci.get("density", False),
                                                slopes_bgr=ci.get("slopes"))
+                elif ci is not None and ci.get("mode") == "ref":
+                    # Reference-frame conversion: replay with the frame BAKED at
+                    # convert time. The live reference_frame must not be trusted —
+                    # a stray right-click clears it (leaving the converted preview
+                    # intact) and a redrawn frame would change the export away
+                    # from the preview (issue #94). The pixel data is still a
+                    # fresh full-quality decode of the original file; only the
+                    # rectangle coordinates come from the snapshot.
+                    ccr_normalize_with_reference(image_obj, output_path=output_path,
+                                                 jpg_out=jpg_output,
+                                                 jpg_quality=jpg_quality,
+                                                 max_long_side=max_long_side,
+                                                 output_colorspace=output_colorspace,
+                                                 reference_rect=ci["ref"],
+                                                 fine_rot=ci.get("fine_rot", 0))
                 elif image_obj.reference_frame is None and self.black_point_bgr is not None:
                     # Legacy/un-snapshotted B/W point conversion — global anchors.
                     # white_point_bgr may be None → default-slope mode (with the
@@ -1329,6 +1350,12 @@ class CCRBackend:
                                                  output_colorspace=output_colorspace)
                 return True
             except Exception as e:
+                # Keep the real reason: the bundled app has no visible stdout,
+                # so export_items/the result dialog surface this per image.
+                # Distinct-key dict writes are safe from the export pool threads.
+                if not hasattr(self, "_export_errors"):
+                    self._export_errors = {}
+                self._export_errors[idx] = f"{type(e).__name__}: {e}"
                 print(f"Failed to export image at index {idx}: {e}")
         return False
 
@@ -1357,6 +1384,7 @@ class CCRBackend:
         total_items = len(items)
         if total_items == 0:
             return result
+        self._export_errors = {}   # per-index failure reasons for this run
 
         print(f"Starting export of {total_items} images...")
 
@@ -1377,7 +1405,7 @@ class CCRBackend:
                 print(f"Export completed for {base_name} in {elapsed:.2f}s")
                 return idx, True, None
             print(f"Export failed for image {idx} after {elapsed:.2f}s")
-            return idx, False, "export failed (see log)"
+            return idx, False, self._export_errors.get(idx, "export failed (see log)")
 
         # Use parallel processing for exports
         max_workers = min(4, os.cpu_count() or 1)  # Use very few workers for export to avoid I/O contention

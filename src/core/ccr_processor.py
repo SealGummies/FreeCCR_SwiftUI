@@ -610,13 +610,22 @@ def _load_export_source(ccr_image, output_path, max_long_side):
     return ccr_image.read_image(ccr_image.file_path, preview=False)
 
 
-def ccr_normalize_with_reference(ccr_image,output_path=None,jpg_out=False,jpg_quality=95,max_long_side=None,output_colorspace="srgb") -> np.ndarray:
+def ccr_normalize_with_reference(ccr_image,output_path=None,jpg_out=False,jpg_quality=95,max_long_side=None,output_colorspace="srgb",reference_rect=None,fine_rot=None) -> np.ndarray:
     """
     Normalize and align the image using the CCR algorithm, using a reference rectangle
     for percentile calculations instead of a crop factor.
 
     Args:
         ccr_image: CCRImage object
+        reference_rect: (x1, y1, x2, y2) in resized_raw coordinates. When given
+            (the conversion_inputs snapshot from convert time) it is used instead
+            of the live ccr_image.reference_frame, so a replay reproduces the
+            conversion even after the on-canvas frame was cleared or redrawn.
+            Coordinates only — the pixel data is always re-read from the file.
+        fine_rot: fine rotation angle (hundredths of a degree) to apply to the
+            reference image before the percentile crop, as at convert time.
+            None falls back to the live angle. The final output orientation
+            warp always uses the live angle (it must match the preview).
 
     Returns:
         np.ndarray: CCR-normalized and inverted image, dtype uint16
@@ -631,9 +640,12 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,jpg_out=False,jpg_qu
         raise ValueError("CCRImage.resized_raw is None")
     print(f"Image loading: {time.time() - step_start:.3f}s")
 
-    # Apply fine rotation rotation 
+    # Apply fine rotation rotation
     step_start = time.time()
     fine_angle = ccr_image.fine_rotation_angle / 100.0
+    # The reference-crop warp reproduces convert time; the final output warp
+    # (fine_angle) tracks the live angle so the export matches the preview.
+    ref_fine_angle = fine_angle if fine_rot is None else fine_rot / 100.0
     h_flip = ccr_image.horizontal_mirrored
     v_flip = ccr_image.vertical_mirrored
 
@@ -648,10 +660,10 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,jpg_out=False,jpg_qu
         img_ref = ccr_image.resized_raw
     
     # fine Rotation
-    if fine_angle != 0:
+    if ref_fine_angle != 0:
         center_ref = (img_ref.shape[1] // 2, img_ref.shape[0] // 2)
         w_ref, h_ref = img_ref.shape[1], img_ref.shape[0]
-        rot_mat = cv2.getRotationMatrix2D(center_ref, -fine_angle, 1.0)
+        rot_mat = cv2.getRotationMatrix2D(center_ref, -ref_fine_angle, 1.0)
         img_ref = cv2.warpAffine(img_ref, rot_mat, (w_ref, h_ref), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,borderValue=0)
         # Clean up rotation matrix as it's no longer needed
         del rot_mat
@@ -662,9 +674,11 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,jpg_out=False,jpg_qu
         #     img = cv2.warpAffine(img, rot_mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,borderValue=0)
     print(f"Image setup and rotation: {time.time() - step_start:.3f}s")
 
-    # Reference frame
+    # Reference frame — the caller's snapshot wins over the live frame (a
+    # right-click clears the live frame without touching the conversion).
     step_start = time.time()
-    reference_rect = ccr_image.reference_frame
+    if reference_rect is None:
+        reference_rect = ccr_image.reference_frame
     if reference_rect is None:
         raise ValueError("CCRImage.reference_frame is None")
 
