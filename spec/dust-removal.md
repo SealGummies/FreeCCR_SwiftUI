@@ -121,10 +121,16 @@ in the catalog, and undoable.
      dragging; the re-heal lands on release, one undo step). The stroke's
      plan records travel with it with their offsets compensated
      (`translate_dust_plan`), so a moved stroke still samples the very same
-     patch of film — the reference location never changes. Double
-     right-click on a stroke DELETES it (one undo step). Hit-testing is
-     against the brush footprint (`dust_spot_hit`, topmost/newest stroke
-     first); a right-click on empty canvas does nothing.
+     patch of film — the reference location never changes. Right-press on a
+     SOURCE ring and drag to RE-PICK where that segment samples from: the
+     arrow follows live, the release re-heal binds the segment at its
+     unchanged centroid and pins the chosen offset verbatim — the user's
+     pick becomes the sticky reference (replayed by hi-res/export,
+     persisted in the catalog; a plan-only edit, not an undo step). Double
+     right-click on a stroke DELETES it (one undo step). Hit-testing tries
+     source markers first (9 px), then the brush footprint
+     (`dust_spot_hit`, topmost/newest stroke first); a right-click on empty
+     canvas does nothing.
    - Hint: "Click or drag over dust to remove it. Ctrl+wheel resizes the
      brush. With heal sources shown: right-drag a stroke to move it (it
      keeps sampling the same patch); double right-click deletes it."

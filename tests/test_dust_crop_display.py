@@ -179,6 +179,30 @@ class TestRightButtonStrokeEditing:
         assert img.pop_undo_state()
         assert len(img.dust_spots) == 1
 
+    def test_right_drag_on_source_marker_repicks_the_sample(self, tmp_path):
+        # Dragging the SOURCE ring changes where that segment samples from:
+        # the plan record's offset follows the drop point, the re-heal pins
+        # it verbatim, and the user's pick becomes the sticky reference.
+        ip, img = _converted_preview(tmp_path, crop_rect=None)
+        ip.enter_dust_mode()
+        ip._maybe_request_hires = lambda: None
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}]
+        img.update_thumbnail_and_preview()
+        (cy, cx, off, *_), = img._dust_plan_cache[1]
+        assert off is not None
+        ip.set_dust_source_overlay(True)
+        # Grab the marker at the source position (no crop: scene == full px).
+        sx, sy = (cx + off[1]) * 600, (cy + off[0]) * 400
+        ip.dust_right_press(QPointF(sx, sy))
+        assert ip._dust_src_drag is not None and ip._dust_drag is None
+        # Drop it 80 px below (clean area) and release.
+        ip.dust_right_move(QPointF(sx, sy + 80))
+        ip.dust_right_release()
+        (cy2, cx2, off2, *_), = img._dust_plan_cache[1]
+        assert (cy2, cx2) == pytest.approx((cy, cx), abs=1e-6)
+        assert cx2 + off2[1] == pytest.approx((sx) / 600.0, abs=0.01)
+        assert cy2 + off2[0] == pytest.approx((sy + 80) / 400.0, abs=0.01)
+
     def test_right_press_needs_overlay_shown(self, tmp_path):
         ip, img = _converted_preview(tmp_path, crop_rect=None)
         ip.enter_dust_mode()

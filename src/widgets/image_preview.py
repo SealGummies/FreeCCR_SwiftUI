@@ -310,7 +310,8 @@ class GraphicsImageView(QGraphicsView):
         if self._space_pan:
             return super().mouseMoveEvent(event)
         if self.parent_widget.dust_mode:
-            if self.parent_widget._dust_drag is not None:
+            if (self.parent_widget._dust_drag is not None
+                    or self.parent_widget._dust_src_drag is not None):
                 self.parent_widget.dust_right_move(self.mapToScene(event.pos()))
             else:
                 self.parent_widget.dust_move(self.mapToScene(event.pos()))
@@ -961,6 +962,7 @@ class ImagePreview(QWidget):
         self._dust_debug = False         # 'Show heal sources' diagnostic overlay
         self._dust_debug_items = []      # its scene items (outlines/arrows)
         self._dust_drag = None           # right-drag state (move a stroke)
+        self._dust_src_drag = None       # right-drag state (re-pick a source)
 
         # Coalesce a fine-rotation drag into a single undo step
         self._fine_rot_burst_active = False
@@ -2629,20 +2631,81 @@ class ImagePreview(QWidget):
                 return i
         return None
 
+    def _dust_source_index_at(self, n):
+        """Index (into the cached plan) of the source marker under the
+        cursor, or None. Markers exist only while the cache matches the
+        spots — the same condition under which they are drawn."""
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        size = self._dust_full_frame_size()
+        if img is None or size is None:
+            return None
+        cached = getattr(img, "_dust_plan_cache", None)
+        spots = getattr(img, "dust_spots", []) or []
+        if cached is None or cached[0] != repr(spots):
+            return None
+        w, h = size
+        for i, rec in enumerate(cached[1]):
+            if rec[2] is None:
+                continue
+            sx, sy = rec[1] + rec[2][1], rec[0] + rec[2][0]
+            if math.hypot((n[0] - sx) * w, (n[1] - sy) * h) <= 9.0:
+                return i
+        return None
+
     def dust_right_press(self, scene_pos):
-        """Right-press on a stroke (sources overlay shown): begin moving it."""
+        """Right-press (sources overlay shown): grab the source marker under
+        the cursor to re-pick where that segment samples from, else grab the
+        stroke to move it."""
         if not (self.dust_mode and self._dust_debug):
             return
-        idx = self._dust_spot_index_at(scene_pos)
         n = self._dust_scene_to_norm(scene_pos)
-        if idx is None or n is None:
+        if n is None:
+            return
+        si = self._dust_source_index_at(n)
+        if si is not None:
+            img = ccr_backend.get_image_by_index(self.current_idx)
+            self._dust_src_drag = {"idx": si, "start": n,
+                                   "rec": img._dust_plan_cache[1][si],
+                                   "moved": False}
+            return
+        idx = self._dust_spot_index_at(scene_pos)
+        if idx is None:
             return
         img = ccr_backend.get_image_by_index(self.current_idx)
         self._dust_drag = {"idx": idx, "start": n, "delta": (0.0, 0.0),
                            "orig": copy.deepcopy(img.dust_spots[idx]),
                            "moved": False}
 
+    def _dust_source_move(self, scene_pos):
+        """Live-update a dragged source marker: rewrite that plan record's
+        offset so the segment samples where the user drops it. The re-heal
+        (on release) binds the segment at its unchanged centroid and pins
+        the chosen offset verbatim — the user's pick becomes the sticky
+        reference, replayed by hi-res/export and persisted in the catalog."""
+        drag = self._dust_src_drag
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        n = self._dust_scene_to_norm(scene_pos)
+        if drag is None or img is None or n is None:
+            return
+        cached = getattr(img, "_dust_plan_cache", None)
+        if cached is None:
+            return
+        rec = drag["rec"]
+        dy = n[1] - drag["start"][1]
+        dx = n[0] - drag["start"][0]
+        # Keep the source center inside the frame.
+        oy = min(max(rec[2][0] + dy, -rec[0]), 1.0 - rec[0])
+        ox = min(max(rec[2][1] + dx, -rec[1]), 1.0 - rec[1])
+        recs = list(cached[1])
+        recs[drag["idx"]] = (rec[0], rec[1], (oy, ox)) + tuple(rec[3:])
+        img._dust_plan_cache = (cached[0], recs)
+        drag["moved"] = abs(dy) > 1e-6 or abs(dx) > 1e-6
+        self._draw_dust_debug()  # arrow follows; the re-heal lands on release
+
     def dust_right_move(self, scene_pos):
+        if self._dust_src_drag is not None:
+            self._dust_source_move(scene_pos)
+            return
         drag = self._dust_drag
         if drag is None:
             return
@@ -2665,6 +2728,16 @@ class ImagePreview(QWidget):
         self._draw_dust_debug()  # live border; the re-heal lands on release
 
     def dust_right_release(self):
+        src = self._dust_src_drag
+        self._dust_src_drag = None
+        if src is not None:
+            if src.get("moved"):
+                img = ccr_backend.get_image_by_index(self.current_idx)
+                if img is not None:
+                    # Re-heal: the segment binds at its centroid and pins
+                    # the user-chosen offset verbatim — the new reference.
+                    self._commit_dust_change(img)
+            return
         drag = self._dust_drag
         self._dust_drag = None
         if drag is None or not drag.get("moved"):
@@ -2694,6 +2767,7 @@ class ImagePreview(QWidget):
         if not (self.dust_mode and self._dust_debug):
             return
         self._dust_drag = None
+        self._dust_src_drag = None
         idx = self._dust_spot_index_at(scene_pos)
         img = ccr_backend.get_image_by_index(self.current_idx)
         if idx is None or img is None:

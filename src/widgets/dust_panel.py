@@ -224,7 +224,9 @@ class DustRemovalPanel(QWidget):
             "Click or drag over dust to remove it. Ctrl+wheel resizes the "
             "brush.\n"
             "With heal sources shown: right-drag a stroke to move it (it "
-            "keeps sampling the same patch); double right-click deletes it.")
+            "keeps sampling the same patch); right-drag a source ring to "
+            "re-pick where it samples; double right-click deletes the "
+            "stroke.")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(hint)
