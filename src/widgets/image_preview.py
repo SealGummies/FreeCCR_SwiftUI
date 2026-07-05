@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QToolBar, QMessageBox, QSlider, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsPathItem, QGraphicsEllipseItem,
-    QGraphicsLineItem, QStyleOptionSlider, QDialog,
+    QGraphicsLineItem, QGraphicsPolygonItem, QStyleOptionSlider, QDialog,
     QLabel, QPushButton, QStyle, QSizePolicy, QApplication, QComboBox
 )
 from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QPainter,
@@ -1346,6 +1346,9 @@ class ImagePreview(QWidget):
         if self.slice_mode:
             self._set_slice_ghost(None)
             self._draw_slice_dim()
+        # Dust source markers are sized from the view scale too.
+        if self.dust_mode:
+            self._draw_dust_debug()
             if self._slice_lines:
                 self._redraw_slice_lines()
 
@@ -1654,6 +1657,8 @@ class ImagePreview(QWidget):
             self._draw_crop_overlay()  # handle sizes track the view scale
         if self.area_mode:
             self._draw_area_overlay()  # area handle sizes track the view scale too
+        if self.dust_mode:
+            self._draw_dust_debug()  # source markers track the view scale too
 
     def zoom_to_percent(self, pct):
         """Zoom to an absolute percentage of the source's ACTUAL size (1.0 =
@@ -2644,11 +2649,15 @@ class ImagePreview(QWidget):
         if cached is None or cached[0] != repr(spots):
             return None
         w, h = size
+        # Hit radius matches the drawn reticle: a constant SCREEN size, so
+        # divide by the view scale to get scene/full-frame pixels — capped,
+        # or a degenerate scale would let the marker swallow every click.
+        hit = min(24.0, 10.0 / max(self._view_scale() or 0.0, 1e-6))
         for i, rec in enumerate(cached[1]):
             if rec[2] is None:
                 continue
             sx, sy = rec[1] + rec[2][1], rec[0] + rec[2][0]
-            if math.hypot((n[0] - sx) * w, (n[1] - sy) * h) <= 9.0:
+            if math.hypot((n[0] - sx) * w, (n[1] - sy) * h) <= hit:
                 return i
         return None
 
@@ -2924,44 +2933,76 @@ class ImagePreview(QWidget):
                 pt = to_display.map(pt)
             return t.map(pt)
 
-        def add(item, color, width=1.5):
-            pen = QPen(color, width)
-            pen.setCosmetic(True)  # constant screen width at any zoom
-            item.setPen(pen)
+        # Marker geometry holds a constant SCREEN size (divided by the view
+        # scale, and redrawn on zoom); pen widths are cosmetic already.
+        vs = max(self._view_scale() or 0.0, 1e-6)
+
+        def px(v):
+            return v / vs
+
+        def pen(color, width, dash=None):
+            p = QPen(color, width)
+            p.setCosmetic(True)
+            p.setCapStyle(Qt.RoundCap)
+            p.setJoinStyle(Qt.RoundJoin)
+            if dash:
+                p.setDashPattern(dash)
+            return p
+
+        def add(item, p, brush=None):
+            item.setPen(p)
+            item.setBrush(brush if brush is not None else Qt.NoBrush)
             self.scene.addItem(item)
             self._dust_debug_items.append(item)
 
-        yellow = QColor(255, 220, 60, 230)   # stroke borders
-        green = QColor(80, 255, 140, 230)    # sampled patch + arrow
-        orange = QColor(255, 150, 40, 230)   # diffusion fallback marker
+        def ellipse(c, r):
+            return QGraphicsEllipseItem(c.x() - r, c.y() - r, 2 * r, 2 * r)
+
+        halo = QColor(12, 16, 20, 150)       # soft dark underlay: everything
+        amber = QColor(255, 200, 80, 235)    # stroke borders (marquee)
+        mint = QColor(105, 232, 165, 245)    # sampled patch + arrow
+        orange = QColor(255, 156, 66, 245)   # diffusion fallback marker
         for poly in geo["borders"]:
             path = QPainterPath()
             path.moveTo(scene_pt(*poly[0]))
             for p in poly[1:]:
                 path.lineTo(scene_pt(*p))
             path.closeSubpath()
-            item = QGraphicsPathItem(path)
-            item.setBrush(Qt.NoBrush)
-            add(item, yellow)
+            add(QGraphicsPathItem(path), pen(halo, 3.4))
+            add(QGraphicsPathItem(path), pen(amber, 1.4, [5.0, 4.0]))
         for sx, sy, dx, dy in geo["arrows"]:
             p1, p2 = scene_pt(sx, sy), scene_pt(dx, dy)
-            add(QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y()), green)
-            r = 6.0
-            e = QGraphicsEllipseItem(p1.x() - r, p1.y() - r, 2 * r, 2 * r)
-            e.setBrush(Qt.NoBrush)
-            add(e, green)
-            ang = math.atan2(p2.y() - p1.y(), p2.x() - p1.x())
-            for da in (math.pi * 5 / 6, -math.pi * 5 / 6):  # arrowhead barbs
-                add(QGraphicsLineItem(
-                    p2.x(), p2.y(),
-                    p2.x() + 9.0 * math.cos(ang + da),
-                    p2.y() + 9.0 * math.sin(ang + da)), green)
+            r_ring, head = px(7.0), px(10.0)
+            vx, vy = p2.x() - p1.x(), p2.y() - p1.y()
+            length = math.hypot(vx, vy)
+            if length > r_ring + head:
+                # Shaft from the reticle's rim to the arrowhead's base.
+                ux, uy = vx / length, vy / length
+                shaft = QPainterPath(
+                    QPointF(p1.x() + ux * r_ring, p1.y() + uy * r_ring))
+                shaft.lineTo(QPointF(p2.x() - ux * head * 0.7,
+                                     p2.y() - uy * head * 0.7))
+                add(QGraphicsPathItem(shaft), pen(halo, 3.4))
+                add(QGraphicsPathItem(shaft), pen(mint, 1.6))
+                ang = math.atan2(vy, vx)
+                tri = QPolygonF([
+                    p2,
+                    QPointF(p2.x() - head * math.cos(ang - 0.42),
+                            p2.y() - head * math.sin(ang - 0.42)),
+                    QPointF(p2.x() - head * math.cos(ang + 0.42),
+                            p2.y() - head * math.sin(ang + 0.42))])
+                add(QGraphicsPolygonItem(tri), pen(halo, 1.6), QBrush(mint))
+            # Source reticle: halo ring, mint ring with a faint fill, dot.
+            add(ellipse(p1, r_ring), pen(halo, 3.4))
+            fill = QColor(mint)
+            fill.setAlpha(34)
+            add(ellipse(p1, r_ring), pen(mint, 1.6), QBrush(fill))
+            add(ellipse(p1, px(1.5)), pen(mint, 1.0), QBrush(mint))
         for x, y in geo["fallbacks"]:
             p = scene_pt(x, y)
-            r = 7.0
-            e = QGraphicsEllipseItem(p.x() - r, p.y() - r, 2 * r, 2 * r)
-            e.setBrush(Qt.NoBrush)
-            add(e, orange, 2.0)
+            add(ellipse(p, px(8.0)), pen(halo, 3.4))
+            add(ellipse(p, px(8.0)), pen(orange, 1.6, [3.0, 2.6]))
+            add(ellipse(p, px(1.5)), pen(orange, 1.0), QBrush(orange))
 
     def _draw_dust_stroke(self):
         """Draw/refresh the live red overlay for the in-progress stroke.
