@@ -70,12 +70,11 @@ class CCRBackend:
         # (hue-preserving). Global display mode, persisted by MainWindow. See
         # spec/gamma-luminance-mode.md.
         self.gamma_luminance: bool = False
-        # Auto white balance: when True (default), a fresh conversion writes
-        # AWB-estimated temperature/tint into the image's sliders — only when
-        # neither is already set. The algorithm id selects the estimator
-        # (core/awb.py). Global, persisted by MainWindow. See
-        # spec/auto-white-balance.md.
-        self.auto_awb: bool = True
+        # Auto white balance: when True, a fresh conversion writes AWB-estimated
+        # temperature/tint into the image's sliders — only when neither is
+        # already set. The algorithm id selects the estimator (core/awb.py).
+        # Global, persisted by MainWindow. See spec/auto-white-balance.md.
+        self.auto_awb: bool = False
         self.awb_algorithm: str = "gray_world"
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
