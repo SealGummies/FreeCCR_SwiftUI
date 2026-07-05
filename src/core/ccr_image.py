@@ -15,6 +15,7 @@ from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 apply_gamma_curve, apply_cineon_to_rec709,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal, DUST_FEATHER_DEFAULT,
+                                _DUST_PLAN_LONG,
                                 _apply_working_space_recovery,
                                 compute_auto_gain_offset)
 from core import color_management
@@ -194,6 +195,10 @@ class CCRImage:
         # (user-set via the dust panel's Feather slider; render parameter,
         # deliberately NOT in undo snapshots — like brush size).
         self.dust_feather: float = DUST_FEATHER_DEFAULT
+        # (spots_key, plan) captured from the last PREVIEW-scale heal, replayed
+        # by hi-res/export renders so they sample exactly the patches shown on
+        # screen. Session cache only — rebuilt by the next preview render.
+        self._dust_plan_cache = None
         # Which layer the adjustment panel currently edits: None = global
         # (whole image); otherwise the id of an area in area_layers. Session
         # state only — never persisted; always defaults to global on load.
@@ -917,14 +922,29 @@ class CCRImage:
     def _apply_dust_removal(self, image: np.ndarray) -> np.ndarray:
         """Inpaint stored dust spots out of the working image (no-op when there
         are none). Spots are normalized, so this scales to whatever resolution
-        is being processed — preview, hi-res zoom, or full-res export. See
-        spec/dust-removal.md."""
+        is being processed — preview, hi-res zoom, or full-res export.
+
+        WYSIWYG plan sharing: a preview-scale heal caches its plan (segments +
+        chosen source patches) keyed by the spots' content; hi-res and export
+        renders replay THAT plan, so they sample exactly the patches the user
+        approved on screen — a fresh plan from the export's own re-decoded
+        pixels can flip near-tie source choices. Feather is excluded from the
+        key (it shapes the blend, not the plan). See spec/dust-removal.md."""
         spots = getattr(self, "dust_spots", None)
         if not spots:
             return image
-        return apply_dust_removal(
-            image, spots,
-            feather=getattr(self, "dust_feather", DUST_FEATHER_DEFAULT))
+        feather = getattr(self, "dust_feather", DUST_FEATHER_DEFAULT)
+        key = repr(spots)
+        h, w = image.shape[:2]
+        if max(h, w) <= _DUST_PLAN_LONG:
+            plan_out = []
+            out = apply_dust_removal(image, spots, feather=feather,
+                                     collect_plan=plan_out)
+            self._dust_plan_cache = (key, plan_out)
+            return out
+        cached = getattr(self, "_dust_plan_cache", None)
+        plan = cached[1] if (cached is not None and cached[0] == key) else None
+        return apply_dust_removal(image, spots, feather=feather, plan=plan)
 
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,

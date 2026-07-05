@@ -628,6 +628,58 @@ class TestResolutionConsistency:
         # And pixels away from the mask are bit-for-bit untouched.
         assert np.array_equal(healed[:100, :100], big[:100, :100])
 
+    @staticmethod
+    def _bare_image(spots):
+        """CCRImage skeleton carrying only what _apply_dust_removal reads —
+        no file decode, so the plan-cache plumbing is tested hermetically."""
+        img = CCRImage.__new__(CCRImage)
+        img.dust_spots = spots
+        img.dust_feather = 0.003
+        img._dust_plan_cache = None
+        return img
+
+    def test_image_render_replays_the_preview_plan(self):
+        """A preview-scale heal caches its plan; larger renders (hi-res,
+        export) must sample what THAT plan says — not a fresh self-plan from
+        their own re-decoded pixels (near-tie source flips = "it sampled
+        different spots than the preview")."""
+        big = self._scene()
+        small = cv2.resize(big, (1080, 720), interpolation=cv2.INTER_AREA)
+        img = self._bare_image(list(self.SPOTS))
+
+        img._apply_dust_removal(small)                # preview render
+        key, plan = img._dust_plan_cache
+        assert key == repr(img.dust_spots)
+        assert any(off is not None for _, _, off in plan)
+
+        out_cached = img._apply_dust_removal(big)     # export render
+        # Tamper with the cached plan (shift the source offsets): the export
+        # output must follow the cache — proof it replays the preview's plan
+        # rather than planning for itself.
+        img._dust_plan_cache = (key, [
+            (cy, cx, None if off is None else (off[0] + 0.02, off[1]))
+            for cy, cx, off in plan])
+        out_tampered = img._apply_dust_removal(big)
+        assert not np.array_equal(out_cached, out_tampered)
+
+        # A stale key (spots changed since the cached preview) self-plans.
+        img.dust_spots = img.dust_spots + [
+            {"kind": "brush", "pts": [[0.2, 0.85]], "r": 0.004}]
+        out_stale = img._apply_dust_removal(big)
+        assert out_stale.shape == big.shape
+
+    def test_explicit_plan_drives_the_sources(self):
+        big = self._scene()
+        small = cv2.resize(big, (1080, 720), interpolation=cv2.INTER_AREA)
+        plan = []
+        apply_dust_removal(small, self.SPOTS, collect_plan=plan)
+        assert plan
+        # Replaying the collected plan reproduces the self-planned result
+        # (the self-plan derives from the same content here).
+        a = apply_dust_removal(big, self.SPOTS, plan=plan)
+        b = apply_dust_removal(big, self.SPOTS)
+        assert np.array_equal(a, b)
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

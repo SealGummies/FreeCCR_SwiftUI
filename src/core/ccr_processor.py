@@ -3363,10 +3363,25 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     if src_off is not None:
         # Resolution-stable replay: reuse the offset the plan chose at the
         # canonical scale instead of re-searching on this buffer's pixels.
-        src = _source_at(int(src_off[0]), int(src_off[1]))
-        if src is not None:
-            best_src = src
-            best_off = (int(src_off[0]), int(src_off[1]))
+        # If scaling rounded the offset onto dust or out of bounds, rescue
+        # with the nearest clean offset (Chebyshev spiral, <= 4 px) — still
+        # essentially the SAME source patch. Only when that fails too does
+        # the local search run below (it may pick a visibly different patch,
+        # so it is the last resort).
+        base_dy, base_dx = int(src_off[0]), int(src_off[1])
+        for rad in range(0, 5):
+            ring_offs = [(jy, jx)
+                         for jy in range(-rad, rad + 1)
+                         for jx in range(-rad, rad + 1)
+                         if max(abs(jy), abs(jx)) == rad]
+            for jy, jx in ring_offs:
+                src = _source_at(base_dy + jy, base_dx + jx)
+                if src is not None:
+                    best_src = src
+                    best_off = (base_dy + jy, base_dx + jx)
+                    break
+            if best_src is not None:
+                break
     if best_src is None:
         # Candidate source offsets: rings of directions at thickness-scaled
         # distances. The integral-image check rejects any source that touches
@@ -3447,7 +3462,8 @@ def _nearest_plan_record(plan, cyn, cxn, tol=0.06):
 
 
 def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
-                       feather: float = DUST_FEATHER_DEFAULT) -> np.ndarray:
+                       feather: float = DUST_FEATHER_DEFAULT,
+                       plan=None, collect_plan=None) -> np.ndarray:
     """Heal the dust spots out of a 16-bit RGB image, non-destructively.
 
     `feather` is the edge fade width as a fraction of image width (the user's
@@ -3476,23 +3492,32 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     is content-adaptive, so re-deriving it independently per resolution
     picked visibly different fills at the 1080px preview vs the full-res
     export ("the preview and the final don't look the same"). Buffers larger
-    than the canonical scale therefore plan on an INTER_AREA downscale at
-    _DUST_PLAN_LONG (matching the preview) and replay that plan with all
-    geometry scaled: same segments, same source patches, same fallbacks —
-    the export heals with the same structure the user approved on screen.
+    than the canonical scale therefore replay a plan computed at
+    _DUST_PLAN_LONG (matching the preview) with all geometry scaled: same
+    segments, same source patches, same fallbacks — the export heals with
+    the same structure the user approved on screen.
+
+    `collect_plan` (a list): on a canonical-scale buffer, receives that
+    heal's plan records — CCRImage caches the PREVIEW render's plan this way.
+    `plan`: replay the given plan instead of self-planning on a downscale,
+    so exports/hi-res sample exactly the patches the on-screen preview did
+    (self-planning re-decodes/resizes and near-tie source choices can flip
+    on real content). Ignored on canonical-scale buffers.
     """
     if not spots:
         return img16
     h, w = img16.shape[:2]
     long_side = max(h, w)
     if long_side <= _DUST_PLAN_LONG:
-        return _heal_impl(img16, spots, inpaint_radius, feather)
+        return _heal_impl(img16, spots, inpaint_radius, feather,
+                          collect=collect_plan)
     scale = long_side / float(_DUST_PLAN_LONG)
-    pw = max(2, int(round(w / scale)))
-    ph = max(2, int(round(h / scale)))
-    small = cv2.resize(img16, (pw, ph), interpolation=cv2.INTER_AREA)
-    plan = []
-    _heal_impl(small, spots, inpaint_radius, feather, collect=plan)
+    if plan is None:
+        pw = max(2, int(round(w / scale)))
+        ph = max(2, int(round(h / scale)))
+        small = cv2.resize(img16, (pw, ph), interpolation=cv2.INTER_AREA)
+        plan = []
+        _heal_impl(small, spots, inpaint_radius, feather, collect=plan)
     return _heal_impl(img16, spots, inpaint_radius, feather,
                       plan=plan, scale_up=scale)
 

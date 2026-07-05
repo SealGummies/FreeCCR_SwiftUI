@@ -370,10 +370,19 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      different patches than the preview the user approved ("the preview and
      the final don't look the same"). Buffers at or below the canonical
      scale (the preview itself, thumbnails, the detect source) plan on
-     themselves — their behavior is unchanged. A replayed offset that no
-     longer lands on a clean window (mask-raster rounding — rare) falls back
-     to the local search for that segment; the tone membrane and feather
-     composite always run natively, so fills stay 16-bit sharp.
+     themselves — their behavior is unchanged.
+     **The preview's plan is the source of truth**: `CCRImage`'s preview
+     render caches its plan (`_dust_plan_cache`, keyed by the spots'
+     content; feather excluded — it shapes the blend, not the plan), and
+     hi-res/export renders replay THAT plan via `apply_dust_removal(plan=)`
+     — a fresh plan from the export's own re-decoded/downscaled pixels can
+     still flip near-tie source choices ("it sampled different spots than
+     the preview"). A replayed offset that lands on dust or out of bounds
+     after scaling (mask-raster rounding — rare) is rescued by the nearest
+     clean offset within a ≤4 px Chebyshev spiral (essentially the same
+     patch); only if that fails does the local search run. The tone
+     membrane and feather composite always run natively, so fills stay
+     16-bit sharp.
   - Identity fast-path: empty `spots` or all-zero mask → return `img16` unchanged.
   - Returns a new `uint16` RGB array; `img16` is never mutated (non-destructive).
   - Residual preview↔export differences are grain/resampling plus a ≤1 px rim
