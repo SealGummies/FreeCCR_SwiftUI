@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
 
 from core import dust_detect
+from core.ccr_processor import DUST_FEATHER_DEFAULT
 from ui import theme
 
 # Brush radius limits as a fraction of image width (the canvas clamps to the
@@ -186,18 +187,20 @@ class DustRemovalPanel(QWidget):
         brush_row.addWidget(self.brush_value)
         layout.addLayout(brush_row)
 
-        # Edge feather: per-image render parameter (fraction of image width)
-        # applied to ALL of the image's spots — manual and AI — live.
+        # Edge feather: per-image render parameter (fraction of each spot's
+        # own radius, so the fade scales with the brush) applied to ALL of
+        # the image's spots — manual and AI — live.
         feather_row = QHBoxLayout()
         feather_row.setSpacing(theme.GAP_TIGHT)
         feather_lbl = QLabel("Feather")
         feather_lbl.setFixedWidth(theme.LABEL_COL_W)
         self.feather_slider = QSlider(Qt.Horizontal)
-        self.feather_slider.setMinimum(0)    # f = value/10000 -> 0 .. 1.0% width
+        self.feather_slider.setMinimum(0)    # f = value/100 -> 0 .. 100% of radius
         self.feather_slider.setMaximum(100)
-        self.feather_slider.setValue(30)     # 0.30% default
+        self.feather_slider.setValue(
+            int(round(DUST_FEATHER_DEFAULT * 100)))
         self.feather_slider.setFixedHeight(theme.CONTROL_H)
-        self.feather_value = QLabel("0.30%")
+        self.feather_value = QLabel(f"{DUST_FEATHER_DEFAULT * 100:.0f}%")
         self.feather_value.setFixedWidth(theme.VALUE_COL_W)
         self.feather_slider.valueChanged.connect(self._on_feather_changed)
         feather_row.addWidget(feather_lbl)
@@ -316,11 +319,12 @@ class DustRemovalPanel(QWidget):
         self.image_preview.set_dust_brush_size(
             slider_to_brush_r(self.brush_slider.value()))
         # Reflect this image's feather without re-triggering a re-render.
-        f = getattr(img, "dust_feather", 0.003) if img is not None else 0.003
+        f = (getattr(img, "dust_feather", DUST_FEATHER_DEFAULT)
+             if img is not None else DUST_FEATHER_DEFAULT)
         self.feather_slider.blockSignals(True)
-        self.feather_slider.setValue(int(round(f * 10000)))
+        self.feather_slider.setValue(int(round(f * 100)))
         self.feather_slider.blockSignals(False)
-        self.feather_value.setText(f"{f * 100.0:.2f}%")
+        self.feather_value.setText(f"{f * 100.0:.0f}%")
         self._refresh_ai_section()
         self.status_label.setText("")
 
@@ -341,7 +345,7 @@ class DustRemovalPanel(QWidget):
         self.image_preview.set_dust_brush_size(r)
 
     def _on_feather_changed(self, value):
-        self.feather_value.setText(f"{value / 100.0:.2f}%")
+        self.feather_value.setText(f"{value}%")
         self._feather_timer.start()
 
     def _apply_feather(self):
@@ -350,7 +354,7 @@ class DustRemovalPanel(QWidget):
         img = self._current_image()
         if img is None:
             return
-        f = self.feather_slider.value() / 10000.0
+        f = self.feather_slider.value() / 100.0
         if abs(getattr(img, "dust_feather", -1.0) - f) < 1e-9:
             return
         img.dust_feather = f

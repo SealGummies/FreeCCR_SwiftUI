@@ -191,9 +191,10 @@ class CCRImage:
         # time (resolution-independent). [] = no dust removal. See
         # spec/dust-removal.md.
         self.dust_spots: List[Dict[str, Any]] = []
-        # Edge fade width for the dust heal, as a fraction of image width
-        # (user-set via the dust panel's Feather slider; render parameter,
-        # deliberately NOT in undo snapshots — like brush size).
+        # Edge fade width for the dust heal, as a fraction of each hole's own
+        # half-thickness so it scales with the brush (user-set via the dust
+        # panel's Feather slider; render parameter, deliberately NOT in undo
+        # snapshots — like brush size).
         self.dust_feather: float = DUST_FEATHER_DEFAULT
         # (spots_key, plan) captured from the last PREVIEW-scale heal, replayed
         # by hi-res/export renders so they sample exactly the patches shown on

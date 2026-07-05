@@ -160,7 +160,10 @@ def serialize_image(img) -> dict:
         "adjustment_settings": dict(img.adjustment_settings),
         "areas": _areas_to_json(getattr(img, "area_layers", None)),
         "dust_spots": copy.deepcopy(getattr(img, "dust_spots", None) or []),
-        "dust_feather": float(getattr(img, "dust_feather", 0.003)),
+        # Feather as a fraction of each hole's own radius. Written under a NEW
+        # key: the legacy "dust_feather" key held a fraction of image width
+        # (0..0.01) and is only ever read back (migrated), never written.
+        "dust_feather_r": float(getattr(img, "dust_feather", 0.25)),
         "color_profile": getattr(img, "color_profile", "color"),
         "crop_rect": list(img.crop_rect) if img.crop_rect else None,
         "crop_angle": float(img.crop_angle or 0.0),
@@ -381,7 +384,14 @@ def _restore_image(file_path: str, state: dict):
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
     img.dust_spots = copy.deepcopy(state.get("dust_spots") or [])
-    img.dust_feather = float(state.get("dust_feather", 0.003))
+    if "dust_feather_r" in state:
+        img.dust_feather = float(state["dust_feather_r"])
+    elif "dust_feather" in state:
+        # Legacy width-fraction feather (slider 0..100 -> 0..1% of image
+        # width): map the old slider position onto today's radius-fraction
+        # scale (0..100 -> 0..100% of radius) so the user's relative setting
+        # survives. Neither key present -> CCRImage's default stands.
+        img.dust_feather = min(1.0, float(state["dust_feather"]) * 100.0)
     img.color_profile = state.get("color_profile", "color")
     ref = state.get("reference_frame")
     img.reference_frame = tuple(ref) if ref else None

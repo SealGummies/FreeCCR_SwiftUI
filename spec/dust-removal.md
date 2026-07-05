@@ -92,13 +92,18 @@ in the catalog, and undoable.
      specks get fine steps (0.05% ≈ 3 px radius on a 6000 px scan) while big
      scratch-covering sizes stay reachable; the label shows the size as a % of
      image width. The canvas Ctrl+wheel resize clamps to the same range.
-   - **Feather** slider (0–1.0% of image width, default 0.30%): the edge fade
-     width of every heal on the image — manual and AI spots alike. A
-     per-image render parameter stored as `CCRImage.dust_feather`; changes
-     re-heal live (debounced ~200 ms), persist in the catalog, and are NOT
-     part of undo snapshots (like brush size). Defect-like pixels are always
-     fully filled regardless of the feather (§5.2 step 6), so a wide fade
-     cannot blend the defect back in.
+   - **Feather** slider (0–100% of each spot's own radius, default 25%): the
+     edge fade width of every heal on the image — manual and AI spots alike.
+     Radius-relative, so the fade **grows with the brush size** — a big
+     scratch patch fades over a proportionally wide rim while a tiny speck
+     stays tight. A per-image render parameter stored as
+     `CCRImage.dust_feather`; changes re-heal live (debounced ~200 ms),
+     persist in the catalog, and are NOT part of undo snapshots (like brush
+     size). Defect-like pixels are always fully filled regardless of the
+     feather (§5.2 step 6), so a wide fade cannot blend the defect back in —
+     which also means the fade only shows on the clean rim between the defect
+     and the brush edge (a tight trace heals hard by design; brush generously
+     to get a soft blend).
    - Hint: "Click or drag over dust to remove it."
    - **Undo last spot** button and **Clear all** button.
 3. Separator.
@@ -203,12 +208,13 @@ a polyline):
   from the component's extent.
 - Empty list = "no dust removal"; the render fast-path leaves the image
   untouched (§5.2).
-- Alongside the spots, `CCRImage.dust_feather` (float, fraction of image
-  width, default 0.003) holds the image's heal edge-fade width — one value
-  for all spots, set by the panel's Feather slider, serialized in the catalog
-  (`dust_feather`, missing key → default), excluded from undo snapshots, and
-  part of the hi-res `dust_sig` so a feather change invalidates cached
-  renders.
+- Alongside the spots, `CCRImage.dust_feather` (float, fraction of each
+  hole's own half-thickness, 0..1, default 0.25) holds the image's heal
+  edge-fade width — one value for all spots, set by the panel's Feather
+  slider, serialized in the catalog under `dust_feather_r` (missing key →
+  legacy width-fraction `dust_feather` migrated by slider position ×100,
+  else default), excluded from undo snapshots, and part of the hi-res
+  `dust_sig` so a feather change invalidates cached renders.
 
 Rationale: mirrors openenlarge's normalized `DustStroke` model, serializes
 cleanly to JSON, deep-copies cleanly for undo, and is fully resolution
@@ -354,14 +360,16 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      scattered, and the full-frame float blend then dominates the heal —
      ~0.9 s at 6000 px; components never touch, so per-component alpha is
      exactly the global answer). The ramp width is the image's **Feather**
-     setting (`dust_feather`, a fraction of image width — default 0.3%, so
-     it covers the same image fraction at preview and export), capped per
-     hole by its depth so the core still reaches full fill. **Defect-like hole pixels** (colored like the estimated defect)
-     are force-filled at alpha 1 regardless of the ramp (`dlike`, with a
-     light blurred lip), so a wide feather can never blend the defect back
-     in — the soft fade only happens across clean rim pixels. Outside the
-     mask alpha is exactly 0 — away from any spot `out == img16`
-     bit-for-bit.
+     setting (`dust_feather`) as a fraction of **each hole's own depth**
+     (its half-thickness) — the fade scales with the brush size, and with
+     resolution, since the rasterized hole does — capped by that depth so
+     the core still reaches full fill. **Defect-like hole pixels** (colored
+     like the estimated defect) are force-filled at alpha 1 regardless of
+     the ramp (`dlike`, with a blurred lip as wide as the component's ramp,
+     confined to the component so it can't bleed into a neighboring hole's
+     blend), so a wide feather can never blend the defect back in — the
+     soft fade only happens across clean rim pixels. Outside the mask alpha
+     is exactly 0 — away from any spot `out == img16` bit-for-bit.
   7. **Resolution-stable plan**: the heal's content-adaptive decisions —
      stroke segmentation, each segment's chosen source offset, and the
      diffusion-fallback verdicts — are computed ONCE at the canonical

@@ -28,7 +28,7 @@ import cv2  # noqa: E402
 from core import catalog, dust_detect  # noqa: E402
 from core.ccr_image import CCRImage  # noqa: E402
 from core.ccr_processor import (apply_dust_removal,  # noqa: E402
-                                rasterize_dust_mask)
+                                rasterize_dust_mask, DUST_FEATHER_DEFAULT)
 
 
 def _flat_with_speck(h=100, w=100, base=30000, speck=60000, cx=50, cy=50, r=4):
@@ -180,13 +180,14 @@ class TestApplyDustRemoval:
         # The user Feather setting widens the fill's cross-fade: with a wide
         # feather the hole's clean rim stays close to the ORIGINAL pixels
         # (low alpha), with feather 0 the rim is the clone (hard edge).
+        # feather is a fraction of the hole's own radius (1.0 = full depth).
         rng = np.random.default_rng(5)
         img = np.clip(rng.normal(30000, 2000, (200, 200, 3)), 0,
                       65535).astype(np.uint16)
         cv2.circle(img, (100, 100), 6, (60000, 60000, 60000), -1)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}  # mask r=16
         hard = apply_dust_removal(img, [spot], feather=0.0)
-        soft = apply_dust_removal(img, [spot], feather=0.08)
+        soft = apply_dust_removal(img, [spot], feather=1.0)
         yy, xx = np.mgrid[0:200, 0:200]
         rim = (np.hypot(yy - 100, xx - 100) > 13.5) & \
               (np.hypot(yy - 100, xx - 100) < 15.5)
@@ -197,15 +198,46 @@ class TestApplyDustRemoval:
         assert int(hard[100, 100, 0]) < 40000
         assert int(soft[100, 100, 0]) < 40000
 
+    def test_feather_ramp_scales_with_brush_size(self):
+        # The feather is a fraction of the hole's own radius: at the SAME
+        # setting, ~6 px inside the boundary is still soft rim for a big
+        # brush but near-full fill for a small one. A fixed-width ramp (the
+        # old fraction-of-image-width feather) would give the same alpha at
+        # the same absolute inset for both sizes.
+        rng = np.random.default_rng(11)
+        base = np.clip(rng.normal(30000, 3000, (300, 300, 3)), 0,
+                       65535).astype(np.uint16)
+
+        def rim_ratio(r_norm):
+            r_px = r_norm * 300
+            img = base.copy()
+            cv2.circle(img, (150, 150), max(3, int(r_px / 4)),
+                       (60000, 60000, 60000), -1)
+            spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": r_norm}
+            hard = apply_dust_removal(img, [spot], feather=0.0)
+            soft = apply_dust_removal(img, [spot], feather=0.75)
+            yy, xx = np.mgrid[0:300, 0:300]
+            d = np.hypot(yy - 150, xx - 150)
+            probe = (d > r_px - 7) & (d < r_px - 5)  # ~6 px inside the rim
+            d_hard = np.abs(hard[probe].astype(np.float32)
+                            - img[probe]).mean()
+            d_soft = np.abs(soft[probe].astype(np.float32)
+                            - img[probe]).mean()
+            return float(d_soft) / max(float(d_hard), 1e-6)
+
+        assert rim_ratio(0.12) < 0.5   # big brush: 6 px in is still soft rim
+        assert rim_ratio(0.04) > 0.5   # small brush: 6 px in is nearly core
+
     def test_wide_feather_never_blends_defect_back(self):
         # Defect-like pixels are force-filled whatever the feather: a tight
-        # hair trace with a huge feather must still remove the hair.
+        # hair trace with the feather at its maximum must still remove the
+        # hair.
         sky = np.array([20000, 25000, 40000], np.float32)
         img = np.broadcast_to(sky.astype(np.uint16), (200, 200, 3)).copy()
         cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
         spot = {"kind": "brush",
                 "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 2.0 / 200}
-        out = apply_dust_removal(img, [spot], feather=0.02)
+        out = apply_dust_removal(img, [spot], feather=1.0)
         core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
         assert float(np.abs(core.mean(axis=0) - sky).max()) < 5000
 
@@ -383,15 +415,21 @@ class TestPersistence:
         path = _scan_png(tmp_path)
         img = CCRImage(path)
         img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.01}]
-        img.dust_feather = 0.007
+        img.dust_feather = 0.7
         catalog.update_for_images([img], path=cat)
         restored = catalog.create_images_for_path(path, path=cat)
-        assert abs(restored[0].dust_feather - 0.007) < 1e-9
+        assert abs(restored[0].dust_feather - 0.7) < 1e-9
         # Pre-feature catalog entries restore to the default.
         state = catalog.serialize_image(img)
-        del state["dust_feather"]
+        del state["dust_feather_r"]
         old = catalog._restore_image(path, state)
-        assert abs(old.dust_feather - 0.003) < 1e-9
+        assert abs(old.dust_feather - DUST_FEATHER_DEFAULT) < 1e-9
+        # Legacy width-fraction entries (old "dust_feather" key, 0..1% of
+        # width) migrate by slider position onto the radius-fraction scale:
+        # 0.30% of width -> 30% of radius.
+        state["dust_feather"] = 0.003
+        legacy = catalog._restore_image(path, state)
+        assert abs(legacy.dust_feather - 0.3) < 1e-9
 
 
 # --- Undo -------------------------------------------------------------------
@@ -497,7 +535,7 @@ class TestPanelWiring:
         from core.ccr_backend import ccr_backend
 
         class _Img:
-            dust_feather = 0.003
+            dust_feather = 0.25
             dust_spots = []
 
         img = _Img()
@@ -508,9 +546,9 @@ class TestPanelWiring:
             prev.current_idx = 0
             panel = DustRemovalPanel(_StubMain(), prev)
             panel.feather_slider.setValue(60)  # emits valueChanged
-            assert panel.feather_value.text() == "0.60%"
+            assert panel.feather_value.text() == "60%"
             panel._apply_feather()             # bypass the debounce timer
-            assert abs(img.dust_feather - 0.006) < 1e-9
+            assert abs(img.dust_feather - 0.6) < 1e-9
         finally:
             ccr_backend.images = saved
 
@@ -634,7 +672,7 @@ class TestResolutionConsistency:
         no file decode, so the plan-cache plumbing is tested hermetically."""
         img = CCRImage.__new__(CCRImage)
         img.dust_spots = spots
-        img.dust_feather = 0.003
+        img.dust_feather = 0.25
         img._dust_plan_cache = None
         return img
 
