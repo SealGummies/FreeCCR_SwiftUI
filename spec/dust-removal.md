@@ -326,7 +326,12 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      = clean known pixels at distance `(guard, guard+ring_w]` from the hole
      (`guard` ≥ 2 px, scaled to half the thickness). The gap matters: the
      defect's soft edge leaks past the brushed mask, and pixels hugging the
-     hole are the most likely to be the defect itself.
+     hole are the most likely to be the defect itself. Near-black pixels
+     (`_HEAL_BLACK_FLOOR`, ~3% of white) are dropped from the ring while
+     they are its minority — the film holder / rebate inverts to near-black
+     and is not scene context; letting it anchor tone painted a dark smudge
+     on strokes near the frame edge. (If dark dominates, the stroke really
+     is in dark content and the ring stays.)
   2. **Defect-color rejection**: the defect's color is estimated from the
      hole's own content (a tight stroke's hole IS the defect; a generous
      brush's defect is the hole's outlier mode vs the ring). Ring pixels
@@ -335,13 +340,26 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      hair edge, or the hair's continuation past the stroke's end (which can
      be the ring's *majority*), cannot lift the fill into a bright ghost of
      the stroke. Legit bimodal structure survives (both modes sit far from
-     the defect color).
+     the defect color). **Sanity cap** (`_HEAL_MIN_KEEP_FRAC`): if the
+     rejection would keep < 20% of the ring, the "defect" was estimated as
+     the ring's own majority (a clean generous brush, whose top-quartile
+     estimate collapses onto the background) and whatever survives is some
+     small foreign mode — a black border, a dark roofline — that would
+     become the entire anchor (clean sky strokes healed to solid black,
+     cloned from the border). The estimate is distrusted (`genuine=False`):
+     full ring, no defect force-fill.
   3. **Search**: candidate source windows on `_HEAL_ANGLES` (16) directions ×
      thickness-scaled distances (`2·half_th + pad + 2`, ×1/2/4, plus the
      window diagonal as a last resort). A candidate must be in-bounds and
      fully clean (checked O(1) against `cv2.integral` of the padded mask), so
      a long stroke heals from the clean strip right beside it. Score = SSD
-     between source and destination **kept ring** pixels; best wins.
+     between source and destination **kept ring** pixels — plus, only past a
+     ring-MAD-scaled tolerance, the candidate's interior-tone excess vs the
+     ring background (the ring SSD never looks inside the window: a source
+     whose ring matches but whose hole area holds a black border edge clones
+     the border into the fill; within tolerance the ring SSD alone ranks, an
+     always-on interior term re-ranked near-ties by texture phase and made
+     preview/export tone drift). Best wins.
   4. **Clone + membrane tone correction**: hole pixels are copied from the
      best source, plus a smooth per-channel correction field interpolated
      from the kept-ring differences (normalized Gaussian convolution,
@@ -353,8 +371,12 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
   5. **Fallback**: a patch with no clean in-bounds source window (image
      border, dense dust) or a starved ring (< `_HEAL_MIN_RING_PX`) falls back
      to the old 8-bit `cv2.inpaint(..., inpaint_radius, INPAINT_TELEA)` fill.
-  6. **Feathered composite**: alpha rises 0 → 1 from each hole's boundary
-     inward over a smoothstep ramp (`_feather_alpha`), `out = img16*(1-a) +
+  6. **Feathered composite**: alpha rises ~0 → 1 from each hole's boundary
+     inward over a smoothstep ramp (`_feather_alpha`, evaluated at
+     pixel-center depths `inside − 0.5` with FLOAT ramp widths, so the
+     relative profile is identical at every resolution — an integer ramp
+     with a boundary lift made thin-stroke rims visibly harder at preview
+     than at export), `out = img16*(1-a) +
      filled*a` computed inside each **component's own padded window** (one
      global mask bbox degenerates to nearly the whole frame when spots are
      scattered, and the full-frame float blend then dominates the heal —
@@ -369,23 +391,30 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      confined to the component so it can't bleed into a neighboring hole's
      blend), so a wide feather can never blend the defect back in — the
      soft fade only happens across clean rim pixels. The classification
-     only engages when the estimated defect color is separated from the
-     cleaned ring's median by > `_DLIKE_SEP_MADS` ring-grain MADs, and then
-     marks the hole pixels closer to the defect than to the surround
-     (nearest centroid): a generous brush over mostly-clean content
-     estimates a "defect" that collapses onto the background mode, and
-     thresholding grain against it force-filled a random salt-and-pepper
-     subset of the hole (dithered rims, no rolloff at wide feathers) —
-     gated off, such a brush blends as a pure opacity dome rolling off
-     from the stroke's center. Outside the mask alpha is exactly 0 — away
-     from any spot `out == img16` bit-for-bit.
+     only engages for a `genuine` estimate (step 2) whose defect color is
+     separated from the cleaned ring's median by > `_DLIKE_SEP_MADS`
+     ring-grain MADs **and brighter than the surround** (film dust inverts
+     WHITE; a darker "defect" is content), and then marks the hole pixels
+     closer to the defect than to the surround (nearest centroid): a
+     generous brush over mostly-clean content estimates a "defect" that
+     collapses onto the background mode, and thresholding grain against it
+     force-filled a random salt-and-pepper subset of the hole (dithered
+     rims, no rolloff at wide feathers) — gated off, such a brush blends as
+     a pure opacity dome rolling off from the stroke's center. Outside the
+     mask alpha is exactly 0 — away from any spot `out == img16`
+     bit-for-bit.
   7. **Resolution-stable plan**: the heal's content-adaptive decisions —
-     stroke segmentation, each segment's chosen source offset, and the
-     diffusion-fallback verdicts — are computed ONCE at the canonical
+     stroke segmentation, each segment's chosen source offset, the
+     diffusion-fallback verdicts, and the per-segment `genuine`/`dlike_on`
+     verdicts — are computed ONCE at the canonical
      preview scale (`_DUST_PLAN_LONG` = 1080 long side) and REPLAYED on
      larger buffers with all pixel geometry scaled (segment size, Telea
      radius, offsets normalized over width/height; segments matched by
-     nearest normalized centroid). Re-deriving the plan per resolution let
+     nearest normalized centroid). Per-pixel threshold classifications
+     (holder-black, defect-like) read a luma smoothed to the plan scale
+     (`img16_c`, box = the scale factor; identity on canonical buffers), so
+     full-res grain crosses those thresholds no more often than the
+     preview's area-averaged pixels did. Re-deriving the plan per resolution let
      the SSD argmin flip between scales, so the export healed from visibly
      different patches than the preview the user approved ("the preview and
      the final don't look the same"). Buffers at or below the canonical

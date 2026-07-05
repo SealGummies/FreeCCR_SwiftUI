@@ -161,20 +161,20 @@ class TestApplyDustRemoval:
         assert float(err.max()) < 5000   # fill stays sky-toned along the stroke
 
     def test_feather_alpha_ramps_inward(self):
-        # The fill blends over a smooth inward ramp: 0 at the hole boundary,
-        # 1 in the core, exactly 0 outside the mask; a 1-px feather is an
-        # essentially hard (fully filled) edge for tight traces.
+        # The fill blends over a smooth inward ramp: ~0 at the hole boundary,
+        # 1 in the core, exactly 0 outside the mask; a ramp of 0.5 px (the
+        # feather-0 convention) is a hard, fully filled edge.
         from core.ccr_processor import _feather_alpha
         mask = np.zeros((60, 60), np.uint8)
         cv2.circle(mask, (30, 30), 20, 255, -1)
-        a = _feather_alpha(mask, np.full((60, 60), 8, np.uint8))
+        a = _feather_alpha(mask, np.full((60, 60), 8.0, np.float32))
         assert a[30, 30] == 1.0                    # core fully filled
         assert a[30, 51] == 0.0                    # outside untouched
         edge, mid = a[30, 49], a[30, 45]
         assert 0.0 < edge < 0.35                   # soft start at the rim
         assert edge < mid < 1.0                    # monotone ramp
-        hard = _feather_alpha(mask, np.ones((60, 60), np.uint8))
-        assert hard[30, 49] > 0.9                  # 1px feather ~ hard fill
+        hard = _feather_alpha(mask, np.full((60, 60), 0.5, np.float32))
+        assert hard[30, 49] > 0.9                  # hard fill at the rim
 
     def test_feather_param_softens_rim(self):
         # The user Feather setting widens the fill's cross-fade: with a wide
@@ -263,6 +263,27 @@ class TestApplyDustRemoval:
         out = apply_dust_removal(img, [spot], feather=1.0)
         core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
         assert float(np.abs(core.mean(axis=0) - sky).max()) < 5000
+
+    def test_clean_stroke_near_black_border_stays_sky(self):
+        # THE black-blob artifact: a generous brush over clean sky near the
+        # frame's black holder border. The defect estimate collapses onto
+        # the sky itself, the ring rejection then discarded the whole sky
+        # ring as "leak" and kept the black border as the only matching and
+        # tone anchor — the stroke healed to solid black, cloned from a
+        # window overlapping the border.
+        rng = np.random.default_rng(9)
+        img = np.clip(rng.normal(34000, 2500, (200, 300, 3)), 0,
+                      65535).astype(np.uint16)
+        img[:14] = np.clip(rng.normal(900, 300, (14, 300, 3)), 0, 65535)
+        spot = {"kind": "brush",
+                "pts": [[0.30, 0.22], [0.40, 0.20], [0.50, 0.22]],
+                "r": 0.055}  # ~17 px dabs, ~30 px below the border
+        out = apply_dust_removal(img, [spot], feather=0.25)
+        mask = rasterize_dust_mask([spot], 200, 300) > 0
+        healed = out[mask].astype(np.float32).mean(axis=1)
+        # Nothing near black anywhere in the fill; tone stays sky-like.
+        assert float(np.percentile(healed, 1)) > 20000
+        assert abs(float(healed.mean()) - 34000) < 4000
 
     def test_underscoped_dab_keeps_tone(self):
         # A click smaller than the speck (the small dot ghost): the speck's
@@ -711,15 +732,16 @@ class TestResolutionConsistency:
         img._apply_dust_removal(small)                # preview render
         key, plan = img._dust_plan_cache
         assert key == repr(img.dust_spots)
-        assert any(off is not None for _, _, off in plan)
+        assert any(rec[2] is not None for rec in plan)
 
         out_cached = img._apply_dust_removal(big)     # export render
         # Tamper with the cached plan (shift the source offsets): the export
         # output must follow the cache — proof it replays the preview's plan
         # rather than planning for itself.
         img._dust_plan_cache = (key, [
-            (cy, cx, None if off is None else (off[0] + 0.02, off[1]))
-            for cy, cx, off in plan])
+            rec if rec[2] is None
+            else (rec[0], rec[1], (rec[2][0] + 0.02, rec[2][1])) + rec[3:]
+            for rec in plan])
         out_tampered = img._apply_dust_removal(big)
         assert not np.array_equal(out_cached, out_tampered)
 

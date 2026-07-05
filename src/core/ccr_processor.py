@@ -3242,6 +3242,11 @@ _HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
 _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
 _DLIKE_SEP_MADS = 6.0     # defect-vs-surround separation (in ring-grain MADs)
                           # required before pixels are force-filled as defect
+_HEAL_MIN_KEEP_FRAC = 0.2  # ring share the defect rejection must leave; below
+                           # it the estimate is distrusted (see _heal_patch)
+_HEAL_BLACK_FLOOR = 2000   # ~3% of white: below this a ring pixel reads as
+                           # film holder / rebate, not scene (dust inverts
+                           # bright; the unexposed border inverts to black)
 DUST_FEATHER_DEFAULT = 0.25   # feather ramp width, fraction of each hole's
                               # own half-thickness (its local radius), so the
                               # fade scales with the brush size (user-adjustable
@@ -3254,20 +3259,24 @@ def _box_sum(integ: np.ndarray, y0: int, x0: int, y1: int, x1: int) -> int:
 
 
 def _feather_alpha(mask: np.ndarray, fmap: np.ndarray) -> np.ndarray:
-    """Per-pixel blend alpha for the fill: 0 at each hole's boundary rising to
-    1 over `fmap` px inward (smoothstep ramp); exactly 0 outside the mask.
-    `fmap` holds each hole's feather ramp width in px (1 = essentially hard).
-    The +1 lift keeps a 1-px-feather rim nearly fully filled while wide
-    feathers still start near 0 at the very edge."""
+    """Per-pixel blend alpha for the fill: rises from ~0 at each hole's
+    boundary to 1 over `fmap` px inward (smoothstep ramp); exactly 0 outside
+    the mask. `fmap` holds each hole's feather ramp width in px (float;
+    <= 0.5 = hard fill). Depths are taken at PIXEL CENTERS (inside - 0.5) so
+    the relative alpha profile is resolution-stable: a 1 px ramp at preview
+    scale and its 3 px equivalent at export cover the same fraction of the
+    hole with the same average alpha — an integer ramp with a boundary lift
+    made thin-stroke rims visibly harder at preview than at export."""
     inside = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 3)
-    f = np.maximum(fmap.astype(np.float32), 1.0)
-    return _smoothstep((inside + 1.0) / (f + 1.0)) * (mask > 0)
+    f = np.maximum(fmap.astype(np.float32), 0.5)
+    return _smoothstep((inside - 0.5) / f) * (mask > 0)
 
 
-def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
+def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
+                comp: int, bbox: tuple,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
                 filled: np.ndarray, fmap: np.ndarray, feather: float,
-                dlike: np.ndarray, src_off=None):
+                dlike: np.ndarray, src_off=None, forced_flags=None):
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
 
@@ -3278,14 +3287,24 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     so gradients continue through the patch while its grain is kept verbatim).
     `bbox` = (bx0, by0, bx1, by1) tight bounds of THIS patch's hole pixels;
     `half_th` = the component's half-thickness (max distance transform), its
-    local scale. Writes the healed hole pixels into `filled` and returns the
-    chosen source-window offset `(dy, dx)` (relative to the match window, in
-    this buffer's pixels), or None when no fully clean, in-bounds source
-    window exists (caller falls back to diffusion inpaint for this patch).
+    local scale. Writes the healed hole pixels into `filled` and returns
+    `(offset, genuine, dlike_on)` — the chosen source-window offset
+    `(dy, dx)` (relative to the match window, in this buffer's pixels) plus
+    the patch's content-adaptive verdicts (rejection trusted; defect
+    force-fill engaged), which the plan records so replays reproduce them —
+    or None when no fully clean, in-bounds source window exists (caller
+    falls back to diffusion inpaint for this patch).
     `src_off`: a pre-planned offset to REUSE (the resolution-stable replay,
     see apply_dust_removal); taken verbatim when it still lands on a clean
     in-bounds window, otherwise the normal search runs (plan drift from
-    mask-raster rounding — rare).
+    mask-raster rounding — rare). `forced_flags`: the plan's
+    (genuine, dlike_on) verdicts to reuse instead of re-deriving them from
+    this buffer's pixels (grain statistics shift with resampling, and a
+    flipped verdict is a visible preview/export difference). `img16_c`:
+    img16 smoothed to the PLAN scale (identity on canonical buffers) — all
+    PER-PIXEL threshold classifications (holder-black, defect-like) read it,
+    so full-res grain crosses those thresholds no more often than the
+    preview's area-averaged pixels did.
 
     Everything local is keyed off the thickness, never the bbox: a traced
     hair's bbox can span half the frame while the stroke is a few px wide.
@@ -3321,10 +3340,20 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
         (~hole).astype(np.uint8), cv2.DIST_L2, 3)  # px from the hole
     ring = ((away > guard) & (away <= pad)
             & (mask_pad[wy0:wy1, wx0:wx1] == 0))
-    if int(ring.sum()) < _HEAL_MIN_RING_PX:
-        return None  # boxed in by other spots — no context to match against
 
     dst = img16[wy0:wy1, wx0:wx1].astype(np.float32)
+    dst_c = img16_c[wy0:wy1, wx0:wx1].astype(np.float32)
+    # Film-holder / rebate pixels are not scene context: the unexposed
+    # border inverts to near-black, and letting it into the ring drags the
+    # membrane's tone correction toward black (a dark smudge on strokes
+    # near the frame edge) and pollutes source matching. Drop near-black
+    # pixels while they are the ring's minority; if they dominate, the
+    # stroke really is in dark content and the ring stays.
+    dark = dst_c.mean(axis=2) < _HEAL_BLACK_FLOOR
+    if int((ring & dark).sum()) < 0.5 * int(ring.sum()):
+        ring &= ~dark
+    if int(ring.sum()) < _HEAL_MIN_RING_PX:
+        return None  # boxed in by other spots — no context to match against
 
     # Robust rejection: the defect leaks past the mask into the ring — its
     # soft edge, or its whole continuation past the stroke's end, where it can
@@ -3349,11 +3378,27 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     d_def = np.abs(ring_px - defect).mean(axis=1)
     thr = 0.5 * float(np.percentile(d_def, 95.0))
     keep = d_def >= thr
-    if int(keep.sum()) < _HEAL_MIN_RING_PX:
-        return None
-    ring[:] = False
-    ring[ry[keep], rx[keep]] = True
+    # Sanity cap on the rejection: discarding nearly the whole ring means
+    # the "defect" was estimated as the ring's own MAJORITY — a generous
+    # brush over clean content, where the top-quartile estimate collapses
+    # onto the background. Whatever survives is then some small foreign
+    # mode (a black film-holder border, a dark roofline) that becomes the
+    # ENTIRE matching/tone anchor: clean sky strokes healed to solid black,
+    # cloned from the border. A real defect's leak never crowds out this
+    # much context (even a thick traced hair leaves ~a third of its ring
+    # clean), so distrust the estimate, keep the full ring, and skip the
+    # defect force-fill (`genuine` gates it below).
+    genuine = int(keep.sum()) >= _HEAL_MIN_KEEP_FRAC * keep.size
+    if forced_flags is not None:
+        genuine = bool(forced_flags[0])
+    if genuine:
+        if int(keep.sum()) < _HEAL_MIN_RING_PX:
+            return None
+        ring[:] = False
+        ring[ry[keep], rx[keep]] = True
     dst_ring = dst[ring]
+    ring_bg = np.median(dst_ring, axis=0)
+    ring_mad = float(np.median(np.abs(dst_ring - ring_bg).mean(axis=1)))
 
     def _source_at(dy, dx):
         sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
@@ -3406,6 +3451,19 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
                     continue
                 diff = src[ring] - dst_ring
                 score = float(np.mean(diff * diff))
+                # The ring SSD never looks INSIDE the candidate window: a
+                # source whose ring matches but whose hole area holds
+                # something foreign (a black border edge, an object) clones
+                # that thing into the fill. Penalize interior tone far from
+                # the destination ring's background — but only the EXCESS
+                # past the ring's own variability: within it the ring SSD
+                # alone must rank candidates (an always-on penalty re-ranked
+                # near-ties by interior phase on textured content, growing
+                # the membrane correction and with it the preview/export
+                # tone drift).
+                i_diff = np.median(src[hole], axis=0) - ring_bg
+                tol = (_DLIKE_SEP_MADS * (ring_mad + 1e-3)) ** 2
+                score += max(0.0, float(np.mean(i_diff * i_diff)) - tol)
                 if best_score is None or score < best_score:
                     best_score, best_src, best_off = score, src, (dy, dx)
 
@@ -3440,8 +3498,8 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     # clean rim pixels.
     inside = cv2.distanceTransform(hole.astype(np.uint8), cv2.DIST_L2, 3)
     depth = max(1.0, float(inside.max()))
-    fmap[wy0:wy1, wx0:wx1][hole] = int(
-        max(1.0, min(round(float(feather) * depth), depth)))
+    fmap[wy0:wy1, wx0:wx1][hole] = \
+        max(0.5, min(float(feather) * depth, depth))
     # Mark defect-like pixels ONLY when the estimated defect color is
     # DISTINCT from the clean surround. With a generous brush over mostly
     # clean content the top-quartile "defect" collapses onto the background
@@ -3451,17 +3509,24 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     # defect/surround separation in units of the surround's own grain
     # (median abs deviation of the cleaned ring), then mark the hole pixels
     # CLOSER to the defect color than to the surround (nearest centroid) —
-    # grain never is, so the marking is coherent, not speckled.
-    ring_bg = np.median(dst_ring, axis=0)
-    mad = float(np.median(np.abs(dst_ring - ring_bg).mean(axis=1)))
+    # grain never is, so the marking is coherent, not speckled. `genuine`:
+    # a distrusted (majority-rejecting) estimate must not force anything.
+    # The brightness comparison is the film prior: dust on the positive is
+    # WHITE (clear film), so a "defect" DARKER than its surround is content,
+    # not dust — never force-fill it.
     sep = float(np.abs(defect - ring_bg).mean())
-    if sep > _DLIKE_SEP_MADS * (mad + 1e-3):
-        like = (np.abs(hole_px - defect).mean(axis=1)
-                < np.abs(hole_px - ring_bg).mean(axis=1))
+    dlike_on = bool(genuine and sep > _DLIKE_SEP_MADS * (ring_mad + 1e-3)
+                    and float(defect.mean()) > float(ring_bg.mean()))
+    if forced_flags is not None:
+        dlike_on = bool(forced_flags[1])
+    if dlike_on:
+        hole_c = dst_c[hole]  # plan-scale smoothed: stable across buffers
+        like = (np.abs(hole_c - defect).mean(axis=1)
+                < np.abs(hole_c - ring_bg).mean(axis=1))
         if like.any():
             hy, hx = np.nonzero(hole)
             dlike[wy0:wy1, wx0:wx1][hy[like], hx[like]] = 255
-    return best_off
+    return best_off, genuine, dlike_on
 
 
 # Canonical planning scale for the heal = the preview's long side. Buffers at
@@ -3557,12 +3622,15 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                feather: float, plan=None, collect=None,
                scale_up: float = 1.0, plan_only: bool = False) -> np.ndarray:
     """apply_dust_removal's engine at ONE resolution. With `collect` (a list),
-    appends a plan record per heal segment: (cy_norm, cx_norm, offset) where
-    offset is the chosen source displacement normalized over (h, w), or None
-    for a diffusion fallback. With `plan` (+ `scale_up` = this buffer's size
-    over the plan scale), segments reuse the planned offsets/fallbacks
-    instead of re-searching, and the pixel-based geometry (segment size,
-    Telea radius) scales by `scale_up` so segmentation matches the plan's.
+    appends a plan record per heal segment:
+    (cy_norm, cx_norm, offset, genuine, dlike_on) where offset is the chosen
+    source displacement normalized over (h, w) — None for a diffusion
+    fallback — and genuine/dlike_on are the patch's content-adaptive
+    verdicts (see _heal_patch). With `plan` (+ `scale_up` = this buffer's
+    size over the plan scale), segments reuse the planned
+    offsets/fallbacks/verdicts instead of re-deriving them, and the
+    pixel-based geometry (segment size, Telea radius) scales by `scale_up`
+    so segmentation matches the plan's.
     `plan_only` skips the Telea fill and the feathered composite (the caller
     only wants the collected plan, not the healed buffer) and returns img16."""
     if not spots:
@@ -3581,16 +3649,24 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     fallback = np.zeros_like(mask)
     # Per-pixel feather ramp width (px): each patch writes feather × its own
     # hole depth (see _heal_patch), so the fade tracks the brush size and the
-    # buffer's resolution alike. uint16: a 20%-of-width brush at export scale
-    # yields ramps far past 255. `dlike` marks defect-like hole pixels that
-    # must be fully filled regardless of feather.
-    fmap = np.ones((h, w), np.uint16)
+    # buffer's resolution alike. float32: fractional ramps keep the relative
+    # alpha profile identical across scales (a rounded 1 px preview ramp vs
+    # its 3 px export equivalent visibly diverged). `dlike` marks defect-like
+    # hole pixels that must be fully filled regardless of feather.
+    fmap = np.full((h, w), 0.5, np.float32)
     dlike = np.zeros((h, w), np.uint8)
     # Pixel-based knobs scale with the buffer (relative to the plan scale) so
     # a stroke splits into the SAME segments here as it did in the plan, and
     # the diffusion fallback blurs over the same image fraction.
     seg_min = max(8, int(round(_HEAL_SEG_MIN * max(1.0, scale_up))))
     telea_r = max(1, int(round(inpaint_radius * max(1.0, scale_up))))
+    # Plan-scale smoothing for per-pixel threshold classifications inside
+    # _heal_patch: a box the size of the scale factor makes this buffer's
+    # pixel statistics match the preview's area-averaged ones, so the same
+    # pixels classify as holder-black / defect-like at every resolution.
+    kb = int(round(max(1.0, scale_up)))
+    kb += 1 - (kb % 2)  # nearest odd
+    img16_c = img16 if kb <= 1 else cv2.blur(img16, (kb, kb))
     t_setup = time.time() - t0
     t0 = time.time()
     n_segs = 0
@@ -3617,7 +3693,7 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                         tx + int(xs.max()) + 1, ty + int(ys.max()) + 1)
                 cyn = (ty + float(ys.mean())) / h
                 cxn = (tx + float(xs.mean())) / w
-                src_off, forced_fb = None, False
+                src_off, forced_fb, flags = None, False, None
                 if plan is not None:
                     rec = _nearest_plan_record(plan, cyn, cxn)
                     if rec is not None:
@@ -3626,22 +3702,27 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                         else:
                             src_off = (int(round(rec[2][0] * h)),
                                        int(round(rec[2][1] * w)))
-                off = None
+                            if len(rec) >= 5:
+                                flags = (rec[3], rec[4])
+                res = None
                 if not forced_fb:
-                    off = _heal_patch(img16, labels, i, bbox, half_th,
-                                      mask_pad, integ, filled, fmap,
-                                      feather, dlike, src_off=src_off)
+                    res = _heal_patch(img16, img16_c, labels, i, bbox,
+                                      half_th, mask_pad, integ, filled, fmap,
+                                      feather, dlike, src_off=src_off,
+                                      forced_flags=flags)
+                off = None if res is None else res[0]
                 if collect is not None:
-                    collect.append((cyn, cxn, None if off is None
-                                    else (off[0] / h, off[1] / w)))
+                    collect.append(
+                        (cyn, cxn, None, None, None) if res is None
+                        else (cyn, cxn, (off[0] / h, off[1] / w),
+                              res[1], res[2]))
                 if off is None:
                     fallback[ty:ty + sub.shape[0],
                              tx:tx + sub.shape[1]][sub] = 255
                     # Same radius-relative ramp as the clone path, using the
                     # component's half-thickness as the local radius.
                     fmap[ty:ty + sub.shape[0], tx:tx + sub.shape[1]][sub] = \
-                        max(1, min(int(round(float(feather) * half_th)),
-                                   int(round(half_th))))
+                        max(0.5, min(float(feather) * half_th, half_th))
 
     t_segs = time.time() - t0
     mode = (" [plan-only]" if plan_only
@@ -3695,7 +3776,7 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
         # can reach a NEIGHBORING component's hole (unlike the old 1 px lip),
         # where blending img16 against that hole's fill would corrupt it.
         dl = np.where(comp, dlike[ys, xs], 0)
-        lip = int(fmap[ys, xs][comp].max())
+        lip = max(1, int(round(float(fmap[ys, xs][comp].max()))))
         forced = np.maximum(dl, cv2.blur(dl, (2 * lip + 1, 2 * lip + 1)))
         forced = forced.astype(np.float32) / 255.0
         forced[~comp] = 0.0
