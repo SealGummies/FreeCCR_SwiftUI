@@ -3542,6 +3542,14 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
 # preview's healing structure. See apply_dust_removal.
 _DUST_PLAN_LONG = 1080
 
+# Centroid-match tolerance (normalized) when an EDIT re-heals with the
+# previous plan as prior (sticky sources): unchanged segments sit at
+# bit-identical centroids (the tile grid is absolute), so the bind is tight —
+# a NEW stroke's segments must never inherit a neighbor's source without
+# ever being scored. Cross-resolution replay keeps the looser default
+# (raster rounding shifts centroids across scales).
+_DUST_EDIT_TOL = 0.004
+
 
 def _nearest_plan_record(plan, cyn, cxn, tol=0.06):
     """The plan record whose segment centroid is nearest to (cyn, cxn) in
@@ -3557,7 +3565,8 @@ def _nearest_plan_record(plan, cyn, cxn, tol=0.06):
 
 def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
                        feather: float = DUST_FEATHER_DEFAULT,
-                       plan=None, collect_plan=None) -> np.ndarray:
+                       plan=None, collect_plan=None,
+                       prior_plan=None) -> np.ndarray:
     """Heal the dust spots out of a 16-bit RGB image, non-destructively.
 
     `feather` is the edge fade width as a fraction of each hole's own
@@ -3601,6 +3610,15 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     so exports/hi-res sample exactly the patches the on-screen preview did
     (self-planning re-decodes/resizes and near-tie source choices can flip
     on real content). Ignored on canonical-scale buffers.
+    `prior_plan` (canonical-scale buffers only): the PREVIOUS edit's plan.
+    Once a patch's source is set, nothing may move it — segments whose
+    centroids are unchanged (tight _DUST_EDIT_TOL bind) reuse their prior
+    source/verdicts VERBATIM instead of re-searching, so painting a new
+    stroke cannot re-sample the strokes already on screen (a fresh search
+    with the new mask in place flipped near-tie sources for any segment
+    whose context ring the new stroke grazed). Only a stroke that lands ON
+    a prior source (making it dust) forces that one segment to re-search;
+    new segments match no prior record and search normally.
     """
     if not spots:
         return img16
@@ -3608,7 +3626,8 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     long_side = max(h, w)
     if long_side <= _DUST_PLAN_LONG:
         return _heal_impl(img16, spots, inpaint_radius, feather,
-                          collect=collect_plan)
+                          collect=collect_plan, plan=prior_plan,
+                          plan_tol=_DUST_EDIT_TOL)
     scale = long_side / float(_DUST_PLAN_LONG)
     if plan is None:
         # No preview plan supplied — derive one from this buffer's own
@@ -3627,7 +3646,8 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
 
 def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                feather: float, plan=None, collect=None,
-               scale_up: float = 1.0, plan_only: bool = False) -> np.ndarray:
+               scale_up: float = 1.0, plan_only: bool = False,
+               plan_tol: float = 0.06) -> np.ndarray:
     """apply_dust_removal's engine at ONE resolution. With `collect` (a list),
     appends a plan record per heal segment:
     (cy_norm, cx_norm, offset, genuine, dlike_on) where offset is the chosen
@@ -3637,7 +3657,9 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     size over the plan scale), segments reuse the planned
     offsets/fallbacks/verdicts instead of re-deriving them, and the
     pixel-based geometry (segment size, Telea radius) scales by `scale_up`
-    so segmentation matches the plan's.
+    so segmentation matches the plan's. `plan_tol` is the centroid-match
+    tolerance: loose for cross-resolution replay (raster rounding), tight
+    (_DUST_EDIT_TOL) when a prior edit's plan pins sources at the same scale.
     `plan_only` skips the Telea fill and the feathered composite (the caller
     only wants the collected plan, not the healed buffer) and returns img16."""
     if not spots:
@@ -3718,7 +3740,7 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                 cxn = (bx + float(xs.mean())) / w
                 src_off, forced_fb, flags = None, False, None
                 if plan is not None:
-                    rec = _nearest_plan_record(plan, cyn, cxn)
+                    rec = _nearest_plan_record(plan, cyn, cxn, tol=plan_tol)
                     if rec is not None:
                         if rec[2] is None:
                             forced_fb = True  # the plan chose diffusion here

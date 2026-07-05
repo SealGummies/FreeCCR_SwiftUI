@@ -289,6 +289,50 @@ class TestApplyDustRemoval:
         assert abs(float(healed.mean()) - float(surround.mean())) < 2000
         assert float(healed.std()) > 0.5 * float(surround.std())
 
+    def test_prior_plan_pins_sources_verbatim(self):
+        # Once a patch's source is set, nothing may move it: the previous
+        # plan seeds every re-heal and matching segments reuse its offset
+        # VERBATIM (no re-scoring). Proof by tampering: a shifted-but-clean
+        # prior offset must drive the heal and be carried into the new plan.
+        rng = np.random.default_rng(17)
+        img = np.clip(rng.normal(30000, 3000, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
+        plan1 = []
+        apply_dust_removal(img, [spot], collect_plan=plan1)
+        (cy, cx, off, g, d), = plan1
+        assert off is not None
+        tampered = [(cy, cx, (off[0], off[1] + 20.0 / 400.0), g, d)]
+        plan2 = []
+        apply_dust_removal(img, [spot], collect_plan=plan2,
+                           prior_plan=tampered)
+        assert plan2[0][2][1] == pytest.approx(tampered[0][2][1])
+
+    def test_new_stroke_keeps_prior_sources_even_in_its_ring(self):
+        # A stroke painted inside an existing segment's context ring used to
+        # change that segment's matching inputs and could flip its source;
+        # with the prior plan pinning sources, the first stroke's sample
+        # stays bit-identical (only a stroke ON the source itself may force
+        # a re-search).
+        rng = np.random.default_rng(17)
+        img = np.clip(rng.normal(30000, 3000, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
+        plan1 = []
+        apply_dust_removal(img, [spot], collect_plan=plan1)
+        (cy, cx, off, _, _), = plan1
+        # Perturb the ring on the side OPPOSITE the chosen source, so the
+        # prior source window stays clean.
+        bx = 0.44 if (cx + off[1]) >= 0.5 else 0.56
+        b = {"kind": "brush", "pts": [[bx, 0.5]], "r": 0.01}
+        plan2 = []
+        apply_dust_removal(img, [spot, b], collect_plan=plan2,
+                           prior_plan=plan1)
+        recs = [r for r in plan2
+                if abs(r[0] - cy) < 1e-9 and abs(r[1] - cx) < 1e-9]
+        assert recs, "first stroke's segment disappeared"
+        assert recs[0][2] == off, "first stroke's source moved"
+
     def test_new_stroke_keeps_far_samples_stable(self):
         # Adding a dab must only re-sample segments near the edit. Tiles
         # used to anchor to the component bbox and scale their windows by
@@ -503,6 +547,25 @@ class TestPersistence:
         img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.01}]
         state = catalog.serialize_image(img)
         assert catalog._is_pristine(state) is False
+
+    def test_dust_plan_round_trips_in_catalog(self, tmp_path):
+        # The heal plan persists with the spots and reseeds the cache on
+        # restore, so a reload keeps the exact sources the user saw (a
+        # from-scratch replan of an incrementally-built plan could differ).
+        cat = str(tmp_path / "catalog.json")
+        path = _scan_png(tmp_path)
+        img = CCRImage(path)
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.02}]
+        img.update_thumbnail_and_preview()   # preview heal caches the plan
+        cached = img._dust_plan_cache
+        assert cached is not None and cached[0] == repr(img.dust_spots)
+        assert cached[1]
+        catalog.update_for_images([img], path=cat)
+        restored = catalog.create_images_for_path(path, path=cat)[0]
+        rc = getattr(restored, "_dust_plan_cache", None)
+        assert rc is not None
+        assert rc[0] == repr(restored.dust_spots)
+        assert rc[1] == cached[1]
 
     def test_dust_feather_round_trips_and_defaults(self, tmp_path):
         cat = str(tmp_path / "catalog.json")

@@ -930,7 +930,14 @@ class CCRImage:
         renders replay THAT plan, so they sample exactly the patches the user
         approved on screen — a fresh plan from the export's own re-decoded
         pixels can flip near-tie source choices. Feather is excluded from the
-        key (it shapes the blend, not the plan). See spec/dust-removal.md."""
+        key (it shapes the blend, not the plan).
+
+        Sticky sources: the cached plan — even one keyed to a PREVIOUS spot
+        set — seeds every preview-scale re-heal as `prior_plan`, so once a
+        segment's source patch is chosen, later strokes/edits reuse it
+        verbatim instead of re-searching (the plan is serialized in the
+        catalog, so this holds across sessions too). See
+        spec/dust-removal.md."""
         spots = getattr(self, "dust_spots", None)
         if not spots:
             return image
@@ -940,8 +947,10 @@ class CCRImage:
         h, w = image.shape[:2]
         if max(h, w) <= _DUST_PLAN_LONG:
             plan_out = []
+            cached = getattr(self, "_dust_plan_cache", None)
+            prior = cached[1] if cached is not None else None
             out = apply_dust_removal(image, spots, feather=feather,
-                                     collect_plan=plan_out)
+                                     collect_plan=plan_out, prior_plan=prior)
             self._dust_plan_cache = (key, plan_out)
             print(f"Dust heal total ({len(spots)} spots, preview scale, "
                   f"plan cached): {time.time() - t0:.3f}s")

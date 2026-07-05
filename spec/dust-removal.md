@@ -217,6 +217,10 @@ a polyline):
   from the component's extent.
 - Empty list = "no dust removal"; the render fast-path leaves the image
   untouched (§5.2).
+- Alongside the spots, the catalog stores `dust_plan` — the cached heal
+  plan's records (`[cy, cx, [oy, ox] | null, genuine, dlike_on]`), written
+  only when they match the current spots — so a reload reseeds
+  `_dust_plan_cache` and keeps the exact sources the user saw.
 - Alongside the spots, `CCRImage.dust_feather` (float, fraction of each
   hole's own half-thickness, 0..1, default 0.25) holds the image's heal
   edge-fade width — one value for all spots, set by the panel's Feather
@@ -444,7 +448,18 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      **The preview's plan is the source of truth**: `CCRImage`'s preview
      render caches its plan (`_dust_plan_cache`, keyed by the spots'
      content; feather excluded — it shapes the blend, not the plan), and
-     hi-res/export renders replay THAT plan via `apply_dust_removal(plan=)`
+     hi-res/export renders replay THAT plan via `apply_dust_removal(plan=)`.
+     **Sticky sources**: once a segment's source is set, nothing may move
+     it — every preview-scale re-heal is seeded with the previous plan
+     (`prior_plan`, bound tightly by `_DUST_EDIT_TOL` so a NEW stroke's
+     segments never inherit a neighbor's source unscored), and segments at
+     unchanged centroids reuse their prior offset/verdicts verbatim instead
+     of re-searching. Painting a new stroke therefore cannot re-sample the
+     strokes already on screen; only a stroke landing ON a prior source
+     (making it dust) forces that one segment to re-search. The plan
+     persists in the catalog (`dust_plan`, dropped when stale) and reseeds
+     the cache on restore, so reloads keep the exact sources the user saw —
+     a from-scratch replan of an incrementally-built plan could differ
      — a fresh plan from the export's own re-decoded/downscaled pixels can
      still flip near-tie source choices ("it sampled different spots than
      the preview"). A replayed offset that lands on dust or out of bounds

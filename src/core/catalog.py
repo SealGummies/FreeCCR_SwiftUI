@@ -160,6 +160,13 @@ def serialize_image(img) -> dict:
         "adjustment_settings": dict(img.adjustment_settings),
         "areas": _areas_to_json(getattr(img, "area_layers", None)),
         "dust_spots": copy.deepcopy(getattr(img, "dust_spots", None) or []),
+        # The heal plan (each segment's chosen source patch + verdicts):
+        # once a source is set, nothing may move it — not even a reload, so
+        # the plan persists next to the spots and reseeds the plan cache on
+        # restore (a from-scratch replan of an incrementally-built plan can
+        # pick different sources than the user saw). None when the cache is
+        # stale or there are no spots.
+        "dust_plan": _dust_plan_to_json(img),
         # Feather as a fraction of each hole's own radius. Written under a NEW
         # key: the legacy "dust_feather" key held a fraction of image width
         # (0..0.01) and is only ever read back (migrated), never written.
@@ -178,6 +185,27 @@ def serialize_image(img) -> dict:
         "tint_balance_factor": float(getattr(img, "tint_balance_factor", 1.0)),
         "reference_frame": list(img.reference_frame) if img.reference_frame else None,
     }
+
+
+def _dust_plan_to_json(img):
+    """The image's cached heal plan as JSON-safe lists, or None when it does
+    not match the current spots (never persist a stale plan). Records mirror
+    _heal_impl's: [cy, cx, [oy, ox] | None, genuine, dlike_on]."""
+    cached = getattr(img, "_dust_plan_cache", None)
+    spots = getattr(img, "dust_spots", None) or []
+    if not cached or not spots or cached[0] != repr(spots):
+        return None
+    out = []
+    for r in cached[1]:
+        off = None if r[2] is None else [float(r[2][0]), float(r[2][1])]
+        out.append([float(r[0]), float(r[1]), off] + list(r[3:5]))
+    return out
+
+
+def _dust_plan_from_json(plan):
+    """Inverse of _dust_plan_to_json (tuples, offset as a tuple)."""
+    return [(r[0], r[1], (tuple(r[2]) if r[2] is not None else None),
+             *r[3:5]) for r in plan]
 
 
 def _is_pristine(state: dict) -> bool:
@@ -384,6 +412,13 @@ def _restore_image(file_path: str, state: dict):
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
     img.dust_spots = copy.deepcopy(state.get("dust_spots") or [])
+    plan = state.get("dust_plan")
+    if plan and img.dust_spots:
+        # Reseed the plan cache so the restored image keeps the exact
+        # sources the user saw (sticky across sessions); a missing/legacy
+        # plan just replans once and is sticky from then on.
+        img._dust_plan_cache = (repr(img.dust_spots),
+                                _dust_plan_from_json(plan))
     if "dust_feather_r" in state:
         img.dust_feather = float(state["dust_feather_r"])
     elif "dust_feather" in state:
