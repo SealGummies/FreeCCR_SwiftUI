@@ -349,11 +349,14 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      to the old 8-bit `cv2.inpaint(..., inpaint_radius, INPAINT_TELEA)` fill.
   6. **Feathered composite**: alpha rises 0 → 1 from each hole's boundary
      inward over a smoothstep ramp (`_feather_alpha`), `out = img16*(1-a) +
-     filled*a` computed inside the mask's bbox only. The ramp width is the
-     image's **Feather** setting (`dust_feather`, a fraction of image width —
-     default 0.3%, so it covers the same image fraction at preview and
-     export), capped per hole by its depth so the core still reaches full
-     fill. **Defect-like hole pixels** (colored like the estimated defect)
+     filled*a` computed inside each **component's own padded window** (one
+     global mask bbox degenerates to nearly the whole frame when spots are
+     scattered, and the full-frame float blend then dominates the heal —
+     ~0.9 s at 6000 px; components never touch, so per-component alpha is
+     exactly the global answer). The ramp width is the image's **Feather**
+     setting (`dust_feather`, a fraction of image width — default 0.3%, so
+     it covers the same image fraction at preview and export), capped per
+     hole by its depth so the core still reaches full fill. **Defect-like hole pixels** (colored like the estimated defect)
      are force-filled at alpha 1 regardless of the ramp (`dlike`, with a
      light blurred lip), so a wide feather can never blend the defect back
      in — the soft fade only happens across clean rim pixels. Outside the
@@ -391,7 +394,12 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
   - Cost: per-component window work only (no full-frame 8-bit convert unless a
     fallback fires). Planning searches at 1080 px and native execution only
     validates + clones, so a full-res export heals FASTER than the old
-    native-resolution search (+ one INTER_AREA downscale of the frame).
+    native-resolution search. Every heal logs its step timing
+    (`Dust heal WxH: setup …, N segments …, telea …, composite …` plus a
+    `Dust heal total` line with the plan provenance) — measured at
+    6000×4000 / 40 spots: preview 0.08 s; export 0.65 s with the cached
+    preview plan (was 1.79 s before the plan replay + per-component
+    composite).
 
 ### 5.3 AI detection (`src/core/dust_detect.py`)
 A self-contained module wrapping the ONNX BOPBTL detector. **`onnxruntime` is

@@ -3513,27 +3513,35 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
                           collect=collect_plan)
     scale = long_side / float(_DUST_PLAN_LONG)
     if plan is None:
+        # No preview plan supplied — derive one from this buffer's own
+        # downscale (plan-only: the healed small buffer would be discarded).
+        t0 = time.time()
         pw = max(2, int(round(w / scale)))
         ph = max(2, int(round(h / scale)))
         small = cv2.resize(img16, (pw, ph), interpolation=cv2.INTER_AREA)
         plan = []
-        _heal_impl(small, spots, inpaint_radius, feather, collect=plan)
+        _heal_impl(small, spots, inpaint_radius, feather, collect=plan,
+                   plan_only=True)
+        print(f"Dust plan (no cached preview plan): {time.time() - t0:.3f}s")
     return _heal_impl(img16, spots, inpaint_radius, feather,
                       plan=plan, scale_up=scale)
 
 
 def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                feather: float, plan=None, collect=None,
-               scale_up: float = 1.0) -> np.ndarray:
+               scale_up: float = 1.0, plan_only: bool = False) -> np.ndarray:
     """apply_dust_removal's engine at ONE resolution. With `collect` (a list),
     appends a plan record per heal segment: (cy_norm, cx_norm, offset) where
     offset is the chosen source displacement normalized over (h, w), or None
     for a diffusion fallback. With `plan` (+ `scale_up` = this buffer's size
     over the plan scale), segments reuse the planned offsets/fallbacks
     instead of re-searching, and the pixel-based geometry (segment size,
-    Telea radius) scales by `scale_up` so segmentation matches the plan's."""
+    Telea radius) scales by `scale_up` so segmentation matches the plan's.
+    `plan_only` skips the Telea fill and the feathered composite (the caller
+    only wants the collected plan, not the healed buffer) and returns img16."""
     if not spots:
         return img16
+    t0 = time.time()
     h, w = img16.shape[:2]
     mask = rasterize_dust_mask(spots, h, w)
     if not mask.any():
@@ -3557,6 +3565,9 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     # the diffusion fallback blurs over the same image fraction.
     seg_min = max(8, int(round(_HEAL_SEG_MIN * max(1.0, scale_up))))
     telea_r = max(1, int(round(inpaint_radius * max(1.0, scale_up))))
+    t_setup = time.time() - t0
+    t0 = time.time()
+    n_segs = 0
     for i in range(1, n):  # 0 is background
         x0 = int(stats[i, cv2.CC_STAT_LEFT])
         y0 = int(stats[i, cv2.CC_STAT_TOP])
@@ -3574,6 +3585,7 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                 sub = comp_win[ty - y0:ty - y0 + seg, tx - x0:tx - x0 + seg]
                 if not sub.any():
                     continue
+                n_segs += 1
                 ys, xs = np.nonzero(sub)
                 bbox = (tx + int(xs.min()), ty + int(ys.min()),
                         tx + int(xs.max()) + 1, ty + int(ys.max()) + 1)
@@ -3604,6 +3616,17 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                     fmap[ty:ty + sub.shape[0], tx:tx + sub.shape[1]][sub] = \
                         max(1, min(feather_px, int(round(0.5 * half_th))))
 
+    t_segs = time.time() - t0
+    mode = (" [plan-only]" if plan_only
+            else (" [replay]" if plan is not None else ""))
+    if plan_only:
+        # The caller only wants the collected plan — the fill/composite work
+        # below would be thrown away with the buffer.
+        print(f"Dust heal {w}x{h}: setup {t_setup:.3f}s, "
+              f"{n_segs} segments {t_segs:.3f}s{mode}")
+        return img16
+
+    t0 = time.time()
     if fallback.any():
         # Diffusion fallback (cv2.inpaint supports 8-bit only).
         bgr8 = cv2.cvtColor(cv2.convertScaleAbs(img16, alpha=255.0 / 65535.0),
@@ -3612,28 +3635,47 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
         telea16 = cv2.cvtColor(telea8, cv2.COLOR_BGR2RGB).astype(np.uint16) * 257
         fb = fallback > 0
         filled[fb] = telea16[fb]
+    t_telea = time.time() - t0
 
     # Feathered composite: alpha rises 0 -> 1 from each hole's boundary inward
     # over its feather ramp (resolution-scaled, capped by the hole's
     # defect-free rim), so the fill cross-fades into the original instead of
     # cutting hard at the mask edge. OUTSIDE the mask alpha is exactly 0 —
-    # those pixels are kept bit-for-bit. The float blend only runs inside the
-    # mask's bounding box (padded 1 px so the cropped distance transform still
-    # sees the zeros surrounding boundary pixels).
-    bx, by, bwd, bhd = cv2.boundingRect(mask)
-    ys = slice(max(0, by - 1), min(h, by + bhd + 1))
-    xs = slice(max(0, bx - 1), min(w, bx + bwd + 1))
-    a = _feather_alpha(mask[ys, xs], fmap[ys, xs])
-    # Defect-like pixels get the fill at full strength whatever the feather;
-    # the max with a light blur adds a soft lip around the forced region
-    # without weakening its interior.
-    dl = dlike[ys, xs]
-    forced = np.maximum(dl, cv2.blur(dl, (3, 3))).astype(np.float32) / 255.0
-    a = np.maximum(a, forced)[..., None]
+    # those pixels are kept bit-for-bit. The float blend runs per COMPONENT
+    # window (padded 2 px): one global mask bbox degenerates to nearly the
+    # whole frame when spots are scattered, and the full-frame float blend
+    # then dominates the heal (~0.9 s at 6000 px for 40 spots). Components
+    # never touch (8-connectivity merges adjacent pixels), so each one's
+    # alpha computed from its own labels is exactly the global answer.
+    t0 = time.time()
     out = img16.copy()
-    blend = (img16[ys, xs].astype(np.float32) * (1.0 - a)
-             + filled[ys, xs].astype(np.float32) * a)
-    out[ys, xs] = np.clip(np.rint(blend), 0, 65535).astype(np.uint16)
+    for i in range(1, n):
+        bx0 = int(stats[i, cv2.CC_STAT_LEFT])
+        by0 = int(stats[i, cv2.CC_STAT_TOP])
+        bw_ = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh_ = int(stats[i, cv2.CC_STAT_HEIGHT])
+        ys = slice(max(0, by0 - 2), min(h, by0 + bh_ + 2))
+        xs = slice(max(0, bx0 - 2), min(w, bx0 + bw_ + 2))
+        comp = labels[ys, xs] == i
+        a = _feather_alpha(comp.astype(np.uint8) * 255, fmap[ys, xs])
+        # Defect-like pixels get the fill at full strength whatever the
+        # feather; the max with a light blur adds a soft lip around the
+        # forced region without weakening its interior. (The lip's 1 px
+        # leak past the hole blends filled==img16 — a no-op.)
+        dl = np.where(comp, dlike[ys, xs], 0)
+        forced = np.maximum(dl, cv2.blur(dl, (3, 3))).astype(np.float32) / 255.0
+        a = np.maximum(a, forced)
+        write = a > 0.0
+        if not write.any():
+            continue
+        a3 = a[..., None]
+        blend = (img16[ys, xs].astype(np.float32) * (1.0 - a3)
+                 + filled[ys, xs].astype(np.float32) * a3)
+        out[ys, xs][write] = np.clip(
+            np.rint(blend[write]), 0, 65535).astype(np.uint16)
+    print(f"Dust heal {w}x{h}: setup {t_setup:.3f}s, "
+          f"{n_segs} segments {t_segs:.3f}s, telea {t_telea:.3f}s, "
+          f"composite {time.time() - t0:.3f}s{mode}")
     return out
 
 

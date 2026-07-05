@@ -933,6 +933,7 @@ class CCRImage:
         spots = getattr(self, "dust_spots", None)
         if not spots:
             return image
+        t0 = time.time()
         feather = getattr(self, "dust_feather", DUST_FEATHER_DEFAULT)
         key = repr(spots)
         h, w = image.shape[:2]
@@ -941,10 +942,16 @@ class CCRImage:
             out = apply_dust_removal(image, spots, feather=feather,
                                      collect_plan=plan_out)
             self._dust_plan_cache = (key, plan_out)
+            print(f"Dust heal total ({len(spots)} spots, preview scale, "
+                  f"plan cached): {time.time() - t0:.3f}s")
             return out
         cached = getattr(self, "_dust_plan_cache", None)
         plan = cached[1] if (cached is not None and cached[0] == key) else None
-        return apply_dust_removal(image, spots, feather=feather, plan=plan)
+        out = apply_dust_removal(image, spots, feather=feather, plan=plan)
+        print(f"Dust heal total ({len(spots)} spots, "
+              f"preview plan {'reused' if plan is not None else 'MISSING'}): "
+              f"{time.time() - t0:.3f}s")
+        return out
 
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,
