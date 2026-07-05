@@ -203,6 +203,22 @@ class TestRightButtonStrokeEditing:
         assert cx2 + off2[1] == pytest.approx((sx) / 600.0, abs=0.01)
         assert cy2 + off2[0] == pytest.approx((sy + 80) / 400.0, abs=0.01)
 
+    def test_adj_sig_tracks_source_repick(self, tmp_path):
+        # Dragging a source ring rewrites only the PLAN (spots untouched);
+        # the hi-res display signature must change with it, or the zoomed
+        # display keeps showing the old fill after a re-pick.
+        ip, img = _converted_preview(tmp_path, crop_rect=None)
+        ip.enter_dust_mode()
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}]
+        img.update_thumbnail_and_preview()
+        sig1 = ip._current_adj_sig()
+        key, plan = img._dust_plan_cache
+        (cy, cx, off, *rest), = plan
+        assert off is not None
+        img._dust_plan_cache = (key, [(cy, cx, (off[0] + 0.05, off[1]),
+                                       *rest)])
+        assert ip._current_adj_sig() != sig1
+
     def test_right_press_needs_overlay_shown(self, tmp_path):
         ip, img = _converted_preview(tmp_path, crop_rect=None)
         ip.enter_dust_mode()

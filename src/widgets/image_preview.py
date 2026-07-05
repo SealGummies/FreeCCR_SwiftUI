@@ -1818,14 +1818,27 @@ class ImagePreview(QWidget):
             for a in getattr(img, "area_layers", []))
         # Dust spots are inpainted inside apply_adjustments, so a change to them
         # must invalidate the cached hi-res display (see spec/dust-removal.md §4.4).
+        # The heal PLAN is part of that identity too: dragging a source ring
+        # rewrites only the plan (spots untouched), and without it here the
+        # zoomed display kept showing the old fill after a re-pick.
+        spots = getattr(img, "dust_spots", [])
+        cached = getattr(img, "_dust_plan_cache", None)
+        plan_sig = ()
+        if cached is not None and cached[0] == repr(spots):
+            plan_sig = tuple(
+                (round(r[0] * 10000), round(r[1] * 10000),
+                 None if r[2] is None else (round(r[2][0] * 10000),
+                                            round(r[2][1] * 10000)))
+                for r in cached[1])
         dust_sig = (tuple(
             (s.get("kind"),
              tuple((round(float(p[0]) * 10000), round(float(p[1]) * 10000))
                    for p in (s.get("pts") or [])),
              round(float(s.get("r", 0)) * 10000))
-            for s in getattr(img, "dust_spots", [])),
+            for s in spots),
             round(float(getattr(img, "dust_feather",
-                                DUST_FEATHER_DEFAULT)) * 10000))
+                                DUST_FEATHER_DEFAULT)) * 10000),
+            plan_sig)
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "exposure_base", 0.0),
