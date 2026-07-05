@@ -558,5 +558,128 @@ class TestUndoRouting:
         assert stub.dust_panel.called is True
 
 
+# --- Resolution consistency (preview heal == export heal) --------------------
+class TestResolutionConsistency:
+    """The heal PLAN (segmentation, source patches, fallbacks) is computed at
+    the canonical preview scale and replayed on larger buffers, so the
+    full-res export reproduces the preview's healing structure. Re-deriving
+    the plan per resolution picked visibly different source patches ("the
+    preview and the final don't look the same")."""
+
+    W, H = 3000, 2000
+
+    @classmethod
+    def _scene(cls):
+        """Structured content where source-patch flips are visible: a strong
+        diagonal edge, a striped band, and film grain (deterministic)."""
+        rng = np.random.default_rng(11)
+        yy, xx = np.mgrid[0:cls.H, 0:cls.W].astype(np.float32)
+        base = 22000 + 18000 * (xx / cls.W)
+        base = np.where(yy > 0.30 * cls.H + 0.25 * xx, base * 0.55, base)
+        stripes = 12000 * np.sin(2 * np.pi * xx / 60.0)
+        band = (yy > 0.55 * cls.H) & (yy < 0.70 * cls.H)
+        img = np.stack([base + np.where(band, stripes, 0)] * 3, axis=-1)
+        img += rng.normal(0, 3000, img.shape)
+        return np.clip(img, 0, 65535).astype(np.uint16)
+
+    # A hair stroke crossing the striped band and a speck on the diagonal
+    # edge — the cases where independent per-resolution planning visibly
+    # diverged (different segment sources at preview vs export).
+    SPOTS = [{"kind": "brush",
+              "pts": [[0.48 + t * 0.04, 0.56 + t * 0.13]
+                      for t in np.linspace(0, 1, 30)],
+              "r": 0.004},
+             {"kind": "brush", "pts": [[0.40, 0.43]], "r": 0.009}]
+
+    def test_export_heal_matches_preview_heal(self):
+        big = self._scene()
+        # The preview is a downscale of the same content (long side 1080).
+        small = cv2.resize(big, (1080, 720), interpolation=cv2.INTER_AREA)
+        healed_small = apply_dust_removal(small, self.SPOTS)
+        healed_big = apply_dust_removal(big, self.SPOTS)
+        big_ds = cv2.resize(healed_big, (1080, 720),
+                            interpolation=cv2.INTER_AREA)
+
+        a8 = cv2.convertScaleAbs(healed_small, alpha=255.0 / 65535.0)
+        b8 = cv2.convertScaleAbs(big_ds, alpha=255.0 / 65535.0)
+        # Windows around the healed hair and the edge speck (1080x720 space).
+        # Calibrated: re-planning per resolution measures p99 = 14 / 10 and
+        # mean = 0.64 / 0.42 here; the replayed plan sits at 4 / 4 (grain +
+        # resampling + the 1-px rim registration inherent to mask rounding).
+        for (y0, y1, x0, x1), p99_lim, mean_lim in (
+                ((390, 510, 490, 590), 6.0, 0.40),   # hair
+                ((270, 350, 390, 480), 6.0, 0.40)):  # edge speck
+            d = np.abs(a8[y0:y1, x0:x1].astype(np.float32)
+                       - b8[y0:y1, x0:x1].astype(np.float32))
+            assert np.percentile(d, 99) <= p99_lim
+            assert d.mean() <= mean_lim
+
+    def test_planned_heal_still_removes_dust_at_full_res(self):
+        big = self._scene()
+        healed = apply_dust_removal(big, self.SPOTS)
+        # The dark hair is gone: no strong dark outlier remains along the
+        # stroke's path (compare against the local median).
+        ys = slice(int(0.54 * self.H), int(0.72 * self.H))
+        xs = slice(int(0.46 * self.W), int(0.54 * self.W))
+        wnd = healed[ys, xs].astype(np.float32).mean(axis=2)
+        med = np.median(wnd)
+        mad = np.median(np.abs(wnd - med)) + 1e-3
+        assert (med - wnd.min()) / (1.4826 * mad) < 8.0
+        # And pixels away from the mask are bit-for-bit untouched.
+        assert np.array_equal(healed[:100, :100], big[:100, :100])
+
+    @staticmethod
+    def _bare_image(spots):
+        """CCRImage skeleton carrying only what _apply_dust_removal reads —
+        no file decode, so the plan-cache plumbing is tested hermetically."""
+        img = CCRImage.__new__(CCRImage)
+        img.dust_spots = spots
+        img.dust_feather = 0.003
+        img._dust_plan_cache = None
+        return img
+
+    def test_image_render_replays_the_preview_plan(self):
+        """A preview-scale heal caches its plan; larger renders (hi-res,
+        export) must sample what THAT plan says — not a fresh self-plan from
+        their own re-decoded pixels (near-tie source flips = "it sampled
+        different spots than the preview")."""
+        big = self._scene()
+        small = cv2.resize(big, (1080, 720), interpolation=cv2.INTER_AREA)
+        img = self._bare_image(list(self.SPOTS))
+
+        img._apply_dust_removal(small)                # preview render
+        key, plan = img._dust_plan_cache
+        assert key == repr(img.dust_spots)
+        assert any(off is not None for _, _, off in plan)
+
+        out_cached = img._apply_dust_removal(big)     # export render
+        # Tamper with the cached plan (shift the source offsets): the export
+        # output must follow the cache — proof it replays the preview's plan
+        # rather than planning for itself.
+        img._dust_plan_cache = (key, [
+            (cy, cx, None if off is None else (off[0] + 0.02, off[1]))
+            for cy, cx, off in plan])
+        out_tampered = img._apply_dust_removal(big)
+        assert not np.array_equal(out_cached, out_tampered)
+
+        # A stale key (spots changed since the cached preview) self-plans.
+        img.dust_spots = img.dust_spots + [
+            {"kind": "brush", "pts": [[0.2, 0.85]], "r": 0.004}]
+        out_stale = img._apply_dust_removal(big)
+        assert out_stale.shape == big.shape
+
+    def test_explicit_plan_drives_the_sources(self):
+        big = self._scene()
+        small = cv2.resize(big, (1080, 720), interpolation=cv2.INTER_AREA)
+        plan = []
+        apply_dust_removal(small, self.SPOTS, collect_plan=plan)
+        assert plan
+        # Replaying the collected plan reproduces the self-planned result
+        # (the self-plan derives from the same content here).
+        a = apply_dust_removal(big, self.SPOTS, plan=plan)
+        b = apply_dust_removal(big, self.SPOTS)
+        assert np.array_equal(a, b)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -843,11 +843,13 @@ class ImagePreview(QWidget):
         self._slice_drag = None          # line dict being dragged, or None
         self._slice_worker = None
 
-        # Dust removal mode. Like crop, dust mode shows the FULL un-cropped
-        # image with coarse rotation/flip only (no fine rotation) so canvas
-        # pixels map 1:1 to resized_raw. Spots are stored on the image; the
-        # brush only draws a live overlay + commits on release. See
-        # spec/dust-removal.md.
+        # Dust removal mode. The canvas keeps the normal display framing (the
+        # confirmed crop, when one is set) with coarse rotation/flip only (no
+        # fine rotation). Spots are stored in FULL-frame normalized coords —
+        # the heal replays on the un-cropped buffer at every resolution — so
+        # strokes painted on a cropped display are mapped back through
+        # _crop_display_transform. The brush only draws a live overlay +
+        # commits on release. See spec/dust-removal.md.
         self.dust_mode = False
         self._dust_painting = False
         self._dust_pts = []              # current stroke, normalized [[x,y],...]
@@ -1054,6 +1056,9 @@ class ImagePreview(QWidget):
 
         # Display-level crop: show only the cropped region, except in crop
         # mode where the full image is shown so the user can adjust/regret.
+        # Dust mode keeps the cropped display (spots are painted on the frame
+        # the user actually keeps); strokes map back to full-frame coords via
+        # _crop_display_transform in _dust_scene_to_norm.
         # Skipped for un-converted images: the crop tool is disabled there,
         # and the full negative (incl. film base) is needed to draw frames.
         prev_display_transform = self._crop_display_transform
@@ -1063,7 +1068,7 @@ class ImagePreview(QWidget):
         crop_angle = getattr(ccr_backend.images[idx], "crop_angle", 0.0) or 0.0
         if (preview_img is not None and not preview_img.isNull()
                 and crop is not None and not self.crop_mode and not self.slice_mode
-                and not self.area_mode and not self.dust_mode
+                and not self.area_mode
                 and (ccr_backend.images[idx].converted or ccr_backend.positive_mode)):
             if crop_angle:
                 extracted = self._extract_rotated_crop(preview_img, crop, crop_angle)
@@ -1592,8 +1597,8 @@ class ImagePreview(QWidget):
         the fitted zoom)."""
         # Dust mode always wants the sharpest pixels for precise spotting, so
         # load hi-res detail even at the fitted view (and on zoom-in). The
-        # display path already shows the full, un-fine-rotated image in dust
-        # mode, so the hi-res lines up with the normalized dust spots.
+        # hi-res display layer is crop-matched exactly like the preview
+        # (_hires_display_pixmap), so it lines up with the dust overlay.
         if self.dust_mode:
             return True
         if self._view_scale() <= 1.05:
@@ -1828,8 +1833,13 @@ class ImagePreview(QWidget):
             return None
         crop = getattr(img, "crop_rect", None)
         angle = getattr(img, "crop_angle", 0.0) or 0.0
+        # Area mode displays the FULL un-cropped frame (its normalized mask
+        # geometry maps directly), so the hi-res layer must not swap cropped
+        # pixels in under it — same mode exclusions as update_preview's
+        # crop-display branch. Dust mode is NOT excluded: it shows the cropped
+        # preview and maps strokes back through the crop transform.
         crop_active = (crop is not None and not self.crop_mode
-                       and not self.slice_mode
+                       and not self.slice_mode and not self.area_mode
                        and (img.converted or ccr_backend.positive_mode))
         crop_sig = (crop, angle) if crop_active else None
         if cache.get("display_pm") is not None and cache.get("crop_sig") == crop_sig:
@@ -2357,12 +2367,14 @@ class ImagePreview(QWidget):
         return t if t.isInvertible() else None
 
     # --- Dust removal mode -------------------------------------------------
-    # Paint over dust to inpaint it (cv2.inpaint), or AI-detect it. Edits are
-    # stored as normalized spots on the image and replayed in the render
-    # pipeline at every resolution. See spec/dust-removal.md.
+    # Paint over dust to heal it (clone fill, see apply_dust_removal), or
+    # AI-detect it. Edits are stored as normalized spots on the image and
+    # replayed in the render pipeline at every resolution. See
+    # spec/dust-removal.md.
     def enter_dust_mode(self) -> bool:
-        """Show the full un-cropped image (coarse rotation/flip only, no fine
-        rotation) so canvas pixels map 1:1 to resized_raw, ready for painting."""
+        """Show the normal display framing (incl. any confirmed crop; coarse
+        rotation/flip only, no fine rotation), ready for painting. Strokes are
+        mapped back to full-frame coords so stored spots stay crop-independent."""
         if self.current_idx is None:
             return False
         img_obj = ccr_backend.get_image_by_index(self.current_idx)
@@ -2382,16 +2394,17 @@ class ImagePreview(QWidget):
         self._dust_pts = []
         self._zoom = 1.0
         self._release_hires(refresh=False)
-        # dust_mode is already True, so update_preview shows the full un-cropped
-        # image (its crop-display branch checks `not self.dust_mode`).
+        # Re-render with dust_mode set: the crop display (if any) is kept —
+        # only the fine rotation is suppressed (apply_transformations), so the
+        # brush works on exactly the framing the user keeps.
         self.update_preview(self.current_idx)
         self._sync_zoom_combo()
         self.view.setCursor(Qt.CrossCursor)
         return True
 
     def exit_dust_mode(self):
-        """Tear down the brush overlay and restore the normal (cropped,
-        fine-rotated) preview. Stored dust edits remain on the image."""
+        """Tear down the brush overlay and restore the normal (fine-rotated)
+        preview. Stored dust edits remain on the image."""
         if not self.dust_mode:
             return
         self.dust_mode = False
@@ -2423,9 +2436,26 @@ class ImagePreview(QWidget):
             self.dust_panel.sync_brush_size(self._dust_brush_r)
         self._update_dust_cursor(anchor_scene)
 
+    def _dust_full_frame_size(self):
+        """(w, h) of the FULL un-cropped frame dust spots are normalized
+        against — resized_raw's size when a crop display is active, else the
+        displayed pixmap's own size (the two coincide with no crop shown)."""
+        if self._crop_display_transform is None:
+            if self.current_pixmap is None:
+                return None
+            return self.current_pixmap.width(), self.current_pixmap.height()
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        raw = getattr(img, "resized_raw", None) if img is not None else None
+        if raw is None:
+            return None
+        h, w = raw.shape[:2]
+        return w, h
+
     def _dust_scene_to_norm(self, scene_pos):
-        """Scene point -> normalized (x over width, y over height) in the
-        displayed (= resized_raw, un-cropped, un-fine-rotated) pixmap."""
+        """Scene point -> normalized (x over width, y over height) in the FULL
+        un-cropped frame (= resized_raw). The displayed pixmap may be the
+        confirmed crop; map_displayed_to_full undoes it (incl. a rotated one)
+        so the stored spot replays correctly on the un-cropped buffer."""
         t = self._base_transform()
         if t is None or self.current_pixmap is None:
             return None
@@ -2433,11 +2463,11 @@ class ImagePreview(QWidget):
         if not ok:
             return None
         local = inv.map(scene_pos)
-        w = self.current_pixmap.width()
-        h = self.current_pixmap.height()
-        if w <= 0 or h <= 0:
+        fx, fy = self.map_displayed_to_full(local.x(), local.y())
+        size = self._dust_full_frame_size()
+        if size is None or size[0] <= 0 or size[1] <= 0:
             return None
-        return [local.x() / w, local.y() / h]
+        return [fx / size[0], fy / size[1]]
 
     def dust_press(self, scene_pos):
         if not self.dust_mode:
@@ -2569,7 +2599,9 @@ class ImagePreview(QWidget):
                 setattr(self, attr, None)
 
     def _draw_dust_stroke(self):
-        """Draw/refresh the live red overlay for the in-progress stroke."""
+        """Draw/refresh the live red overlay for the in-progress stroke.
+        Stroke points are full-frame normalized; map them back into the
+        displayed (possibly cropped) pixmap before the scene transform."""
         if self._dust_stroke_item is not None:
             try:
                 self.scene.removeItem(self._dust_stroke_item)
@@ -2579,18 +2611,32 @@ class ImagePreview(QWidget):
         if not self._dust_pts or self.current_pixmap is None:
             return
         t = self._base_transform()
-        if t is None:
+        size = self._dust_full_frame_size()
+        if t is None or size is None:
             return
-        w = self.current_pixmap.width()
-        h = self.current_pixmap.height()
+        w, h = size
+        to_display = None
+        if self._crop_display_transform is not None:
+            to_display, ok = self._crop_display_transform.inverted()
+            if not ok:
+                return
+
+        def scene_pt(p):
+            pt = QPointF(p[0] * w, p[1] * h)
+            if to_display is not None:
+                pt = to_display.map(pt)
+            return t.map(pt)
+
         path = QPainterPath()
-        first = t.map(QPointF(self._dust_pts[0][0] * w, self._dust_pts[0][1] * h))
+        first = scene_pt(self._dust_pts[0])
         path.moveTo(first)
         for p in self._dust_pts[1:]:
-            path.lineTo(t.map(QPointF(p[0] * w, p[1] * h)))
+            path.lineTo(scene_pt(p))
         if len(self._dust_pts) == 1:
             path.lineTo(first)  # a single dab
         item = QGraphicsPathItem(path)
+        # The crop extraction is isometric (translate/rotate only), so a
+        # brush width in full-frame pixels is the same length on the display.
         pen = QPen(QColor(255, 40, 40, 150), 2.0 * self._dust_brush_r * w,
                    Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         item.setPen(pen)
@@ -2608,7 +2654,12 @@ class ImagePreview(QWidget):
         if (scene_pos is None or self.current_pixmap is None
                 or not self.dust_mode or self.pixmap_item is None):
             return
-        r = self._dust_brush_r * self.current_pixmap.width()
+        # Brush radius is a fraction of the FULL frame width (what the heal
+        # uses); with a cropped display that differs from the pixmap's width.
+        size = self._dust_full_frame_size()
+        if size is None:
+            return
+        r = self._dust_brush_r * size[0]
         item = QGraphicsEllipseItem(scene_pos.x() - r, scene_pos.y() - r,
                                     2 * r, 2 * r)
         pen = QPen(QColor(255, 255, 255, 220), 1)

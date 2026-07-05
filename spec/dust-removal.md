@@ -73,15 +73,16 @@ in the catalog, and undoable.
 - **Entering** dust mode (`ImagePreview.enter_dust_mode()`):
   1. Exit any other canvas mode (crop / slice / area / bw-point / wb-pick).
   2. Set `self.dust_mode = True`; reset zoom to fit and `_release_hires`.
-  3. `update_preview(idx)` now shows the **full, un-cropped** working positive
-     with **coarse rotation/flip only** (no fine rotation, no displayed crop) —
-     mirroring crop mode — so canvas pixels map 1:1 to `resized_raw` (§5.5).
+  3. `update_preview(idx)` keeps the **normal display framing** — the confirmed
+     crop (when one is set) with **coarse rotation/flip only** (no fine
+     rotation) — so the brush works on exactly the frame the user keeps;
+     strokes are mapped back to full-frame coords (§5.5).
   4. Set a brush-circle cursor and draw the red mask overlay for the image's
      stored spots.
   5. Call `self.window().toggle_dust_removal(True)` so `MainWindow` swaps panels.
 - **Exiting** dust mode (the **Done** button, the toggled-off toolbar action, or
   `Esc`): hide the red mask overlay, clear `dust_mode`, restore the normal
-  (cropped, fine-rotated) preview, restore the sliders panel, and re-enable the
+  (fine-rotated) preview, restore the sliders panel, and re-enable the
   toolbar actions. **Previously applied dust edits remain on the image.**
 
 ### 3.2 DustRemovalPanel layout (top → bottom)
@@ -140,8 +141,9 @@ reference to `MainWindow` and `ImagePreview` passed at construction (it does
     only the brush moves to Ctrl + wheel.)
   - **Hi-res detail loads on entry** (and refines on zoom) so dust is visible at
     full sharpness. The hi-res render reproduces `resized_raw`'s orientation and
-    goes through `apply_adjustments` (so it shows the dust-removed result); the
-    dust-mode display stays full / un-fine-rotated, so spots stay aligned.
+    goes through `apply_adjustments` (so it shows the dust-removed result); its
+    display layer is crop-matched exactly like the preview, so spots stay
+    aligned.
   - A **brush-circle cursor** tracks the pointer; its on-screen radius is
     `r_norm * W * view_scale` display pixels (§5.5).
 - Coordinate mapping reuses the existing inverse-`base_transform` +
@@ -347,23 +349,57 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      to the old 8-bit `cv2.inpaint(..., inpaint_radius, INPAINT_TELEA)` fill.
   6. **Feathered composite**: alpha rises 0 → 1 from each hole's boundary
      inward over a smoothstep ramp (`_feather_alpha`), `out = img16*(1-a) +
-     filled*a` computed inside the mask's bbox only. The ramp width is the
-     image's **Feather** setting (`dust_feather`, a fraction of image width —
-     default 0.3%, so it covers the same image fraction at preview and
-     export), capped per hole by its depth so the core still reaches full
-     fill. **Defect-like hole pixels** (colored like the estimated defect)
+     filled*a` computed inside each **component's own padded window** (one
+     global mask bbox degenerates to nearly the whole frame when spots are
+     scattered, and the full-frame float blend then dominates the heal —
+     ~0.9 s at 6000 px; components never touch, so per-component alpha is
+     exactly the global answer). The ramp width is the image's **Feather**
+     setting (`dust_feather`, a fraction of image width — default 0.3%, so
+     it covers the same image fraction at preview and export), capped per
+     hole by its depth so the core still reaches full fill. **Defect-like hole pixels** (colored like the estimated defect)
      are force-filled at alpha 1 regardless of the ramp (`dlike`, with a
      light blurred lip), so a wide feather can never blend the defect back
      in — the soft fade only happens across clean rim pixels. Outside the
      mask alpha is exactly 0 — away from any spot `out == img16`
      bit-for-bit.
+  7. **Resolution-stable plan**: the heal's content-adaptive decisions —
+     stroke segmentation, each segment's chosen source offset, and the
+     diffusion-fallback verdicts — are computed ONCE at the canonical
+     preview scale (`_DUST_PLAN_LONG` = 1080 long side) and REPLAYED on
+     larger buffers with all pixel geometry scaled (segment size, Telea
+     radius, offsets normalized over width/height; segments matched by
+     nearest normalized centroid). Re-deriving the plan per resolution let
+     the SSD argmin flip between scales, so the export healed from visibly
+     different patches than the preview the user approved ("the preview and
+     the final don't look the same"). Buffers at or below the canonical
+     scale (the preview itself, thumbnails, the detect source) plan on
+     themselves — their behavior is unchanged.
+     **The preview's plan is the source of truth**: `CCRImage`'s preview
+     render caches its plan (`_dust_plan_cache`, keyed by the spots'
+     content; feather excluded — it shapes the blend, not the plan), and
+     hi-res/export renders replay THAT plan via `apply_dust_removal(plan=)`
+     — a fresh plan from the export's own re-decoded/downscaled pixels can
+     still flip near-tie source choices ("it sampled different spots than
+     the preview"). A replayed offset that lands on dust or out of bounds
+     after scaling (mask-raster rounding — rare) is rescued by the nearest
+     clean offset within a ≤4 px Chebyshev spiral (essentially the same
+     patch); only if that fails does the local search run. The tone
+     membrane and feather composite always run natively, so fills stay
+     16-bit sharp.
   - Identity fast-path: empty `spots` or all-zero mask → return `img16` unchanged.
   - Returns a new `uint16` RGB array; `img16` is never mutated (non-destructive).
-  - The chosen source patch may differ between preview and export resolution
-    (scoring at different scales); both are plausible clean fills, and tone is
-    anchored to the same ring either way.
+  - Residual preview↔export differences are grain/resampling plus a ≤1 px rim
+    registration from mask rounding at hard edges — the healed structure is
+    identical (regression-tested in `TestResolutionConsistency`).
   - Cost: per-component window work only (no full-frame 8-bit convert unless a
-    fallback fires); ≤ the old Telea path even at export res with 100 spots.
+    fallback fires). Planning searches at 1080 px and native execution only
+    validates + clones, so a full-res export heals FASTER than the old
+    native-resolution search. Every heal logs its step timing
+    (`Dust heal WxH: setup …, N segments …, telea …, composite …` plus a
+    `Dust heal total` line with the plan provenance) — measured at
+    6000×4000 / 40 spots: preview 0.08 s; export 0.65 s with the cached
+    preview plan (was 1.79 s before the plan replay + per-component
+    composite).
 
 ### 5.3 AI detection (`src/core/dust_detect.py`)
 A self-contained module wrapping the ONNX BOPBTL detector. **`onnxruntime` is
@@ -418,22 +454,26 @@ manual brush (a stroke = many dabs) is the tool for those. Keeps the stored mode
 uniform and resolution-independent. (Future: component polygons / multi-circle.)
 
 ### 5.5 Coordinate mapping (canvas → normalized spot)
-Dust mode shows the working positive with **coarse rotation/flip only** — no
-displayed crop (the `not self.dust_mode` guard is added to update_preview's
-crop-display branch, image_preview.py:951) and no fine rotation (mirroring crop
-mode's `apply_transformations`). Therefore canvas pixels map **exactly** to
-`resized_raw` pixels via:
+Dust mode shows the working positive with the **normal display framing** — the
+confirmed crop (when one is set) with **coarse rotation/flip only**, no fine
+rotation (mirroring crop mode's `apply_transformations`). Spots are stored
+normalized against the **full un-cropped frame** — they are healed in
+`apply_adjustments` **before** crop and fine rotation (§5.1) — so canvas points
+map back via:
 1. `scene = view.mapToScene(event.pos())` (auto-accounts for zoom/pan).
 2. Invert the display `base_transform` (coarse 90°/180°/270° + H/V flips) → local
-   pixmap coords.
-3. `map_displayed_to_full(x, y)` — **identity** in dust mode (no crop shown).
+   (possibly cropped) pixmap coords.
+3. `map_displayed_to_full(x, y)` — identity with no crop displayed; under a
+   confirmed crop it applies `_crop_display_transform` (a translation, plus a
+   rotation for an angled crop) into full-frame pixel coords.
 4. Normalize: `H, W = resized_raw.shape[:2]`; `x_n = px/W`, `y_n = py/H`,
    `r_n = r_px/W`.
 
-Because spots are applied in `apply_adjustments` **before** crop and fine rotation
-(§5.1), and dust mode shows the image **without** those, mapping is exact — no
-sub-pixel fine-rotation error. The on-canvas brush radius is `r_n*W*view_scale`
-display pixels.
+No fine rotation is displayed, and the crop extraction is isometric
+(translate/rotate only) so lengths are preserved: the on-canvas brush radius is
+`r_n*W*view_scale` display pixels with `W` the **full-frame** width, and the
+live stroke overlay maps its stored full-frame points back through the inverse
+crop transform for drawing (`_draw_dust_stroke`).
 
 ## 6. Integration points
 
@@ -443,7 +483,7 @@ display pixels.
 | `src/core/ccr_processor.py` | `rasterize_dust_mask`, `apply_dust_removal`, feathered-composite helper. |
 | `src/core/dust_detect.py` (new) | ONNX detector: availability, model path/download/verify, `detect`, `prob_to_spots`, constants. `onnxruntime` imported only inside functions. |
 | `src/core/catalog.py` | Serialize/restore `dust_spots`; add `not state.get("dust_spots")` to `_is_pristine`. |
-| `src/widgets/image_preview.py` | Toolbar **Dust Removal** checkable action (after Gradient, with separator) + gating in `_update_unconvert_action_state`; `dust_mode` flag; `enter_dust_mode`/`exit_dust_mode`; canvas press/move/release + brush cursor + red mask overlay; `_scene_to_norm_spot()`; `and not self.dust_mode` in the crop-display branch + clear_preview/Esc routing; `dust_sig` in `_current_adj_sig`. |
+| `src/widgets/image_preview.py` | Toolbar **Dust Removal** checkable action (after Gradient, with separator) + gating in `_update_unconvert_action_state`; `dust_mode` flag; `enter_dust_mode`/`exit_dust_mode`; canvas press/move/release + brush cursor + red mask overlay; crop-aware stroke mapping (`_dust_scene_to_norm` via `map_displayed_to_full`, normalized by the full frame) + clear_preview/Esc routing; `dust_sig` in `_current_adj_sig`. |
 | `src/widgets/dust_panel.py` (new) | `DustRemovalPanel(QWidget)` (manual + AI sections, Done); QThread workers for model download and detection; explicit MainWindow/ImagePreview refs. |
 | `src/ui/main_window.py` | Add `dust_panel` as a **direct child** of `central_widget`'s layout (fixed 300 px, hidden); `toggle_dust_removal(on)` toggles `sliders_panel`/`dust_panel` visibility (no `QStackedWidget` — preserves `SlidersPanel`'s `parent().parent()` chains) and drives canvas enter/exit + toolbar action state. |
 | `requirements.txt` | Add `onnxruntime` (CPU). Manual path needs nothing new (`cv2`, `requests` already present). |
@@ -533,9 +573,10 @@ The lazy in-function import still means a build *without* onnxruntime runs fine
 3. **Esc / exit** routes through `_on_escape_key` (`elif self.dust_mode:
    self.exit_dust_mode()`) and `clear_preview` also exits dust mode, alongside
    the existing crop/slice/area handling.
-4. **Exact rendering in dust mode**: full image, coarse rotation/flip only, no
-   crop, no fine rotation → exact 1:1 canvas↔`resized_raw` mapping (§5.5). This
-   removes the fine-rotation sub-pixel error entirely.
+4. **Exact rendering in dust mode**: the normal display framing (incl. the
+   confirmed crop), coarse rotation/flip only, no fine rotation → exact
+   canvas↔`resized_raw` mapping through the isometric crop transform (§5.5).
+   This removes the fine-rotation sub-pixel error entirely.
 5. **Single-funnel verified** against the real export paths (§5.1 line refs); a
    single insertion at the top of `apply_adjustments` covers preview, zoom, and
    all export modes.
