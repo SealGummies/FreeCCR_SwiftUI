@@ -16,7 +16,7 @@ import math
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                 QPushButton, QSlider, QFrame, QProgressBar,
-                                QMessageBox)
+                                QMessageBox, QCheckBox)
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
 
 from core import dust_detect
@@ -207,6 +207,18 @@ class DustRemovalPanel(QWidget):
         feather_row.addWidget(self.feather_slider)
         feather_row.addWidget(self.feather_value)
         layout.addLayout(feather_row)
+
+        # Diagnostic overlay: outline every stroke and mark where each heal
+        # segment sampled its patch from (arrow source -> segment; ring only
+        # = diffusion fallback, nothing was sampled).
+        self.show_sources_cb = QCheckBox("Show heal sources")
+        self.show_sources_cb.setToolTip(
+            "Outline each stroke and mark where every heal sampled its "
+            "patch from (green arrow: sampled patch → healed segment; "
+            "orange ring: diffusion fill, nothing sampled).")
+        self.show_sources_cb.toggled.connect(
+            lambda on: self.image_preview.set_dust_source_overlay(on))
+        layout.addWidget(self.show_sources_cb)
 
         hint = QLabel("Click or drag over dust to remove it.")
         hint.setWordWrap(True)

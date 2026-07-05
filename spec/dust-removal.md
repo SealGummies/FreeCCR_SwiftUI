@@ -104,6 +104,15 @@ in the catalog, and undoable.
      which also means the fade only shows on the clean rim between the defect
      and the brush edge (a tight trace heals hard by design; brush generously
      to get a soft blend).
+   - **Show heal sources** checkbox: diagnostic overlay on the canvas —
+     every stroke's border outlined (yellow), and for each heal segment a
+     green arrow drawn FROM the patch it sampled TO the healed segment
+     (ring at the source), or an orange ring where the segment fell back to
+     diffusion (nothing was sampled). Geometry comes from the cached
+     preview heal plan (`dust_debug_geometry` + `_dust_plan_cache`), mapped
+     through the same crop-display transform as the brush, so it shows
+     exactly what exports will replay. Refreshes on every dust edit /
+     feather change; cleared on exit.
    - Hint: "Click or drag over dust to remove it."
    - **Undo last spot** button and **Clear all** button.
 3. Separator.
@@ -321,7 +330,12 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      are healed in thickness-scaled segments, each from its own local source
      strip — one whole-stroke window would demand a clean area the size of the
      stroke's bbox, which rarely exists (a traced curl would silently fall
-     back to diffusion and ghost).
+     back to diffusion and ghost). Segments are also CAPPED at
+     `_HEAL_SEG_MAX` (96 px at plan scale, ×`scale_up`): a big compact dab
+     is thickness-scaled to one giant segment whose window rarely has a
+     clean home anywhere, dumping the whole blob into the flat, grainless
+     diffusion fallback — a visible smooth disc on film grain. Tiles keep
+     cloning real texture from beside the blob.
   1. **Window + guarded ring**: patch bbox padded by `guard + ring_w`; `ring`
      = clean known pixels at distance `(guard, guard+ring_w]` from the hole
      (`guard` ≥ 2 px, scaled to half the thickness). The gap matters: the

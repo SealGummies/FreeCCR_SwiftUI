@@ -115,6 +115,29 @@ class TestDustModeShowsCrop:
         assert ip._crop_display_transform is None
 
 
+class TestHealSourceOverlay:
+    def test_overlay_draws_from_plan_and_clears(self, tmp_path):
+        # 'Show heal sources': stroke outline + per-segment sample markers,
+        # derived from the cached preview plan, drawn through the same
+        # crop-display mapping as the brush; toggling off removes them.
+        ip, img = _converted_preview(tmp_path)
+        ip.enter_dust_mode()
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.02}]
+        img.update_thumbnail_and_preview()   # preview heal caches the plan
+        cached = getattr(img, "_dust_plan_cache", None)
+        assert cached is not None and cached[0] == repr(img.dust_spots)
+        ip.set_dust_source_overlay(True)
+        # At least the stroke outline plus one sample arrow / fallback ring.
+        assert len(ip._dust_debug_items) >= 2
+        ip.set_dust_source_overlay(False)
+        assert ip._dust_debug_items == []
+        # Exit tears the overlay down with the other dust items.
+        ip.set_dust_source_overlay(True)
+        assert ip._dust_debug_items
+        ip.exit_dust_mode()
+        assert ip._dust_debug_items == []
+
+
 class TestSceneToNormThroughCrop:
     def test_center_of_crop_maps_to_crop_center(self, tmp_path):
         ip, img = _converted_preview(tmp_path)

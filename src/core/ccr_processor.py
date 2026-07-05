@@ -3240,6 +3240,13 @@ _HEAL_ANGLES = 16         # candidate source directions searched around a spot
 _HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
 _HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
 _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
+_HEAL_SEG_MAX = 96        # segment-size cap (px at plan scale): a big compact
+                          # dab otherwise becomes ONE segment whose source
+                          # window (bbox + thickness-scaled pad) rarely fits
+                          # anywhere clean, dumping the whole blob into the
+                          # flat, grainless diffusion fallback — a visible
+                          # smooth disc on film grain. Tiles keep cloning
+                          # real texture from beside the blob.
 _DLIKE_SEP_MADS = 6.0     # defect-vs-surround separation (in ring-grain MADs)
                           # required before pixels are force-filled as defect
 _HEAL_MIN_KEEP_FRAC = 0.2  # ring share the defect rejection must leave; below
@@ -3681,7 +3688,9 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
         hole0 = np.zeros((ch + 2, cw + 2), np.uint8)
         hole0[1:-1, 1:-1] = comp_win
         half_th = float(cv2.distanceTransform(hole0, cv2.DIST_L2, 3).max())
-        seg = max(seg_min, int(round(_HEAL_SEG_THICKNESS * half_th)))
+        seg_max = max(seg_min, int(round(_HEAL_SEG_MAX * max(1.0, scale_up))))
+        seg = max(seg_min, min(int(round(_HEAL_SEG_THICKNESS * half_th)),
+                               seg_max))
         for ty in range(y0, y0 + ch, seg):
             for tx in range(x0, x0 + cw, seg):
                 sub = comp_win[ty - y0:ty - y0 + seg, tx - x0:tx - x0 + seg]

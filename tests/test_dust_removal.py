@@ -264,6 +264,31 @@ class TestApplyDustRemoval:
         core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
         assert float(np.abs(core.mean(axis=0) - sky).max()) < 5000
 
+    def test_big_merged_dabs_clone_texture_not_smear(self):
+        # Big overlapping dabs used to become ONE segment whose source
+        # window (bbox + thickness-scaled pad) could not fit anywhere clean,
+        # dumping the whole blob into the flat diffusion fallback — a
+        # visible grainless disc on film. The segment-size cap tiles the
+        # blob so each tile clones real texture from beside it.
+        rng = np.random.default_rng(21)
+        img = np.clip(rng.normal(32000, 3000, (640, 640, 3)), 0,
+                      65535).astype(np.uint16)
+        # A merged blob whose ONE-segment window has no clean in-bounds home
+        # in this frame, while per-tile windows do.
+        spots = [{"kind": "brush", "pts": [[0.42, 0.40]], "r": 0.075},
+                 {"kind": "brush", "pts": [[0.55, 0.38]], "r": 0.075},
+                 {"kind": "brush", "pts": [[0.48, 0.52]], "r": 0.07}]
+        out = apply_dust_removal(img, spots)
+        mask = rasterize_dust_mask(spots, 640, 640) > 0
+        core = cv2.erode(mask.astype(np.uint8), np.ones((25, 25), np.uint8)) > 0
+        healed = out[core].astype(np.float32)
+        ann = (~mask) & (cv2.dilate(mask.astype(np.uint8),
+                                    np.ones((41, 41), np.uint8)) > 0)
+        surround = out[ann].astype(np.float32)
+        # Tone lands on the surround AND grain survives (Telea ~ 0 std).
+        assert abs(float(healed.mean()) - float(surround.mean())) < 2000
+        assert float(healed.std()) > 0.5 * float(surround.std())
+
     def test_clean_stroke_near_black_border_stays_sky(self):
         # THE black-blob artifact: a generous brush over clean sky near the
         # frame's black holder border. The defect estimate collapses onto
@@ -506,9 +531,13 @@ class _StubPreview:
         self.dust_mode = True
         self.current_idx = None
         self.brush = None
+        self.source_overlay = None
 
     def set_dust_brush_size(self, r):
         self.brush = r
+
+    def set_dust_source_overlay(self, on):
+        self.source_overlay = on
 
     def dust_undo_last(self):
         return False
@@ -595,6 +624,30 @@ class TestPanelWiring:
             assert abs(img.dust_feather - 0.6) < 1e-9
         finally:
             ccr_backend.images = saved
+
+    def test_show_sources_checkbox_drives_canvas_overlay(self):
+        from widgets.dust_panel import DustRemovalPanel
+        prev = _StubPreview()
+        panel = DustRemovalPanel(_StubMain(), prev)
+        panel.show_sources_cb.setChecked(True)
+        assert prev.source_overlay is True
+        panel.show_sources_cb.setChecked(False)
+        assert prev.source_overlay is False
+
+    def test_dust_debug_geometry_maps_plan_to_arrows(self):
+        # Full-frame pixel geometry for the 'Show heal sources' overlay:
+        # spot outlines, one arrow per cloned segment (source -> segment,
+        # source = centroid + planned offset), a marker per Telea fallback.
+        from widgets.image_preview import dust_debug_geometry
+        spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.05}]
+        plan = [(0.5, 0.5, (0.1, -0.2), True, False),
+                (0.3, 0.4, None, None, None)]
+        geo = dust_debug_geometry(spots, plan, 1000, 500)
+        assert geo["strokes"] == [([(500.0, 250.0)], 100.0)]
+        (sx, sy, dx, dy), = geo["arrows"]
+        assert (dx, dy) == (500.0, 250.0)
+        assert (sx, sy) == (500.0 - 0.2 * 1000, 250.0 + 0.1 * 500)
+        assert geo["fallbacks"] == [(0.4 * 1000, 0.3 * 500)]
 
     def test_detect_all_no_targets_is_safe(self):
         from widgets.dust_panel import DustRemovalPanel, _DetectAllWorker  # noqa: F401
