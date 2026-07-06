@@ -345,6 +345,42 @@ class TestApplyDustRemoval:
         assert recs, "first stroke's segment disappeared"
         assert recs[0][2] == off, "first stroke's source moved"
 
+    def test_search_prefers_the_strokes_surroundings(self):
+        # On content where every direction matches equally well (uniform
+        # grain), the pick must come from the NEAREST candidate ring: the
+        # sweep runs nearest-first and stops once the best match reaches the
+        # grain floor, instead of letting a lucky far patch win the SSD by
+        # noise.
+        rng = np.random.default_rng(3)
+        img = np.clip(rng.normal(30000, 3000, (400, 400, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
+        plan = []
+        apply_dust_removal(img, [spot], collect_plan=plan)
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        # r = 12 px -> guard 6, ring 9, pad 15 -> d_base = 41 px.
+        dist = float(np.hypot(off[0] * 400, off[1] * 400))
+        assert dist <= 1.6 * 41
+
+    def test_stripes_pattern_heals_phase_aligned(self):
+        # On patterned content the match must pick a phase-aligned patch —
+        # the healed hole continues the stripes, not a misphased smear (and
+        # the early-accept must NOT trip on a misphased near candidate: the
+        # grain floor is estimated from the detrended residual, not the
+        # ring's structure).
+        yy, xx = np.mgrid[0:200, 0:200]
+        base = 30000 + 12000 * np.sin(2 * np.pi * xx / 24.0)
+        img = np.stack([base] * 3, axis=-1).astype(np.uint16)
+        expected = img.copy()
+        cv2.circle(img, (100, 100), 5, (62000, 62000, 62000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.05}
+        out = apply_dust_removal(img, [spot], feather=0.0)
+        hole = np.hypot(yy - 100, xx - 100) <= 10
+        err = np.abs(out[hole].astype(np.float32)
+                     - expected[hole].astype(np.float32))
+        assert float(err.mean()) < 1500
+
     def test_manual_source_pick_clones_verbatim(self):
         # A USER-PICKED source (overlay ring drag, manual=True in the plan)
         # is cloned verbatim — color AND texture. The membrane re-toning is
@@ -951,13 +987,17 @@ class TestResolutionConsistency:
         b8 = cv2.convertScaleAbs(big_ds, alpha=255.0 / 65535.0)
         # Windows around the healed hair and the edge speck (1080x720 space).
         # Calibrated: re-planning per resolution measures p99 = 14 / 10 and
-        # mean = 0.64 / 0.42 here; the replayed plan sits at 4 / 8 (grain +
-        # resampling + the 1-px rim registration inherent to mask rounding —
-        # the speck's rim rides the feather dome over a high-contrast defect
-        # since the force-fill floor was removed, so a 1-px raster shift is
-        # worth more diff there; the sources themselves are identical).
+        # mean = 0.64 / 0.42 here; the replayed plan sits at 10 / 8. The
+        # residuals are NOT source flips (those are what the guard is for —
+        # the offsets replay verbatim): the speck's rim rides the feather
+        # dome over a high-contrast defect (a 1-px raster shift is worth
+        # more diff there), and the hair's nearest-first search now picks
+        # phase-aligned patches in the striped band whose INTEGER offsets
+        # quantize differently at export scale (sub-pixel pattern phase,
+        # bounded by ±0.5 px). The means stay far below the re-planning
+        # 0.64/0.42 and carry the structure-flip discrimination.
         for (y0, y1, x0, x1), p99_lim, mean_lim in (
-                ((390, 510, 490, 590), 6.0, 0.40),   # hair
+                ((390, 510, 490, 590), 11.0, 0.40),  # hair
                 ((270, 350, 390, 480), 9.0, 0.40)):  # edge speck
             d = np.abs(a8[y0:y1, x0:x1].astype(np.float32)
                        - b8[y0:y1, x0:x1].astype(np.float32))

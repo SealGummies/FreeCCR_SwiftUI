@@ -406,18 +406,27 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      become the entire anchor (clean sky strokes healed to solid black,
      cloned from the border). The estimate is distrusted (`genuine=False`):
      full ring, no defect force-fill.
-  3. **Search**: candidate source windows on `_HEAL_ANGLES` (16) directions ×
-     thickness-scaled distances (`2·half_th + pad + 2`, ×1/2/4, plus the
-     window diagonal as a last resort). A candidate must be in-bounds and
-     fully clean (checked O(1) against `cv2.integral` of the padded mask), so
-     a long stroke heals from the clean strip right beside it. Score = SSD
-     between source and destination **kept ring** pixels — plus, only past a
-     ring-MAD-scaled tolerance, the candidate's interior-tone excess vs the
-     ring background (the ring SSD never looks inside the window: a source
-     whose ring matches but whose hole area holds a black border edge clones
-     the border into the fill; within tolerance the ring SSD alone ranks, an
-     always-on interior term re-ranked near-ties by texture phase and made
-     preview/export tone drift). Best wins.
+  3. **Search**: candidate source windows on rings of directions at
+     thickness-scaled distances (`d_base = 2·half_th + pad + 2`,
+     ×1/1.5/2.25/3.5, plus the window diagonal as a last resort),
+     **nearest first**: the stroke's own surroundings are the most likely
+     to carry the same pattern, so the two nearest rings sample at DOUBLE
+     angular density (2×`_HEAL_ANGLES`), near-ties fall to the closer
+     patch (`_HEAL_DIST_W` per-ring score penalty), and the sweep STOPS at
+     the first ring whose best raw match reaches the grain floor
+     (`_HEAL_ACCEPT_MADS` × sigma², sigma estimated from the CLEANEST
+     QUARTILE of the 3×3-detrended ring residual — the raw ring MAD
+     inflates on structure and the residual's median inflates under edge
+     bleed, and an inflated floor early-accepts a bad near patch; an
+     underestimated floor only costs a longer sweep). A candidate must be
+     in-bounds and fully clean (checked O(1) against `cv2.integral` of the
+     padded mask), so a long stroke heals from the clean strip right beside
+     it. Score = SSD between source and destination **kept ring** pixels —
+     plus, only past a ring-MAD-scaled tolerance, the candidate's
+     interior-tone excess vs the ring background (the ring SSD never looks
+     inside the window: a source whose ring matches but whose hole area
+     holds a black border edge clones the border into the fill; within
+     tolerance the ring SSD alone ranks). Best adjusted score wins.
   4. **Clone + membrane tone correction**: hole pixels are copied from the
      best source, plus a smooth per-channel correction field interpolated
      from the kept-ring differences (normalized Gaussian convolution,
