@@ -318,6 +318,9 @@ class TestApplyDustRemoval:
         # plan seeds every re-heal and matching segments reuse its offset
         # VERBATIM (no re-scoring). Proof by tampering: a shifted-but-clean
         # prior offset must drive the heal and be carried into the new plan.
+        # (The tamper stays within the rule's ±4 px touching tolerance — an
+        # AUTOMATIC pin shifted beyond touching is a fossil and re-picks,
+        # see test_fossil_automatic_pins_repick_under_the_rule.)
         rng = np.random.default_rng(17)
         img = np.clip(rng.normal(30000, 3000, (400, 400, 3)), 0,
                       65535).astype(np.uint16)
@@ -326,7 +329,7 @@ class TestApplyDustRemoval:
         apply_dust_removal(img, [spot], collect_plan=plan1)
         (cy, cx, off, g, d, *_), = plan1
         assert off is not None
-        tampered = [(cy, cx, (off[0], off[1] + 20.0 / 400.0), g, d)]
+        tampered = [(cy, cx, (off[0], off[1] + 3.0 / 400.0), g, d)]
         plan2 = []
         apply_dust_removal(img, [spot], collect_plan=plan2,
                            prior_plan=tampered)
@@ -763,6 +766,30 @@ class TestStalePlanPruning:
         # Fresh TOUCHING pick, not the resurrected 156 px fossil.
         assert float(np.hypot(off[0] * 400, off[1] * 400)) <= 2 * 12 + 8
 
+    def test_fossil_automatic_pins_repick_under_the_rule(self):
+        # Fossil offsets propagate through GENERATIONS of sticky plans (each
+        # re-detect rebound the old offset into a fresh, validly-keyed plan
+        # for as long as the pre-rule search existed) — no spot bookkeeping
+        # can identify them. The rule retroacts instead: an AUTOMATIC pin
+        # whose sample no longer touches its patch is dropped and re-picked;
+        # a USER re-pick keeps any distance (explicit choice).
+        rng = np.random.default_rng(6)
+        img16 = np.clip(rng.normal(30000, 2000, (400, 400, 3)), 0,
+                        65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
+        far = (120.0 / 400, 100.0 / 400)
+        plan = []
+        apply_dust_removal(img16, [spot], collect_plan=plan,
+                           prior_plan=[(0.5, 0.5, far, False, False, False)])
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        assert float(np.hypot(off[0] * 400, off[1] * 400)) <= 2 * 12 + 8
+        plan2 = []
+        apply_dust_removal(img16, [spot], collect_plan=plan2,
+                           prior_plan=[(0.5, 0.5, far, False, False, True)])
+        (cy, cx, off2, *_), = plan2
+        assert off2 == far   # the user's own pick is never second-guessed
+
     def test_surviving_spots_keep_their_pinned_sources(self):
         # The stickiness the pruning must NOT break: a spot that still
         # exists keeps its planned source verbatim across a re-heal.
@@ -771,7 +798,7 @@ class TestStalePlanPruning:
                         65535).astype(np.uint16)
         holder = CCRImage.__new__(CCRImage)
         keep = {"kind": "brush", "pts": [[0.3, 0.3]], "r": 0.03}
-        pinned = (30.0 / 400, 0.0)
+        pinned = (25.0 / 400, 0.0)   # a touching offset (hole r = 12 px)
         holder._dust_plan_cache = ("k", [(0.3, 0.3, pinned,
                                           False, False, False)])
         holder._dust_plan_spots = [keep]

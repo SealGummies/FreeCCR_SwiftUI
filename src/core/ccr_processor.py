@@ -3492,6 +3492,32 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
         # re-searching elsewhere.
         dy = min(max(int(src_off[0]), -wy0), h - wy1)
         dx = min(max(int(src_off[1]), -wx0), w - wx1)
+        if not manual:
+            # THE RULE RETROACTS ON AUTOMATIC PINS. Stored automatic offsets
+            # that do not TOUCH their patch are pre-rule fossils: catalog
+            # plans carry them, and sticky binding propagated them into
+            # fresh, validly-keyed plans on every re-detect for as long as
+            # the old search existed — pruning by spot identity can never
+            # catch that. An automatic pin is honoured only if its sample
+            # still touches (within ±4 px for cross-scale raster rounding);
+            # otherwise it is dropped here and the segment re-picks under
+            # the rule, so the whole catalog converges as images render.
+            # USER re-picks (manual=True) keep any distance — that pick is
+            # the user's explicit choice.
+            def _shifted_hits(mask_a, ty, tx):
+                hh2, ww2 = hole.shape
+                ay0, ay1 = max(0, ty), min(hh2, hh2 + ty)
+                ax0, ax1 = max(0, tx), min(ww2, ww2 + tx)
+                if ay0 >= ay1 or ax0 >= ax1:
+                    return False
+                return bool(np.any(mask_a[ay0:ay1, ax0:ax1]
+                                   & hole[ay0 - ty:ay1 - ty,
+                                          ax0 - tx:ax1 - tx]))
+            near = cv2.dilate(hole.astype(np.uint8),
+                              np.ones((9, 9), np.uint8)).astype(bool)
+            if _shifted_hits(hole, dy, dx) or not _shifted_hits(near, dy, dx):
+                src_off = None  # fossil pin — fall through to the rule
+    if src_off is not None:
         best_off = (dy, dx)
         if _box_sum(integ, wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx) == 0:
             best_src = img16[wy0 + dy:wy1 + dy,
