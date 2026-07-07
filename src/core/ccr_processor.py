@@ -3476,6 +3476,27 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
     ring_bg = np.median(dst_ring, axis=0)
     ring_mad = float(np.median(np.abs(dst_ring - ring_bg).mean(axis=1)))
 
+    def _touches_patch(ty, tx):
+        """Does the sample area (hole shifted by (ty, tx)) come within the
+        rule's ±4 px of THE PATCH (labels == comp — the whole spot, not just
+        this segment's tile)? Used by both the pinned-offset validation and
+        the per-patch shared-offset (pref) path so plan time and replay
+        agree: a shared offset that stops touching where the patch boundary
+        curves away must re-pick at BOTH, or the plans drift."""
+        gy0 = max(0, min(wy0, wy0 + ty) - 5)
+        gx0 = max(0, min(wx0, wx0 + tx) - 5)
+        gy1 = min(h, max(wy1, wy1 + ty) + 5)
+        gx1 = min(w, max(wx1, wx1 + tx) + 5)
+        comp_near = cv2.dilate(
+            (labels[gy0:gy1, gx0:gx1] == comp).astype(np.uint8),
+            np.ones((9, 9), np.uint8)).astype(bool)
+        hy_, hx_ = np.nonzero(hole)
+        py_ = hy_ + (wy0 + ty - gy0)
+        px_ = hx_ + (wx0 + tx - gx0)
+        okp = ((py_ >= 0) & (py_ < gy1 - gy0)
+               & (px_ >= 0) & (px_ < gx1 - gx0))
+        return bool(comp_near[py_[okp], px_[okp]].any())
+
     best_src, best_off, best_rv = None, None, None
     if src_off is not None:
         # Pinned source (scale replay, or a prior edit's plan): the offset
@@ -3499,23 +3520,15 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
             # fresh, validly-keyed plans on every re-detect for as long as
             # the old search existed — pruning by spot identity can never
             # catch that. An automatic pin is honoured only if its sample
-            # still touches (within ±4 px for cross-scale raster rounding);
-            # otherwise it is dropped here and the segment re-picks under
-            # the rule, so the whole catalog converges as images render.
-            # USER re-picks (manual=True) keep any distance — that pick is
-            # the user's explicit choice.
-            def _shifted_hits(mask_a, ty, tx):
-                hh2, ww2 = hole.shape
-                ay0, ay1 = max(0, ty), min(hh2, hh2 + ty)
-                ax0, ax1 = max(0, tx), min(ww2, ww2 + tx)
-                if ay0 >= ay1 or ax0 >= ax1:
-                    return False
-                return bool(np.any(mask_a[ay0:ay1, ax0:ax1]
-                                   & hole[ay0 - ty:ay1 - ty,
-                                          ax0 - tx:ax1 - tx]))
-            near = cv2.dilate(hole.astype(np.uint8),
-                              np.ones((9, 9), np.uint8)).astype(bool)
-            if _shifted_hits(hole, dy, dx) or not _shifted_hits(near, dy, dx):
+            # still touches THE PATCH — the whole spot (labels == comp), not
+            # just this segment's tile: a long stroke shares ONE patch-
+            # touching offset across its segments, and a tile-local test
+            # wrongly rejected that shared offset on the stroke's far tiles.
+            # ±4 px tolerance covers cross-scale raster rounding; a sample
+            # overlapping dust routes through the existing clean/defer
+            # machinery below. USER re-picks (manual=True) keep any
+            # distance — that pick is the user's explicit choice.
+            if not _touches_patch(dy, dx):
                 src_off = None  # fossil pin — fall through to the rule
     if src_off is not None:
         best_off = (dy, dx)
@@ -3620,7 +3633,7 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                     return None
                 return lw[ring] == 0
             pdy, pdx = int(pref_off[0]), int(pref_off[1])
-            rvp = _pref_ok(pdy, pdx)
+            rvp = _pref_ok(pdy, pdx) if _touches_patch(pdy, pdx) else None
             if rvp is None:
                 # A raster-level graze (the offset has a small along-stroke
                 # component) must NUDGE the shared offset, not abandon it —
@@ -3632,6 +3645,8 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                     for ddy in range(-rr, rr + 1):
                         for ddx in range(-rr, rr + 1):
                             if max(abs(ddy), abs(ddx)) != rr:
+                                continue
+                            if not _touches_patch(pdy + ddy, pdx + ddx):
                                 continue
                             rvp = _pref_ok(pdy + ddy, pdx + ddx)
                             if rvp is not None and bool(rvp.any()):
@@ -3939,16 +3954,50 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     if not mask.any():
         return img16
 
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    # Spot kind per component: the AUTO sampling rule (touch + HSV/texture
-    # argmin) applies only to components made purely of auto-detected spots;
-    # anything a brush touched keeps the manual machinery (hair defenses).
-    kinds = {s.get("kind") for s in spots}
-    all_auto = kinds == {"auto"}
-    brush_mask = None
-    if not all_auto and "auto" in kinds:
-        brush_mask = rasterize_dust_mask(
-            [s for s in spots if s.get("kind") != "auto"], h, w)
+    # PER-SPOT PATCHES (maintainer rule: never auto-connect two strokes —
+    # each spot samples separately). `labels` carries one id PER SPOT, with
+    # drawing order owning shared pixels, so touching/overlapping strokes
+    # keep their own segments, their own touching-sample argmin and their
+    # own per-patch offset. Only the never-clone-dust checks (mask_pad /
+    # integ / labels>0) and the feathered composite see the union. Each
+    # spot rasterizes into its own bbox-local canvas with the exact integer
+    # geometry of rasterize_dust_mask (rounded full-frame coords, integer
+    # translation), so the stamped labels match the union mask bit for bit.
+    labels = np.zeros((h, w), np.int32)
+    boxes = {}
+    for si, s in enumerate(spots, start=1):
+        r_px = max(1, int(round(float(s.get("r", 0.0)) * w)))
+        pxy = []
+        for p in (s.get("pts") or []):
+            try:
+                pxy.append((int(round(float(p[0]) * w)),
+                            int(round(float(p[1]) * h))))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not pxy:
+            continue
+        bx0 = max(0, min(p[0] for p in pxy) - r_px - 1)
+        bx1 = min(w, max(p[0] for p in pxy) + r_px + 2)
+        by0 = max(0, min(p[1] for p in pxy) - r_px - 1)
+        by1 = min(h, max(p[1] for p in pxy) + r_px + 2)
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        local = np.zeros((by1 - by0, bx1 - bx0), np.uint8)
+        prev = None
+        for (x, y) in pxy:
+            cv2.circle(local, (x - bx0, y - by0), r_px, 255, -1)
+            if prev is not None:
+                cv2.line(local, prev, (x - bx0, y - by0), 255,
+                         thickness=2 * r_px)
+            prev = (x - bx0, y - by0)
+        if not local.any():
+            continue
+        labels[by0:by1, bx0:bx1][local > 0] = si
+        lys, lxs = np.nonzero(local)
+        boxes[si] = (bx0 + int(lxs.min()), by0 + int(lys.min()),
+                     int(lxs.max()) - int(lxs.min()) + 1,
+                     int(lys.max()) - int(lys.min()) + 1)
+    n = len(spots) + 1
     # "Clean" excludes every spot plus 1 px (buries antialiased speck edges).
     mask_pad = cv2.dilate(mask, np.ones((3, 3), np.uint8))
     if crop is not None and crop[0]:
@@ -3991,15 +4040,14 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     t_setup = time.time() - t0
     t0 = time.time()
     n_segs = 0
-    for i in range(1, n):  # 0 is background
-        x0 = int(stats[i, cv2.CC_STAT_LEFT])
-        y0 = int(stats[i, cv2.CC_STAT_TOP])
-        cw = int(stats[i, cv2.CC_STAT_WIDTH])
-        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+    for i in range(1, n):  # 0 is background; one patch PER SPOT
+        if i not in boxes:
+            continue
+        x0, y0, cw, ch = boxes[i]
         comp_win = labels[y0:y0 + ch, x0:x0 + cw] == i
-        comp_auto = all_auto or (
-            brush_mask is not None
-            and not bool(brush_mask[y0:y0 + ch, x0:x0 + cw][comp_win].any()))
+        if not comp_win.any():
+            continue  # fully overwritten by later strokes (shared pixels)
+        comp_auto = spots[i - 1].get("kind") == "auto"
         # Half-thickness = the defect's local scale (1px zero border so a
         # component touching its bbox edge still measures correctly).
         hole0 = np.zeros((ch + 2, cw + 2), np.uint8)
@@ -4119,14 +4167,20 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     # alpha computed from its own labels is exactly the global answer.
     t0 = time.time()
     out = img16.copy()
-    for i in range(1, n):
-        bx0 = int(stats[i, cv2.CC_STAT_LEFT])
-        by0 = int(stats[i, cv2.CC_STAT_TOP])
-        bw_ = int(stats[i, cv2.CC_STAT_WIDTH])
-        bh_ = int(stats[i, cv2.CC_STAT_HEIGHT])
+    # The composite blends over the UNION's connected regions: sampling is
+    # per spot, but two overlapping strokes still cross-fade as one filled
+    # area — a per-spot alpha would ramp to zero along their shared border,
+    # cutting a seam through the middle of the union's interior.
+    nu, ulab, ustats, _ = cv2.connectedComponentsWithStats(mask,
+                                                           connectivity=8)
+    for i in range(1, nu):
+        bx0 = int(ustats[i, cv2.CC_STAT_LEFT])
+        by0 = int(ustats[i, cv2.CC_STAT_TOP])
+        bw_ = int(ustats[i, cv2.CC_STAT_WIDTH])
+        bh_ = int(ustats[i, cv2.CC_STAT_HEIGHT])
         ys = slice(max(0, by0 - 2), min(h, by0 + bh_ + 2))
         xs = slice(max(0, bx0 - 2), min(w, bx0 + bw_ + 2))
-        comp = labels[ys, xs] == i
+        comp = ulab[ys, xs] == i
         # The dome IS the whole story: no defect force-fill floor (see
         # _heal_patch's feather comment) — the slider's rolloff shows on
         # every heal, dust included.

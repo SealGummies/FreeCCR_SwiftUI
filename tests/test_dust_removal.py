@@ -454,13 +454,13 @@ class TestApplyDustRemoval:
         assert abs(float(healed.mean()) - 30000) < 3000
         assert float(healed.max()) < 50000
 
-    def test_stroke_on_prior_source_merges_and_heals_clean(self):
-        # A TOUCHING source sits directly beside its patch (the sampling
-        # rule), so a stroke painted over the source area merges with the
-        # original patch into ONE connected component — the union re-heals
-        # as a single bigger patch from ITS touching border. What must hold:
-        # the new defect is never cloned into any fill, and the merged
-        # region heals to the background.
+    def test_stroke_on_prior_source_stays_separate_and_heals_clean(self):
+        # MAINTAINER RULE: two strokes are NEVER auto-connected — even when
+        # one is painted right on the other's touching source, each patch
+        # keeps its own segments and samples separately. The first stroke's
+        # pinned source now sits under the new stroke's dust, so it defers
+        # and clones the HEALED content at the same touching offset; the new
+        # stroke argmins its own touching sample. No dust is ever cloned.
         rng = np.random.default_rng(23)
         img = np.clip(rng.normal(30000, 2500, (400, 400, 3)), 0,
                       65535).astype(np.uint16)
@@ -472,7 +472,7 @@ class TestApplyDustRemoval:
         # Touching: the chosen source borders the patch.
         assert float(np.hypot(off[0] * 400, off[1] * 400)) <= 2 * 12 + 4
         # A bright defect appears at the chosen source and the user paints
-        # over it — the two patches now form one merged region.
+        # over it.
         sy, sx = cy + off[0], cx + off[1]
         img2 = img.copy()
         cv2.circle(img2, (int(sx * 400), int(sy * 400)), 5,
@@ -481,12 +481,33 @@ class TestApplyDustRemoval:
         plan2 = []
         out = apply_dust_removal(img2, [spot, b], collect_plan=plan2,
                                  prior_plan=plan1)
-        assert plan2
-        # No dust cloned anywhere in the merged fill; background restored.
+        # Two separate patches -> (at least) two records, one per stroke.
+        assert len(plan2) >= 2
+        # No dust cloned anywhere; background restored in both fills.
         m = rasterize_dust_mask([spot, b], 400, 400) > 0
         healed = out[m].astype(np.float32)
         assert float(healed.mean()) < 40000
         assert float(healed.max()) < 55000
+
+    def test_touching_strokes_sample_separately(self):
+        # MAINTAINER RULE, verbatim: "do not auto connect 2 strokes — sample
+        # separately." Two overlapping dabs must remain two patches, each
+        # with its own record and its own TOUCHING sample; the union used to
+        # merge into one component healed as a single bigger patch.
+        rng = np.random.default_rng(12)
+        img = np.clip(rng.normal(30000, 2000, (300, 300, 3)), 0,
+                      65535).astype(np.uint16)
+        a = {"kind": "brush", "pts": [[0.45, 0.5]], "r": 0.03}   # r = 9 px
+        b = {"kind": "brush", "pts": [[0.50, 0.5]], "r": 0.03}   # overlaps a
+        plan = []
+        apply_dust_removal(img, [a, b], collect_plan=plan)
+        assert len(plan) == 2                    # one record per stroke
+        for (cy, cx, off, *_), s in zip(plan, (a, b)):
+            assert off is not None
+            # Each record's segment lies on its own stroke...
+            assert abs(cx - s["pts"][0][0]) < 0.03
+            # ...and each sample touches ITS patch.
+            assert float(np.hypot(off[0] * 300, off[1] * 300)) <= 2 * 9 + 8
 
     def test_new_stroke_keeps_far_samples_stable(self):
         # Adding a dab must only re-sample segments near the edit. In the
