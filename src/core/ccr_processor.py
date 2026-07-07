@@ -3262,27 +3262,23 @@ _HEAL_ANGLES = 16         # candidate source directions searched around a spot
 _SRC_RING_CLEAN_MIN = 0.6  # a candidate source window beside other dust stays
                            # usable while at least this fraction of its ring
                            # positions is clean (fill pixels must ALL be clean)
-_HEAL_TONE_W = 3.0        # extra weight on the ring-MEAN mismatch (the areas'
-                          # chroma + brightness). The raw SSD weighs tone and
-                          # pattern equally per pixel, so beside a high-contrast
-                          # edge a remote FLAT patch of different color could
-                          # beat every near candidate whose ring straddles the
-                          # edge at imperfect phase ("sampled brown dirt to heal
-                          # a spot on white pavement"). Tone must dominate:
-                          # with the SSD's own mean term this makes an area
-                          # tone offset count 4x its per-pixel share, and it is
-                          # scale-stable (means survive resampling) so preview
+_HEAL_TONE_TOL_MADS = 3.0  # USABILITY gate (maintainer rule: sample the
+                           # immediate surroundings, same chroma+brightness):
+                           # a candidate is usable only when its weighted
+                           # ring-mean offset stays within this many weighted
+                           # MADs of the hole-adjacent surround. The sweep
+                           # accepts the best USABLE candidate of the NEAREST
+                           # ring that has one — distance is control flow,
+                           # not a score weight, so a far patch can never
+                           # outbid a usable adjacent one.
+_HEAL_TONE_W = 3.0        # within-ring ranking: extra weight on the ring-MEAN
+                          # mismatch (the areas' chroma + brightness), so the
+                          # tone-closest of a ring's usable candidates wins;
+                          # scale-stable (means survive resampling), preview
                           # and export rank candidates the same way.
-_HEAL_DIST_W = 0.45       # per-ring score penalty: the IMMEDIATE AREA comes
-                          # first — a far-ring candidate must be ~3x better on
-                          # raw match to beat one from the stroke's own
-                          # surroundings (0.15 was too weak to stop a flat
-                          # remote patch from outbidding the local area beside
-                          # a high-contrast edge)
-_HEAL_ACCEPT_MADS = 4.0   # accept a ring once its best raw match reaches the
-                          # grain floor (~2 sigma^2, sigma from the detrended
-                          # ring residual): farther candidates could only
-                          # swap the local pattern for a lucky remote one
+_HEAL_DIST_W = 0.45       # FALLBACK ranking only (no ring had a usable
+                          # candidate): prefer nearer among the wrong-tone
+                          # leftovers
 _HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
 _HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
 _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
@@ -3436,6 +3432,27 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
     d_def = np.abs(ring_px - defect).mean(axis=1)
     thr = 0.5 * float(np.percentile(d_def, 95.0))
     keep = d_def >= thr
+    # The rejection is trusted only under the WHITE-DUST PRIOR, validated on
+    # the SPLIT IT PRODUCED (no ring population is trustworthy a priori — a
+    # hair's continuation can be the ring's majority, including its outer
+    # band): film dust and the bright hairs this rejection was built for
+    # read BRIGHTER than the context they leak over, so the REJECTED pixels
+    # must be brighter than the KEPT ones by a noise margin. For a faint
+    # speck or a clean-ish hole the "defect" estimate collapses onto the
+    # BACKGROUND itself; the rejection then strips the background and
+    # whatever foreign minority remains (a wall across an edge, a curb)
+    # becomes the ENTIRE matching/tone anchor — the search then hunts for
+    # wrong-toned patches far away while perfect same-tone context sits
+    # right beside the spot. That inverted split fails this check (its
+    # "rejected" side is the darker or equal one) and the full ring stays.
+    rejected_brighter = False
+    if bool(keep.any()) and not bool(keep.all()):
+        kept_med = np.median(ring_px[keep], axis=0)
+        kept_mad = float(np.median(
+            np.abs(ring_px[keep] - kept_med).mean(axis=1))) + 1e-3
+        rejected_brighter = (
+            float(np.median(ring_px[~keep], axis=0).mean())
+            > float(kept_med.mean()) + 2.0 * kept_mad)
     # Sanity cap on the rejection: discarding nearly the whole ring means
     # the "defect" was estimated as the ring's own MAJORITY — a generous
     # brush over clean content, where the top-quartile estimate collapses
@@ -3446,7 +3463,8 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
     # much context (even a thick traced hair leaves ~a third of its ring
     # clean), so distrust the estimate and keep the full ring (`genuine`
     # also rides the plan as metadata).
-    genuine = int(keep.sum()) >= _HEAL_MIN_KEEP_FRAC * keep.size
+    genuine = (rejected_brighter
+               and int(keep.sum()) >= _HEAL_MIN_KEEP_FRAC * keep.size)
     if forced_flags is not None:
         genuine = bool(forced_flags[0])
     if genuine:
@@ -3482,7 +3500,7 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
             return None, None  # too little clean ring to match/tone against
         return img16[sy0:sy1, sx0:sx1].astype(np.float32), rv
 
-    best_score, best_src, best_off, best_rv = None, None, None, None
+    best_src, best_off, best_rv = None, None, None
     if src_off is not None:
         # Pinned source (scale replay, or a prior edit's plan): the offset
         # is taken VERBATIM — once a patch's reference is set, NOTHING may
@@ -3519,38 +3537,54 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 return best_off, g0, d0, "defer"
     if best_src is None:
         # Candidate source offsets: rings of directions at thickness-scaled
-        # distances, NEAREST FIRST — the stroke's own surroundings are the
-        # most likely to carry the same pattern, so the near rings are
-        # sampled at double angular density, near-ties fall to the closer
-        # patch (a mild per-ring penalty), and the sweep STOPS at the first
-        # ring whose best raw match reaches the grain floor: once a
-        # candidate matches as well as two clean patches of the same
-        # texture can, farther candidates could only trade the local
-        # pattern for a lucky remote one. The integral-image check rejects
-        # any source that touches dust/outside-crop, so offsets need only
-        # clear the local thickness — a long stroke heals from the clean
-        # strip right beside it. The window diagonal stays as a last-resort
-        # ring for compact spots.
+        # distances, NEAREST FIRST, near rings at double angular density.
+        # The pixels-actually-read check (_source_at) rejects any source
+        # that would READ dust/outside-crop, so offsets need only clear the
+        # local thickness — a long stroke heals from the clean strip right
+        # beside it. The window diagonal stays as a last-resort ring for
+        # compact spots; the acceptance rule below decides when the sweep
+        # stops.
         d_base = 2.0 * half_th + pad + 2.0
         d0 = float(np.hypot(wy1 - wy0, wx1 - wx0))
-        # Grain floor: E[SSD] between two clean patches of the same texture
-        # is ~2*sigma^2 per channel, with sigma the GRAIN — estimated from
-        # the CLEANEST QUARTILE of the 3x3-detrended ring residual. Anything
-        # less robust inflates the floor and early-accepts a bad near patch:
-        # raw ring MAD inflates on structure (stripes), and the residual's
-        # MEDIAN inflates when a high-contrast edge hugs most of the ring
-        # (edge bleed); contamination is never the cleanest quarter. An
-        # underestimated floor only costs a longer sweep, never a worse
-        # pick. (1.8: p25 of a 3-channel half-normal mean ~ 0.56 sigma.)
-        resid = np.abs((dst - cv2.blur(dst, (3, 3)))[ring]).mean(axis=1)
-        sigma = 1.8 * float(np.percentile(resid, 25.0))
-        floor = _HEAL_ACCEPT_MADS * sigma ** 2 + 1e-3
         tol = (_DLIKE_SEP_MADS * (ring_mad + 1e-3)) ** 2
-        best_raw = None
+        # THE ACCEPTANCE RULE (maintainer): the sampling point is closer the
+        # better — the IMMEDIATE surroundings, never across the frame. This
+        # holds BY CONSTRUCTION: the sweep accepts the best candidate of the
+        # FIRST (nearest) ring that contains a USABLE one, and never looks
+        # farther once it exists. A usable candidate is clean where it is
+        # read (_source_at) and matches the hole's adjacent surround in
+        # CHROMA + BRIGHTNESS (weighted ring-mean within tone_tol). Farther
+        # rings are reached only while nearer rings hold nothing usable;
+        # if NO ring does, the fallback is the overall distance-penalized
+        # best, wrong tone and all (still better than leaving the dust).
+        #
+        # Ring positions are weighted by PROXIMITY TO THE HOLE: the pixels
+        # touching the hole govern the fill's continuity, and a strong
+        # feature crossing the WINDOW's periphery — an edge a few px from
+        # the spot — must not veto a candidate whose fill-adjacent
+        # surroundings match perfectly. Demanding the whole-window
+        # surroundings match did exactly that: the perfect patch
+        # immediately beside a spot-near-an-edge could not re-phase the
+        # edge at its own periphery and scored WORSE than a remote flat
+        # patch that had no edge at all ("sampled dirt from across the
+        # frame while perfect pavement sat right next to the spot").
+        w_ring = np.exp(-0.5 * (away[ring] / (0.5 * pad)) ** 2
+                        ).astype(np.float32)
+        w_all = float(w_ring.sum()) + 1e-6
+        wmean_dst = (dst_ring * w_ring[:, None]).sum(axis=0) / w_all
+        wmad_dst = float((np.abs(dst_ring - wmean_dst).mean(axis=1)
+                          * w_ring).sum() / w_all)
+        # Tone tolerance scales with the adjacent surround's own weighted
+        # variability: tight on smooth content (sky — dirt across the frame
+        # can never qualify), naturally looser when the hole itself sits on
+        # structure (there, candidates must carry the structure anyway).
+        tone_tol = _HEAL_TONE_TOL_MADS * (wmad_dst + 1e-3)
+        fb_score, fb_src, fb_off, fb_rv = None, None, None, None
         for fi, (d, n_ang) in enumerate(
                 ((d_base, 2 * _HEAL_ANGLES), (1.5 * d_base, 2 * _HEAL_ANGLES),
                  (2.25 * d_base, _HEAL_ANGLES), (3.5 * d_base, _HEAL_ANGLES),
                  (d0, _HEAL_ANGLES))):
+            ring_best = None
             for k in range(n_ang):
                 ang = 2.0 * np.pi * (k + 0.35 * fi) / n_ang
                 dy = int(round(d * np.sin(ang)))
@@ -3559,16 +3593,16 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 if src is None:
                     continue
                 diff = src[ring] - dst_ring
+                wv = w_ring
                 if rv is not None:
                     diff = diff[rv]  # match on the ring's clean subset only
-                ssd = float(np.mean(diff * diff))
-                # Same chroma + brightness first (user rule): the per-channel
-                # ring-mean offset is the candidate AREA's tone mismatch —
-                # weigh it far above its per-pixel share so a remote flat
-                # patch of different color can never outbid the local area
-                # on pattern luck (see _HEAL_TONE_W).
-                mu = diff.mean(axis=0)
-                ssd += _HEAL_TONE_W * float(np.mean(mu * mu))
+                    wv = w_ring[rv]
+                wsum = float(wv.sum()) + 1e-6
+                ssd = float(((diff * diff).mean(axis=1) * wv).sum() / wsum)
+                # The candidate AREA's chroma + brightness offset, weighted
+                # toward the hole-adjacent pixels.
+                mu = (diff * wv[:, None]).sum(axis=0) / wsum
+                tone = float(np.abs(mu).mean())
                 # The ring SSD never looks INSIDE the candidate window: a
                 # source whose ring matches but whose hole area holds
                 # something foreign (a black border edge, an object) clones
@@ -3577,13 +3611,23 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 # penalty re-ranked near-ties by interior phase on textured
                 # content and drifted preview/export tone).
                 i_diff = np.median(src[hole], axis=0) - ring_bg
-                raw = ssd + max(0.0, float(np.mean(i_diff * i_diff)) - tol)
-                score = raw * (1.0 + _HEAL_DIST_W * fi)
-                if best_score is None or score < best_score:
-                    best_score, best_src, best_off = score, src, (dy, dx)
-                    best_rv, best_raw = rv, raw
-            if best_raw is not None and best_raw <= floor:
-                break  # the surroundings already match at the grain floor
+                raw = (ssd + _HEAL_TONE_W * float(np.mean(mu * mu))
+                       + max(0.0, float(np.mean(i_diff * i_diff)) - tol))
+                if fb_score is None or raw * (1.0 + _HEAL_DIST_W * fi) < fb_score:
+                    fb_score = raw * (1.0 + _HEAL_DIST_W * fi)
+                    fb_src, fb_off, fb_rv = src, (dy, dx), rv
+                if tone > tone_tol:
+                    continue  # wrong chroma/brightness — unusable at ANY ring
+                if ring_best is None or raw < ring_best:
+                    ring_best = raw
+                    best_src, best_off, best_rv = src, (dy, dx), rv
+            if ring_best is not None:
+                break  # nearest ring with a usable patch WINS — never farther
+        if best_src is None and fb_src is not None:
+            # No tone-matched patch on any ring (hole boxed into content
+            # unlike anything reachable) — take the least-bad match rather
+            # than leaving the dust; the membrane re-tones what it can.
+            best_src, best_off, best_rv = fb_src, fb_off, fb_rv
 
     if best_src is None:
         return None

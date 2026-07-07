@@ -412,35 +412,44 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      hair edge, or the hair's continuation past the stroke's end (which can
      be the ring's *majority*), cannot lift the fill into a bright ghost of
      the stroke. Legit bimodal structure survives (both modes sit far from
-     the defect color). **Sanity cap** (`_HEAL_MIN_KEEP_FRAC`): if the
-     rejection would keep < 20% of the ring, the "defect" was estimated as
-     the ring's own majority (a clean generous brush, whose top-quartile
-     estimate collapses onto the background) and whatever survives is some
-     small foreign mode — a black border, a dark roofline — that would
+     the defect color). **The split validates itself under the white-dust
+     prior**: the rejection is trusted only when the REJECTED pixels are
+     luma-brighter than the KEPT ones by a noise margin — for a faint speck
+     or clean-ish hole the "defect" estimate collapses onto the background,
+     and the (inverted) split would strip the background and anchor the
+     entire match/tone on some foreign minority in the ring (a wall across
+     an edge), sending the source hunt far away while perfect same-tone
+     context sits beside the spot. **Sanity cap** (`_HEAL_MIN_KEEP_FRAC`):
+     if the rejection would keep < 20% of the ring, whatever survives is
+     some small foreign mode — a black border, a dark roofline — that would
      become the entire anchor (clean sky strokes healed to solid black,
-     cloned from the border). The estimate is distrusted (`genuine=False`):
-     full ring, no defect force-fill.
+     cloned from the border). Either failure distrusts the estimate
+     (`genuine=False`): full ring, no defect force-fill.
   3. **Search**: candidate source windows on rings of directions at
      thickness-scaled distances (`d_base = 2·half_th + pad + 2`,
      ×1/1.5/2.25/3.5, plus the window diagonal as a last resort),
-     **nearest first**: the stroke's own surroundings are the most likely
-     to carry the same pattern, so the two nearest rings sample at DOUBLE
-     angular density (2×`_HEAL_ANGLES`), near-ties fall to the closer
-     patch (`_HEAL_DIST_W` per-ring score penalty), and the sweep STOPS at
-     the first ring whose best raw match reaches the grain floor
-     (`_HEAL_ACCEPT_MADS` × sigma², sigma estimated from the CLEANEST
-     QUARTILE of the 3×3-detrended ring residual — the raw ring MAD
-     inflates on structure and the residual's median inflates under edge
-     bleed, and an inflated floor early-accepts a bad near patch; an
-     underestimated floor only costs a longer sweep). A candidate must be
-     in-bounds and fully clean (checked O(1) against `cv2.integral` of the
-     padded mask), so a long stroke heals from the clean strip right beside
-     it. Score = SSD between source and destination **kept ring** pixels —
-     plus, only past a ring-MAD-scaled tolerance, the candidate's
-     interior-tone excess vs the ring background (the ring SSD never looks
-     inside the window: a source whose ring matches but whose hole area
-     holds a black border edge clones the border into the fill; within
-     tolerance the ring SSD alone ranks). Best adjusted score wins.
+     **nearest first, and the nearest ring with a USABLE candidate wins BY
+     CONSTRUCTION** (maintainer rule: the sampling point is closer the
+     better — the immediate surroundings, never across the frame). The two
+     nearest rings sample at DOUBLE angular density (2×`_HEAL_ANGLES`). A
+     candidate must be in-bounds and clean where it is READ — hole
+     projection spotless, ≥ `_SRC_RING_CLEAN_MIN` of the ring clean
+     (checked O(1) against `cv2.integral`, per-pixel only when the window
+     touches dust) — so a long stroke heals from the clean strip right
+     beside it and a speck inside a dust cluster still samples its
+     immediate area. USABLE additionally means the candidate's
+     proximity-weighted ring-mean stays within `_HEAL_TONE_TOL_MADS`
+     weighted MADs of the destination's (same chroma + brightness; ring
+     pixels are weighted toward the hole — a feature crossing the window's
+     periphery must not veto a candidate whose fill-adjacent surroundings
+     match). Within the accepted ring, candidates rank by weighted ring
+     SSD + `_HEAL_TONE_W`·(ring-mean offset)² + (only past a
+     ring-MAD-scaled tolerance) the interior-tone excess vs the ring
+     background (the ring SSD never looks inside the window: a source
+     whose ring matches but whose hole area holds a black border edge
+     clones the border into the fill). Only when NO ring holds a usable
+     candidate does the distance-penalized (`_HEAL_DIST_W`) best of the
+     wrong-tone leftovers fill instead.
   4. **Clone + membrane tone correction**: hole pixels are copied from the
      best source, plus a smooth per-channel correction field interpolated
      from the kept-ring differences (normalized Gaussian convolution,
