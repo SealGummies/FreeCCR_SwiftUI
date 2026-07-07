@@ -8,4 +8,8 @@ imagecodecs
 requests
 nuitka
 pyopencl
-onnxruntime
+# AI dust detection. The DirectML build runs the detector on any Windows GPU
+# (~10x faster than CPU); same import name, and dust_detect falls back to CPU
+# when no usable GPU exists. Other platforms use the CPU/CoreML package.
+onnxruntime-directml; sys_platform == 'win32'
+onnxruntime; sys_platform != 'win32'

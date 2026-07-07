@@ -438,8 +438,8 @@ class DustRemovalPanel(QWidget):
         self.detect_btn.setEnabled(False)
         self.detect_btn.setText("Detecting…")
         self.status_label.setText(
-            "Running AI detection at high resolution — this can take a "
-            "minute…")
+            "Running AI detection at high resolution — seconds on GPU, "
+            "up to a minute on CPU…")
         self._detect_thread = QThread()
         self._detect_worker = _DetectWorker(img)
         self._detect_worker.moveToThread(self._detect_thread)

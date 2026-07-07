@@ -179,11 +179,22 @@ def _get_session():
         # (e.g. onnxruntime-directml on Windows) — native-res tiled detection
         # is compute-bound on CPU (~30 s/image). Plain `onnxruntime` only has
         # CPU, so this is a no-op there; unsupported ops fall back per-node.
+        # CPU is always listed last, and if the GPU session itself fails to
+        # build (no adapter, broken driver), retry CPU-only — AI detection
+        # must degrade, never break, on machines without a usable GPU.
         preferred = ("DmlExecutionProvider", "CUDAExecutionProvider",
                      "CoreMLExecutionProvider", "CPUExecutionProvider")
         avail = set(ort.get_available_providers())
         providers = [p for p in preferred if p in avail] or ["CPUExecutionProvider"]
-        sess = ort.InferenceSession(path, providers=providers)
+        try:
+            sess = ort.InferenceSession(path, providers=providers)
+        except Exception:
+            if providers == ["CPUExecutionProvider"]:
+                raise
+            logging.warning("dust_detect: GPU provider failed to initialise "
+                            "(%s) — falling back to CPU", providers[0])
+            sess = ort.InferenceSession(path,
+                                        providers=["CPUExecutionProvider"])
         _session = sess
         _session_path = path
         return sess
