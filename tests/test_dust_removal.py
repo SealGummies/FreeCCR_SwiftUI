@@ -604,6 +604,18 @@ class TestProbToSpots:
         busy[40:46, 40:46] += 0.03
         assert dust_detect.prob_to_spots(prob, busy, 60) == []
 
+    def test_texture_rule_rejects_even_sharp_glints(self):
+        # Auto-detection is sky/shadow ONLY (maintainer rule): in busy texture
+        # a compact bright glint is indistinguishable from dust and healing it
+        # eats real detail, so even a SHARP, high-lift blob is rejected when
+        # its surround ring is textured. Manual brush territory.
+        rng = np.random.default_rng(9)
+        prob = np.zeros((200, 200), np.float32)
+        prob[40:46, 40:46] = 0.9
+        busy = np.clip(rng.normal(0.4, 0.06, (200, 200)), 0, 1).astype(np.float32)
+        busy[40:46, 40:46] = 0.95              # huge lift — still rejected
+        assert dust_detect.prob_to_spots(prob, busy, 60) == []
+
 
 # --- Tiled inference grid (pure) ---------------------------------------------
 class TestTileStarts:

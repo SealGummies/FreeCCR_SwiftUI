@@ -2881,6 +2881,20 @@ class ImagePreview(QWidget):
         return self.dust_detect_source_for(img) if img is not None else None
 
     @staticmethod
+    def dust_detect_keep_mask_for(img, h: int, w: int):
+        """Confirmed-crop footprint as a uint8 {0,1} mask at (h, w) — the
+        detection source's resolution — or None without a crop. Passed to
+        dust_detect.detect so tiles wholly outside the crop are never
+        inferred (on a film strip cropped to one frame, most of the strip
+        skips the net); _auto_spots_in_crop stays the correctness filter."""
+        rect = getattr(img, "crop_rect", None)
+        if rect is None:
+            return None
+        return _crop_keep_mask(tuple(rect),
+                               float(getattr(img, "crop_angle", 0.0) or 0.0),
+                               h, w)
+
+    @staticmethod
     def _auto_spots_in_crop(img, spots):
         """Only auto-detected spots whose center lies inside the confirmed
         crop are kept. Content outside the crop (film rebate, holder, edge

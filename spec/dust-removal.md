@@ -567,6 +567,14 @@ panel that imports it) load even when `onnxruntime` is absent.
       also fires on legitimate thin LINES (a bike frame, the horizon, a path
       edge); circle-inpainting those smears real detail, so linear defects are
       left to the manual brush (§5.4).
+    - **smooth-surround rule**: auto-detection keeps spots on SMOOTH surrounds
+      only — sky, open shadow (surround-ring luma std ≤ `SMOOTH_MAX_STD`). In
+      busy texture (foliage, stucco, gravel) a compact bright glint is
+      indistinguishable from dust at this scale and healing it eats real
+      detail; textured areas are the manual brush's job. `detect()` uses the
+      same idea (windowed-std map + the confirmed crop's footprint as a
+      keep-mask) to skip whole tiles with nothing keepable — on a strip
+      cropped to one frame most tiles never hit the net (~3× faster).
     - **bright-speck gate**: film dust inverts to **white** specks, so a real
       dust blob is brighter than its surroundings. The gate is
       **noise-relative** — dust sits off the focal plane, so most real specks
@@ -583,10 +591,12 @@ panel that imports it) load even when `onnxruntime` is absent.
       grayscale. This and the aspect filter are the main guards against AI
       false positives.
   - Each surviving (compact) component → one `auto` spot: centroid
-    `(cx/prob_w, cy/prob_h)`; **area-equivalent** radius
-    `r = (sqrt(area/π) + pad) / prob_w` — a tight circle matching the speck, so
-    the inpaint stays invisible rather than leaving a smudge (the old
-    bounding-extent radius over-covered and was the artifact source).
+    `(cx/prob_w, cy/prob_h)`; **area-equivalent** radius scaled by
+    `SPOT_SCALE`: `r = (sqrt(area/π)·SPOT_SCALE + pad) / prob_w`. Area-based,
+    NOT the bounding-box extent (that over-covered and was the artifact
+    source) — but scaled up because the thresholded component is only the
+    bright CORE of a soft off-focus speck; an exact-fit circle left its faint
+    skirt unhealed.
   - `prob_to_spots` is **pure / model-free** (operates on a numpy prob map) so it
     is unit-testable without ONNX.
 - All ONNX use is guarded; any import/inference error surfaces as

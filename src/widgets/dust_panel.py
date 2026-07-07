@@ -64,7 +64,9 @@ class _DetectWorker(QObject):
             if source is None:
                 self.failed.emit("No image to detect on.")
                 return
-            prob, luma = dust_detect.detect(source)
+            keep = ImagePreview.dust_detect_keep_mask_for(
+                self.img, source.shape[0], source.shape[1])
+            prob, luma = dust_detect.detect(source, keep_mask=keep)
             self.done.emit((prob, luma))
         except Exception as e:  # noqa: BLE001 — surfaced to the user
             self.failed.emit(str(e))
@@ -101,7 +103,9 @@ class _DetectAllWorker(QObject):
                 if source is None:
                     self.progress.emit(processed, total)
                     continue
-                prob, luma = dust_detect.detect(source)
+                keep = ImagePreview.dust_detect_keep_mask_for(
+                    img, source.shape[0], source.shape[1])
+                prob, luma = dust_detect.detect(source, keep_mask=keep)
                 spots = dust_detect.prob_to_spots(prob, luma, self._sensitivity)
                 self.detected.emit(img, spots)
                 processed += 1
