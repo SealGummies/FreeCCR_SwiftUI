@@ -194,7 +194,11 @@ reference to `MainWindow` and `ImagePreview` passed at construction (it does
 ### 3.4 AI detect & remove
 - **Detect & Remove** runs detection **off the GUI thread** on the current
   working positive (`resized_raw` with existing spots already inpainted, so
-  already-cleaned dust is not re-flagged), at preview resolution:
+  already-cleaned dust is not re-flagged), at preview resolution. When the
+  base is a **windowed working-space buffer**, the detection source is
+  de-windowed + window-clamped first (same as the WB picker / AWB): fed raw
+  container codes the net sees a black frame and the bright-speck gate's
+  absolute margin is unreachable — no dust would ever be found.
   1. If no cached probability map for this image, run the ONNX detector and cache
      it (so re-tuning Sensitivity does not re-run the net).
   2. Threshold + size-gate + dilate the prob map into a binary mask at detection

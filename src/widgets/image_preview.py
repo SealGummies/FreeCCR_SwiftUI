@@ -2832,10 +2832,24 @@ class ImagePreview(QWidget):
         rect = getattr(img, "crop_rect", None)
         crop = ((tuple(rect), float(getattr(img, "crop_angle", 0.0) or 0.0))
                 if rect else None)
-        return apply_dust_removal(
+        healed = apply_dust_removal(
             raw, brush,
             feather=getattr(img, "dust_feather", DUST_FEATHER_DEFAULT),
             crop=crop)
+        # A windowed working-space base is in container codes — the whole image
+        # sits in the bottom ~1.5% of the 16-bit range, so the detector would
+        # see a black frame (and the bright-speck gate's absolute margin could
+        # never be cleared). De-window + window-clamp to the display-referred
+        # positive the user actually sees, same as the WB picker / AWB do
+        # (a no-op when the feature is off / base is full-range).
+        if getattr(img, "_ws_windowed", False):
+            from core.ccr_processor import WS_B, WS_W
+            d = healed.astype(np.float32)
+            d -= np.float32(WS_B)
+            d *= np.float32(1.0 / (WS_W - WS_B))
+            np.clip(d, 0.0, 1.0, out=d)
+            healed = (d * np.float32(65535.0)).astype(np.uint16)
+        return healed
 
     def dust_detect_source(self):
         """Detection source for the current image (see dust_detect_source_for)."""

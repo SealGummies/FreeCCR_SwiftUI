@@ -1032,5 +1032,44 @@ class TestResolutionConsistency:
         assert np.array_equal(a, b)
 
 
+# --- AI detection source: windowed working-space base ------------------------
+class TestDetectSourceDewindow:
+    """dust_detect_source_for must hand the detector a DISPLAY-referred
+    positive. A bw conversion with working-space headroom stores resized_raw
+    in windowed container codes — the whole image sits in the bottom ~1.5% of
+    the 16-bit range — so fed raw to the net it is a black frame: the detector
+    never fires and the bright-speck gate's absolute margin is unreachable
+    ("AI finds no dust" on every windowed image)."""
+
+    @staticmethod
+    def _img(base_u16, windowed):
+        img = CCRImage.__new__(CCRImage)
+        img.resized_raw = base_u16
+        img.dust_spots = []
+        img.dust_feather = DUST_FEATHER_DEFAULT
+        img.crop_rect = None
+        img.crop_angle = 0.0
+        img._ws_windowed = windowed
+        return img
+
+    def test_windowed_base_is_dewindowed_for_detection(self):
+        from core.ccr_processor import encode_window
+        from widgets.image_preview import ImagePreview
+        d = np.full((60, 80, 3), 0.4, dtype=np.float32)
+        d[20:24, 30:34] = 1.0                      # white dust speck
+        code = encode_window(d.copy())             # windowed container codes
+        assert code.max() < 3000                   # near-black fed as-is
+        src = ImagePreview.dust_detect_source_for(self._img(code, True))
+        lum = src.astype(np.float32) / 65535.0
+        assert abs(float(lum[10, 10, 0]) - 0.4) < 0.01  # display tone restored
+        assert float(lum[21, 31, 0]) > 0.98             # speck back at white
+
+    def test_full_range_base_passes_through_unchanged(self):
+        from widgets.image_preview import ImagePreview
+        base = _flat_with_speck()
+        src = ImagePreview.dust_detect_source_for(self._img(base, False))
+        assert np.array_equal(src, base)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
