@@ -425,49 +425,38 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      become the entire anchor (clean sky strokes healed to solid black,
      cloned from the border). Either failure distrusts the estimate
      (`genuine=False`): full ring, no defect force-fill.
-  3. **Search — AUTO spots (maintainer rule, verbatim)**: (1) the sample
-     area MUST TOUCH the patch area; (2) among the touching candidates (64
-     directions at `2·half_th` + a few px to clear the mask dilation) the
+  3. **Search — THE AUTOMATIC SAMPLING RULE (maintainer, verbatim)**,
+     applied to EVERY automatically picked initial sample — AI-detected
+     spots and painted strokes alike (only the user's explicit right-drag
+     re-pick is exempt): (1) the sample area MUST TOUCH the patch area —
+     border-to-border, union contiguous (candidates: 64 directions at
+     `2·half_th` +0/+1/+2 px of raster slack, sample-area cleanliness
+     checked against the RAW mask so the dilation cannot push the sample
+     off the border it must touch); (2) among the touching candidates the
      one with the lowest combined Δhue + Δsat + ΔV — measured against the
      patch's own background, estimated as the darker half of the HOLE's
-     pixels (film dust is white; the hole is `SPOT_SCALE`× the speck core,
-     so the true background is visible inside it) — plus the lowest
-     texture wins; (3) again: the areas must touch. A TOTAL selection — no
-     distance escalation, no "good enough" gate, no fallback ranking. No
-     ring statistic participates in the choice, and the defect-leak
-     rejection (§ step 2) is disabled for auto components (a manual-stroke
-     defense; an auto spot cannot leak by construction — its misfires
-     re-anchored auto heals on foreign structure across an edge).
-     Invariant intersections: dust is never cloned (a touching window
-     overlapping another spot is excluded; a fully-encircled spot clones
-     the HEALED content at a touching offset via the deferred pass), and a
-     candidate needs ≥ 1 clean ring px for the tone membrane.
-     **Search — MANUAL strokes**: candidate source windows on rings of
-     directions at thickness-scaled distances
-     (`d_base = 2·half_th + pad + 2`,
-     ×1/1.5/2.25/3.5, plus the window diagonal as a last resort),
-     **nearest first, and the nearest ring with a USABLE candidate wins BY
-     CONSTRUCTION** (maintainer rule: the sampling point is closer the
-     better — the immediate surroundings, never across the frame). The two
-     nearest rings sample at DOUBLE angular density (2×`_HEAL_ANGLES`). A
-     candidate must be in-bounds and clean where it is READ — hole
-     projection spotless, ≥ `_SRC_RING_CLEAN_MIN` of the ring clean
-     (checked O(1) against `cv2.integral`, per-pixel only when the window
-     touches dust) — so a long stroke heals from the clean strip right
-     beside it and a speck inside a dust cluster still samples its
-     immediate area. USABLE additionally means the candidate's
-     proximity-weighted ring-mean stays within `_HEAL_TONE_TOL_MADS`
-     weighted MADs of the destination's (same chroma + brightness; ring
-     pixels are weighted toward the hole — a feature crossing the window's
-     periphery must not veto a candidate whose fill-adjacent surroundings
-     match). Within the accepted ring, candidates rank by weighted ring
-     SSD + `_HEAL_TONE_W`·(ring-mean offset)² + (only past a
-     ring-MAD-scaled tolerance) the interior-tone excess vs the ring
-     background (the ring SSD never looks inside the window: a source
-     whose ring matches but whose hole area holds a black border edge
-     clones the border into the fill). Only when NO ring holds a usable
-     candidate does the distance-penalized (`_HEAL_DIST_W`) best of the
-     wrong-tone leftovers fill instead.
+     pixels (film dust is white) — plus the lowest texture wins; (3)
+     again: the areas must touch. A TOTAL selection — no distance
+     escalation, no "good enough" gate, no fallback ranking. On a windowed
+     working-space buffer the deltas are computed on de-windowed display
+     values. No ring statistic participates in the choice, and the
+     defect-leak rejection (§ step 2) is disabled for auto components (it
+     is a manual-trace defense; an auto spot cannot leak by construction).
+     **One sample offset per patch**: the rule speaks of the patch as a
+     unit — the component's first segment runs the argmin and the rest of
+     the patch reuses its offset (nudged ≤ 4 px around raster grazes), so
+     a long stroke cannot get differently-phased clones butted together
+     mid-stroke. Known consequences, accepted with the rule: a brush
+     NARROWER than the defect it traces samples the defect's own
+     continuation (cover a defect to remove it), and on patterned content
+     the fill may land phase-shifted (the rule has no pattern-phase term;
+     the re-pick drag is the alignment tool). Invariant intersections:
+     dust is never cloned (a touching window overlapping any spot is
+     excluded; when NO in-bounds touching candidate exists at all — patch
+     at frame edge or fully encircled — the boundary-diffusion Telea fill
+     applies, growing from the patch's own touching border), and a
+     candidate needs ≥ 1 clean ring px for the tone membrane (raw-mask
+     subset, scale-stable).
   4. **Clone + membrane tone correction**: hole pixels are copied from the
      best source, plus a smooth per-channel correction field interpolated
      from the kept-ring differences (normalized Gaussian convolution,

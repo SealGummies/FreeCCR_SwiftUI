@@ -3259,26 +3259,11 @@ _HEAL_RING = 3            # min ring width of clean context (matching + tone)
 _HEAL_GUARD = 2           # min gap (px) between the hole and its context ring
 _HEAL_ANGLES = 16         # candidate source directions searched around a spot
                           # (the two NEAREST rings sample at double density)
-_SRC_RING_CLEAN_MIN = 0.6  # a candidate source window beside other dust stays
-                           # usable while at least this fraction of its ring
-                           # positions is clean (fill pixels must ALL be clean)
-_HEAL_TONE_TOL_MADS = 3.0  # USABILITY gate (maintainer rule: sample the
-                           # immediate surroundings, same chroma+brightness):
-                           # a candidate is usable only when its weighted
-                           # ring-mean offset stays within this many weighted
-                           # MADs of the hole-adjacent surround. The sweep
-                           # accepts the best USABLE candidate of the NEAREST
-                           # ring that has one — distance is control flow,
-                           # not a score weight, so a far patch can never
-                           # outbid a usable adjacent one.
-_HEAL_TONE_W = 3.0        # within-ring ranking: extra weight on the ring-MEAN
-                          # mismatch (the areas' chroma + brightness), so the
-                          # tone-closest of a ring's usable candidates wins;
-                          # scale-stable (means survive resampling), preview
-                          # and export rank candidates the same way.
-_HEAL_DIST_W = 0.45       # FALLBACK ranking only (no ring had a usable
-                          # candidate): prefer nearer among the wrong-tone
-                          # leftovers
+# The automatic sampling rule (maintainer, verbatim — see _heal_patch): the
+# sample area must TOUCH the patch area, and among the touching candidates
+# the lowest combined Δhue+Δsat+ΔV (vs the patch's own background) plus the
+# lowest texture wins. Total selection — no distance rings, no gates, no
+# fallback ranking. The former ring-sweep constants died with the sweep.
 _HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
 _HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
 _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
@@ -3334,7 +3319,8 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
                 filled: np.ndarray, fmap: np.ndarray, feather: float,
                 src_off=None, forced_flags=None,
-                sample=None, manual=False, auto=False):
+                sample=None, manual=False, auto=False, ws_windowed=False,
+                pref_off=None):
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
 
@@ -3490,30 +3476,6 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
     ring_bg = np.median(dst_ring, axis=0)
     ring_mad = float(np.median(np.abs(dst_ring - ring_bg).mean(axis=1)))
 
-    def _source_at(dy, dx):
-        """Candidate source window, or (None, None). Returns (pixels, rv):
-        rv is None for a fully clean window, else the boolean CLEAN subset of
-        the ring positions. The old all-or-nothing dust check rejected any
-        window touching dust ANYWHERE — in a dusty sky (specks cluster) every
-        near window was disqualified by its neighbors and the pick leapt to
-        the far rings. Only the pixels a heal actually READS must be clean:
-        the hole projection (cloned verbatim — mandatory), and the ring
-        (matching + membrane tone), which keeps its clean subset when at
-        least _SRC_RING_CLEAN_MIN of it survives."""
-        sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
-        if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
-            return None, None
-        if _box_sum(integ, sy0, sx0, sy1, sx1) == 0:
-            return img16[sy0:sy1, sx0:sx1].astype(np.float32), None
-        m = mask_pad[sy0:sy1, sx0:sx1]
-        if m[hole].any():
-            return None, None  # fill pixels would clone dust
-        rv = m[ring] == 0
-        if (float(rv.mean()) < _SRC_RING_CLEAN_MIN
-                or int(rv.sum()) < _HEAL_MIN_RING_PX):
-            return None, None  # too little clean ring to match/tone against
-        return img16[sy0:sy1, sx0:sx1].astype(np.float32), rv
-
     best_src, best_off, best_rv = None, None, None
     if src_off is not None:
         # Pinned source (scale replay, or a prior edit's plan): the offset
@@ -3535,9 +3497,41 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
             best_src = img16[wy0 + dy:wy1 + dy,
                              wx0 + dx:wx1 + dx].astype(np.float32)
         else:
-            sm = mask_pad[wy0 + dy:wy1 + dy, wx0 + dx:wx1 + dx]
-            rv_pin = sm[ring] == 0
-            if not sm[hole].any() and int(rv_pin.sum()) >= _HEAL_MIN_RING_PX:
+            # Same cleanliness criterion as the fresh pick (RAW mask for the
+            # sample area): a TOUCHING source hugs the patch border, and the
+            # 1 px mask_pad dilation flipping the verdict at another scale
+            # made replays reroute through the deferred pass — preview and
+            # export diverged on the very segments the rule pins. Scale
+            # rounding can still push a tangent offset ~1 px INTO the mask;
+            # such an offset is rescued by the nearest clean offset within a
+            # ≤4 px Chebyshev spiral (essentially the same patch) before the
+            # deferred pass is considered.
+            def _raw_clean(oy, ox):
+                if (wy0 + oy < 0 or wx0 + ox < 0
+                        or wy1 + oy > h or wx1 + ox > w):
+                    return False
+                win = labels[wy0 + oy:wy1 + oy, wx0 + ox:wx1 + ox]
+                return not (win[hole] > 0).any()
+            if not _raw_clean(dy, dx):
+                for rr in range(1, 5):
+                    hit = None
+                    for ddy in range(-rr, rr + 1):
+                        for ddx in range(-rr, rr + 1):
+                            if max(abs(ddy), abs(ddx)) != rr:
+                                continue
+                            if _raw_clean(dy + ddy, dx + ddx):
+                                hit = (dy + ddy, dx + ddx)
+                                break
+                        if hit:
+                            break
+                    if hit:
+                        dy, dx = hit
+                        best_off = (dy, dx)
+                        break
+            # Raw-mask ring subset, matching the fresh pick (scale-stable
+            # tone anchor — see the fresh branch below).
+            rv_pin = labels[wy0 + dy:wy1 + dy, wx0 + dx:wx1 + dx][ring] == 0
+            if _raw_clean(dy, dx) and bool(rv_pin.any()):
                 best_src = img16[wy0 + dy:wy1 + dy,
                                  wx0 + dx:wx1 + dx].astype(np.float32)
                 if not rv_pin.all():
@@ -3549,28 +3543,95 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 g0, d0 = forced_flags if forced_flags is not None else (True,
                                                                         False)
                 return best_off, g0, d0, "defer"
-    if best_src is None and auto:
-        # ============== AUTO SAMPLING RULE (maintainer, verbatim) ============
-        # 1. The sample area MUST TOUCH the patch area.
+    if best_src is None:
+        # ========== AUTOMATIC SAMPLING RULE (maintainer, verbatim) ==========
+        # Applies to EVERY automatically picked initial sample — AI-detected
+        # spots and painted strokes alike (only an explicit user re-pick is
+        # exempt, and it arrives as a pinned src_off above):
+        # 1. The sample area MUST TOUCH the patch area — the border of the
+        #    sample area and the border of the patch share at least one
+        #    pixel of contact (union contiguous). Not 500 px away, not
+        #    50 px away: touching.
         # 2. Among the touching candidates pick the lowest combined
         #    delta-hue + delta-saturation + delta-V (vs the patch's own
-        #    background) plus the lowest texture. This is a TOTAL selection:
-        #    the best touching candidate always wins — no distance
-        #    escalation, no "good enough" gate, no fallback.
+        #    background) plus the lowest texture. A TOTAL selection: the
+        #    best touching candidate always wins — no distance escalation,
+        #    no "good enough" gate, no fallback ranking.
         # 3. (Again) the sample area and the patch area must touch.
         # Reference = the darker half of the HOLE's own pixels (film dust is
-        # white, and the hole is SPOT_SCALE× the speck's core, so the true
-        # background is visible inside it). No ring statistic participates
-        # in the choice — a shadow band or wall crossing the ring cannot
-        # redirect the anchor (both reported failures did exactly that).
+        # white, so the darker half is the background under/around the
+        # defect). No ring statistic participates in the choice — a shadow
+        # band or wall crossing the ring cannot redirect the anchor.
+        # On a WINDOWED working-space buffer the hue/sat/value deltas are
+        # computed on de-windowed display values (container codes compress
+        # them 64×, hue degenerating first).
+        if ws_windowed:
+            dwk = 65535.0 / (WS_W - WS_B)
+
+            def _dw(v):
+                return np.clip((np.asarray(v, np.float32) - WS_B) * dwk,
+                               0.0, 65535.0)
+        else:
+            dwk = 1.0
+
+            def _dw(v):
+                return v
+        # ONE sample offset per PATCH: the rule speaks of "the patch area"
+        # as a unit — a long stroke is healed in internal segments, and
+        # letting each segment argmin independently put differently-phased
+        # clones side by side (a visible seam inside one stroke, whose
+        # raster position drifted between preview and export). The
+        # component's first segment runs the argmin; its offset is reused
+        # by the rest of the patch whenever it stays in-bounds and clean
+        # (a curled stroke folding into the offset re-runs the argmin).
+        if pref_off is not None:
+            def _pref_ok(oy, ox):
+                if (wy0 + oy < 0 or wx0 + ox < 0
+                        or wy1 + oy > h or wx1 + ox > w):
+                    return None
+                lw = labels[wy0 + oy:wy1 + oy, wx0 + ox:wx1 + ox]
+                if (lw[hole] > 0).any():
+                    return None
+                return lw[ring] == 0
+            pdy, pdx = int(pref_off[0]), int(pref_off[1])
+            rvp = _pref_ok(pdy, pdx)
+            if rvp is None:
+                # A raster-level graze (the offset has a small along-stroke
+                # component) must NUDGE the shared offset, not abandon it —
+                # an independent re-pick here puts a differently-phased
+                # clone mid-stroke (a visible seam that also drifts between
+                # preview and export). Same ≤4 px spiral as the replay
+                # rescue: essentially the same patch.
+                for rr in range(1, 5):
+                    for ddy in range(-rr, rr + 1):
+                        for ddx in range(-rr, rr + 1):
+                            if max(abs(ddy), abs(ddx)) != rr:
+                                continue
+                            rvp = _pref_ok(pdy + ddy, pdx + ddx)
+                            if rvp is not None and bool(rvp.any()):
+                                pdy, pdx = pdy + ddy, pdx + ddx
+                                break
+                            rvp = None
+                        if rvp is not None:
+                            break
+                    if rvp is not None:
+                        break
+            if rvp is not None and bool(rvp.any()):
+                best_src = img16[wy0 + pdy:wy1 + pdy,
+                                 wx0 + pdx:wx1 + pdx].astype(np.float32)
+                best_off = (pdy, pdx)
+                best_rv = None if bool(rvp.all()) else rvp
+    if best_src is None:
         hl = hole_px.mean(axis=1)
-        ref = np.median(hole_px[hl <= np.median(hl)], axis=0)
+        ref = _dw(np.median(hole_px[hl <= np.median(hl)], axis=0))
         ref_h, ref_s, ref_v = _hsv1(ref)
         best_comb = None
-        # The mask is dilated ~1 px around every spot (plus crop padding), so
-        # the touching distance steps out a few px until the sampled area
-        # clears its own spot's dilation — all three radii border the patch.
-        for extra in (2.0, 4.0, 6.0):
+        # Touching distances: at dt = 2·half_th the sampled area's border
+        # meets the patch border (tangency); +1/+2 cover raster rounding.
+        # The sample-area dust check uses the RAW mask (labels) — the 1 px
+        # mask_pad dilation exists to bury antialiased speck edges and would
+        # otherwise push the sample off the border it must touch.
+        for extra in (0.0, 1.0, 2.0):
             dt = 2.0 * half_th + extra
             for k in range(2 * _HEAL_ANGLES):
                 ang = 2.0 * np.pi * k / (2 * _HEAL_ANGLES)
@@ -3579,127 +3640,39 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
                 if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
                     continue
-                m = mask_pad[sy0:sy1, sx0:sx1]
                 # Pre-existing invariant: dust is never cloned — a touching
-                # window whose SAMPLE AREA holds another spot is not scene.
-                if m[hole].any():
+                # window whose SAMPLE AREA overlaps any spot is not scene.
+                # The membrane's ring subset ALSO derives from the raw mask:
+                # raw geometry scales proportionally, while mask_pad's fixed
+                # 1 px dilation shrinks relative to the export raster and
+                # gave preview and export different tone-anchor subsets (a
+                # visible drift wherever the touching source is
+                # phase-shifted on patterned content).
+                lbl_win = labels[sy0:sy1, sx0:sx1]
+                if (lbl_win[hole] > 0).any():
                     continue
-                rv2 = m[ring] == 0
+                rv2 = lbl_win[ring] == 0
                 if not rv2.any():
                     continue  # membrane needs ≥1 clean ring px (NaN guard)
                 src = img16[sy0:sy1, sx0:sx1].astype(np.float32)
                 area = src[hole]
-                ah, as_, av = _hsv1(np.median(area, axis=0))
+                ah, as_, av = _hsv1(_dw(np.median(area, axis=0)))
                 dh_ = abs(ah - ref_h)
                 dh_ = min(dh_, 1.0 - dh_) * 2.0 * max(as_, ref_s)
-                tex = float(area.mean(axis=1).std()) / 65535.0
+                tex = float(area.mean(axis=1).std()) * dwk / 65535.0
                 comb = dh_ + abs(as_ - ref_s) + abs(av - ref_v) + tex
                 if best_comb is None or comb < best_comb:
                     best_comb = comb
                     best_src, best_off = src, (dy, dx)
                     best_rv = None if bool(rv2.all()) else rv2
         if best_src is None:
-            # Every touching direction lies inside other dust (the spot is
-            # fully encircled). Dust pixels are never cloned (pre-existing
-            # invariant), so the segment defers and clones the HEALED
-            # content at a touching offset via the existing second pass —
-            # the answer still exists and still touches the patch.
-            dy = int(round(2.0 * half_th + 2.0))
-            dy = min(max(dy, -wy0), h - wy1)
-            return (dy, 0), False, False, "defer"
-    if best_src is None:
-        # Candidate source offsets: rings of directions at thickness-scaled
-        # distances, NEAREST FIRST, near rings at double angular density.
-        # The pixels-actually-read check (_source_at) rejects any source
-        # that would READ dust/outside-crop, so offsets need only clear the
-        # local thickness — a long stroke heals from the clean strip right
-        # beside it. The window diagonal stays as a last-resort ring for
-        # compact spots; the acceptance rule below decides when the sweep
-        # stops.
-        d_base = 2.0 * half_th + pad + 2.0
-        d0 = float(np.hypot(wy1 - wy0, wx1 - wx0))
-        tol = (_DLIKE_SEP_MADS * (ring_mad + 1e-3)) ** 2
-        # THE ACCEPTANCE RULE (maintainer): the sampling point is closer the
-        # better — the IMMEDIATE surroundings, never across the frame. This
-        # holds BY CONSTRUCTION: the sweep accepts the best candidate of the
-        # FIRST (nearest) ring that contains a USABLE one, and never looks
-        # farther once it exists. A usable candidate is clean where it is
-        # read (_source_at) and matches the hole's adjacent surround in
-        # CHROMA + BRIGHTNESS (weighted ring-mean within tone_tol). Farther
-        # rings are reached only while nearer rings hold nothing usable;
-        # if NO ring does, the fallback is the overall distance-penalized
-        # best, wrong tone and all (still better than leaving the dust).
-        #
-        # Ring positions are weighted by PROXIMITY TO THE HOLE: the pixels
-        # touching the hole govern the fill's continuity, and a strong
-        # feature crossing the WINDOW's periphery — an edge a few px from
-        # the spot — must not veto a candidate whose fill-adjacent
-        # surroundings match perfectly. Demanding the whole-window
-        # surroundings match did exactly that: the perfect patch
-        # immediately beside a spot-near-an-edge could not re-phase the
-        # edge at its own periphery and scored WORSE than a remote flat
-        # patch that had no edge at all ("sampled dirt from across the
-        # frame while perfect pavement sat right next to the spot").
-        w_ring = np.exp(-0.5 * (away[ring] / (0.5 * pad)) ** 2
-                        ).astype(np.float32)
-        w_all = float(w_ring.sum()) + 1e-6
-        wmean_dst = (dst_ring * w_ring[:, None]).sum(axis=0) / w_all
-        wmad_dst = float((np.abs(dst_ring - wmean_dst).mean(axis=1)
-                          * w_ring).sum() / w_all)
-        # Tone tolerance scales with the adjacent surround's own weighted
-        # variability: tight on smooth content (sky — dirt across the frame
-        # can never qualify), naturally looser when the hole itself sits on
-        # structure (there, candidates must carry the structure anyway).
-        tone_tol = _HEAL_TONE_TOL_MADS * (wmad_dst + 1e-3)
-        fb_score, fb_src, fb_off, fb_rv = None, None, None, None
-        for fi, (d, n_ang) in enumerate(
-                ((d_base, 2 * _HEAL_ANGLES), (1.5 * d_base, 2 * _HEAL_ANGLES),
-                 (2.25 * d_base, _HEAL_ANGLES), (3.5 * d_base, _HEAL_ANGLES),
-                 (d0, _HEAL_ANGLES))):
-            ring_best = None
-            for k in range(n_ang):
-                ang = 2.0 * np.pi * (k + 0.35 * fi) / n_ang
-                dy = int(round(d * np.sin(ang)))
-                dx = int(round(d * np.cos(ang)))
-                src, rv = _source_at(dy, dx)
-                if src is None:
-                    continue
-                diff = src[ring] - dst_ring
-                wv = w_ring
-                if rv is not None:
-                    diff = diff[rv]  # match on the ring's clean subset only
-                    wv = w_ring[rv]
-                wsum = float(wv.sum()) + 1e-6
-                ssd = float(((diff * diff).mean(axis=1) * wv).sum() / wsum)
-                # The candidate AREA's chroma + brightness offset, weighted
-                # toward the hole-adjacent pixels.
-                mu = (diff * wv[:, None]).sum(axis=0) / wsum
-                tone = float(np.abs(mu).mean())
-                # The ring SSD never looks INSIDE the candidate window: a
-                # source whose ring matches but whose hole area holds
-                # something foreign (a black border edge, an object) clones
-                # that thing into the fill. Penalize interior tone past the
-                # ring's own variability (the EXCESS only: an always-on
-                # penalty re-ranked near-ties by interior phase on textured
-                # content and drifted preview/export tone).
-                i_diff = np.median(src[hole], axis=0) - ring_bg
-                raw = (ssd + _HEAL_TONE_W * float(np.mean(mu * mu))
-                       + max(0.0, float(np.mean(i_diff * i_diff)) - tol))
-                if fb_score is None or raw * (1.0 + _HEAL_DIST_W * fi) < fb_score:
-                    fb_score = raw * (1.0 + _HEAL_DIST_W * fi)
-                    fb_src, fb_off, fb_rv = src, (dy, dx), rv
-                if tone > tone_tol:
-                    continue  # wrong chroma/brightness — unusable at ANY ring
-                if ring_best is None or raw < ring_best:
-                    ring_best = raw
-                    best_src, best_off, best_rv = src, (dy, dx), rv
-            if ring_best is not None:
-                break  # nearest ring with a usable patch WINS — never farther
-        if best_src is None and fb_src is not None:
-            # No tone-matched patch on any ring (hole boxed into content
-            # unlike anything reachable) — take the least-bad match rather
-            # than leaving the dust; the membrane re-tones what it can.
-            best_src, best_off, best_rv = fb_src, fb_off, fb_rv
+            # No touching candidate EXISTS: every touching direction is out
+            # of frame (a patch nearly as big as the buffer) or inside other
+            # dust. There is no sample to select — dust pixels are never
+            # cloned (pre-existing invariant) — so this degenerates to the
+            # boundary-diffusion fill (Telea), which grows the fill from the
+            # patch's own touching border.
+            return None
 
     if best_src is None:
         return None
@@ -3795,7 +3768,8 @@ def _nearest_plan_record(plan, cyn, cxn, tol=0.06):
 def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
                        feather: float = DUST_FEATHER_DEFAULT,
                        plan=None, collect_plan=None,
-                       prior_plan=None, crop=None) -> np.ndarray:
+                       prior_plan=None, crop=None,
+                       ws_windowed: bool = False) -> np.ndarray:
     """Heal the dust spots out of a 16-bit RGB image, non-destructively.
 
     `feather` is the edge fade width as a fraction of each hole's own
@@ -3862,7 +3836,8 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     if long_side <= _DUST_PLAN_LONG:
         return _heal_impl(img16, spots, inpaint_radius, feather,
                           collect=collect_plan, plan=prior_plan,
-                          plan_tol=_DUST_EDIT_TOL, crop=crop)
+                          plan_tol=_DUST_EDIT_TOL, crop=crop,
+                          ws_windowed=ws_windowed)
     scale = long_side / float(_DUST_PLAN_LONG)
     if plan is None:
         # No preview plan supplied — derive one from this buffer's own
@@ -3873,16 +3848,18 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
         small = cv2.resize(img16, (pw, ph), interpolation=cv2.INTER_AREA)
         plan = []
         _heal_impl(small, spots, inpaint_radius, feather, collect=plan,
-                   plan_only=True, crop=crop)
+                   plan_only=True, crop=crop, ws_windowed=ws_windowed)
         print(f"Dust plan (no cached preview plan): {time.time() - t0:.3f}s")
     return _heal_impl(img16, spots, inpaint_radius, feather,
-                      plan=plan, scale_up=scale, crop=crop)
+                      plan=plan, scale_up=scale, crop=crop,
+                      ws_windowed=ws_windowed)
 
 
 def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                feather: float, plan=None, collect=None,
                scale_up: float = 1.0, plan_only: bool = False,
-               plan_tol: float = 0.06, crop=None) -> np.ndarray:
+               plan_tol: float = 0.06, crop=None,
+               ws_windowed: bool = False) -> np.ndarray:
     """apply_dust_removal's engine at ONE resolution. With `collect` (a list),
     appends a plan record per heal segment:
     (cy_norm, cx_norm, offset, genuine, dlike_on, manual) where offset is
@@ -3953,6 +3930,9 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
     # Segments whose PINNED source is under newer dust: re-run after the
     # fills below so they clone the healed content at the same location.
     deferred = []
+    # One sample offset per patch (component): the first segment's argmin
+    # seeds the rest — see _heal_patch's pref_off.
+    comp_off = {}
     t_setup = time.time() - t0
     t0 = time.time()
     n_segs = 0
@@ -4017,7 +3997,11 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                                       loc_th, mask_pad, integ, filled, fmap,
                                       feather, src_off=src_off,
                                       forced_flags=flags, manual=manual,
-                                      auto=comp_auto)
+                                      auto=comp_auto, ws_windowed=ws_windowed,
+                                      pref_off=comp_off.get(i))
+                if (res is not None and len(res) == 3 and src_off is None
+                        and res[0] is not None):
+                    comp_off.setdefault(i, res[0])
                 if res is not None and len(res) == 4:
                     # Pinned source now under new dust: fill in a SECOND
                     # pass from the healed buffer (after Telea), so the

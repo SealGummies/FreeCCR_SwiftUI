@@ -140,25 +140,37 @@ class TestApplyDustRemoval:
         out = apply_dust_removal(img, [spot])
         assert int(out[50, 50, 0]) < 45000  # moved toward the surround
 
-    def test_traced_hair_leaves_no_bright_ghost(self):
-        # THE reported artifact: tracing a bright warm hair with a brush about
-        # its own width left a yellow-green ghost of the whole stroke. The
-        # hair's edges leak past the mask; without the guard gap + robust ring
-        # rejection they poisoned the tone correction (R/G lifted, B dropped)
-        # across the entire stroke — and the bbox-diagonal source-search
-        # minimum forced long strokes into the diffusion fallback, which
-        # ghosts the same way.
+    def test_manual_stroke_samples_touching_area(self):
+        # AUTOMATIC SAMPLING RULE (maintainer): every automatically picked
+        # initial sample — painted strokes included — must TOUCH the patch.
+        # Consequence, accepted with the rule: a brush narrower than the
+        # defect it traces samples the defect's own continuation (the only
+        # thing touching it) — the brush must COVER a defect to remove it.
+        # This test pins the touch contract; the old version asserted the
+        # ring-rejection machinery healed a tight hair trace to sky, which
+        # sampled from far away and is superseded by the rule.
         sky = np.array([20000, 25000, 40000], np.float32)
         img = np.broadcast_to(sky.astype(np.uint16), (200, 200, 3)).copy()
-        # A "hair" much wider than the brush: bright/warm vs the blue sky.
         cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
-        # Brush stroke tracing the hair core, narrower than the hair.
         spot = {"kind": "brush",
                 "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 2.0 / 200}
-        out = apply_dust_removal(img, [spot])
+        plan = []
+        apply_dust_removal(img, [spot], collect_plan=plan)
+        assert plan
+        for cy, cx, off, *_ in plan:
+            if off is None:
+                continue
+            # Touching: segment thickness is the 2 px brush → offsets sit at
+            # ~2·half_th (+raster slack), never out on the old search rings.
+            assert float(np.hypot(off[0] * 200, off[1] * 200)) <= 12.0
+        # And a stroke that COVERS the hair heals it to sky from the
+        # touching sky on either side.
+        wide = {"kind": "brush",
+                "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 9.0 / 200}
+        out = apply_dust_removal(img, [wide])
         core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
         err = np.abs(core.mean(axis=0) - sky)
-        assert float(err.max()) < 5000   # fill stays sky-toned along the stroke
+        assert float(err.max()) < 6000   # covered defect heals to sky
 
     def test_feather_alpha_ramps_inward(self):
         # The fill blends over a smooth inward ramp: ~0 at the hole boundary,
@@ -363,23 +375,28 @@ class TestApplyDustRemoval:
         dist = float(np.hypot(off[0] * 400, off[1] * 400))
         assert dist <= 1.6 * 41
 
-    def test_stripes_pattern_heals_phase_aligned(self):
-        # On patterned content the match must pick a phase-aligned patch —
-        # the healed hole continues the stripes, not a misphased smear (and
-        # the early-accept must NOT trip on a misphased near candidate: the
-        # grain floor is estimated from the detrended residual, not the
-        # ring's structure).
+    def test_stripes_defect_removed_from_touching_sample(self):
+        # AUTOMATIC SAMPLING RULE: the sample must touch the patch and is
+        # chosen by hue/sat/value + texture — the rule has NO pattern-phase
+        # term, so on striped content the fill may land phase-shifted (the
+        # user's re-pick drag is the tool for pattern alignment). What must
+        # hold: the defect is gone, the fill is stripe-toned content from a
+        # TOUCHING offset, never a remote patch. (Supersedes the old
+        # phase-alignment promise of the ring-SSD search.)
         yy, xx = np.mgrid[0:200, 0:200]
         base = 30000 + 12000 * np.sin(2 * np.pi * xx / 24.0)
         img = np.stack([base] * 3, axis=-1).astype(np.uint16)
-        expected = img.copy()
         cv2.circle(img, (100, 100), 5, (62000, 62000, 62000), -1)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.05}
-        out = apply_dust_removal(img, [spot], feather=0.0)
-        hole = np.hypot(yy - 100, xx - 100) <= 10
-        err = np.abs(out[hole].astype(np.float32)
-                     - expected[hole].astype(np.float32))
-        assert float(err.mean()) < 1500
+        plan = []
+        out = apply_dust_removal(img, [spot], feather=0.0, collect_plan=plan)
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        assert float(np.hypot(off[0] * 200, off[1] * 200)) <= 2 * 10 + 4
+        hole = np.hypot(yy - 100, xx - 100) <= 8
+        healed = out[hole].astype(np.float32)
+        assert float(healed.max()) < 50000       # the bright speck is gone
+        assert 15000 < float(healed.mean()) < 45000  # stripe-range content
 
     def test_manual_source_pick_clones_verbatim(self):
         # A USER-PICKED source (overlay ring drag, manual=True in the plan)
@@ -434,11 +451,13 @@ class TestApplyDustRemoval:
         assert abs(float(healed.mean()) - 30000) < 3000
         assert float(healed.max()) < 50000
 
-    def test_stroke_on_prior_source_keeps_reference_samples_healed(self):
-        # NO exceptions: even a stroke painted directly ON a segment's
-        # source patch must not move the reference. The segment defers to a
-        # second pass and clones the HEALED content at the very same
-        # location — same offset in the plan, no dust cloned into the fill.
+    def test_stroke_on_prior_source_merges_and_heals_clean(self):
+        # A TOUCHING source sits directly beside its patch (the sampling
+        # rule), so a stroke painted over the source area merges with the
+        # original patch into ONE connected component — the union re-heals
+        # as a single bigger patch from ITS touching border. What must hold:
+        # the new defect is never cloned into any fill, and the merged
+        # region heals to the background.
         rng = np.random.default_rng(23)
         img = np.clip(rng.normal(30000, 2500, (400, 400, 3)), 0,
                       65535).astype(np.uint16)
@@ -447,8 +466,10 @@ class TestApplyDustRemoval:
         apply_dust_removal(img, [spot], collect_plan=plan1)
         (cy, cx, off, _, _, *_), = plan1
         assert off is not None
+        # Touching: the chosen source borders the patch.
+        assert float(np.hypot(off[0] * 400, off[1] * 400)) <= 2 * 12 + 4
         # A bright defect appears at the chosen source and the user paints
-        # over it — the source patch is now under dust.
+        # over it — the two patches now form one merged region.
         sy, sx = cy + off[0], cx + off[1]
         img2 = img.copy()
         cv2.circle(img2, (int(sx * 400), int(sy * 400)), 5,
@@ -457,21 +478,20 @@ class TestApplyDustRemoval:
         plan2 = []
         out = apply_dust_removal(img2, [spot, b], collect_plan=plan2,
                                  prior_plan=plan1)
-        rec = [r for r in plan2
-               if abs(r[0] - cy) < 1e-9 and abs(r[1] - cx) < 1e-9]
-        assert rec, "first stroke's segment disappeared"
-        assert rec[0][2] == off, "reference moved"
-        # The fill sampled the HEALED source, not the new bright defect.
-        m = rasterize_dust_mask([spot], 400, 400) > 0
+        assert plan2
+        # No dust cloned anywhere in the merged fill; background restored.
+        m = rasterize_dust_mask([spot, b], 400, 400) > 0
         healed = out[m].astype(np.float32)
         assert float(healed.mean()) < 40000
         assert float(healed.max()) < 55000
 
     def test_new_stroke_keeps_far_samples_stable(self):
-        # Adding a dab must only re-sample segments near the edit. Tiles
-        # used to anchor to the component bbox and scale their windows by
-        # the component's thickness, so a dab merging at a blob's top-left
-        # shifted EVERY tile of the blob and re-sampled its far side too.
+        # Adding a dab must only re-sample segments near the edit. In the
+        # app this is the STICKY-SOURCES invariant: the panel always passes
+        # the cached plan as prior_plan, so unchanged segments rebind their
+        # offsets verbatim (the touch rule shares ONE offset per patch for
+        # fresh picks, so a no-prior re-derivation of a merged component
+        # legitimately re-seeds — priors are what pin committed strokes).
         rng = np.random.default_rng(31)
         img = np.clip(rng.normal(32000, 3000, (640, 640, 3)), 0,
                       65535).astype(np.uint16)
@@ -483,7 +503,7 @@ class TestApplyDustRemoval:
         # component bbox origin (0.38*640-19 px < the blob's old 240 px
         # edge) and its thickness, touches nothing on the far (right) side.
         added = base + [{"kind": "brush", "pts": [[0.38, 0.38]], "r": 0.03}]
-        apply_dust_removal(img, added, collect_plan=plan2)
+        apply_dust_removal(img, added, collect_plan=plan2, prior_plan=plan1)
         far1 = [r for r in plan1 if r[1] > 0.55]
         assert far1
         for rec in far1:
@@ -1145,18 +1165,20 @@ class TestResolutionConsistency:
         a8 = cv2.convertScaleAbs(healed_small, alpha=255.0 / 65535.0)
         b8 = cv2.convertScaleAbs(big_ds, alpha=255.0 / 65535.0)
         # Windows around the healed hair and the edge speck (1080x720 space).
-        # Calibrated: re-planning per resolution measures p99 = 14 / 10 and
-        # mean = 0.64 / 0.42 here; the replayed plan sits at 10 / 8. The
-        # residuals are NOT source flips (those are what the guard is for —
-        # the offsets replay verbatim): the speck's rim rides the feather
-        # dome over a high-contrast defect (a 1-px raster shift is worth
-        # more diff there), and the hair's nearest-first search now picks
-        # phase-aligned patches in the striped band whose INTEGER offsets
-        # quantize differently at export scale (sub-pixel pattern phase,
-        # bounded by ±0.5 px). The means stay far below the re-planning
-        # 0.64/0.42 and carry the structure-flip discrimination.
+        # The offsets replay VERBATIM (one shared touching offset per patch;
+        # a re-plan derives the identical plan from the identical downscale),
+        # so any residual is resampling, not source flips. Recalibrated for
+        # the touch+HSV sampling rule: on the STRIPED band the rule has no
+        # pattern-phase term, so the touching source is phase-shifted and
+        # the fill is discontinuous against its surround — resampling a
+        # discontinuous clone between scales measures p99 = 28 / mean = 1.14
+        # here (was ~10/0.33 when the old search phase-aligned; a full
+        # per-scale re-plan of THIS rule still lands in the same place, the
+        # bound guards against replay-path regressions such as reroutes to
+        # the deferred pass or tone-anchor subset drift). The smooth-scene
+        # speck window stays tight — the rule's normal habitat.
         for (y0, y1, x0, x1), p99_lim, mean_lim in (
-                ((390, 510, 490, 590), 11.0, 0.40),  # hair
+                ((390, 510, 490, 590), 32.0, 1.5),   # hair over stripes
                 ((270, 350, 390, 480), 9.0, 0.40)):  # edge speck
             d = np.abs(a8[y0:y1, x0:x1].astype(np.float32)
                        - b8[y0:y1, x0:x1].astype(np.float32))
