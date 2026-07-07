@@ -425,8 +425,26 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      become the entire anchor (clean sky strokes healed to solid black,
      cloned from the border). Either failure distrusts the estimate
      (`genuine=False`): full ring, no defect force-fill.
-  3. **Search**: candidate source windows on rings of directions at
-     thickness-scaled distances (`d_base = 2·half_th + pad + 2`,
+  3. **Search — AUTO spots (maintainer rule, verbatim)**: (1) the sample
+     area MUST TOUCH the patch area; (2) among the touching candidates (64
+     directions at `2·half_th` + a few px to clear the mask dilation) the
+     one with the lowest combined Δhue + Δsat + ΔV — measured against the
+     patch's own background, estimated as the darker half of the HOLE's
+     pixels (film dust is white; the hole is `SPOT_SCALE`× the speck core,
+     so the true background is visible inside it) — plus the lowest
+     texture wins; (3) again: the areas must touch. A TOTAL selection — no
+     distance escalation, no "good enough" gate, no fallback ranking. No
+     ring statistic participates in the choice, and the defect-leak
+     rejection (§ step 2) is disabled for auto components (a manual-stroke
+     defense; an auto spot cannot leak by construction — its misfires
+     re-anchored auto heals on foreign structure across an edge).
+     Invariant intersections: dust is never cloned (a touching window
+     overlapping another spot is excluded; a fully-encircled spot clones
+     the HEALED content at a touching offset via the deferred pass), and a
+     candidate needs ≥ 1 clean ring px for the tone membrane.
+     **Search — MANUAL strokes**: candidate source windows on rings of
+     directions at thickness-scaled distances
+     (`d_base = 2·half_th + pad + 2`,
      ×1/1.5/2.25/3.5, plus the window diagonal as a last resort),
      **nearest first, and the nearest ring with a USABLE candidate wins BY
      CONSTRUCTION** (maintainer rule: the sampling point is closer the
