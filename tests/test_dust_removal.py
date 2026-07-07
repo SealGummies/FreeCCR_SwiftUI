@@ -564,14 +564,17 @@ class TestProbToSpots:
         assert x > 0.5 and y > 0.5  # the compact speck, not the line
 
     def test_radius_is_area_equivalent_not_extent(self):
-        # A 6x6 compact blob -> radius ~ sqrt(36/pi) ~ 3.4 px (+pad), NOT the
-        # 0.5*extent=3 of the old bounding-box sizing blown up by elongation.
+        # A 6x6 compact blob -> radius ~ sqrt(36/pi)*SPOT_SCALE (+pad), NOT
+        # the old bounding-box sizing blown up by elongation. The scale covers
+        # a soft speck's faint skirt; the area base keeps it from smudging.
         prob = np.zeros((200, 200), np.float32)
         prob[100:106, 100:106] = 0.9
         spots = dust_detect.prob_to_spots(prob, _bright_luma(prob), 60)
         assert len(spots) == 1
         r_px = spots[0]["r"] * 200
-        assert 3.0 < r_px < 7.0     # tight circle, no big smudge
+        expected = np.sqrt(36 / np.pi) * dust_detect.SPOT_SCALE + dust_detect.SPOT_PAD
+        assert abs(r_px - expected) < 0.5
+        assert r_px < 2.0 * 6.0     # still circle-sized, no big smudge
 
     def test_bright_gate_drops_dark_blob(self):
         # Film dust inverts to WHITE specks. A compact, right-sized blob that is

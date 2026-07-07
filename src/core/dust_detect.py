@@ -43,10 +43,11 @@ MAX_BLOB = 400          # connected-component pixel cap at ~2k px (resolution-no
 MAX_ASPECT = 3.0        # drop elongated detections (thin LINES are usually real
                         # structure — a bike frame, the horizon — not dust)
 SPOT_PAD = 1.5          # px added to each detected spot's radius (inpaint margin)
-SPOT_SCALE = 1.35       # radius multiplier: the thresholded component is only
+SPOT_SCALE = 1.62       # radius multiplier: the thresholded component is only
                         # the bright CORE of a soft off-focus speck — its faint
                         # skirt extends beyond, and an exact area-equivalent
-                        # circle left the fringe unhealed
+                        # circle left the fringe unhealed (1.35 still clipped
+                        # the widest skirts; +20% per field feedback)
 # Auto-detection is restricted to SMOOTH regions — sky, open shadow — where
 # dust is both visible and safely distinguishable (maintainer rule). In busy
 # texture (foliage, brick, gravel) compact bright glints are indistinguishable
