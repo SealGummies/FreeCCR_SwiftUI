@@ -205,7 +205,12 @@ reference to `MainWindow` and `ImagePreview` passed at construction (it does
      resolution (§5.3).
   3. Extract connected components; convert each to one normalized `auto` spot
      (centroid + radius from component extent).
-  4. Replace any prior `auto` spots on the image with the new set (manual `brush`
+  4. With a confirmed crop, drop `auto` spots whose center falls **outside the
+     crop frame** (same rasterized geometry as the display crop): the rebate /
+     holder is not scene — it is cropped away everywhere, and its bright edge
+     printing (frame numbers, sprocket edges) reads as dust to the detector.
+     Manual `brush` spots are never filtered.
+  5. Replace any prior `auto` spots on the image with the new set (manual `brush`
      spots are untouched), `push_undo_state()` once, re-render.
 - **Sensitivity** changes re-threshold the cached prob map and refresh the
   `auto` spots live (no net re-run) unless the working buffer changed.

@@ -10,7 +10,8 @@ from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QP
                            QImage)
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
-from core.ccr_processor import apply_dust_removal, DUST_FEATHER_DEFAULT
+from core.ccr_processor import (apply_dust_removal, DUST_FEATHER_DEFAULT,
+                                _crop_keep_mask)
 from core import crop_aspect
 from widgets.dust_panel import DUST_BRUSH_R_MIN, DUST_BRUSH_R_MAX
 from widgets.export_dialog import ExportSettingsDialog
@@ -2856,6 +2857,34 @@ class ImagePreview(QWidget):
         img = ccr_backend.get_image_by_index(self.current_idx)
         return self.dust_detect_source_for(img) if img is not None else None
 
+    @staticmethod
+    def _auto_spots_in_crop(img, spots):
+        """Only auto-detected spots whose center lies inside the confirmed
+        crop are kept. Content outside the crop (film rebate, holder, edge
+        printing) is not scene — it is cropped away on screen and in exports,
+        and its bright markings (frame numbers, sprocket edges) read as dust
+        to the detector. Same rasterized geometry as the display crop and the
+        heal's context mask (_crop_keep_mask). No crop → whole frame kept.
+        Manual brush spots are never filtered — the user painted them."""
+        rect = getattr(img, "crop_rect", None)
+        raw = getattr(img, "resized_raw", None)
+        if not spots or rect is None or raw is None:
+            return spots
+        h, w = raw.shape[:2]
+        keep = _crop_keep_mask(tuple(rect),
+                               float(getattr(img, "crop_angle", 0.0) or 0.0),
+                               h, w)
+        if keep is None:
+            return spots
+        kept = []
+        for s in spots:
+            x, y = s["pts"][0]
+            px = min(w - 1, max(0, int(round(float(x) * w))))
+            py = min(h - 1, max(0, int(round(float(y) * h))))
+            if keep[py, px]:
+                kept.append(s)
+        return kept
+
     def apply_detected_spots(self, new_auto_spots) -> int:
         """Replace the AI-detected ('auto') spots with a fresh set; manual
         ('brush') spots are kept. Returns the new auto-spot count."""
@@ -2871,9 +2900,10 @@ class ImagePreview(QWidget):
         # the user removed or replaced (new Open) must not mutate an orphan.
         if img is None or img not in ccr_backend.images:
             return 0
+        new_auto_spots = self._auto_spots_in_crop(img, new_auto_spots or [])
         img.push_undo_state()
         img.dust_spots = [s for s in img.dust_spots if s.get("kind") != "auto"]
-        img.dust_spots.extend(new_auto_spots or [])
+        img.dust_spots.extend(new_auto_spots)
         cur = (ccr_backend.get_image_by_index(self.current_idx)
                if self.current_idx is not None else None)
         if img is cur:

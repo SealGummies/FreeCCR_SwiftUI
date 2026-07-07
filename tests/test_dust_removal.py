@@ -1071,5 +1071,48 @@ class TestDetectSourceDewindow:
         assert np.array_equal(src, base)
 
 
+# --- AI detection scope: only inside the confirmed crop ----------------------
+class TestAutoSpotsCropScope:
+    """AI 'auto' spots are scene fixes: a detection whose center lies outside
+    the confirmed crop (film rebate, holder, edge printing) is dropped before
+    it is stored — that content is cropped away on screen and in exports, and
+    the rebate's bright markings read as dust to the detector."""
+
+    @staticmethod
+    def _img(crop_rect=None, crop_angle=0.0):
+        img = CCRImage.__new__(CCRImage)
+        img.resized_raw = np.zeros((100, 200, 3), np.uint16)
+        img.crop_rect = crop_rect
+        img.crop_angle = crop_angle
+        return img
+
+    @staticmethod
+    def _spot(x, y):
+        return {"kind": "auto", "pts": [[x, y]], "r": 0.01}
+
+    def test_no_crop_keeps_everything(self):
+        from widgets.image_preview import ImagePreview
+        spots = [self._spot(0.05, 0.05), self._spot(0.95, 0.95)]
+        assert ImagePreview._auto_spots_in_crop(self._img(), spots) == spots
+
+    def test_outside_crop_spots_are_dropped(self):
+        from widgets.image_preview import ImagePreview
+        img = self._img(crop_rect=(0.25, 0.25, 0.75, 0.75))
+        spots = [self._spot(0.5, 0.5),    # inside
+                 self._spot(0.05, 0.5),   # left of the crop (rebate)
+                 self._spot(0.5, 0.9)]    # below the crop
+        assert ImagePreview._auto_spots_in_crop(img, spots) == [spots[0]]
+
+    def test_rotated_crop_uses_the_rotated_footprint(self):
+        from widgets.image_preview import ImagePreview
+        # 200x100 frame, square 60x60 px crop at the center, rotated 45°:
+        # the un-rotated box corner falls OUTSIDE the rotated footprint.
+        img = self._img(crop_rect=(0.35, 0.20, 0.65, 0.80), crop_angle=45.0)
+        center = self._spot(0.5, 0.5)
+        corner = self._spot(0.36, 0.22)
+        kept = ImagePreview._auto_spots_in_crop(img, [center, corner])
+        assert kept == [center]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
