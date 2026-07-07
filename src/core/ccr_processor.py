@@ -3727,17 +3727,23 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
         # frequencies land on the hole's boundary values (gradients continue
         # seamlessly through the patch). Sigma is thickness-local: a
         # bbox-sized sigma turned the correction into one constant for the
-        # whole component, letting one bad segment tint it all. A partially
-        # clean source ring (window beside a neighboring speck) anchors the
-        # tone on its CLEAN subset only — the dusty positions would inject
-        # the neighbor's brightness into the correction.
+        # whole component, letting one bad segment tint it all. Where the
+        # source ring is blocked by a neighboring spot (dust clusters), the
+        # blocked positions contribute the CLEAN subset's median difference
+        # instead of dropping out: dropping them left a spatially LOPSIDED
+        # anchor, and on a gradient the one-sided difference interpolated
+        # into a tone dome over the whole fill — the visible gray disc that
+        # read as "it sampled from the wrong place" even though the clone
+        # content was right.
         ring_m = ring
-        if best_rv is not None and not best_rv.all():
-            ring_m = ring.copy()
-            rmy, rmx = np.nonzero(ring)
-            ring_m[rmy[~best_rv], rmx[~best_rv]] = False
         dmap = np.zeros_like(dst)
-        dmap[ring_m] = dst[ring_m] - best_src[ring_m]
+        if best_rv is not None and not best_rv.all():
+            diffs = dst[ring] - best_src[ring]
+            med = np.median(diffs[best_rv], axis=0)
+            diffs[~best_rv] = med
+            dmap[ring] = diffs
+        else:
+            dmap[ring] = dst[ring] - best_src[ring]
         ind = ring_m.astype(np.float32)
         sigma = half_th + pad
         wsum = cv2.GaussianBlur(ind, (0, 0), sigma)
