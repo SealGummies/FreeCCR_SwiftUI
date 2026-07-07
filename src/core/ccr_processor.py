@@ -3626,45 +3626,53 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
         ref = _dw(np.median(hole_px[hl <= np.median(hl)], axis=0))
         ref_h, ref_s, ref_v = _hsv1(ref)
         best_comb = None
-        # Touching distances: at dt = 2·half_th the sampled area's border
-        # meets the patch border (tangency); +1/+2 cover raster rounding.
-        # The sample-area dust check uses the RAW mask (labels) — the 1 px
-        # mask_pad dilation exists to bury antialiased speck edges and would
-        # otherwise push the sample off the border it must touch.
-        for extra in (0.0, 1.0, 2.0):
-            dt = 2.0 * half_th + extra
-            for k in range(2 * _HEAL_ANGLES):
-                ang = 2.0 * np.pi * k / (2 * _HEAL_ANGLES)
-                dy = int(round(dt * np.sin(ang)))
-                dx = int(round(dt * np.cos(ang)))
-                sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
-                if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
-                    continue
-                # Pre-existing invariant: dust is never cloned — a touching
-                # window whose SAMPLE AREA overlaps any spot is not scene.
-                # The membrane's ring subset ALSO derives from the raw mask:
-                # raw geometry scales proportionally, while mask_pad's fixed
-                # 1 px dilation shrinks relative to the export raster and
-                # gave preview and export different tone-anchor subsets (a
-                # visible drift wherever the touching source is
-                # phase-shifted on patterned content).
-                lbl_win = labels[sy0:sy1, sx0:sx1]
-                if (lbl_win[hole] > 0).any():
-                    continue
-                rv2 = lbl_win[ring] == 0
-                if not rv2.any():
-                    continue  # membrane needs ≥1 clean ring px (NaN guard)
-                src = img16[sy0:sy1, sx0:sx1].astype(np.float32)
-                area = src[hole]
-                ah, as_, av = _hsv1(_dw(np.median(area, axis=0)))
-                dh_ = abs(ah - ref_h)
-                dh_ = min(dh_, 1.0 - dh_) * 2.0 * max(as_, ref_s)
-                tex = float(area.mean(axis=1).std()) * dwk / 65535.0
-                comb = dh_ + abs(as_ - ref_s) + abs(av - ref_v) + tex
-                if best_comb is None or comb < best_comb:
-                    best_comb = comb
-                    best_src, best_off = src, (dy, dx)
-                    best_rv = None if bool(rv2.all()) else rv2
+        # THE FINITE TOUCHING SET: every translation that places a congruent
+        # copy of the patch so its border shares contact with the patch
+        # border — no angular sampling, no gaps. Translations that OVERLAP
+        # the patch form the support of the shape's autocorrelation (the
+        # Minkowski sum of the hole with its own reflection); the touching
+        # set is that support's outer 8-connected boundary. Finite and
+        # complete: every member touches by construction, and every possible
+        # touching placement is a member. The sample-area dust check uses
+        # the RAW mask (labels) — the 1 px mask_pad dilation would push the
+        # sample off the border it must touch — and the membrane's ring
+        # subset derives from the raw mask too (scale-stable, where
+        # mask_pad's fixed dilation drifted preview vs export).
+        hys, hxs = np.nonzero(hole)
+        K = hole[int(hys.min()):int(hys.max()) + 1,
+                 int(hxs.min()):int(hxs.max()) + 1].astype(np.float32)
+        kh, kw = K.shape
+        pyk, pxk = kh + 2, kw + 2
+        canvas = np.zeros((kh + 2 * pyk, kw + 2 * pxk), np.float32)
+        canvas[pyk:pyk + kh, pxk:pxk + kw] = K
+        overlap = cv2.matchTemplate(canvas, K, cv2.TM_CCORR) > 0.5
+        touching = (cv2.dilate(overlap.astype(np.uint8),
+                               np.ones((3, 3), np.uint8)).astype(bool)
+                    & ~overlap)
+        t_ys, t_xs = np.nonzero(touching)
+        for dy, dx in zip((t_ys - pyk).tolist(), (t_xs - pxk).tolist()):
+            sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
+            if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
+                continue
+            # Pre-existing invariant: dust is never cloned — a touching
+            # placement whose SAMPLE AREA overlaps any spot is not scene.
+            lbl_win = labels[sy0:sy1, sx0:sx1]
+            if (lbl_win[hole] > 0).any():
+                continue
+            rv2 = lbl_win[ring] == 0
+            if not rv2.any():
+                continue  # membrane needs ≥1 clean ring px (NaN guard)
+            src = img16[sy0:sy1, sx0:sx1].astype(np.float32)
+            area = src[hole]
+            ah, as_, av = _hsv1(_dw(np.median(area, axis=0)))
+            dh_ = abs(ah - ref_h)
+            dh_ = min(dh_, 1.0 - dh_) * 2.0 * max(as_, ref_s)
+            tex = float(area.mean(axis=1).std()) * dwk / 65535.0
+            comb = dh_ + abs(as_ - ref_s) + abs(av - ref_v) + tex
+            if best_comb is None or comb < best_comb:
+                best_comb = comb
+                best_src, best_off = src, (dy, dx)
+                best_rv = None if bool(rv2.all()) else rv2
         if best_src is None:
             # No touching candidate EXISTS: every touching direction is out
             # of frame (a patch nearly as big as the buffer) or inside other

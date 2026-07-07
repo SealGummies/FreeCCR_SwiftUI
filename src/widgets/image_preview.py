@@ -2939,8 +2939,25 @@ class ImagePreview(QWidget):
             return 0
         new_auto_spots = self._auto_spots_in_crop(img, new_auto_spots or [])
         img.push_undo_state()
+        old_auto = [s for s in img.dust_spots if s.get("kind") == "auto"]
         img.dust_spots = [s for s in img.dust_spots if s.get("kind") != "auto"]
         img.dust_spots.extend(new_auto_spots)
+        # A re-detect is a NEW initial pick for the auto set (sampling rule):
+        # cached plan records under the replaced auto spots must not rebind
+        # to the fresh ones — a re-detected speck at the same coordinates is
+        # value-identical and would inherit the old source verbatim. User
+        # re-picks (manual=True) survive; brush strokes are untouched.
+        cached = getattr(img, "_dust_plan_cache", None)
+        raw = getattr(img, "resized_raw", None)
+        if cached is not None and old_auto and raw is not None:
+            from core.ccr_processor import rasterize_dust_mask
+            h, w = raw.shape[:2]
+            gm = rasterize_dust_mask(old_auto, h, w) > 0
+            img._dust_plan_cache = (cached[0], [
+                r for r in cached[1]
+                if (len(r) >= 6 and r[5])
+                or not gm[min(h - 1, max(0, int(round(r[0] * h)))),
+                          min(w - 1, max(0, int(round(r[1] * w))))]])
         cur = (ccr_backend.get_image_by_index(self.current_idx)
                if self.current_idx is not None else None)
         if img is cur:

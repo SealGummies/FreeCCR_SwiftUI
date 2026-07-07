@@ -731,6 +731,60 @@ class TestAutoSamplingRule:
         assert float(np.hypot(off[0] * 200, off[1] * 200)) <= 2 * 8 + 8
 
 
+# --- Stale plan records must never seed new spots ------------------------------
+class TestStalePlanPruning:
+    def test_deleted_spots_records_never_seed_new_spots(self):
+        # THE field bug that made the touch rule look broken: catalog plans
+        # saved by OLDER code hold far offsets, the plan cache deliberately
+        # outlives spot edits (sticky sources), and a spot repainted or
+        # re-detected at a dead record's position rebound the old offset
+        # VERBATIM — the sampling rule never ran for the new spot. Records
+        # of spots that no longer exist are pruned before the cache seeds a
+        # re-heal.
+        rng = np.random.default_rng(2)
+        img16 = np.clip(rng.normal(30000, 2000, (400, 400, 3)), 0,
+                        65535).astype(np.uint16)
+        holder = CCRImage.__new__(CCRImage)
+        old_spot = {"kind": "auto", "pts": [[0.5, 0.5]], "r": 0.03}
+        holder._dust_plan_cache = (
+            "stale", [(0.5, 0.5, (120.0 / 400, 100.0 / 400),
+                       False, False, False)])       # 156 px fossil offset
+        holder._dust_plan_spots = [old_spot]
+        # The user cleared/deleted and repainted at (almost) the same place.
+        holder.dust_spots = [{"kind": "brush",
+                              "pts": [[0.501, 0.499]], "r": 0.03}]
+        holder.dust_feather = 0.25
+        holder.crop_rect = None
+        holder.crop_angle = 0.0
+        holder._apply_dust_removal(img16)
+        key, plan = holder._dust_plan_cache
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        # Fresh TOUCHING pick, not the resurrected 156 px fossil.
+        assert float(np.hypot(off[0] * 400, off[1] * 400)) <= 2 * 12 + 8
+
+    def test_surviving_spots_keep_their_pinned_sources(self):
+        # The stickiness the pruning must NOT break: a spot that still
+        # exists keeps its planned source verbatim across a re-heal.
+        rng = np.random.default_rng(4)
+        img16 = np.clip(rng.normal(30000, 2000, (400, 400, 3)), 0,
+                        65535).astype(np.uint16)
+        holder = CCRImage.__new__(CCRImage)
+        keep = {"kind": "brush", "pts": [[0.3, 0.3]], "r": 0.03}
+        pinned = (30.0 / 400, 0.0)
+        holder._dust_plan_cache = ("k", [(0.3, 0.3, pinned,
+                                          False, False, False)])
+        holder._dust_plan_spots = [keep]
+        holder.dust_spots = [keep]
+        holder.dust_feather = 0.25
+        holder.crop_rect = None
+        holder.crop_angle = 0.0
+        holder._apply_dust_removal(img16)
+        key, plan = holder._dust_plan_cache
+        (cy, cx, off, *_), = plan
+        assert off == pinned
+
+
 # --- Source tone locality ------------------------------------------------------
 class TestSourceMatchesLocalTone:
     def test_edge_spot_source_stays_on_its_own_tone_side(self):

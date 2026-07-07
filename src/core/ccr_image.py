@@ -955,10 +955,30 @@ class CCRImage:
             plan_out = []
             cached = getattr(self, "_dust_plan_cache", None)
             prior = cached[1] if cached is not None else None
+            # A prior record may only rebind to a spot that STILL EXISTS.
+            # The cache deliberately outlives spot edits (sticky sources),
+            # but a record whose spot was deleted/replaced must never seed
+            # a NEW spot painted or re-detected at the same place — that
+            # resurrected old sources verbatim and the sampling rule never
+            # ran for the new spot (stale catalog plans made the touch rule
+            # look permanently broken).
+            snap = getattr(self, "_dust_plan_spots", None)
+            if prior and snap is not None:
+                gone = [s for s in snap if s not in spots]
+                if gone:
+                    from core.ccr_processor import rasterize_dust_mask
+                    gm = rasterize_dust_mask(gone, h, w) > 0
+                    prior = [r for r in prior
+                             if not gm[min(h - 1, max(0, int(round(r[0] * h)))),
+                                       min(w - 1, max(0, int(round(r[1] * w))))]]
             out = apply_dust_removal(image, spots, feather=feather,
                                      collect_plan=plan_out, prior_plan=prior,
                                      crop=crop, ws_windowed=ws_windowed)
             self._dust_plan_cache = (key, plan_out)
+            # Shallow copy ON PURPOSE: a right-drag stroke MOVE mutates the
+            # spot dict in place, so the snapshot entry stays identical and
+            # the moved stroke keeps its pinned source.
+            self._dust_plan_spots = list(spots)
             print(f"Dust heal total ({len(spots)} spots, preview scale, "
                   f"plan cached): {time.time() - t0:.3f}s")
             return out
