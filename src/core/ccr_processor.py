@@ -3322,12 +3322,19 @@ def _feather_alpha(mask: np.ndarray, fmap: np.ndarray) -> np.ndarray:
     return _smoothstep((inside - 0.5) / f) * (mask > 0)
 
 
+def _hsv1(rgb):
+    """(h, s, v) of one RGB triple (float 0..65535) — all three in 0..1."""
+    px = np.asarray(rgb, np.float32).reshape(1, 1, 3) / 65535.0
+    hh, ss, vv = cv2.cvtColor(px, cv2.COLOR_RGB2HSV)[0, 0]
+    return float(hh) / 360.0, float(ss), float(vv)
+
+
 def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 comp: int, bbox: tuple,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
                 filled: np.ndarray, fmap: np.ndarray, feather: float,
                 src_off=None, forced_flags=None,
-                sample=None, manual=False):
+                sample=None, manual=False, auto=False):
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
 
@@ -3465,6 +3472,13 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
     # also rides the plan as metadata).
     genuine = (rejected_brighter
                and int(keep.sum()) >= _HEAL_MIN_KEEP_FRAC * keep.size)
+    if auto:
+        # The strip is a MANUAL-stroke defense (a traced hair's leak). An
+        # auto spot cannot leak — its hole is SPOT_SCALE× the speck's core,
+        # the skirt sits inside it — so the strip's misfires (anchoring the
+        # membrane tone on foreign ring structure across an edge) are its
+        # only possible effect here.
+        genuine = False
     if forced_flags is not None:
         genuine = bool(forced_flags[0])
     if genuine:
@@ -3535,6 +3549,64 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 g0, d0 = forced_flags if forced_flags is not None else (True,
                                                                         False)
                 return best_off, g0, d0, "defer"
+    if best_src is None and auto:
+        # ============== AUTO SAMPLING RULE (maintainer, verbatim) ============
+        # 1. The sample area MUST TOUCH the patch area.
+        # 2. Among the touching candidates pick the lowest combined
+        #    delta-hue + delta-saturation + delta-V (vs the patch's own
+        #    background) plus the lowest texture. This is a TOTAL selection:
+        #    the best touching candidate always wins — no distance
+        #    escalation, no "good enough" gate, no fallback.
+        # 3. (Again) the sample area and the patch area must touch.
+        # Reference = the darker half of the HOLE's own pixels (film dust is
+        # white, and the hole is SPOT_SCALE× the speck's core, so the true
+        # background is visible inside it). No ring statistic participates
+        # in the choice — a shadow band or wall crossing the ring cannot
+        # redirect the anchor (both reported failures did exactly that).
+        hl = hole_px.mean(axis=1)
+        ref = np.median(hole_px[hl <= np.median(hl)], axis=0)
+        ref_h, ref_s, ref_v = _hsv1(ref)
+        best_comb = None
+        # The mask is dilated ~1 px around every spot (plus crop padding), so
+        # the touching distance steps out a few px until the sampled area
+        # clears its own spot's dilation — all three radii border the patch.
+        for extra in (2.0, 4.0, 6.0):
+            dt = 2.0 * half_th + extra
+            for k in range(2 * _HEAL_ANGLES):
+                ang = 2.0 * np.pi * k / (2 * _HEAL_ANGLES)
+                dy = int(round(dt * np.sin(ang)))
+                dx = int(round(dt * np.cos(ang)))
+                sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
+                if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
+                    continue
+                m = mask_pad[sy0:sy1, sx0:sx1]
+                # Pre-existing invariant: dust is never cloned — a touching
+                # window whose SAMPLE AREA holds another spot is not scene.
+                if m[hole].any():
+                    continue
+                rv2 = m[ring] == 0
+                if not rv2.any():
+                    continue  # membrane needs ≥1 clean ring px (NaN guard)
+                src = img16[sy0:sy1, sx0:sx1].astype(np.float32)
+                area = src[hole]
+                ah, as_, av = _hsv1(np.median(area, axis=0))
+                dh_ = abs(ah - ref_h)
+                dh_ = min(dh_, 1.0 - dh_) * 2.0 * max(as_, ref_s)
+                tex = float(area.mean(axis=1).std()) / 65535.0
+                comb = dh_ + abs(as_ - ref_s) + abs(av - ref_v) + tex
+                if best_comb is None or comb < best_comb:
+                    best_comb = comb
+                    best_src, best_off = src, (dy, dx)
+                    best_rv = None if bool(rv2.all()) else rv2
+        if best_src is None:
+            # Every touching direction lies inside other dust (the spot is
+            # fully encircled). Dust pixels are never cloned (pre-existing
+            # invariant), so the segment defers and clones the HEALED
+            # content at a touching offset via the existing second pass —
+            # the answer still exists and still touches the patch.
+            dy = int(round(2.0 * half_th + 2.0))
+            dy = min(max(dy, -wy0), h - wy1)
+            return (dy, 0), False, False, "defer"
     if best_src is None:
         # Candidate source offsets: rings of directions at thickness-scaled
         # distances, NEAREST FIRST, near rings at double angular density.
@@ -3836,6 +3908,15 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
         return img16
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    # Spot kind per component: the AUTO sampling rule (touch + HSV/texture
+    # argmin) applies only to components made purely of auto-detected spots;
+    # anything a brush touched keeps the manual machinery (hair defenses).
+    kinds = {s.get("kind") for s in spots}
+    all_auto = kinds == {"auto"}
+    brush_mask = None
+    if not all_auto and "auto" in kinds:
+        brush_mask = rasterize_dust_mask(
+            [s for s in spots if s.get("kind") != "auto"], h, w)
     # "Clean" excludes every spot plus 1 px (buries antialiased speck edges).
     mask_pad = cv2.dilate(mask, np.ones((3, 3), np.uint8))
     if crop is not None and crop[0]:
@@ -3881,6 +3962,9 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
         cw = int(stats[i, cv2.CC_STAT_WIDTH])
         ch = int(stats[i, cv2.CC_STAT_HEIGHT])
         comp_win = labels[y0:y0 + ch, x0:x0 + cw] == i
+        comp_auto = all_auto or (
+            brush_mask is not None
+            and not bool(brush_mask[y0:y0 + ch, x0:x0 + cw][comp_win].any()))
         # Half-thickness = the defect's local scale (1px zero border so a
         # component touching its bbox edge still measures correctly).
         hole0 = np.zeros((ch + 2, cw + 2), np.uint8)
@@ -3932,7 +4016,8 @@ def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
                     res = _heal_patch(img16, img16_c, labels, i, bbox,
                                       loc_th, mask_pad, integ, filled, fmap,
                                       feather, src_off=src_off,
-                                      forced_flags=flags, manual=manual)
+                                      forced_flags=flags, manual=manual,
+                                      auto=comp_auto)
                 if res is not None and len(res) == 4:
                     # Pinned source now under new dust: fill in a SECOND
                     # pass from the healed buffer (after Telea), so the

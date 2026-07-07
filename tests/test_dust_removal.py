@@ -662,6 +662,55 @@ class TestProbToSpots:
         assert dust_detect.prob_to_spots(prob, busy, 60) == []
 
 
+# --- AUTO sampling rule: touch + HSV/texture argmin ---------------------------
+class TestAutoSamplingRule:
+    """Maintainer rule, verbatim: (1) the auto sample area MUST TOUCH the
+    patch area; (2) it samples the touching candidate with the lowest
+    combined delta-hue/delta-sat/delta-V vs the patch's own background plus
+    the lowest texture; (3) again — the areas must touch. Total selection:
+    always an answer, no distance escalation."""
+
+    def test_white_speck_on_light_wall_beside_shadow_band(self):
+        # THE reported case: white dust on the light wall right above a dark
+        # shadow band. The old ring machinery stripped the light context as
+        # "defect leak" and anchored on the band — sampling dark shadow from
+        # far away. The rule: sample must touch and match the LIGHT wall.
+        rng = np.random.default_rng(5)
+        H_, W_ = 220, 270
+        img = np.zeros((H_, W_, 3), np.float32)
+        img[:, :] = [52000, 51000, 49000]        # light wall
+        img[95:160, :] = [17000, 17000, 18000]   # dark shadow band
+        img[160:, :] = [46000, 45000, 43000]
+        img += rng.normal(0, 1200, img.shape)
+        img = np.clip(img, 0, 65535).astype(np.uint16)
+        cv2.line(img, (96, 122), (114, 104), (58000,) * 3, 3,
+                 lineType=cv2.LINE_AA)                   # nearby white streak
+        cv2.circle(img, (123, 88), 3, (62000,) * 3, -1,
+                   lineType=cv2.LINE_AA)                 # the white speck
+        spot = {"kind": "auto", "pts": [[123 / W_, 88 / H_]], "r": 9.0 / W_}
+        plan = []
+        out = apply_dust_removal(img, [spot], collect_plan=plan)
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        dy, dx = off
+        # (1)+(3) touching: offset ~ 2·half_th + a few px of mask dilation.
+        assert float(np.hypot(dy * H_, dx * W_)) <= 2 * 9 + 8
+        # (2) the fill is LIGHT WALL, not shadow.
+        m = rasterize_dust_mask([spot], H_, W_) > 0
+        assert float(out[m].astype(np.float32).mean()) > 40000
+
+    def test_isolated_speck_samples_touching(self):
+        rng = np.random.default_rng(8)
+        img = np.clip(rng.normal(30000, 2000, (200, 200, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "auto", "pts": [[0.5, 0.5]], "r": 0.04}  # r = 8 px
+        plan = []
+        apply_dust_removal(img, [spot], collect_plan=plan)
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        assert float(np.hypot(off[0] * 200, off[1] * 200)) <= 2 * 8 + 8
+
+
 # --- Source tone locality ------------------------------------------------------
 class TestSourceMatchesLocalTone:
     def test_edge_spot_source_stays_on_its_own_tone_side(self):
