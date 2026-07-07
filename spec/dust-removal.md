@@ -555,12 +555,20 @@ panel that imports it) load even when `onnxruntime` is absent.
       edge); circle-inpainting those smears real detail, so linear defects are
       left to the manual brush (§5.4).
     - **bright-speck gate**: film dust inverts to **white** specks, so a real
-      dust blob is brighter than its surroundings. Require the blob's mean luma
-      to exceed a surrounding ring by `BRIGHT_MARGIN`; this rejects normal-toned
-      content the detector wrongly fires on (a face, a dark feature — which is
-      how the AI once removed a person's head). `detect` therefore returns
-      `(prob, luma)` so `prob_to_spots` has the detection-resolution grayscale.
-      This and the aspect filter are the main guards against AI false positives.
+      dust blob is brighter than its surroundings. The gate is
+      **noise-relative** — dust sits off the focal plane, so most real specks
+      are soft-edged and faint (a fixed absolute margin missed nearly all of
+      them on smooth sky while they stood many grain-sigmas above it): the
+      blob's mean-luma lift over a surrounding ring must exceed
+      `min(BRIGHT_MARGIN, max(BRIGHT_FLOOR, BRIGHT_SNR·σ))` with σ the ring's
+      own luma std. Sharp dust (≥ `BRIGHT_MARGIN`) always passes; faint dust
+      passes where the surround is smooth; busy texture keeps the full
+      absolute bar. Normal-toned content the detector wrongly fires on (a
+      face, a dark feature — which is how the AI once removed a person's
+      head) still fails: its lift is ~0 or negative. `detect` therefore
+      returns `(prob, luma)` so `prob_to_spots` has the detection-resolution
+      grayscale. This and the aspect filter are the main guards against AI
+      false positives.
   - Each surviving (compact) component → one `auto` spot: centroid
     `(cx/prob_w, cy/prob_h)`; **area-equivalent** radius
     `r = (sqrt(area/π) + pad) / prob_w` — a tight circle matching the speck, so

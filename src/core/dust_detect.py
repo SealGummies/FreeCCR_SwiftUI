@@ -34,10 +34,18 @@ MAX_ASPECT = 3.0        # drop elongated detections (thin LINES are usually real
                         # structure — a bike frame, the horizon — not dust)
 SPOT_PAD = 1.5          # px added to each detected spot's radius (inpaint margin)
 # Film dust inverts to BRIGHT/white specks, so a real dust blob is brighter than
-# its surroundings. Require at least this luma lift (0..1) over the surrounding
-# ring; this rejects normal-toned content the detector wrongly fires on (a face,
-# a dark feature) — those are not bright specks.
-BRIGHT_MARGIN = 0.06
+# its surroundings. The gate is NOISE-RELATIVE: dust sits off the focal plane,
+# so most real specks are soft-edged and faint — a fixed absolute lift missed
+# nearly all of them on smooth sky while their lift stood many grain-sigmas
+# above the surround. A blob passes when its luma lift (0..1) over the
+# surrounding ring exceeds min(BRIGHT_MARGIN, max(BRIGHT_FLOOR, BRIGHT_SNR·σ)),
+# σ = the ring's own luma std: sharp dust (≥ BRIGHT_MARGIN) always passes;
+# faint dust passes where the surround is smooth; on busy texture the bar
+# stays at the full absolute margin. Normal-toned/dark content (a face, a
+# dark feature) still fails — its lift is ~0 or negative.
+BRIGHT_MARGIN = 0.06    # absolute lift that always passes (sharp dust)
+BRIGHT_FLOOR = 0.02     # minimum lift for the noise-relative pass
+BRIGHT_SNR = 3.0        # ...or the lift must beat this many surround-sigmas
 BRIGHT_RING = 3         # px ring around a blob used as the "surround" reference
 
 _session = None          # cached ort.InferenceSession
@@ -239,7 +247,12 @@ def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
         comp_luma = float(win_luma[win_comp].mean())
         surround = win_luma[~win_comp]
         surround_luma = float(surround.mean()) if surround.size else comp_luma
-        if comp_luma - surround_luma < BRIGHT_MARGIN:
+        # Noise-relative bar (see BRIGHT_* above): soft off-focus dust is
+        # faint in absolute terms but stands many grain-sigmas above a
+        # smooth surround; busy texture keeps the full absolute margin.
+        noise = float(surround.std()) if surround.size else 0.0
+        need = min(BRIGHT_MARGIN, max(BRIGHT_FLOOR, BRIGHT_SNR * noise))
+        if comp_luma - surround_luma < need:
             continue  # not a bright speck → not film dust
         cx, cy = centroids[i]
         # Area-EQUIVALENT radius (+ small margin), NOT the bounding-box extent:

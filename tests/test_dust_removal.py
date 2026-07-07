@@ -588,6 +588,22 @@ class TestProbToSpots:
         bright[40:46, 40:46] = 0.9               # bright blob (real dust)
         assert len(dust_detect.prob_to_spots(prob, bright, 60)) == 1
 
+    def test_soft_dust_passes_on_smooth_surround_only(self):
+        # Dust sits off the focal plane, so real specks are soft and FAINT: a
+        # +0.03 lift is many grain-sigmas above smooth sky (kept) but lost in
+        # the texture of a busy surround (rejected). The bright gate is
+        # noise-relative — a fixed absolute margin missed nearly every soft
+        # speck on smooth sky (the example_raw dusty-sky case).
+        rng = np.random.default_rng(5)
+        prob = np.zeros((200, 200), np.float32)
+        prob[40:46, 40:46] = 0.9
+        smooth = np.clip(rng.normal(0.75, 0.005, (200, 200)), 0, 1).astype(np.float32)
+        smooth[40:46, 40:46] += 0.03
+        assert len(dust_detect.prob_to_spots(prob, smooth, 60)) == 1
+        busy = np.clip(rng.normal(0.75, 0.04, (200, 200)), 0, 1).astype(np.float32)
+        busy[40:46, 40:46] += 0.03
+        assert dust_detect.prob_to_spots(prob, busy, 60) == []
+
 
 # --- Availability / graceful degradation ------------------------------------
 class TestAvailability:
