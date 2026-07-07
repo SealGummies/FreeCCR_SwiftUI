@@ -62,11 +62,16 @@ jobs:
           body: |
             ## What's New
 
-            **FreeCCR 1.1.1** — fixes for the macOS scanner-TIFF reports (issues #86 and #87). Thanks for the detailed reports!
+            **FreeCCR 1.2.0** — one-click auto white balance, a major dust-removal upgrade, and the first Linux builds.
 
-            - **B/W-point conversion no longer fails on macOS.** The .app launches with an ASCII console encoding, and a diagnostic log line crashed every conversion with `'ascii' codec can't encode character…` ("Convert All" silently produced un-inverted frames). Logging can no longer abort any operation.
-            - **Pakon / Nikon Coolscan TIFFs load correctly.** Planar TIFFs (Pakon `expRGB` exports) were silently decoded with scrambled channels; LZW/deflate-compressed scans could take minutes or never finish loading; float and wide-integer sample formats rendered black. All fixed.
-            - **Consistent film-base colour on import.** The un-converted preview's auto-brightness no longer shifts hue per frame — the film base reads the same colour on a mostly-blank frame as on an exposed one. (Display only; conversion and export are unchanged.)
+            - **Auto White Balance.** New **AWB** button next to the WB picker: one click estimates the neutral colour of the converted frame and sets the Temperature/Tint sliders — no grey spot to hunt for, undoable, and re-clicking gives the same answer. **Settings → General** picks the estimator (Gray World, White Patch, Shades of Gray, Gray Edge) and can run AWB automatically after each conversion (off by default; images that already have a white balance are never touched).
+            - **Linux builds.** Releases now ship a Linux x86_64 **AppImage** and a portable **tar.gz** — install notes below.
+            - **Dust removal overhaul.**
+              - **Dust mode edits the framed image** — the crop you keep, not the full scan — and healing is resolution-independent: **exports now match the preview exactly**.
+              - **Auto-detection finds far more dust.** Detection runs tiled at the scan's native resolution with a noise-relative brightness gate, so the soft out-of-focus specks the old 1080px pass missed are found; it looks only in smooth areas where specks actually show, stays inside your crop, and uses the GPU on Windows when available. Also fixed: detection returned nothing on B/W-point-converted images.
+              - **Cleaner heals.** Source patches are searched nearest-first by texture match, every spot samples its own patch (nearby strokes no longer share one), healed tone anchors to its local surroundings, and feather scales with the brush size.
+              - **Editable heals.** With heal sources shown: right-drag a stroke to move it (it keeps sampling the same patch of film), right-drag a source ring to re-pick where it samples, double right-click deletes a stroke.
+            - **Reference-frame exports are faithful.** Exports now replay the exact reference frame captured at convert time, so changing the reference afterwards can no longer alter an export (#94).
 
             ## Install
 
@@ -178,11 +183,16 @@ jobs:
           body: |
             ## What's New
 
-            **FreeCCR 1.1.1** — fixes for the macOS scanner-TIFF reports (issues #86 and #87). Thanks for the detailed reports!
+            **FreeCCR 1.2.0** — one-click auto white balance, a major dust-removal upgrade, and the first Linux builds.
 
-            - **B/W-point conversion no longer fails on macOS.** The .app launches with an ASCII console encoding, and a diagnostic log line crashed every conversion with `'ascii' codec can't encode character…` ("Convert All" silently produced un-inverted frames). Logging can no longer abort any operation.
-            - **Pakon / Nikon Coolscan TIFFs load correctly.** Planar TIFFs (Pakon `expRGB` exports) were silently decoded with scrambled channels; LZW/deflate-compressed scans could take minutes or never finish loading; float and wide-integer sample formats rendered black. All fixed.
-            - **Consistent film-base colour on import.** The un-converted preview's auto-brightness no longer shifts hue per frame — the film base reads the same colour on a mostly-blank frame as on an exposed one. (Display only; conversion and export are unchanged.)
+            - **Auto White Balance.** New **AWB** button next to the WB picker: one click estimates the neutral colour of the converted frame and sets the Temperature/Tint sliders — no grey spot to hunt for, undoable, and re-clicking gives the same answer. **Settings → General** picks the estimator (Gray World, White Patch, Shades of Gray, Gray Edge) and can run AWB automatically after each conversion (off by default; images that already have a white balance are never touched).
+            - **Linux builds.** Releases now ship a Linux x86_64 **AppImage** and a portable **tar.gz** — install notes below.
+            - **Dust removal overhaul.**
+              - **Dust mode edits the framed image** — the crop you keep, not the full scan — and healing is resolution-independent: **exports now match the preview exactly**.
+              - **Auto-detection finds far more dust.** Detection runs tiled at the scan's native resolution with a noise-relative brightness gate, so the soft out-of-focus specks the old 1080px pass missed are found; it looks only in smooth areas where specks actually show, stays inside your crop, and uses the GPU on Windows when available. Also fixed: detection returned nothing on B/W-point-converted images.
+              - **Cleaner heals.** Source patches are searched nearest-first by texture match, every spot samples its own patch (nearby strokes no longer share one), healed tone anchors to its local surroundings, and feather scales with the brush size.
+              - **Editable heals.** With heal sources shown: right-drag a stroke to move it (it keeps sampling the same patch of film), right-drag a source ring to re-pick where it samples, double right-click deletes a stroke.
+            - **Reference-frame exports are faithful.** Exports now replay the exact reference frame captured at convert time, so changing the reference afterwards can no longer alter an export (#94).
 
             ## Install
 
@@ -413,11 +423,16 @@ jobs:
           body: |
             ## What's New
 
-            **FreeCCR 1.1.1** — fixes for the macOS scanner-TIFF reports (issues #86 and #87). Thanks for the detailed reports!
+            **FreeCCR 1.2.0** — one-click auto white balance, a major dust-removal upgrade, and the first Linux builds.
 
-            - **B/W-point conversion no longer fails on macOS.** The .app launches with an ASCII console encoding, and a diagnostic log line crashed every conversion with `'ascii' codec can't encode character…` ("Convert All" silently produced un-inverted frames). Logging can no longer abort any operation.
-            - **Pakon / Nikon Coolscan TIFFs load correctly.** Planar TIFFs (Pakon `expRGB` exports) were silently decoded with scrambled channels; LZW/deflate-compressed scans could take minutes or never finish loading; float and wide-integer sample formats rendered black. All fixed.
-            - **Consistent film-base colour on import.** The un-converted preview's auto-brightness no longer shifts hue per frame — the film base reads the same colour on a mostly-blank frame as on an exposed one. (Display only; conversion and export are unchanged.)
+            - **Auto White Balance.** New **AWB** button next to the WB picker: one click estimates the neutral colour of the converted frame and sets the Temperature/Tint sliders — no grey spot to hunt for, undoable, and re-clicking gives the same answer. **Settings → General** picks the estimator (Gray World, White Patch, Shades of Gray, Gray Edge) and can run AWB automatically after each conversion (off by default; images that already have a white balance are never touched).
+            - **Linux builds.** Releases now ship a Linux x86_64 **AppImage** and a portable **tar.gz** — install notes below.
+            - **Dust removal overhaul.**
+              - **Dust mode edits the framed image** — the crop you keep, not the full scan — and healing is resolution-independent: **exports now match the preview exactly**.
+              - **Auto-detection finds far more dust.** Detection runs tiled at the scan's native resolution with a noise-relative brightness gate, so the soft out-of-focus specks the old 1080px pass missed are found; it looks only in smooth areas where specks actually show, stays inside your crop, and uses the GPU on Windows when available. Also fixed: detection returned nothing on B/W-point-converted images.
+              - **Cleaner heals.** Source patches are searched nearest-first by texture match, every spot samples its own patch (nearby strokes no longer share one), healed tone anchors to its local surroundings, and feather scales with the brush size.
+              - **Editable heals.** With heal sources shown: right-drag a stroke to move it (it keeps sampling the same patch of film), right-drag a source ring to re-pick where it samples, double right-click deletes a stroke.
+            - **Reference-frame exports are faithful.** Exports now replay the exact reference frame captured at convert time, so changing the reference afterwards can no longer alter an export (#94).
 
             ## Install
 
