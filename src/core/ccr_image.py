@@ -920,7 +920,8 @@ class CCRImage:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
-    def _apply_dust_removal(self, image: np.ndarray) -> np.ndarray:
+    def _apply_dust_removal(self, image: np.ndarray,
+                            ws_windowed: bool = False) -> np.ndarray:
         """Inpaint stored dust spots out of the working image (no-op when there
         are none). Spots are normalized, so this scales to whatever resolution
         is being processed — preview, hi-res zoom, or full-res export.
@@ -954,17 +955,37 @@ class CCRImage:
             plan_out = []
             cached = getattr(self, "_dust_plan_cache", None)
             prior = cached[1] if cached is not None else None
+            # A prior record may only rebind to a spot that STILL EXISTS.
+            # The cache deliberately outlives spot edits (sticky sources),
+            # but a record whose spot was deleted/replaced must never seed
+            # a NEW spot painted or re-detected at the same place — that
+            # resurrected old sources verbatim and the sampling rule never
+            # ran for the new spot (stale catalog plans made the touch rule
+            # look permanently broken).
+            snap = getattr(self, "_dust_plan_spots", None)
+            if prior and snap is not None:
+                gone = [s for s in snap if s not in spots]
+                if gone:
+                    from core.ccr_processor import rasterize_dust_mask
+                    gm = rasterize_dust_mask(gone, h, w) > 0
+                    prior = [r for r in prior
+                             if not gm[min(h - 1, max(0, int(round(r[0] * h)))),
+                                       min(w - 1, max(0, int(round(r[1] * w))))]]
             out = apply_dust_removal(image, spots, feather=feather,
                                      collect_plan=plan_out, prior_plan=prior,
-                                     crop=crop)
+                                     crop=crop, ws_windowed=ws_windowed)
             self._dust_plan_cache = (key, plan_out)
+            # Shallow copy ON PURPOSE: a right-drag stroke MOVE mutates the
+            # spot dict in place, so the snapshot entry stays identical and
+            # the moved stroke keeps its pinned source.
+            self._dust_plan_spots = list(spots)
             print(f"Dust heal total ({len(spots)} spots, preview scale, "
                   f"plan cached): {time.time() - t0:.3f}s")
             return out
         cached = getattr(self, "_dust_plan_cache", None)
         plan = cached[1] if (cached is not None and cached[0] == key) else None
         out = apply_dust_removal(image, spots, feather=feather, plan=plan,
-                                 crop=crop)
+                                 crop=crop, ws_windowed=ws_windowed)
         print(f"Dust heal total ({len(spots)} spots, "
               f"preview plan {'reused' if plan is not None else 'MISSING'}): "
               f"{time.time() - t0:.3f}s")
@@ -982,13 +1003,15 @@ class CCRImage:
         # Dust removal runs FIRST so the inpainted positive flows through the
         # rest of the adjustment stage (and so a dust-only image is still
         # cleaned even when the early-return guard below would otherwise skip).
-        image = self._apply_dust_removal(image)
+        # It runs on the (possibly WINDOWED) base, so the heal must know — the
+        # sampling rule's hue/sat/value deltas are computed on display values.
+        ws = self._ws_windowed if ws_windowed is None else ws_windowed
+        image = self._apply_dust_removal(image, ws_windowed=ws)
         s = self.adjustment_settings if settings is None else settings
         cb = self.contrast_base if contrast_base is None else contrast_base
         tb = self.temperature_base if temperature_base is None else temperature_base
         bb = self.brightness_base if brightness_base is None else brightness_base
         eb = self.exposure_base if exposure_base is None else exposure_base
-        ws = self._ws_windowed if ws_windowed is None else ws_windowed
         profile = self.color_profile if color_profile is None else color_profile
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)

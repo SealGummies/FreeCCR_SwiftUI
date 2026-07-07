@@ -416,9 +416,12 @@ def _restore_image(file_path: str, state: dict):
     if plan and img.dust_spots:
         # Reseed the plan cache so the restored image keeps the exact
         # sources the user saw (sticky across sessions); a missing/legacy
-        # plan just replans once and is sticky from then on.
+        # plan just replans once and is sticky from then on. The snapshot
+        # ties the plan to THESE spots — records of spots later deleted or
+        # replaced are pruned instead of rebinding to new spots.
         img._dust_plan_cache = (repr(img.dust_spots),
                                 _dust_plan_from_json(plan))
+        img._dust_plan_spots = list(img.dust_spots)
     if "dust_feather_r" in state:
         img.dust_feather = float(state["dust_feather_r"])
     elif "dust_feather" in state:

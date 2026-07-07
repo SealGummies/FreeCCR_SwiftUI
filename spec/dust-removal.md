@@ -193,15 +193,29 @@ reference to `MainWindow` and `ImagePreview` passed at construction (it does
 
 ### 3.4 AI detect & remove
 - **Detect & Remove** runs detection **off the GUI thread** on the current
-  working positive (`resized_raw` with existing spots already inpainted, so
-  already-cleaned dust is not re-flagged), at preview resolution:
+  working positive (with existing manual spots already inpainted, so
+  already-cleaned dust is not re-flagged). The source is a **hi-res
+  conversion replay** (`render_hires_base`, the same snapshot replay the
+  zoom view uses) downscaled to `DETECT_MAX_LONG`, falling back to
+  `resized_raw` when no replay is possible — soft off-focus dust is ~1 px
+  at preview resolution and undetectable there. The source build runs
+  inside the detect worker (it decodes + converts: seconds). When the base
+  is a **windowed working-space buffer**, the detection source is
+  de-windowed + window-clamped first (same as the WB picker / AWB): fed raw
+  container codes the net sees a black frame and the bright-speck gate's
+  absolute margin is unreachable — no dust would ever be found.
   1. If no cached probability map for this image, run the ONNX detector and cache
      it (so re-tuning Sensitivity does not re-run the net).
   2. Threshold + size-gate + dilate the prob map into a binary mask at detection
      resolution (§5.3).
   3. Extract connected components; convert each to one normalized `auto` spot
      (centroid + radius from component extent).
-  4. Replace any prior `auto` spots on the image with the new set (manual `brush`
+  4. With a confirmed crop, drop `auto` spots whose center falls **outside the
+     crop frame** (same rasterized geometry as the display crop): the rebate /
+     holder is not scene — it is cropped away everywhere, and its bright edge
+     printing (frame numbers, sprocket edges) reads as dust to the detector.
+     Manual `brush` spots are never filtered.
+  5. Replace any prior `auto` spots on the image with the new set (manual `brush`
      spots are untouched), `push_undo_state()` once, re-render.
 - **Sensitivity** changes re-threshold the cached prob map and refresh the
   `auto` spots live (no net re-run) unless the working buffer changed.
@@ -398,35 +412,56 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      hair edge, or the hair's continuation past the stroke's end (which can
      be the ring's *majority*), cannot lift the fill into a bright ghost of
      the stroke. Legit bimodal structure survives (both modes sit far from
-     the defect color). **Sanity cap** (`_HEAL_MIN_KEEP_FRAC`): if the
-     rejection would keep < 20% of the ring, the "defect" was estimated as
-     the ring's own majority (a clean generous brush, whose top-quartile
-     estimate collapses onto the background) and whatever survives is some
-     small foreign mode — a black border, a dark roofline — that would
+     the defect color). **The split validates itself under the white-dust
+     prior**: the rejection is trusted only when the REJECTED pixels are
+     luma-brighter than the KEPT ones by a noise margin — for a faint speck
+     or clean-ish hole the "defect" estimate collapses onto the background,
+     and the (inverted) split would strip the background and anchor the
+     entire match/tone on some foreign minority in the ring (a wall across
+     an edge), sending the source hunt far away while perfect same-tone
+     context sits beside the spot. **Sanity cap** (`_HEAL_MIN_KEEP_FRAC`):
+     if the rejection would keep < 20% of the ring, whatever survives is
+     some small foreign mode — a black border, a dark roofline — that would
      become the entire anchor (clean sky strokes healed to solid black,
-     cloned from the border). The estimate is distrusted (`genuine=False`):
-     full ring, no defect force-fill.
-  3. **Search**: candidate source windows on rings of directions at
-     thickness-scaled distances (`d_base = 2·half_th + pad + 2`,
-     ×1/1.5/2.25/3.5, plus the window diagonal as a last resort),
-     **nearest first**: the stroke's own surroundings are the most likely
-     to carry the same pattern, so the two nearest rings sample at DOUBLE
-     angular density (2×`_HEAL_ANGLES`), near-ties fall to the closer
-     patch (`_HEAL_DIST_W` per-ring score penalty), and the sweep STOPS at
-     the first ring whose best raw match reaches the grain floor
-     (`_HEAL_ACCEPT_MADS` × sigma², sigma estimated from the CLEANEST
-     QUARTILE of the 3×3-detrended ring residual — the raw ring MAD
-     inflates on structure and the residual's median inflates under edge
-     bleed, and an inflated floor early-accepts a bad near patch; an
-     underestimated floor only costs a longer sweep). A candidate must be
-     in-bounds and fully clean (checked O(1) against `cv2.integral` of the
-     padded mask), so a long stroke heals from the clean strip right beside
-     it. Score = SSD between source and destination **kept ring** pixels —
-     plus, only past a ring-MAD-scaled tolerance, the candidate's
-     interior-tone excess vs the ring background (the ring SSD never looks
-     inside the window: a source whose ring matches but whose hole area
-     holds a black border edge clones the border into the fill; within
-     tolerance the ring SSD alone ranks). Best adjusted score wins.
+     cloned from the border). Either failure distrusts the estimate
+     (`genuine=False`): full ring, no defect force-fill.
+  3. **Search — THE AUTOMATIC SAMPLING RULE (maintainer, verbatim)**,
+     applied to EVERY automatically picked initial sample — AI-detected
+     spots and painted strokes alike (only the user's explicit right-drag
+     re-pick is exempt). **Strokes are never auto-connected**: each spot is
+     its own patch with its own segments, argmin and per-patch offset even
+     when spots touch or overlap (drawing order owns shared pixels; only
+     the never-clone-dust checks and the feathered composite see the
+     union). Pinned and shared offsets validate touching against THE WHOLE
+     PATCH, at plan time and replay alike: (1) the sample area MUST TOUCH the patch area —
+     border-to-border, union contiguous (candidates: 64 directions at
+     `2·half_th` +0/+1/+2 px of raster slack, sample-area cleanliness
+     checked against the RAW mask so the dilation cannot push the sample
+     off the border it must touch); (2) among the touching candidates the
+     one with the lowest combined Δhue + Δsat + ΔV — measured against the
+     patch's own background, estimated as the darker half of the HOLE's
+     pixels (film dust is white) — plus the lowest texture wins; (3)
+     again: the areas must touch. A TOTAL selection — no distance
+     escalation, no "good enough" gate, no fallback ranking. On a windowed
+     working-space buffer the deltas are computed on de-windowed display
+     values. No ring statistic participates in the choice, and the
+     defect-leak rejection (§ step 2) is disabled for auto components (it
+     is a manual-trace defense; an auto spot cannot leak by construction).
+     **One sample offset per patch**: the rule speaks of the patch as a
+     unit — the component's first segment runs the argmin and the rest of
+     the patch reuses its offset (nudged ≤ 4 px around raster grazes), so
+     a long stroke cannot get differently-phased clones butted together
+     mid-stroke. Known consequences, accepted with the rule: a brush
+     NARROWER than the defect it traces samples the defect's own
+     continuation (cover a defect to remove it), and on patterned content
+     the fill may land phase-shifted (the rule has no pattern-phase term;
+     the re-pick drag is the alignment tool). Invariant intersections:
+     dust is never cloned (a touching window overlapping any spot is
+     excluded; when NO in-bounds touching candidate exists at all — patch
+     at frame edge or fully encircled — the boundary-diffusion Telea fill
+     applies, growing from the patch's own touching border), and a
+     candidate needs ≥ 1 clean ring px for the tone membrane (raw-mask
+     subset, scale-stable).
   4. **Clone + membrane tone correction**: hole pixels are copied from the
      best source, plus a smooth per-channel correction field interpolated
      from the kept-ring differences (normalized Gaussian convolution,
@@ -539,11 +574,19 @@ panel that imports it) load even when `onnxruntime` is absent.
   - URL: `https://github.com/MohaElder/openenlarge/releases/download/autodust-assets-v1/detector.onnx`
   - SHA‑256: `61e4a93d4e94b4fc6212e2e9b785fa12b5cbc9654724b02aaf8b212075bb729f`
   - (URL / SHA / filename are module constants so they can be repointed.)
-- **`detect(positive_rgb16) -> (prob_h, prob_w, prob: float32[0,1])`**: resize so
-  the short side is `DETECT_SHORT=512` and both dims are multiples of 16; Rec.709
-  luma; normalize to `[-1,1]`; run the session (`[1,1,dh,dw]` → logits); sigmoid.
-  CPU execution provider (matches openenlarge's Windows guidance). Returns the
-  prob map at detection resolution (cached per image for cheap Sensitivity).
+- **`detect(positive_rgb16) -> (prob_h, prob_w, prob: float32[0,1])`**: run at
+  the input's **native resolution** capped at `DETECT_MAX_LONG` (both dims
+  rounded to multiples of 16), **tiled** through the U-Net (`DETECT_TILE`,
+  `DETECT_OVERLAP` overlap, max-stitched so a seam can't split a speck);
+  Rec.709 luma; normalize to `[-1,1]`; per tile `[1,1,th,tw]` → logits →
+  sigmoid. CPU execution provider (matches openenlarge's Windows guidance).
+  Returns the prob map at detection resolution (cached per image for cheap
+  Sensitivity). **Why native/tiled:** most real film dust sits off the focal
+  plane — soft, faint blobs a few scan-pixels wide. They are ~1 px blips at
+  the 1080 preview and vanished entirely at the old fixed 512-short
+  detection downscale; recall keeps rising up to ~3.2k long side (measured
+  on the example dusty-sky scan), beyond which the time quadruples and the
+  now-huge diffuse blobs start to fragment.
 - **`prob_to_spots(prob, prob_h, prob_w, sensitivity, max_dim) -> list[spot]`**:
   - `thr = 0.85 - 0.60 * (sensitivity/100)` (0 → very selective … 100 →
     aggressive), matching openenlarge.
@@ -554,18 +597,36 @@ panel that imports it) load even when `onnxruntime` is absent.
       also fires on legitimate thin LINES (a bike frame, the horizon, a path
       edge); circle-inpainting those smears real detail, so linear defects are
       left to the manual brush (§5.4).
+    - **smooth-surround rule**: auto-detection keeps spots on SMOOTH surrounds
+      only — sky, open shadow (surround-ring luma std ≤ `SMOOTH_MAX_STD`). In
+      busy texture (foliage, stucco, gravel) a compact bright glint is
+      indistinguishable from dust at this scale and healing it eats real
+      detail; textured areas are the manual brush's job. `detect()` uses the
+      same idea (windowed-std map + the confirmed crop's footprint as a
+      keep-mask) to skip whole tiles with nothing keepable — on a strip
+      cropped to one frame most tiles never hit the net (~3× faster).
     - **bright-speck gate**: film dust inverts to **white** specks, so a real
-      dust blob is brighter than its surroundings. Require the blob's mean luma
-      to exceed a surrounding ring by `BRIGHT_MARGIN`; this rejects normal-toned
-      content the detector wrongly fires on (a face, a dark feature — which is
-      how the AI once removed a person's head). `detect` therefore returns
-      `(prob, luma)` so `prob_to_spots` has the detection-resolution grayscale.
-      This and the aspect filter are the main guards against AI false positives.
+      dust blob is brighter than its surroundings. The gate is
+      **noise-relative** — dust sits off the focal plane, so most real specks
+      are soft-edged and faint (a fixed absolute margin missed nearly all of
+      them on smooth sky while they stood many grain-sigmas above it): the
+      blob's mean-luma lift over a surrounding ring must exceed
+      `min(BRIGHT_MARGIN, max(BRIGHT_FLOOR, BRIGHT_SNR·σ))` with σ the ring's
+      own luma std. Sharp dust (≥ `BRIGHT_MARGIN`) always passes; faint dust
+      passes where the surround is smooth; busy texture keeps the full
+      absolute bar. Normal-toned content the detector wrongly fires on (a
+      face, a dark feature — which is how the AI once removed a person's
+      head) still fails: its lift is ~0 or negative. `detect` therefore
+      returns `(prob, luma)` so `prob_to_spots` has the detection-resolution
+      grayscale. This and the aspect filter are the main guards against AI
+      false positives.
   - Each surviving (compact) component → one `auto` spot: centroid
-    `(cx/prob_w, cy/prob_h)`; **area-equivalent** radius
-    `r = (sqrt(area/π) + pad) / prob_w` — a tight circle matching the speck, so
-    the inpaint stays invisible rather than leaving a smudge (the old
-    bounding-extent radius over-covered and was the artifact source).
+    `(cx/prob_w, cy/prob_h)`; **area-equivalent** radius scaled by
+    `SPOT_SCALE`: `r = (sqrt(area/π)·SPOT_SCALE + pad) / prob_w`. Area-based,
+    NOT the bounding-box extent (that over-covered and was the artifact
+    source) — but scaled up because the thresholded component is only the
+    bright CORE of a soft off-focus speck; an exact-fit circle left its faint
+    skirt unhealed.
   - `prob_to_spots` is **pure / model-free** (operates on a numpy prob map) so it
     is unit-testable without ONNX.
 - All ONNX use is guarded; any import/inference error surfaces as

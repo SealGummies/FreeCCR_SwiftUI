@@ -140,25 +140,37 @@ class TestApplyDustRemoval:
         out = apply_dust_removal(img, [spot])
         assert int(out[50, 50, 0]) < 45000  # moved toward the surround
 
-    def test_traced_hair_leaves_no_bright_ghost(self):
-        # THE reported artifact: tracing a bright warm hair with a brush about
-        # its own width left a yellow-green ghost of the whole stroke. The
-        # hair's edges leak past the mask; without the guard gap + robust ring
-        # rejection they poisoned the tone correction (R/G lifted, B dropped)
-        # across the entire stroke — and the bbox-diagonal source-search
-        # minimum forced long strokes into the diffusion fallback, which
-        # ghosts the same way.
+    def test_manual_stroke_samples_touching_area(self):
+        # AUTOMATIC SAMPLING RULE (maintainer): every automatically picked
+        # initial sample — painted strokes included — must TOUCH the patch.
+        # Consequence, accepted with the rule: a brush narrower than the
+        # defect it traces samples the defect's own continuation (the only
+        # thing touching it) — the brush must COVER a defect to remove it.
+        # This test pins the touch contract; the old version asserted the
+        # ring-rejection machinery healed a tight hair trace to sky, which
+        # sampled from far away and is superseded by the rule.
         sky = np.array([20000, 25000, 40000], np.float32)
         img = np.broadcast_to(sky.astype(np.uint16), (200, 200, 3)).copy()
-        # A "hair" much wider than the brush: bright/warm vs the blue sky.
         cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
-        # Brush stroke tracing the hair core, narrower than the hair.
         spot = {"kind": "brush",
                 "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 2.0 / 200}
-        out = apply_dust_removal(img, [spot])
+        plan = []
+        apply_dust_removal(img, [spot], collect_plan=plan)
+        assert plan
+        for cy, cx, off, *_ in plan:
+            if off is None:
+                continue
+            # Touching: segment thickness is the 2 px brush → offsets sit at
+            # ~2·half_th (+raster slack), never out on the old search rings.
+            assert float(np.hypot(off[0] * 200, off[1] * 200)) <= 12.0
+        # And a stroke that COVERS the hair heals it to sky from the
+        # touching sky on either side.
+        wide = {"kind": "brush",
+                "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 9.0 / 200}
+        out = apply_dust_removal(img, [wide])
         core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
         err = np.abs(core.mean(axis=0) - sky)
-        assert float(err.max()) < 5000   # fill stays sky-toned along the stroke
+        assert float(err.max()) < 6000   # covered defect heals to sky
 
     def test_feather_alpha_ramps_inward(self):
         # The fill blends over a smooth inward ramp: ~0 at the hole boundary,
@@ -306,6 +318,9 @@ class TestApplyDustRemoval:
         # plan seeds every re-heal and matching segments reuse its offset
         # VERBATIM (no re-scoring). Proof by tampering: a shifted-but-clean
         # prior offset must drive the heal and be carried into the new plan.
+        # (The tamper stays within the rule's ±4 px touching tolerance — an
+        # AUTOMATIC pin shifted beyond touching is a fossil and re-picks,
+        # see test_fossil_automatic_pins_repick_under_the_rule.)
         rng = np.random.default_rng(17)
         img = np.clip(rng.normal(30000, 3000, (400, 400, 3)), 0,
                       65535).astype(np.uint16)
@@ -314,7 +329,7 @@ class TestApplyDustRemoval:
         apply_dust_removal(img, [spot], collect_plan=plan1)
         (cy, cx, off, g, d, *_), = plan1
         assert off is not None
-        tampered = [(cy, cx, (off[0], off[1] + 20.0 / 400.0), g, d)]
+        tampered = [(cy, cx, (off[0], off[1] + 3.0 / 400.0), g, d)]
         plan2 = []
         apply_dust_removal(img, [spot], collect_plan=plan2,
                            prior_plan=tampered)
@@ -363,23 +378,28 @@ class TestApplyDustRemoval:
         dist = float(np.hypot(off[0] * 400, off[1] * 400))
         assert dist <= 1.6 * 41
 
-    def test_stripes_pattern_heals_phase_aligned(self):
-        # On patterned content the match must pick a phase-aligned patch —
-        # the healed hole continues the stripes, not a misphased smear (and
-        # the early-accept must NOT trip on a misphased near candidate: the
-        # grain floor is estimated from the detrended residual, not the
-        # ring's structure).
+    def test_stripes_defect_removed_from_touching_sample(self):
+        # AUTOMATIC SAMPLING RULE: the sample must touch the patch and is
+        # chosen by hue/sat/value + texture — the rule has NO pattern-phase
+        # term, so on striped content the fill may land phase-shifted (the
+        # user's re-pick drag is the tool for pattern alignment). What must
+        # hold: the defect is gone, the fill is stripe-toned content from a
+        # TOUCHING offset, never a remote patch. (Supersedes the old
+        # phase-alignment promise of the ring-SSD search.)
         yy, xx = np.mgrid[0:200, 0:200]
         base = 30000 + 12000 * np.sin(2 * np.pi * xx / 24.0)
         img = np.stack([base] * 3, axis=-1).astype(np.uint16)
-        expected = img.copy()
         cv2.circle(img, (100, 100), 5, (62000, 62000, 62000), -1)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.05}
-        out = apply_dust_removal(img, [spot], feather=0.0)
-        hole = np.hypot(yy - 100, xx - 100) <= 10
-        err = np.abs(out[hole].astype(np.float32)
-                     - expected[hole].astype(np.float32))
-        assert float(err.mean()) < 1500
+        plan = []
+        out = apply_dust_removal(img, [spot], feather=0.0, collect_plan=plan)
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        assert float(np.hypot(off[0] * 200, off[1] * 200)) <= 2 * 10 + 4
+        hole = np.hypot(yy - 100, xx - 100) <= 8
+        healed = out[hole].astype(np.float32)
+        assert float(healed.max()) < 50000       # the bright speck is gone
+        assert 15000 < float(healed.mean()) < 45000  # stripe-range content
 
     def test_manual_source_pick_clones_verbatim(self):
         # A USER-PICKED source (overlay ring drag, manual=True in the plan)
@@ -408,8 +428,12 @@ class TestApplyDustRemoval:
 
     def test_sources_stay_inside_the_crop(self):
         # Content outside the confirmed crop (film holder, rebate, junk the
-        # user cut away) is not scene: fresh searches must never sample it,
-        # and the context ring must not anchor on it.
+        # user cut away) is not scene: the pixels a heal READS must never
+        # come from it. The source WINDOW may overlap it with its unused
+        # corners (pixels-actually-read semantics — same rule that keeps
+        # sources near inside dust clusters), but the fill projection stays
+        # in-crop and matching/tone anchor only on the ring's clean subset,
+        # so none of the junk's brightness can reach the output.
         rng = np.random.default_rng(29)
         img = np.clip(rng.normal(30000, 2500, (400, 400, 3)), 0,
                       65535).astype(np.uint16)
@@ -419,20 +443,24 @@ class TestApplyDustRemoval:
         plan = []
         out = apply_dust_removal(img, [spot], collect_plan=plan, crop=crop)
         assert plan
-        # Every sampled window lies inside the crop: source-window center +
-        # its half extent (hole r 12 + guard/ring pad 15 = 27 px) fits.
+        # Every FILL projection lies inside the crop (hole r 12 px).
         for cy, cx, off, *_ in plan:
             if off is not None:
-                assert (cx + off[1]) * 400 + 27 <= 260 + 1e-6
-        # The fill is sky, not the junk strip.
+                assert (cx + off[1]) * 400 + 12 <= 260 + 1e-6
+        # The fill is sky, not the junk strip — tone anchored on the clean
+        # ring subset, junk excluded from the membrane.
         m = rasterize_dust_mask([spot], 400, 400) > 0
-        assert float(out[m].astype(np.float32).mean()) < 40000
+        healed = out[m].astype(np.float32)
+        assert abs(float(healed.mean()) - 30000) < 3000
+        assert float(healed.max()) < 50000
 
-    def test_stroke_on_prior_source_keeps_reference_samples_healed(self):
-        # NO exceptions: even a stroke painted directly ON a segment's
-        # source patch must not move the reference. The segment defers to a
-        # second pass and clones the HEALED content at the very same
-        # location — same offset in the plan, no dust cloned into the fill.
+    def test_stroke_on_prior_source_stays_separate_and_heals_clean(self):
+        # MAINTAINER RULE: two strokes are NEVER auto-connected — even when
+        # one is painted right on the other's touching source, each patch
+        # keeps its own segments and samples separately. The first stroke's
+        # pinned source now sits under the new stroke's dust, so it defers
+        # and clones the HEALED content at the same touching offset; the new
+        # stroke argmins its own touching sample. No dust is ever cloned.
         rng = np.random.default_rng(23)
         img = np.clip(rng.normal(30000, 2500, (400, 400, 3)), 0,
                       65535).astype(np.uint16)
@@ -441,8 +469,10 @@ class TestApplyDustRemoval:
         apply_dust_removal(img, [spot], collect_plan=plan1)
         (cy, cx, off, _, _, *_), = plan1
         assert off is not None
+        # Touching: the chosen source borders the patch.
+        assert float(np.hypot(off[0] * 400, off[1] * 400)) <= 2 * 12 + 4
         # A bright defect appears at the chosen source and the user paints
-        # over it — the source patch is now under dust.
+        # over it.
         sy, sx = cy + off[0], cx + off[1]
         img2 = img.copy()
         cv2.circle(img2, (int(sx * 400), int(sy * 400)), 5,
@@ -451,21 +481,41 @@ class TestApplyDustRemoval:
         plan2 = []
         out = apply_dust_removal(img2, [spot, b], collect_plan=plan2,
                                  prior_plan=plan1)
-        rec = [r for r in plan2
-               if abs(r[0] - cy) < 1e-9 and abs(r[1] - cx) < 1e-9]
-        assert rec, "first stroke's segment disappeared"
-        assert rec[0][2] == off, "reference moved"
-        # The fill sampled the HEALED source, not the new bright defect.
-        m = rasterize_dust_mask([spot], 400, 400) > 0
+        # Two separate patches -> (at least) two records, one per stroke.
+        assert len(plan2) >= 2
+        # No dust cloned anywhere; background restored in both fills.
+        m = rasterize_dust_mask([spot, b], 400, 400) > 0
         healed = out[m].astype(np.float32)
         assert float(healed.mean()) < 40000
         assert float(healed.max()) < 55000
 
+    def test_touching_strokes_sample_separately(self):
+        # MAINTAINER RULE, verbatim: "do not auto connect 2 strokes — sample
+        # separately." Two overlapping dabs must remain two patches, each
+        # with its own record and its own TOUCHING sample; the union used to
+        # merge into one component healed as a single bigger patch.
+        rng = np.random.default_rng(12)
+        img = np.clip(rng.normal(30000, 2000, (300, 300, 3)), 0,
+                      65535).astype(np.uint16)
+        a = {"kind": "brush", "pts": [[0.45, 0.5]], "r": 0.03}   # r = 9 px
+        b = {"kind": "brush", "pts": [[0.50, 0.5]], "r": 0.03}   # overlaps a
+        plan = []
+        apply_dust_removal(img, [a, b], collect_plan=plan)
+        assert len(plan) == 2                    # one record per stroke
+        for (cy, cx, off, *_), s in zip(plan, (a, b)):
+            assert off is not None
+            # Each record's segment lies on its own stroke...
+            assert abs(cx - s["pts"][0][0]) < 0.03
+            # ...and each sample touches ITS patch.
+            assert float(np.hypot(off[0] * 300, off[1] * 300)) <= 2 * 9 + 8
+
     def test_new_stroke_keeps_far_samples_stable(self):
-        # Adding a dab must only re-sample segments near the edit. Tiles
-        # used to anchor to the component bbox and scale their windows by
-        # the component's thickness, so a dab merging at a blob's top-left
-        # shifted EVERY tile of the blob and re-sampled its far side too.
+        # Adding a dab must only re-sample segments near the edit. In the
+        # app this is the STICKY-SOURCES invariant: the panel always passes
+        # the cached plan as prior_plan, so unchanged segments rebind their
+        # offsets verbatim (the touch rule shares ONE offset per patch for
+        # fresh picks, so a no-prior re-derivation of a merged component
+        # legitimately re-seeds — priors are what pin committed strokes).
         rng = np.random.default_rng(31)
         img = np.clip(rng.normal(32000, 3000, (640, 640, 3)), 0,
                       65535).astype(np.uint16)
@@ -477,7 +527,7 @@ class TestApplyDustRemoval:
         # component bbox origin (0.38*640-19 px < the blob's old 240 px
         # edge) and its thickness, touches nothing on the far (right) side.
         added = base + [{"kind": "brush", "pts": [[0.38, 0.38]], "r": 0.03}]
-        apply_dust_removal(img, added, collect_plan=plan2)
+        apply_dust_removal(img, added, collect_plan=plan2, prior_plan=plan1)
         far1 = [r for r in plan1 if r[1] > 0.55]
         assert far1
         for rec in far1:
@@ -600,14 +650,17 @@ class TestProbToSpots:
         assert x > 0.5 and y > 0.5  # the compact speck, not the line
 
     def test_radius_is_area_equivalent_not_extent(self):
-        # A 6x6 compact blob -> radius ~ sqrt(36/pi) ~ 3.4 px (+pad), NOT the
-        # 0.5*extent=3 of the old bounding-box sizing blown up by elongation.
+        # A 6x6 compact blob -> radius ~ sqrt(36/pi)*SPOT_SCALE (+pad), NOT
+        # the old bounding-box sizing blown up by elongation. The scale covers
+        # a soft speck's faint skirt; the area base keeps it from smudging.
         prob = np.zeros((200, 200), np.float32)
         prob[100:106, 100:106] = 0.9
         spots = dust_detect.prob_to_spots(prob, _bright_luma(prob), 60)
         assert len(spots) == 1
         r_px = spots[0]["r"] * 200
-        assert 3.0 < r_px < 7.0     # tight circle, no big smudge
+        expected = np.sqrt(36 / np.pi) * dust_detect.SPOT_SCALE + dust_detect.SPOT_PAD
+        assert abs(r_px - expected) < 0.5
+        assert r_px < 2.0 * 6.0     # still circle-sized, no big smudge
 
     def test_bright_gate_drops_dark_blob(self):
         # Film dust inverts to WHITE specks. A compact, right-sized blob that is
@@ -623,6 +676,234 @@ class TestProbToSpots:
         bright = np.full((200, 200), 0.2, np.float32)
         bright[40:46, 40:46] = 0.9               # bright blob (real dust)
         assert len(dust_detect.prob_to_spots(prob, bright, 60)) == 1
+
+    def test_soft_dust_passes_on_smooth_surround_only(self):
+        # Dust sits off the focal plane, so real specks are soft and FAINT: a
+        # +0.03 lift is many grain-sigmas above smooth sky (kept) but lost in
+        # the texture of a busy surround (rejected). The bright gate is
+        # noise-relative — a fixed absolute margin missed nearly every soft
+        # speck on smooth sky (the example_raw dusty-sky case).
+        rng = np.random.default_rng(5)
+        prob = np.zeros((200, 200), np.float32)
+        prob[40:46, 40:46] = 0.9
+        smooth = np.clip(rng.normal(0.75, 0.005, (200, 200)), 0, 1).astype(np.float32)
+        smooth[40:46, 40:46] += 0.03
+        assert len(dust_detect.prob_to_spots(prob, smooth, 60)) == 1
+        busy = np.clip(rng.normal(0.75, 0.04, (200, 200)), 0, 1).astype(np.float32)
+        busy[40:46, 40:46] += 0.03
+        assert dust_detect.prob_to_spots(prob, busy, 60) == []
+
+    def test_texture_rule_rejects_even_sharp_glints(self):
+        # Auto-detection is sky/shadow ONLY (maintainer rule): in busy texture
+        # a compact bright glint is indistinguishable from dust and healing it
+        # eats real detail, so even a SHARP, high-lift blob is rejected when
+        # its surround ring is textured. Manual brush territory.
+        rng = np.random.default_rng(9)
+        prob = np.zeros((200, 200), np.float32)
+        prob[40:46, 40:46] = 0.9
+        busy = np.clip(rng.normal(0.4, 0.06, (200, 200)), 0, 1).astype(np.float32)
+        busy[40:46, 40:46] = 0.95              # huge lift — still rejected
+        assert dust_detect.prob_to_spots(prob, busy, 60) == []
+
+
+# --- AUTO sampling rule: touch + HSV/texture argmin ---------------------------
+class TestAutoSamplingRule:
+    """Maintainer rule, verbatim: (1) the auto sample area MUST TOUCH the
+    patch area; (2) it samples the touching candidate with the lowest
+    combined delta-hue/delta-sat/delta-V vs the patch's own background plus
+    the lowest texture; (3) again — the areas must touch. Total selection:
+    always an answer, no distance escalation."""
+
+    def test_white_speck_on_light_wall_beside_shadow_band(self):
+        # THE reported case: white dust on the light wall right above a dark
+        # shadow band. The old ring machinery stripped the light context as
+        # "defect leak" and anchored on the band — sampling dark shadow from
+        # far away. The rule: sample must touch and match the LIGHT wall.
+        rng = np.random.default_rng(5)
+        H_, W_ = 220, 270
+        img = np.zeros((H_, W_, 3), np.float32)
+        img[:, :] = [52000, 51000, 49000]        # light wall
+        img[95:160, :] = [17000, 17000, 18000]   # dark shadow band
+        img[160:, :] = [46000, 45000, 43000]
+        img += rng.normal(0, 1200, img.shape)
+        img = np.clip(img, 0, 65535).astype(np.uint16)
+        cv2.line(img, (96, 122), (114, 104), (58000,) * 3, 3,
+                 lineType=cv2.LINE_AA)                   # nearby white streak
+        cv2.circle(img, (123, 88), 3, (62000,) * 3, -1,
+                   lineType=cv2.LINE_AA)                 # the white speck
+        spot = {"kind": "auto", "pts": [[123 / W_, 88 / H_]], "r": 9.0 / W_}
+        plan = []
+        out = apply_dust_removal(img, [spot], collect_plan=plan)
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        dy, dx = off
+        # (1)+(3) touching: offset ~ 2·half_th + a few px of mask dilation.
+        assert float(np.hypot(dy * H_, dx * W_)) <= 2 * 9 + 8
+        # (2) the fill is LIGHT WALL, not shadow.
+        m = rasterize_dust_mask([spot], H_, W_) > 0
+        assert float(out[m].astype(np.float32).mean()) > 40000
+
+    def test_isolated_speck_samples_touching(self):
+        rng = np.random.default_rng(8)
+        img = np.clip(rng.normal(30000, 2000, (200, 200, 3)), 0,
+                      65535).astype(np.uint16)
+        spot = {"kind": "auto", "pts": [[0.5, 0.5]], "r": 0.04}  # r = 8 px
+        plan = []
+        apply_dust_removal(img, [spot], collect_plan=plan)
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        assert float(np.hypot(off[0] * 200, off[1] * 200)) <= 2 * 8 + 8
+
+
+# --- Stale plan records must never seed new spots ------------------------------
+class TestStalePlanPruning:
+    def test_deleted_spots_records_never_seed_new_spots(self):
+        # THE field bug that made the touch rule look broken: catalog plans
+        # saved by OLDER code hold far offsets, the plan cache deliberately
+        # outlives spot edits (sticky sources), and a spot repainted or
+        # re-detected at a dead record's position rebound the old offset
+        # VERBATIM — the sampling rule never ran for the new spot. Records
+        # of spots that no longer exist are pruned before the cache seeds a
+        # re-heal.
+        rng = np.random.default_rng(2)
+        img16 = np.clip(rng.normal(30000, 2000, (400, 400, 3)), 0,
+                        65535).astype(np.uint16)
+        holder = CCRImage.__new__(CCRImage)
+        old_spot = {"kind": "auto", "pts": [[0.5, 0.5]], "r": 0.03}
+        holder._dust_plan_cache = (
+            "stale", [(0.5, 0.5, (120.0 / 400, 100.0 / 400),
+                       False, False, False)])       # 156 px fossil offset
+        holder._dust_plan_spots = [old_spot]
+        # The user cleared/deleted and repainted at (almost) the same place.
+        holder.dust_spots = [{"kind": "brush",
+                              "pts": [[0.501, 0.499]], "r": 0.03}]
+        holder.dust_feather = 0.25
+        holder.crop_rect = None
+        holder.crop_angle = 0.0
+        holder._apply_dust_removal(img16)
+        key, plan = holder._dust_plan_cache
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        # Fresh TOUCHING pick, not the resurrected 156 px fossil.
+        assert float(np.hypot(off[0] * 400, off[1] * 400)) <= 2 * 12 + 8
+
+    def test_fossil_automatic_pins_repick_under_the_rule(self):
+        # Fossil offsets propagate through GENERATIONS of sticky plans (each
+        # re-detect rebound the old offset into a fresh, validly-keyed plan
+        # for as long as the pre-rule search existed) — no spot bookkeeping
+        # can identify them. The rule retroacts instead: an AUTOMATIC pin
+        # whose sample no longer touches its patch is dropped and re-picked;
+        # a USER re-pick keeps any distance (explicit choice).
+        rng = np.random.default_rng(6)
+        img16 = np.clip(rng.normal(30000, 2000, (400, 400, 3)), 0,
+                        65535).astype(np.uint16)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.03}
+        far = (120.0 / 400, 100.0 / 400)
+        plan = []
+        apply_dust_removal(img16, [spot], collect_plan=plan,
+                           prior_plan=[(0.5, 0.5, far, False, False, False)])
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        assert float(np.hypot(off[0] * 400, off[1] * 400)) <= 2 * 12 + 8
+        plan2 = []
+        apply_dust_removal(img16, [spot], collect_plan=plan2,
+                           prior_plan=[(0.5, 0.5, far, False, False, True)])
+        (cy, cx, off2, *_), = plan2
+        assert off2 == far   # the user's own pick is never second-guessed
+
+    def test_surviving_spots_keep_their_pinned_sources(self):
+        # The stickiness the pruning must NOT break: a spot that still
+        # exists keeps its planned source verbatim across a re-heal.
+        rng = np.random.default_rng(4)
+        img16 = np.clip(rng.normal(30000, 2000, (400, 400, 3)), 0,
+                        65535).astype(np.uint16)
+        holder = CCRImage.__new__(CCRImage)
+        keep = {"kind": "brush", "pts": [[0.3, 0.3]], "r": 0.03}
+        pinned = (25.0 / 400, 0.0)   # a touching offset (hole r = 12 px)
+        holder._dust_plan_cache = ("k", [(0.3, 0.3, pinned,
+                                          False, False, False)])
+        holder._dust_plan_spots = [keep]
+        holder.dust_spots = [keep]
+        holder.dust_feather = 0.25
+        holder.crop_rect = None
+        holder.crop_angle = 0.0
+        holder._apply_dust_removal(img16)
+        key, plan = holder._dust_plan_cache
+        (cy, cx, off, *_), = plan
+        assert off == pinned
+
+
+# --- Source tone locality ------------------------------------------------------
+class TestSourceMatchesLocalTone:
+    def test_edge_spot_source_stays_on_its_own_tone_side(self):
+        # The reported case: a speck right beside a high-contrast edge
+        # sampled flat DIRT from across the frame — near candidates straddle
+        # the edge at imperfect phase, so their per-pixel SSD outweighed the
+        # remote patch's wholesale tone mismatch. Area tone (chroma +
+        # brightness) now dominates the score and locality is strong: the
+        # pick must stay in the immediate area, on the spot's own tone side.
+        rng = np.random.default_rng(17)
+        img = np.zeros((300, 300, 3), np.float32)
+        img[:, :140] = [26000, 22000, 18000]        # brown dirt field
+        img[:, 140:] = [48000, 47000, 45000]        # light pavement
+        img[:, 137:143] = [61000, 61000, 61000]     # bright edge stripe
+        img += rng.normal(0, 1200, img.shape)
+        img = np.clip(img, 0, 65535).astype(np.uint16)
+        spot = {"kind": "auto", "pts": [[0.55, 0.5]], "r": 0.025}  # pavement
+        plan = []
+        apply_dust_removal(img, [spot], collect_plan=plan)
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        dy, dx = off
+        assert float(np.hypot(dy * 300, dx * 300)) < 70   # immediate area
+        assert (cx + dx) * 300 > 143   # never the dirt across the edge
+
+
+# --- Source search in dust clusters ------------------------------------------
+class TestClusterSourceStaysNear:
+    def test_cluster_of_specks_still_samples_nearby(self):
+        # A dusty sky: neighboring specks surround the healed one, so NO fully
+        # clean window exists on the near rings. The old all-or-nothing source
+        # check leapt to the far rings for every speck in the cluster; the
+        # pixels a heal actually READS are only the hole projection + ring, so
+        # windows whose unused corners touch a neighbor stay valid and the
+        # source stays in the immediate area.
+        rng = np.random.default_rng(3)
+        img = np.clip(rng.normal(30000, 2000, (240, 240, 3)), 0,
+                      65535).astype(np.uint16)
+        spots = [{"kind": "auto", "pts": [[0.5, 0.5]], "r": 0.03}]
+        for k in range(10):
+            a = 2 * np.pi * k / 10
+            spots.append({"kind": "auto",
+                          "pts": [[0.5 + 0.18 * np.cos(a),
+                                   0.5 + 0.18 * np.sin(a)]],
+                          "r": 0.02})
+        plan = []
+        out = apply_dust_removal(img, spots, collect_plan=plan)
+        rec = min(plan, key=lambda r: (r[0] - 0.5) ** 2 + (r[1] - 0.5) ** 2)
+        assert rec[2] is not None            # sampled, not diffusion fallback
+        dy, dx = rec[2]
+        dist = float(np.hypot(dy * 240, dx * 240))
+        assert dist < 45                     # immediate area, not a far ring
+        # And the fill still lands on the surround's tone (a partial source
+        # ring anchors the membrane on its clean subset only).
+        core = out[114:126, 114:126].astype(np.float32)
+        assert abs(float(core.mean()) - 30000) < 4000
+
+
+# --- Tiled inference grid (pure) ---------------------------------------------
+class TestTileStarts:
+    def test_short_dim_is_one_tile(self):
+        assert dust_detect._tile_starts(512, 768, 704) == [0]
+        assert dust_detect._tile_starts(768, 768, 704) == [0]
+
+    def test_covers_to_the_end_without_remainder_tile(self):
+        starts = dust_detect._tile_starts(2000, 768, 704)
+        assert starts[0] == 0
+        assert starts[-1] == 2000 - 768        # flush with the end
+        # Full coverage: consecutive windows overlap (no gaps).
+        for a, b in zip(starts, starts[1:]):
+            assert b < a + 768
 
 
 # --- Availability / graceful degradation ------------------------------------
@@ -986,18 +1267,20 @@ class TestResolutionConsistency:
         a8 = cv2.convertScaleAbs(healed_small, alpha=255.0 / 65535.0)
         b8 = cv2.convertScaleAbs(big_ds, alpha=255.0 / 65535.0)
         # Windows around the healed hair and the edge speck (1080x720 space).
-        # Calibrated: re-planning per resolution measures p99 = 14 / 10 and
-        # mean = 0.64 / 0.42 here; the replayed plan sits at 10 / 8. The
-        # residuals are NOT source flips (those are what the guard is for —
-        # the offsets replay verbatim): the speck's rim rides the feather
-        # dome over a high-contrast defect (a 1-px raster shift is worth
-        # more diff there), and the hair's nearest-first search now picks
-        # phase-aligned patches in the striped band whose INTEGER offsets
-        # quantize differently at export scale (sub-pixel pattern phase,
-        # bounded by ±0.5 px). The means stay far below the re-planning
-        # 0.64/0.42 and carry the structure-flip discrimination.
+        # The offsets replay VERBATIM (one shared touching offset per patch;
+        # a re-plan derives the identical plan from the identical downscale),
+        # so any residual is resampling, not source flips. Recalibrated for
+        # the touch+HSV sampling rule: on the STRIPED band the rule has no
+        # pattern-phase term, so the touching source is phase-shifted and
+        # the fill is discontinuous against its surround — resampling a
+        # discontinuous clone between scales measures p99 = 28 / mean = 1.14
+        # here (was ~10/0.33 when the old search phase-aligned; a full
+        # per-scale re-plan of THIS rule still lands in the same place, the
+        # bound guards against replay-path regressions such as reroutes to
+        # the deferred pass or tone-anchor subset drift). The smooth-scene
+        # speck window stays tight — the rule's normal habitat.
         for (y0, y1, x0, x1), p99_lim, mean_lim in (
-                ((390, 510, 490, 590), 11.0, 0.40),  # hair
+                ((390, 510, 490, 590), 32.0, 1.5),   # hair over stripes
                 ((270, 350, 390, 480), 9.0, 0.40)):  # edge speck
             d = np.abs(a8[y0:y1, x0:x1].astype(np.float32)
                        - b8[y0:y1, x0:x1].astype(np.float32))
@@ -1070,6 +1353,88 @@ class TestResolutionConsistency:
         a = apply_dust_removal(big, self.SPOTS, plan=plan)
         b = apply_dust_removal(big, self.SPOTS)
         assert np.array_equal(a, b)
+
+
+# --- AI detection source: windowed working-space base ------------------------
+class TestDetectSourceDewindow:
+    """dust_detect_source_for must hand the detector a DISPLAY-referred
+    positive. A bw conversion with working-space headroom stores resized_raw
+    in windowed container codes — the whole image sits in the bottom ~1.5% of
+    the 16-bit range — so fed raw to the net it is a black frame: the detector
+    never fires and the bright-speck gate's absolute margin is unreachable
+    ("AI finds no dust" on every windowed image)."""
+
+    @staticmethod
+    def _img(base_u16, windowed):
+        img = CCRImage.__new__(CCRImage)
+        img.resized_raw = base_u16
+        img.dust_spots = []
+        img.dust_feather = DUST_FEATHER_DEFAULT
+        img.crop_rect = None
+        img.crop_angle = 0.0
+        img._ws_windowed = windowed
+        return img
+
+    def test_windowed_base_is_dewindowed_for_detection(self):
+        from core.ccr_processor import encode_window
+        from widgets.image_preview import ImagePreview
+        d = np.full((60, 80, 3), 0.4, dtype=np.float32)
+        d[20:24, 30:34] = 1.0                      # white dust speck
+        code = encode_window(d.copy())             # windowed container codes
+        assert code.max() < 3000                   # near-black fed as-is
+        src = ImagePreview.dust_detect_source_for(self._img(code, True))
+        lum = src.astype(np.float32) / 65535.0
+        assert abs(float(lum[10, 10, 0]) - 0.4) < 0.01  # display tone restored
+        assert float(lum[21, 31, 0]) > 0.98             # speck back at white
+
+    def test_full_range_base_passes_through_unchanged(self):
+        from widgets.image_preview import ImagePreview
+        base = _flat_with_speck()
+        src = ImagePreview.dust_detect_source_for(self._img(base, False))
+        assert np.array_equal(src, base)
+
+
+# --- AI detection scope: only inside the confirmed crop ----------------------
+class TestAutoSpotsCropScope:
+    """AI 'auto' spots are scene fixes: a detection whose center lies outside
+    the confirmed crop (film rebate, holder, edge printing) is dropped before
+    it is stored — that content is cropped away on screen and in exports, and
+    the rebate's bright markings read as dust to the detector."""
+
+    @staticmethod
+    def _img(crop_rect=None, crop_angle=0.0):
+        img = CCRImage.__new__(CCRImage)
+        img.resized_raw = np.zeros((100, 200, 3), np.uint16)
+        img.crop_rect = crop_rect
+        img.crop_angle = crop_angle
+        return img
+
+    @staticmethod
+    def _spot(x, y):
+        return {"kind": "auto", "pts": [[x, y]], "r": 0.01}
+
+    def test_no_crop_keeps_everything(self):
+        from widgets.image_preview import ImagePreview
+        spots = [self._spot(0.05, 0.05), self._spot(0.95, 0.95)]
+        assert ImagePreview._auto_spots_in_crop(self._img(), spots) == spots
+
+    def test_outside_crop_spots_are_dropped(self):
+        from widgets.image_preview import ImagePreview
+        img = self._img(crop_rect=(0.25, 0.25, 0.75, 0.75))
+        spots = [self._spot(0.5, 0.5),    # inside
+                 self._spot(0.05, 0.5),   # left of the crop (rebate)
+                 self._spot(0.5, 0.9)]    # below the crop
+        assert ImagePreview._auto_spots_in_crop(img, spots) == [spots[0]]
+
+    def test_rotated_crop_uses_the_rotated_footprint(self):
+        from widgets.image_preview import ImagePreview
+        # 200x100 frame, square 60x60 px crop at the center, rotated 45°:
+        # the un-rotated box corner falls OUTSIDE the rotated footprint.
+        img = self._img(crop_rect=(0.35, 0.20, 0.65, 0.80), crop_angle=45.0)
+        center = self._spot(0.5, 0.5)
+        corner = self._spot(0.36, 0.22)
+        kept = ImagePreview._auto_spots_in_crop(img, [center, corner])
+        assert kept == [center]
 
 
 if __name__ == "__main__":

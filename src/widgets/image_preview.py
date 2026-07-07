@@ -10,7 +10,8 @@ from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QP
                            QImage)
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
-from core.ccr_processor import apply_dust_removal, DUST_FEATHER_DEFAULT
+from core.ccr_processor import (apply_dust_removal, DUST_FEATHER_DEFAULT,
+                                _crop_keep_mask)
 from core import crop_aspect
 from widgets.dust_panel import DUST_BRUSH_R_MIN, DUST_BRUSH_R_MAX
 from widgets.export_dialog import ExportSettingsDialog
@@ -2824,23 +2825,102 @@ class ImagePreview(QWidget):
         """The working positive the AI detector should run on for `img`, or None.
         Only the MANUAL (brush) spots are healed first — the 'auto' spots are
         about to be replaced, so healing them would hide the very dust we want to
-        re-detect (making a second Detect lose the first one's coverage)."""
-        raw = getattr(img, "resized_raw", None)
-        if img is None or raw is None:
+        re-detect (making a second Detect lose the first one's coverage).
+
+        Resolution: most real film dust sits off the focal plane — soft, faint
+        blobs a few scan-pixels wide that are ~1 px blips in the 1080 preview
+        buffer and simply not there for the net to find. The source is
+        therefore a HI-RES conversion replay (render_hires_base, same snapshot
+        the zoom view uses), downscaled to dust_detect.DETECT_MAX_LONG,
+        falling back to resized_raw when no replay is possible. Runs on the
+        detect worker threads (render_hires_base is worker-safe)."""
+        if img is None or getattr(img, "resized_raw", None) is None:
             return None
+        from core import dust_detect
+        raw = None
+        try:
+            raw = img.render_hires_base(
+                max_long_side=dust_detect.DETECT_MAX_LONG)
+        except Exception:
+            raw = None   # decode/replay failed — the preview buffer still works
+        if raw is None:
+            raw = img.resized_raw
+        h, w = raw.shape[:2]
+        if max(h, w) > dust_detect.DETECT_MAX_LONG:
+            import cv2
+            s = dust_detect.DETECT_MAX_LONG / float(max(h, w))
+            raw = cv2.resize(raw, (max(1, int(round(w * s))),
+                                   max(1, int(round(h * s)))),
+                             interpolation=cv2.INTER_AREA)
         brush = [s for s in getattr(img, "dust_spots", []) if s.get("kind") == "brush"]
         rect = getattr(img, "crop_rect", None)
         crop = ((tuple(rect), float(getattr(img, "crop_angle", 0.0) or 0.0))
                 if rect else None)
-        return apply_dust_removal(
+        healed = apply_dust_removal(
             raw, brush,
             feather=getattr(img, "dust_feather", DUST_FEATHER_DEFAULT),
             crop=crop)
+        # A windowed working-space base is in container codes — the whole image
+        # sits in the bottom ~1.5% of the 16-bit range, so the detector would
+        # see a black frame (and the bright-speck gate's absolute margin could
+        # never be cleared). De-window + window-clamp to the display-referred
+        # positive the user actually sees, same as the WB picker / AWB do
+        # (a no-op when the feature is off / base is full-range).
+        if getattr(img, "_ws_windowed", False):
+            from core.ccr_processor import WS_B, WS_W
+            d = healed.astype(np.float32)
+            d -= np.float32(WS_B)
+            d *= np.float32(1.0 / (WS_W - WS_B))
+            np.clip(d, 0.0, 1.0, out=d)
+            healed = (d * np.float32(65535.0)).astype(np.uint16)
+        return healed
 
     def dust_detect_source(self):
         """Detection source for the current image (see dust_detect_source_for)."""
         img = ccr_backend.get_image_by_index(self.current_idx)
         return self.dust_detect_source_for(img) if img is not None else None
+
+    @staticmethod
+    def dust_detect_keep_mask_for(img, h: int, w: int):
+        """Confirmed-crop footprint as a uint8 {0,1} mask at (h, w) — the
+        detection source's resolution — or None without a crop. Passed to
+        dust_detect.detect so tiles wholly outside the crop are never
+        inferred (on a film strip cropped to one frame, most of the strip
+        skips the net); _auto_spots_in_crop stays the correctness filter."""
+        rect = getattr(img, "crop_rect", None)
+        if rect is None:
+            return None
+        return _crop_keep_mask(tuple(rect),
+                               float(getattr(img, "crop_angle", 0.0) or 0.0),
+                               h, w)
+
+    @staticmethod
+    def _auto_spots_in_crop(img, spots):
+        """Only auto-detected spots whose center lies inside the confirmed
+        crop are kept. Content outside the crop (film rebate, holder, edge
+        printing) is not scene — it is cropped away on screen and in exports,
+        and its bright markings (frame numbers, sprocket edges) read as dust
+        to the detector. Same rasterized geometry as the display crop and the
+        heal's context mask (_crop_keep_mask). No crop → whole frame kept.
+        Manual brush spots are never filtered — the user painted them."""
+        rect = getattr(img, "crop_rect", None)
+        raw = getattr(img, "resized_raw", None)
+        if not spots or rect is None or raw is None:
+            return spots
+        h, w = raw.shape[:2]
+        keep = _crop_keep_mask(tuple(rect),
+                               float(getattr(img, "crop_angle", 0.0) or 0.0),
+                               h, w)
+        if keep is None:
+            return spots
+        kept = []
+        for s in spots:
+            x, y = s["pts"][0]
+            px = min(w - 1, max(0, int(round(float(x) * w))))
+            py = min(h - 1, max(0, int(round(float(y) * h))))
+            if keep[py, px]:
+                kept.append(s)
+        return kept
 
     def apply_detected_spots(self, new_auto_spots) -> int:
         """Replace the AI-detected ('auto') spots with a fresh set; manual
@@ -2857,9 +2937,27 @@ class ImagePreview(QWidget):
         # the user removed or replaced (new Open) must not mutate an orphan.
         if img is None or img not in ccr_backend.images:
             return 0
+        new_auto_spots = self._auto_spots_in_crop(img, new_auto_spots or [])
         img.push_undo_state()
+        old_auto = [s for s in img.dust_spots if s.get("kind") == "auto"]
         img.dust_spots = [s for s in img.dust_spots if s.get("kind") != "auto"]
-        img.dust_spots.extend(new_auto_spots or [])
+        img.dust_spots.extend(new_auto_spots)
+        # A re-detect is a NEW initial pick for the auto set (sampling rule):
+        # cached plan records under the replaced auto spots must not rebind
+        # to the fresh ones — a re-detected speck at the same coordinates is
+        # value-identical and would inherit the old source verbatim. User
+        # re-picks (manual=True) survive; brush strokes are untouched.
+        cached = getattr(img, "_dust_plan_cache", None)
+        raw = getattr(img, "resized_raw", None)
+        if cached is not None and old_auto and raw is not None:
+            from core.ccr_processor import rasterize_dust_mask
+            h, w = raw.shape[:2]
+            gm = rasterize_dust_mask(old_auto, h, w) > 0
+            img._dust_plan_cache = (cached[0], [
+                r for r in cached[1]
+                if (len(r) >= 6 and r[5])
+                or not gm[min(h - 1, max(0, int(round(r[0] * h)))),
+                          min(w - 1, max(0, int(round(r[1] * w))))]])
         cur = (ccr_backend.get_image_by_index(self.current_idx)
                if self.current_idx is not None else None)
         if img is cur:

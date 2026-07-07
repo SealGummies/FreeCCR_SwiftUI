@@ -139,7 +139,13 @@ class TestHealSourceOverlay:
 
 
 class TestRightButtonStrokeEditing:
-    def test_right_drag_moves_stroke_and_keeps_absolute_source(self, tmp_path):
+    def test_right_drag_moves_stroke_and_repicks_touching(self, tmp_path):
+        # THE SAMPLING RULE retroacts on automatic pins: a moved stroke's
+        # AUTOMATIC source used to travel absolutely (offset compensated),
+        # which leaves it far from the stroke's new position — a non-touching
+        # automatic sample, which the rule forbids. After a move the segment
+        # re-picks a TOUCHING sample at its new location; only a USER re-pick
+        # (manual=True, see the repick test below) travels absolutely.
         ip, img = _converted_preview(tmp_path, crop_rect=None)
         ip.enter_dust_mode()
         ip._maybe_request_hires = lambda: None   # keep the test in-thread
@@ -147,7 +153,6 @@ class TestRightButtonStrokeEditing:
         img.update_thumbnail_and_preview()
         (cy, cx, off, *_), = img._dust_plan_cache[1]
         assert off is not None
-        abs_src = (cy + off[0], cx + off[1])
         ip.set_dust_source_overlay(True)
         # Right-drag the stroke 60 px right (no crop: scene == full coords).
         ip.dust_right_press(QPointF(300, 200))
@@ -155,12 +160,13 @@ class TestRightButtonStrokeEditing:
         ip.dust_right_move(QPointF(360, 200))
         ip.dust_right_release()
         assert img.dust_spots[0]["pts"][0] == pytest.approx([0.6, 0.5])
-        # The re-heal bound the translated record: the segment moved but its
-        # ABSOLUTE source position did not (the offset compensated).
+        # The moved stroke's automatic sample TOUCHES it at the new place.
         (cy2, cx2, off2, *_), = img._dust_plan_cache[1]
         assert cx2 == pytest.approx(0.6, abs=0.01)
-        assert (cy2 + off2[0], cx2 + off2[1]) == pytest.approx(abs_src,
-                                                               abs=0.01)
+        assert off2 is not None
+        h, w = img.resized_raw.shape[:2]
+        r_px = 0.03 * w
+        assert float(np.hypot(off2[0] * h, off2[1] * w)) <= 2 * r_px + 8
         # The drag is one undo step back to the pre-drag stroke.
         assert img.pop_undo_state()
         assert img.dust_spots[0]["pts"][0] == pytest.approx([0.5, 0.5])

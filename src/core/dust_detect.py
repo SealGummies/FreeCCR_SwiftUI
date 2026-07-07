@@ -26,18 +26,53 @@ MODEL_URL = ("https://github.com/MohaElder/openenlarge/releases/download/"
 MODEL_SHA256 = "61e4a93d4e94b4fc6212e2e9b785fa12b5cbc9654724b02aaf8b212075bb729f"
 
 # --- Detection tuning -------------------------------------------------------
-DETECT_SHORT = 512      # short side the detector runs at
+# Most real film dust sits OFF the focal plane: soft-edged, faint blobs a few
+# scan-pixels wide. At the 1080 preview they are ~1 px blips and at a 512-short
+# detection downscale they vanish entirely — the net never fires. Detection
+# therefore runs at the SOURCE buffer's native resolution (never downscaled to
+# a fixed short side), tiled through the U-Net and max-stitched, with the
+# source capped at DETECT_MAX_LONG: measured on the example dusty-sky scan,
+# recall rises up to ~3.2k long side, while full scan res quadruples the time
+# and the now-huge diffuse blobs start to fragment.
+DETECT_MAX_LONG = 3264  # cap on the detection long side (multiple of 16)
+DETECT_TILE = 768       # tile size for native-res inference
+DETECT_OVERLAP = 64     # tile overlap; max-stitch so a seam can't split a speck
 DETECT_MULTIPLE = 16    # both dims rounded to a multiple of this (U-Net req.)
 MAX_BLOB = 400          # connected-component pixel cap at ~2k px (resolution-normalized);
                         # drops large detections (film border / real image content)
 MAX_ASPECT = 3.0        # drop elongated detections (thin LINES are usually real
                         # structure — a bike frame, the horizon — not dust)
 SPOT_PAD = 1.5          # px added to each detected spot's radius (inpaint margin)
+SPOT_SCALE = 2.9        # radius multiplier: the thresholded component is only
+                        # the bright CORE of a soft off-focus speck — its faint
+                        # skirt extends beyond, and an exact area-equivalent
+                        # circle left the fringe unhealed (raised 1.35 → 1.62
+                        # → 2.9 across three rounds of field feedback: soft
+                        # skirts are far wider than the core)
+# Auto-detection is restricted to SMOOTH regions — sky, open shadow — where
+# dust is both visible and safely distinguishable (maintainer rule). In busy
+# texture (foliage, brick, gravel) compact bright glints are indistinguishable
+# from dust at this scale and healing them eats real detail; those areas are
+# the manual brush's job. A component is kept only when its surround ring's
+# luma std is below SMOOTH_MAX_STD (sky measures ~0.007-0.022, deep shadow
+# ~0.01-0.03, foliage/stucco 0.04+). detect() also uses a windowed-std map to
+# SKIP whole tiles with almost no smooth content — the main speed lever.
+SMOOTH_MAX_STD = 0.025  # max surround-ring luma std for a keepable spot
+SMOOTH_WIN = 15         # window (px) of the local-texture map for tile skipping
+SMOOTH_TILE_MIN = 0.02  # run a tile only if at least this fraction is smooth
 # Film dust inverts to BRIGHT/white specks, so a real dust blob is brighter than
-# its surroundings. Require at least this luma lift (0..1) over the surrounding
-# ring; this rejects normal-toned content the detector wrongly fires on (a face,
-# a dark feature) — those are not bright specks.
-BRIGHT_MARGIN = 0.06
+# its surroundings. The gate is NOISE-RELATIVE: dust sits off the focal plane,
+# so most real specks are soft-edged and faint — a fixed absolute lift missed
+# nearly all of them on smooth sky while their lift stood many grain-sigmas
+# above the surround. A blob passes when its luma lift (0..1) over the
+# surrounding ring exceeds min(BRIGHT_MARGIN, max(BRIGHT_FLOOR, BRIGHT_SNR·σ)),
+# σ = the ring's own luma std: sharp dust (≥ BRIGHT_MARGIN) always passes;
+# faint dust passes where the surround is smooth; on busy texture the bar
+# stays at the full absolute margin. Normal-toned/dark content (a face, a
+# dark feature) still fails — its lift is ~0 or negative.
+BRIGHT_MARGIN = 0.06    # absolute lift that always passes (sharp dust)
+BRIGHT_FLOOR = 0.02     # minimum lift for the noise-relative pass
+BRIGHT_SNR = 3.0        # ...or the lift must beat this many surround-sigmas
 BRIGHT_RING = 3         # px ring around a blob used as the "surround" reference
 
 _session = None          # cached ort.InferenceSession
@@ -141,17 +176,35 @@ def _get_session():
         if not is_model_present():
             raise FileNotFoundError("Detector model not downloaded")
         import onnxruntime as ort  # late import
-        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        # Prefer a GPU provider when the installed onnxruntime offers one
+        # (e.g. onnxruntime-directml on Windows) — native-res tiled detection
+        # is compute-bound on CPU (~30 s/image). Plain `onnxruntime` only has
+        # CPU, so this is a no-op there; unsupported ops fall back per-node.
+        # CPU is always listed last, and if the GPU session itself fails to
+        # build (no adapter, broken driver), retry CPU-only — AI detection
+        # must degrade, never break, on machines without a usable GPU.
+        preferred = ("DmlExecutionProvider", "CUDAExecutionProvider",
+                     "CoreMLExecutionProvider", "CPUExecutionProvider")
+        avail = set(ort.get_available_providers())
+        providers = [p for p in preferred if p in avail] or ["CPUExecutionProvider"]
+        try:
+            sess = ort.InferenceSession(path, providers=providers)
+        except Exception:
+            if providers == ["CPUExecutionProvider"]:
+                raise
+            logging.warning("dust_detect: GPU provider failed to initialise "
+                            "(%s) — falling back to CPU", providers[0])
+            sess = ort.InferenceSession(path,
+                                        providers=["CPUExecutionProvider"])
         _session = sess
         _session_path = path
         return sess
 
 
 def _detect_size(h: int, w: int) -> tuple:
-    """Detection resolution: short side ~DETECT_SHORT (never upscaled), both
-    dims rounded to a multiple of DETECT_MULTIPLE."""
-    short_side = max(1, min(h, w))
-    scale = min(1.0, DETECT_SHORT / short_side)
+    """Detection resolution: the input's own size capped at DETECT_MAX_LONG
+    (never upscaled), both dims rounded to a multiple of DETECT_MULTIPLE."""
+    scale = min(1.0, DETECT_MAX_LONG / float(max(1, h, w)))
     dh = max(DETECT_MULTIPLE,
              int(round(h * scale / DETECT_MULTIPLE)) * DETECT_MULTIPLE)
     dw = max(DETECT_MULTIPLE,
@@ -159,33 +212,78 @@ def _detect_size(h: int, w: int) -> tuple:
     return dh, dw
 
 
-def detect(positive_rgb16: np.ndarray) -> tuple:
+def _tile_starts(length: int, tile: int, step: int) -> list:
+    """Start offsets covering [0, length) with `tile`-wide windows advancing
+    by `step`; the last window is pulled back flush with the end so the whole
+    extent is covered without a short remainder tile."""
+    if length <= tile:
+        return [0]
+    starts = list(range(0, length - tile, step))
+    starts.append(length - tile)
+    return starts
+
+
+def detect(positive_rgb16: np.ndarray, keep_mask=None) -> tuple:
     """Run the detector on a 16-bit RGB positive. Returns
     `(prob, luma)` — both float32 at detection resolution: the probability map
     (0..1) and the grayscale luma (0..1, used for the bright-speck gate in
     prob_to_spots). Raises if the model or onnxruntime is unavailable. Cache the
-    pair per image — a Sensitivity change re-runs only prob_to_spots, not the net."""
+    pair per image — a Sensitivity change re-runs only prob_to_spots, not the net.
+
+    The net runs at the input's NATIVE resolution (capped at DETECT_MAX_LONG),
+    TILED (DETECT_TILE, DETECT_OVERLAP overlap, max-stitched): soft off-focus
+    dust — most real film dust — survives only near scan resolution; a fixed
+    512-short downscale erased it before the net ever saw it.
+
+    Speed: tiles with almost no SMOOTH content are skipped outright (detection
+    only keeps smooth-surround spots anyway — see SMOOTH_MAX_STD), and
+    `keep_mask` (bool/uint8 at the input's resolution, e.g. the confirmed
+    crop's footprint) additionally skips tiles wholly outside it — on a film
+    strip cropped to one frame most of the strip never hits the net."""
     sess = _get_session()
+    name = sess.get_inputs()[0].name
     h, w = positive_rgb16.shape[:2]
     dh, dw = _detect_size(h, w)
     small = cv2.resize(positive_rgb16, (dw, dh), interpolation=cv2.INTER_AREA)
     small_f = small.astype(np.float32) / 65535.0
     luma = (0.2126 * small_f[..., 0] + 0.7152 * small_f[..., 1]
-            + 0.0722 * small_f[..., 2])
-    inp = (luma * 2.0 - 1.0)[None, None, :, :].astype(np.float32)
-    name = sess.get_inputs()[0].name
-    out = sess.run(None, {name: inp})[0]
-    arr = np.asarray(out, dtype=np.float32).squeeze()
-    if arr.ndim > 2:
-        arr = arr.reshape(arr.shape[-2], arr.shape[-1])
-    elif arr.ndim < 2:
-        # Unexpected flat output — reshape to the detection grid (raises a clear
-        # ValueError if the size doesn't fit, rather than a cryptic IndexError).
-        arr = arr.reshape(dh, dw)
-    prob = 1.0 / (1.0 + np.exp(-arr))
-    if prob.shape != (dh, dw):
-        prob = cv2.resize(prob, (dw, dh), interpolation=cv2.INTER_LINEAR)
-    return prob.astype(np.float32), luma.astype(np.float32)
+            + 0.0722 * small_f[..., 2]).astype(np.float32)
+    # Where could a keepable spot even live? Smooth areas (windowed-std map;
+    # a speck inflates the map only in its own small neighborhood, a tiny
+    # fraction of any tile) intersected with the caller's keep_mask.
+    m1 = cv2.boxFilter(luma, -1, (SMOOTH_WIN, SMOOTH_WIN))
+    m2 = cv2.boxFilter(luma * luma, -1, (SMOOTH_WIN, SMOOTH_WIN))
+    eligible = np.sqrt(np.maximum(m2 - m1 * m1, 0.0)) < SMOOTH_MAX_STD
+    if keep_mask is not None:
+        km = np.asarray(keep_mask)
+        if km.shape[:2] != (dh, dw):
+            km = cv2.resize(km.astype(np.uint8), (dw, dh),
+                            interpolation=cv2.INTER_NEAREST)
+        eligible &= km.astype(bool)
+    prob = np.zeros((dh, dw), np.float32)
+    step = DETECT_TILE - DETECT_OVERLAP
+    for y in _tile_starts(dh, DETECT_TILE, step):
+        th = min(DETECT_TILE, dh)
+        for x in _tile_starts(dw, DETECT_TILE, step):
+            tw = min(DETECT_TILE, dw)
+            if float(eligible[y:y + th, x:x + tw].mean()) < SMOOTH_TILE_MIN:
+                continue  # no smooth (or in-crop) content — nothing keepable
+            t = luma[y:y + th, x:x + tw]
+            inp = (t * 2.0 - 1.0)[None, None, :, :].astype(np.float32)
+            out = sess.run(None, {name: inp})[0]
+            arr = np.asarray(out, dtype=np.float32).squeeze()
+            if arr.ndim > 2:
+                arr = arr.reshape(arr.shape[-2], arr.shape[-1])
+            elif arr.ndim < 2:
+                # Unexpected flat output — reshape to the tile grid (raises a
+                # clear ValueError if the size doesn't fit).
+                arr = arr.reshape(th, tw)
+            p = 1.0 / (1.0 + np.exp(-arr))
+            if p.shape != (th, tw):
+                p = cv2.resize(p, (tw, th), interpolation=cv2.INTER_LINEAR)
+            win = prob[y:y + th, x:x + tw]
+            np.maximum(win, p, out=win)
+    return prob, luma
 
 
 def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
@@ -198,6 +296,8 @@ def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
     so higher sensitivity removes more. A surviving component must be:
       - small enough (not film border / real content),
       - compact (elongated lines are structure/scratches → manual brush),
+      - on a SMOOTH surround (sky / open shadow — in busy texture a bright
+        glint is indistinguishable from dust; manual brush territory),
       - BRIGHTER than its surroundings (film dust inverts to white specks; this
         rejects normal-toned content the detector wrongly fires on — e.g. a
         face). See spec/dust-removal.md §5.3.
@@ -239,13 +339,24 @@ def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
         comp_luma = float(win_luma[win_comp].mean())
         surround = win_luma[~win_comp]
         surround_luma = float(surround.mean()) if surround.size else comp_luma
-        if comp_luma - surround_luma < BRIGHT_MARGIN:
+        noise = float(surround.std()) if surround.size else 0.0
+        # Smooth-surround rule: auto-detection works sky/shadow ONLY. In busy
+        # texture a compact bright glint is indistinguishable from dust and
+        # healing it eats real detail — those areas are the manual brush's job.
+        if noise > SMOOTH_MAX_STD:
+            continue  # textured surround → never auto-heal here
+        # Noise-relative bar (see BRIGHT_* above): soft off-focus dust is
+        # faint in absolute terms but stands many grain-sigmas above a
+        # smooth surround.
+        need = min(BRIGHT_MARGIN, max(BRIGHT_FLOOR, BRIGHT_SNR * noise))
+        if comp_luma - surround_luma < need:
             continue  # not a bright speck → not film dust
         cx, cy = centroids[i]
-        # Area-EQUIVALENT radius (+ small margin), NOT the bounding-box extent:
-        # a tight circle matches the speck so the inpaint stays invisible
-        # instead of leaving a big smudge over the surrounding pixels.
-        r_px = float(np.sqrt(area / np.pi)) + SPOT_PAD
+        # Area-EQUIVALENT radius, NOT the bounding-box extent (a bbox radius
+        # over-covered and smudged) — but scaled up by SPOT_SCALE (+ pad):
+        # the thresholded component is only the bright CORE of a soft speck,
+        # and an exact-fit circle left its faint skirt unhealed.
+        r_px = float(np.sqrt(area / np.pi)) * SPOT_SCALE + SPOT_PAD
         spots.append({
             "kind": kind,
             "pts": [[float(cx) / w, float(cy) / h]],
