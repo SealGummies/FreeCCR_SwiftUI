@@ -3259,6 +3259,9 @@ _HEAL_RING = 3            # min ring width of clean context (matching + tone)
 _HEAL_GUARD = 2           # min gap (px) between the hole and its context ring
 _HEAL_ANGLES = 16         # candidate source directions searched around a spot
                           # (the two NEAREST rings sample at double density)
+_SRC_RING_CLEAN_MIN = 0.6  # a candidate source window beside other dust stays
+                           # usable while at least this fraction of its ring
+                           # positions is clean (fill pixels must ALL be clean)
 _HEAL_DIST_W = 0.15       # per-ring score penalty: near-ties go to the CLOSER
                           # patch — the stroke's surroundings first
 _HEAL_ACCEPT_MADS = 4.0   # accept a ring once its best raw match reaches the
@@ -3441,36 +3444,64 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
     ring_mad = float(np.median(np.abs(dst_ring - ring_bg).mean(axis=1)))
 
     def _source_at(dy, dx):
+        """Candidate source window, or (None, None). Returns (pixels, rv):
+        rv is None for a fully clean window, else the boolean CLEAN subset of
+        the ring positions. The old all-or-nothing dust check rejected any
+        window touching dust ANYWHERE — in a dusty sky (specks cluster) every
+        near window was disqualified by its neighbors and the pick leapt to
+        the far rings. Only the pixels a heal actually READS must be clean:
+        the hole projection (cloned verbatim — mandatory), and the ring
+        (matching + membrane tone), which keeps its clean subset when at
+        least _SRC_RING_CLEAN_MIN of it survives."""
         sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
         if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
-            return None
-        if _box_sum(integ, sy0, sx0, sy1, sx1) != 0:
-            return None  # source window touches dust (this or another spot)
-        return img16[sy0:sy1, sx0:sx1].astype(np.float32)
+            return None, None
+        if _box_sum(integ, sy0, sx0, sy1, sx1) == 0:
+            return img16[sy0:sy1, sx0:sx1].astype(np.float32), None
+        m = mask_pad[sy0:sy1, sx0:sx1]
+        if m[hole].any():
+            return None, None  # fill pixels would clone dust
+        rv = m[ring] == 0
+        if (float(rv.mean()) < _SRC_RING_CLEAN_MIN
+                or int(rv.sum()) < _HEAL_MIN_RING_PX):
+            return None, None  # too little clean ring to match/tone against
+        return img16[sy0:sy1, sx0:sx1].astype(np.float32), rv
 
-    best_score, best_src, best_off = None, None, None
+    best_score, best_src, best_off, best_rv = None, None, None, None
     if src_off is not None:
         # Pinned source (scale replay, or a prior edit's plan): the offset
         # is taken VERBATIM — once a patch's reference is set, NOTHING may
         # move it. It is only clamped into bounds (scale rounding can push
-        # the window a pixel past the frame). If dust has landed on it
-        # since (a new stroke painted over the sampled patch), the segment
-        # is DEFERRED and re-run after the Telea pass with `sample` = the
-        # healed buffer: it clones the healed content at the very same
-        # location instead of re-searching elsewhere.
+        # the window a pixel past the frame). Same pixels-actually-read rule
+        # as the search (so a plan picked beside a neighboring speck replays
+        # identically at every scale): a clean hole projection samples raw
+        # pixels, with the ring's clean subset driving the tone. Only when
+        # dust has landed on the FILL pixels themselves (a new stroke
+        # painted over the sampled patch) is the segment DEFERRED and re-run
+        # after the Telea pass with `sample` = the healed buffer: it clones
+        # the healed content at the very same location instead of
+        # re-searching elsewhere.
         dy = min(max(int(src_off[0]), -wy0), h - wy1)
         dx = min(max(int(src_off[1]), -wx0), w - wx1)
         best_off = (dy, dx)
         if _box_sum(integ, wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx) == 0:
             best_src = img16[wy0 + dy:wy1 + dy,
                              wx0 + dx:wx1 + dx].astype(np.float32)
-        elif sample is not None:
-            best_src = sample[wy0 + dy:wy1 + dy,
-                              wx0 + dx:wx1 + dx].astype(np.float32)
         else:
-            g0, d0 = forced_flags if forced_flags is not None else (True,
-                                                                    False)
-            return best_off, g0, d0, "defer"
+            sm = mask_pad[wy0 + dy:wy1 + dy, wx0 + dx:wx1 + dx]
+            rv_pin = sm[ring] == 0
+            if not sm[hole].any() and int(rv_pin.sum()) >= _HEAL_MIN_RING_PX:
+                best_src = img16[wy0 + dy:wy1 + dy,
+                                 wx0 + dx:wx1 + dx].astype(np.float32)
+                if not rv_pin.all():
+                    best_rv = rv_pin
+            elif sample is not None:
+                best_src = sample[wy0 + dy:wy1 + dy,
+                                  wx0 + dx:wx1 + dx].astype(np.float32)
+            else:
+                g0, d0 = forced_flags if forced_flags is not None else (True,
+                                                                        False)
+                return best_off, g0, d0, "defer"
     if best_src is None:
         # Candidate source offsets: rings of directions at thickness-scaled
         # distances, NEAREST FIRST — the stroke's own surroundings are the
@@ -3509,10 +3540,12 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 ang = 2.0 * np.pi * (k + 0.35 * fi) / n_ang
                 dy = int(round(d * np.sin(ang)))
                 dx = int(round(d * np.cos(ang)))
-                src = _source_at(dy, dx)
+                src, rv = _source_at(dy, dx)
                 if src is None:
                     continue
                 diff = src[ring] - dst_ring
+                if rv is not None:
+                    diff = diff[rv]  # match on the ring's clean subset only
                 ssd = float(np.mean(diff * diff))
                 # The ring SSD never looks INSIDE the candidate window: a
                 # source whose ring matches but whose hole area holds
@@ -3526,7 +3559,7 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 score = raw * (1.0 + _HEAL_DIST_W * fi)
                 if best_score is None or score < best_score:
                     best_score, best_src, best_off = score, src, (dy, dx)
-                    best_raw = raw
+                    best_rv, best_raw = rv, raw
             if best_raw is not None and best_raw <= floor:
                 break  # the surroundings already match at the grain floor
 
@@ -3549,14 +3582,22 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
         # frequencies land on the hole's boundary values (gradients continue
         # seamlessly through the patch). Sigma is thickness-local: a
         # bbox-sized sigma turned the correction into one constant for the
-        # whole component, letting one bad segment tint it all.
+        # whole component, letting one bad segment tint it all. A partially
+        # clean source ring (window beside a neighboring speck) anchors the
+        # tone on its CLEAN subset only — the dusty positions would inject
+        # the neighbor's brightness into the correction.
+        ring_m = ring
+        if best_rv is not None and not best_rv.all():
+            ring_m = ring.copy()
+            rmy, rmx = np.nonzero(ring)
+            ring_m[rmy[~best_rv], rmx[~best_rv]] = False
         dmap = np.zeros_like(dst)
-        dmap[ring] = dst_ring - best_src[ring]
-        ind = ring.astype(np.float32)
+        dmap[ring_m] = dst[ring_m] - best_src[ring_m]
+        ind = ring_m.astype(np.float32)
         sigma = half_th + pad
         wsum = cv2.GaussianBlur(ind, (0, 0), sigma)
         dsum = cv2.GaussianBlur(dmap, (0, 0), sigma)
-        mean_diff = dmap[ring].mean(axis=0)
+        mean_diff = dmap[ring_m].mean(axis=0)
         corr = np.where(wsum[..., None] > 1e-4,
                         dsum / np.maximum(wsum, 1e-6)[..., None], mean_diff)
         heal = best_src + corr

@@ -408,8 +408,12 @@ class TestApplyDustRemoval:
 
     def test_sources_stay_inside_the_crop(self):
         # Content outside the confirmed crop (film holder, rebate, junk the
-        # user cut away) is not scene: fresh searches must never sample it,
-        # and the context ring must not anchor on it.
+        # user cut away) is not scene: the pixels a heal READS must never
+        # come from it. The source WINDOW may overlap it with its unused
+        # corners (pixels-actually-read semantics — same rule that keeps
+        # sources near inside dust clusters), but the fill projection stays
+        # in-crop and matching/tone anchor only on the ring's clean subset,
+        # so none of the junk's brightness can reach the output.
         rng = np.random.default_rng(29)
         img = np.clip(rng.normal(30000, 2500, (400, 400, 3)), 0,
                       65535).astype(np.uint16)
@@ -419,14 +423,16 @@ class TestApplyDustRemoval:
         plan = []
         out = apply_dust_removal(img, [spot], collect_plan=plan, crop=crop)
         assert plan
-        # Every sampled window lies inside the crop: source-window center +
-        # its half extent (hole r 12 + guard/ring pad 15 = 27 px) fits.
+        # Every FILL projection lies inside the crop (hole r 12 px).
         for cy, cx, off, *_ in plan:
             if off is not None:
-                assert (cx + off[1]) * 400 + 27 <= 260 + 1e-6
-        # The fill is sky, not the junk strip.
+                assert (cx + off[1]) * 400 + 12 <= 260 + 1e-6
+        # The fill is sky, not the junk strip — tone anchored on the clean
+        # ring subset, junk excluded from the membrane.
         m = rasterize_dust_mask([spot], 400, 400) > 0
-        assert float(out[m].astype(np.float32).mean()) < 40000
+        healed = out[m].astype(np.float32)
+        assert abs(float(healed.mean()) - 30000) < 3000
+        assert float(healed.max()) < 50000
 
     def test_stroke_on_prior_source_keeps_reference_samples_healed(self):
         # NO exceptions: even a stroke painted directly ON a segment's
@@ -654,6 +660,38 @@ class TestProbToSpots:
         busy = np.clip(rng.normal(0.4, 0.06, (200, 200)), 0, 1).astype(np.float32)
         busy[40:46, 40:46] = 0.95              # huge lift — still rejected
         assert dust_detect.prob_to_spots(prob, busy, 60) == []
+
+
+# --- Source search in dust clusters ------------------------------------------
+class TestClusterSourceStaysNear:
+    def test_cluster_of_specks_still_samples_nearby(self):
+        # A dusty sky: neighboring specks surround the healed one, so NO fully
+        # clean window exists on the near rings. The old all-or-nothing source
+        # check leapt to the far rings for every speck in the cluster; the
+        # pixels a heal actually READS are only the hole projection + ring, so
+        # windows whose unused corners touch a neighbor stay valid and the
+        # source stays in the immediate area.
+        rng = np.random.default_rng(3)
+        img = np.clip(rng.normal(30000, 2000, (240, 240, 3)), 0,
+                      65535).astype(np.uint16)
+        spots = [{"kind": "auto", "pts": [[0.5, 0.5]], "r": 0.03}]
+        for k in range(10):
+            a = 2 * np.pi * k / 10
+            spots.append({"kind": "auto",
+                          "pts": [[0.5 + 0.18 * np.cos(a),
+                                   0.5 + 0.18 * np.sin(a)]],
+                          "r": 0.02})
+        plan = []
+        out = apply_dust_removal(img, spots, collect_plan=plan)
+        rec = min(plan, key=lambda r: (r[0] - 0.5) ** 2 + (r[1] - 0.5) ** 2)
+        assert rec[2] is not None            # sampled, not diffusion fallback
+        dy, dx = rec[2]
+        dist = float(np.hypot(dy * 240, dx * 240))
+        assert dist < 45                     # immediate area, not a far ring
+        # And the fill still lands on the surround's tone (a partial source
+        # ring anchors the membrane on its clean subset only).
+        core = out[114:126, 114:126].astype(np.float32)
+        assert abs(float(core.mean()) - 30000) < 4000
 
 
 # --- Tiled inference grid (pure) ---------------------------------------------
