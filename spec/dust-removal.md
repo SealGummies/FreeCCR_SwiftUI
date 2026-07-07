@@ -428,7 +428,12 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
   3. **Search — THE AUTOMATIC SAMPLING RULE (maintainer, verbatim)**,
      applied to EVERY automatically picked initial sample — AI-detected
      spots and painted strokes alike (only the user's explicit right-drag
-     re-pick is exempt): (1) the sample area MUST TOUCH the patch area —
+     re-pick is exempt). **Strokes are never auto-connected**: each spot is
+     its own patch with its own segments, argmin and per-patch offset even
+     when spots touch or overlap (drawing order owns shared pixels; only
+     the never-clone-dust checks and the feathered composite see the
+     union). Pinned and shared offsets validate touching against THE WHOLE
+     PATCH, at plan time and replay alike: (1) the sample area MUST TOUCH the patch area —
      border-to-border, union contiguous (candidates: 64 directions at
      `2·half_th` +0/+1/+2 px of raster slack, sample-area cleanliness
      checked against the RAW mask so the dilation cannot push the sample
