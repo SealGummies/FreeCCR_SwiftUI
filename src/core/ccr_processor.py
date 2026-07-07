@@ -3258,6 +3258,13 @@ def _crop_keep_mask(rect, angle, h: int, w: int):
 _HEAL_RING = 3            # min ring width of clean context (matching + tone)
 _HEAL_GUARD = 2           # min gap (px) between the hole and its context ring
 _HEAL_ANGLES = 16         # candidate source directions searched around a spot
+                          # (the two NEAREST rings sample at double density)
+_HEAL_DIST_W = 0.15       # per-ring score penalty: near-ties go to the CLOSER
+                          # patch — the stroke's surroundings first
+_HEAL_ACCEPT_MADS = 4.0   # accept a ring once its best raw match reaches the
+                          # grain floor (~2 sigma^2, sigma from the detrended
+                          # ring residual): farther candidates could only
+                          # swap the local pattern for a lucky remote one
 _HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
 _HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
 _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
@@ -3466,39 +3473,62 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
             return best_off, g0, d0, "defer"
     if best_src is None:
         # Candidate source offsets: rings of directions at thickness-scaled
-        # distances. The integral-image check rejects any source that touches
-        # dust, so offsets need only clear the local thickness — a long stroke
-        # heals from the clean strip right beside it (requiring bbox-diagonal
-        # clearance forced long strokes into the ghost-prone diffusion
-        # fallback). The window diagonal stays as a last-resort ring for
-        # compact spots.
+        # distances, NEAREST FIRST — the stroke's own surroundings are the
+        # most likely to carry the same pattern, so the near rings are
+        # sampled at double angular density, near-ties fall to the closer
+        # patch (a mild per-ring penalty), and the sweep STOPS at the first
+        # ring whose best raw match reaches the grain floor: once a
+        # candidate matches as well as two clean patches of the same
+        # texture can, farther candidates could only trade the local
+        # pattern for a lucky remote one. The integral-image check rejects
+        # any source that touches dust/outside-crop, so offsets need only
+        # clear the local thickness — a long stroke heals from the clean
+        # strip right beside it. The window diagonal stays as a last-resort
+        # ring for compact spots.
         d_base = 2.0 * half_th + pad + 2.0
         d0 = float(np.hypot(wy1 - wy0, wx1 - wx0))
-        for fi, d in enumerate((d_base, 2.0 * d_base, 4.0 * d_base, d0)):
-            for k in range(_HEAL_ANGLES):
-                ang = 2.0 * np.pi * (k + 0.35 * fi) / _HEAL_ANGLES
+        # Grain floor: E[SSD] between two clean patches of the same texture
+        # is ~2*sigma^2 per channel, with sigma the GRAIN — estimated from
+        # the CLEANEST QUARTILE of the 3x3-detrended ring residual. Anything
+        # less robust inflates the floor and early-accepts a bad near patch:
+        # raw ring MAD inflates on structure (stripes), and the residual's
+        # MEDIAN inflates when a high-contrast edge hugs most of the ring
+        # (edge bleed); contamination is never the cleanest quarter. An
+        # underestimated floor only costs a longer sweep, never a worse
+        # pick. (1.8: p25 of a 3-channel half-normal mean ~ 0.56 sigma.)
+        resid = np.abs((dst - cv2.blur(dst, (3, 3)))[ring]).mean(axis=1)
+        sigma = 1.8 * float(np.percentile(resid, 25.0))
+        floor = _HEAL_ACCEPT_MADS * sigma ** 2 + 1e-3
+        tol = (_DLIKE_SEP_MADS * (ring_mad + 1e-3)) ** 2
+        best_raw = None
+        for fi, (d, n_ang) in enumerate(
+                ((d_base, 2 * _HEAL_ANGLES), (1.5 * d_base, 2 * _HEAL_ANGLES),
+                 (2.25 * d_base, _HEAL_ANGLES), (3.5 * d_base, _HEAL_ANGLES),
+                 (d0, _HEAL_ANGLES))):
+            for k in range(n_ang):
+                ang = 2.0 * np.pi * (k + 0.35 * fi) / n_ang
                 dy = int(round(d * np.sin(ang)))
                 dx = int(round(d * np.cos(ang)))
                 src = _source_at(dy, dx)
                 if src is None:
                     continue
                 diff = src[ring] - dst_ring
-                score = float(np.mean(diff * diff))
+                ssd = float(np.mean(diff * diff))
                 # The ring SSD never looks INSIDE the candidate window: a
                 # source whose ring matches but whose hole area holds
                 # something foreign (a black border edge, an object) clones
-                # that thing into the fill. Penalize interior tone far from
-                # the destination ring's background — but only the EXCESS
-                # past the ring's own variability: within it the ring SSD
-                # alone must rank candidates (an always-on penalty re-ranked
-                # near-ties by interior phase on textured content, growing
-                # the membrane correction and with it the preview/export
-                # tone drift).
+                # that thing into the fill. Penalize interior tone past the
+                # ring's own variability (the EXCESS only: an always-on
+                # penalty re-ranked near-ties by interior phase on textured
+                # content and drifted preview/export tone).
                 i_diff = np.median(src[hole], axis=0) - ring_bg
-                tol = (_DLIKE_SEP_MADS * (ring_mad + 1e-3)) ** 2
-                score += max(0.0, float(np.mean(i_diff * i_diff)) - tol)
+                raw = ssd + max(0.0, float(np.mean(i_diff * i_diff)) - tol)
+                score = raw * (1.0 + _HEAL_DIST_W * fi)
                 if best_score is None or score < best_score:
                     best_score, best_src, best_off = score, src, (dy, dx)
+                    best_raw = raw
+            if best_raw is not None and best_raw <= floor:
+                break  # the surroundings already match at the grain floor
 
     if best_src is None:
         return None
