@@ -662,6 +662,32 @@ class TestProbToSpots:
         assert dust_detect.prob_to_spots(prob, busy, 60) == []
 
 
+# --- Source tone locality ------------------------------------------------------
+class TestSourceMatchesLocalTone:
+    def test_edge_spot_source_stays_on_its_own_tone_side(self):
+        # The reported case: a speck right beside a high-contrast edge
+        # sampled flat DIRT from across the frame — near candidates straddle
+        # the edge at imperfect phase, so their per-pixel SSD outweighed the
+        # remote patch's wholesale tone mismatch. Area tone (chroma +
+        # brightness) now dominates the score and locality is strong: the
+        # pick must stay in the immediate area, on the spot's own tone side.
+        rng = np.random.default_rng(17)
+        img = np.zeros((300, 300, 3), np.float32)
+        img[:, :140] = [26000, 22000, 18000]        # brown dirt field
+        img[:, 140:] = [48000, 47000, 45000]        # light pavement
+        img[:, 137:143] = [61000, 61000, 61000]     # bright edge stripe
+        img += rng.normal(0, 1200, img.shape)
+        img = np.clip(img, 0, 65535).astype(np.uint16)
+        spot = {"kind": "auto", "pts": [[0.55, 0.5]], "r": 0.025}  # pavement
+        plan = []
+        apply_dust_removal(img, [spot], collect_plan=plan)
+        (cy, cx, off, *_), = plan
+        assert off is not None
+        dy, dx = off
+        assert float(np.hypot(dy * 300, dx * 300)) < 70   # immediate area
+        assert (cx + dx) * 300 > 143   # never the dirt across the edge
+
+
 # --- Source search in dust clusters ------------------------------------------
 class TestClusterSourceStaysNear:
     def test_cluster_of_specks_still_samples_nearby(self):

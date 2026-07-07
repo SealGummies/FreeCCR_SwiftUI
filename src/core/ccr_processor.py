@@ -3262,8 +3262,23 @@ _HEAL_ANGLES = 16         # candidate source directions searched around a spot
 _SRC_RING_CLEAN_MIN = 0.6  # a candidate source window beside other dust stays
                            # usable while at least this fraction of its ring
                            # positions is clean (fill pixels must ALL be clean)
-_HEAL_DIST_W = 0.15       # per-ring score penalty: near-ties go to the CLOSER
-                          # patch — the stroke's surroundings first
+_HEAL_TONE_W = 3.0        # extra weight on the ring-MEAN mismatch (the areas'
+                          # chroma + brightness). The raw SSD weighs tone and
+                          # pattern equally per pixel, so beside a high-contrast
+                          # edge a remote FLAT patch of different color could
+                          # beat every near candidate whose ring straddles the
+                          # edge at imperfect phase ("sampled brown dirt to heal
+                          # a spot on white pavement"). Tone must dominate:
+                          # with the SSD's own mean term this makes an area
+                          # tone offset count 4x its per-pixel share, and it is
+                          # scale-stable (means survive resampling) so preview
+                          # and export rank candidates the same way.
+_HEAL_DIST_W = 0.45       # per-ring score penalty: the IMMEDIATE AREA comes
+                          # first — a far-ring candidate must be ~3x better on
+                          # raw match to beat one from the stroke's own
+                          # surroundings (0.15 was too weak to stop a flat
+                          # remote patch from outbidding the local area beside
+                          # a high-contrast edge)
 _HEAL_ACCEPT_MADS = 4.0   # accept a ring once its best raw match reaches the
                           # grain floor (~2 sigma^2, sigma from the detrended
                           # ring residual): farther candidates could only
@@ -3547,6 +3562,13 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
                 if rv is not None:
                     diff = diff[rv]  # match on the ring's clean subset only
                 ssd = float(np.mean(diff * diff))
+                # Same chroma + brightness first (user rule): the per-channel
+                # ring-mean offset is the candidate AREA's tone mismatch —
+                # weigh it far above its per-pixel share so a remote flat
+                # patch of different color can never outbid the local area
+                # on pattern luck (see _HEAL_TONE_W).
+                mu = diff.mean(axis=0)
+                ssd += _HEAL_TONE_W * float(np.mean(mu * mu))
                 # The ring SSD never looks INSIDE the candidate window: a
                 # source whose ring matches but whose hole area holds
                 # something foreign (a black border edge, an object) clones
