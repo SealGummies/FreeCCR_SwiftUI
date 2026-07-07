@@ -3744,6 +3744,21 @@ def _heal_patch(img16: np.ndarray, img16_c: np.ndarray, labels: np.ndarray,
             dmap[ring] = diffs
         else:
             dmap[ring] = dst[ring] - best_src[ring]
+        # MEDIAN-ANCHORED tone (maintainer decision): the normalized Gaussian
+        # convolution below is a spatially-varying MEAN, and pattern
+        # mismatches between the two rings (a bokeh highlight present in
+        # only one of them) are heavy-tailed outliers that dragged the whole
+        # fill's tone — the ~4%-dark gray discs. The differences are
+        # winsorized to median ± 3 scaled-MADs per channel: the anchor's
+        # center is the ring's MEDIAN difference, the bulk still varies
+        # spatially (gradients continue through the fill), the tail cannot
+        # tint. Median/MAD resample stably, so preview == export holds.
+        diffs_all = dmap[ring]
+        med_all = np.median(diffs_all, axis=0)
+        mad_all = (np.median(np.abs(diffs_all - med_all), axis=0)
+                   * 1.4826 + 1e-3)
+        dmap[ring] = np.clip(diffs_all, med_all - 3.0 * mad_all,
+                             med_all + 3.0 * mad_all)
         ind = ring_m.astype(np.float32)
         sigma = half_th + pad
         wsum = cv2.GaussianBlur(ind, (0, 0), sigma)
