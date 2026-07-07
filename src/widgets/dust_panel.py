@@ -51,13 +51,20 @@ class _DetectWorker(QObject):
     done = Signal(object)   # (prob, luma) numpy arrays
     failed = Signal(str)
 
-    def __init__(self, source):
+    def __init__(self, img):
         super().__init__()
-        self.source = source
+        self.img = img
 
     def run(self):
         try:
-            prob, luma = dust_detect.detect(self.source)
+            # Built here, off the GUI thread: the source is a hi-res
+            # conversion replay (decode + convert takes seconds).
+            from widgets.image_preview import ImagePreview
+            source = ImagePreview.dust_detect_source_for(self.img)
+            if source is None:
+                self.failed.emit("No image to detect on.")
+                return
+            prob, luma = dust_detect.detect(source)
             self.done.emit((prob, luma))
         except Exception as e:  # noqa: BLE001 — surfaced to the user
             self.failed.emit(str(e))
@@ -418,17 +425,19 @@ class DustRemovalPanel(QWidget):
     def _on_detect(self):
         if self._detecting or self._detecting_all or self._downloading:
             return
-        source = self.image_preview.dust_detect_source()
-        if source is None:
+        img = self._current_image()
+        if img is None or getattr(img, "resized_raw", None) is None:
             self.status_label.setText("No image to detect on.")
             return
         self._detecting = True
-        self._detect_image_ref = self._current_image()
+        self._detect_image_ref = img
         self.detect_btn.setEnabled(False)
         self.detect_btn.setText("Detecting…")
-        self.status_label.setText("Running AI detection…")
+        self.status_label.setText(
+            "Running AI detection at high resolution — this can take a "
+            "minute…")
         self._detect_thread = QThread()
-        self._detect_worker = _DetectWorker(source)
+        self._detect_worker = _DetectWorker(img)
         self._detect_worker.moveToThread(self._detect_thread)
         self._detect_thread.started.connect(self._detect_worker.run)
         self._detect_worker.done.connect(self._on_detect_done)

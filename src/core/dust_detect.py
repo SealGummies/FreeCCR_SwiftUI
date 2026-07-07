@@ -26,7 +26,17 @@ MODEL_URL = ("https://github.com/MohaElder/openenlarge/releases/download/"
 MODEL_SHA256 = "61e4a93d4e94b4fc6212e2e9b785fa12b5cbc9654724b02aaf8b212075bb729f"
 
 # --- Detection tuning -------------------------------------------------------
-DETECT_SHORT = 512      # short side the detector runs at
+# Most real film dust sits OFF the focal plane: soft-edged, faint blobs a few
+# scan-pixels wide. At the 1080 preview they are ~1 px blips and at a 512-short
+# detection downscale they vanish entirely — the net never fires. Detection
+# therefore runs at the SOURCE buffer's native resolution (never downscaled to
+# a fixed short side), tiled through the U-Net and max-stitched, with the
+# source capped at DETECT_MAX_LONG: measured on the example dusty-sky scan,
+# recall rises up to ~3.2k long side, while full scan res quadruples the time
+# and the now-huge diffuse blobs start to fragment.
+DETECT_MAX_LONG = 3264  # cap on the detection long side (multiple of 16)
+DETECT_TILE = 768       # tile size for native-res inference
+DETECT_OVERLAP = 64     # tile overlap; max-stitch so a seam can't split a speck
 DETECT_MULTIPLE = 16    # both dims rounded to a multiple of this (U-Net req.)
 MAX_BLOB = 400          # connected-component pixel cap at ~2k px (resolution-normalized);
                         # drops large detections (film border / real image content)
@@ -156,10 +166,9 @@ def _get_session():
 
 
 def _detect_size(h: int, w: int) -> tuple:
-    """Detection resolution: short side ~DETECT_SHORT (never upscaled), both
-    dims rounded to a multiple of DETECT_MULTIPLE."""
-    short_side = max(1, min(h, w))
-    scale = min(1.0, DETECT_SHORT / short_side)
+    """Detection resolution: the input's own size capped at DETECT_MAX_LONG
+    (never upscaled), both dims rounded to a multiple of DETECT_MULTIPLE."""
+    scale = min(1.0, DETECT_MAX_LONG / float(max(1, h, w)))
     dh = max(DETECT_MULTIPLE,
              int(round(h * scale / DETECT_MULTIPLE)) * DETECT_MULTIPLE)
     dw = max(DETECT_MULTIPLE,
@@ -167,33 +176,58 @@ def _detect_size(h: int, w: int) -> tuple:
     return dh, dw
 
 
+def _tile_starts(length: int, tile: int, step: int) -> list:
+    """Start offsets covering [0, length) with `tile`-wide windows advancing
+    by `step`; the last window is pulled back flush with the end so the whole
+    extent is covered without a short remainder tile."""
+    if length <= tile:
+        return [0]
+    starts = list(range(0, length - tile, step))
+    starts.append(length - tile)
+    return starts
+
+
 def detect(positive_rgb16: np.ndarray) -> tuple:
     """Run the detector on a 16-bit RGB positive. Returns
     `(prob, luma)` — both float32 at detection resolution: the probability map
     (0..1) and the grayscale luma (0..1, used for the bright-speck gate in
     prob_to_spots). Raises if the model or onnxruntime is unavailable. Cache the
-    pair per image — a Sensitivity change re-runs only prob_to_spots, not the net."""
+    pair per image — a Sensitivity change re-runs only prob_to_spots, not the net.
+
+    The net runs at the input's NATIVE resolution (capped at DETECT_MAX_LONG),
+    TILED (DETECT_TILE, DETECT_OVERLAP overlap, max-stitched): soft off-focus
+    dust — most real film dust — survives only near scan resolution; a fixed
+    512-short downscale erased it before the net ever saw it."""
     sess = _get_session()
+    name = sess.get_inputs()[0].name
     h, w = positive_rgb16.shape[:2]
     dh, dw = _detect_size(h, w)
     small = cv2.resize(positive_rgb16, (dw, dh), interpolation=cv2.INTER_AREA)
     small_f = small.astype(np.float32) / 65535.0
     luma = (0.2126 * small_f[..., 0] + 0.7152 * small_f[..., 1]
-            + 0.0722 * small_f[..., 2])
-    inp = (luma * 2.0 - 1.0)[None, None, :, :].astype(np.float32)
-    name = sess.get_inputs()[0].name
-    out = sess.run(None, {name: inp})[0]
-    arr = np.asarray(out, dtype=np.float32).squeeze()
-    if arr.ndim > 2:
-        arr = arr.reshape(arr.shape[-2], arr.shape[-1])
-    elif arr.ndim < 2:
-        # Unexpected flat output — reshape to the detection grid (raises a clear
-        # ValueError if the size doesn't fit, rather than a cryptic IndexError).
-        arr = arr.reshape(dh, dw)
-    prob = 1.0 / (1.0 + np.exp(-arr))
-    if prob.shape != (dh, dw):
-        prob = cv2.resize(prob, (dw, dh), interpolation=cv2.INTER_LINEAR)
-    return prob.astype(np.float32), luma.astype(np.float32)
+            + 0.0722 * small_f[..., 2]).astype(np.float32)
+    prob = np.zeros((dh, dw), np.float32)
+    step = DETECT_TILE - DETECT_OVERLAP
+    for y in _tile_starts(dh, DETECT_TILE, step):
+        th = min(DETECT_TILE, dh)
+        for x in _tile_starts(dw, DETECT_TILE, step):
+            tw = min(DETECT_TILE, dw)
+            t = luma[y:y + th, x:x + tw]
+            inp = (t * 2.0 - 1.0)[None, None, :, :].astype(np.float32)
+            out = sess.run(None, {name: inp})[0]
+            arr = np.asarray(out, dtype=np.float32).squeeze()
+            if arr.ndim > 2:
+                arr = arr.reshape(arr.shape[-2], arr.shape[-1])
+            elif arr.ndim < 2:
+                # Unexpected flat output — reshape to the tile grid (raises a
+                # clear ValueError if the size doesn't fit).
+                arr = arr.reshape(th, tw)
+            p = 1.0 / (1.0 + np.exp(-arr))
+            if p.shape != (th, tw):
+                p = cv2.resize(p, (tw, th), interpolation=cv2.INTER_LINEAR)
+            win = prob[y:y + th, x:x + tw]
+            np.maximum(win, p, out=win)
+    return prob, luma
 
 
 def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,

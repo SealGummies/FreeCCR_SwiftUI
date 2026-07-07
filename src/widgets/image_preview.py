@@ -2825,10 +2825,33 @@ class ImagePreview(QWidget):
         """The working positive the AI detector should run on for `img`, or None.
         Only the MANUAL (brush) spots are healed first — the 'auto' spots are
         about to be replaced, so healing them would hide the very dust we want to
-        re-detect (making a second Detect lose the first one's coverage)."""
-        raw = getattr(img, "resized_raw", None)
-        if img is None or raw is None:
+        re-detect (making a second Detect lose the first one's coverage).
+
+        Resolution: most real film dust sits off the focal plane — soft, faint
+        blobs a few scan-pixels wide that are ~1 px blips in the 1080 preview
+        buffer and simply not there for the net to find. The source is
+        therefore a HI-RES conversion replay (render_hires_base, same snapshot
+        the zoom view uses), downscaled to dust_detect.DETECT_MAX_LONG,
+        falling back to resized_raw when no replay is possible. Runs on the
+        detect worker threads (render_hires_base is worker-safe)."""
+        if img is None or getattr(img, "resized_raw", None) is None:
             return None
+        from core import dust_detect
+        raw = None
+        try:
+            raw = img.render_hires_base(
+                max_long_side=dust_detect.DETECT_MAX_LONG)
+        except Exception:
+            raw = None   # decode/replay failed — the preview buffer still works
+        if raw is None:
+            raw = img.resized_raw
+        h, w = raw.shape[:2]
+        if max(h, w) > dust_detect.DETECT_MAX_LONG:
+            import cv2
+            s = dust_detect.DETECT_MAX_LONG / float(max(h, w))
+            raw = cv2.resize(raw, (max(1, int(round(w * s))),
+                                   max(1, int(round(h * s)))),
+                             interpolation=cv2.INTER_AREA)
         brush = [s for s in getattr(img, "dust_spots", []) if s.get("kind") == "brush"]
         rect = getattr(img, "crop_rect", None)
         crop = ((tuple(rect), float(getattr(img, "crop_angle", 0.0) or 0.0))

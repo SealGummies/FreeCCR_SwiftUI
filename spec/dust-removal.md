@@ -193,9 +193,14 @@ reference to `MainWindow` and `ImagePreview` passed at construction (it does
 
 ### 3.4 AI detect & remove
 - **Detect & Remove** runs detection **off the GUI thread** on the current
-  working positive (`resized_raw` with existing spots already inpainted, so
-  already-cleaned dust is not re-flagged), at preview resolution. When the
-  base is a **windowed working-space buffer**, the detection source is
+  working positive (with existing manual spots already inpainted, so
+  already-cleaned dust is not re-flagged). The source is a **hi-res
+  conversion replay** (`render_hires_base`, the same snapshot replay the
+  zoom view uses) downscaled to `DETECT_MAX_LONG`, falling back to
+  `resized_raw` when no replay is possible — soft off-focus dust is ~1 px
+  at preview resolution and undetectable there. The source build runs
+  inside the detect worker (it decodes + converts: seconds). When the base
+  is a **windowed working-space buffer**, the detection source is
   de-windowed + window-clamped first (same as the WB picker / AWB): fed raw
   container codes the net sees a black frame and the bright-speck gate's
   absolute margin is unreachable — no dust would ever be found.
@@ -539,11 +544,19 @@ panel that imports it) load even when `onnxruntime` is absent.
   - URL: `https://github.com/MohaElder/openenlarge/releases/download/autodust-assets-v1/detector.onnx`
   - SHA‑256: `61e4a93d4e94b4fc6212e2e9b785fa12b5cbc9654724b02aaf8b212075bb729f`
   - (URL / SHA / filename are module constants so they can be repointed.)
-- **`detect(positive_rgb16) -> (prob_h, prob_w, prob: float32[0,1])`**: resize so
-  the short side is `DETECT_SHORT=512` and both dims are multiples of 16; Rec.709
-  luma; normalize to `[-1,1]`; run the session (`[1,1,dh,dw]` → logits); sigmoid.
-  CPU execution provider (matches openenlarge's Windows guidance). Returns the
-  prob map at detection resolution (cached per image for cheap Sensitivity).
+- **`detect(positive_rgb16) -> (prob_h, prob_w, prob: float32[0,1])`**: run at
+  the input's **native resolution** capped at `DETECT_MAX_LONG` (both dims
+  rounded to multiples of 16), **tiled** through the U-Net (`DETECT_TILE`,
+  `DETECT_OVERLAP` overlap, max-stitched so a seam can't split a speck);
+  Rec.709 luma; normalize to `[-1,1]`; per tile `[1,1,th,tw]` → logits →
+  sigmoid. CPU execution provider (matches openenlarge's Windows guidance).
+  Returns the prob map at detection resolution (cached per image for cheap
+  Sensitivity). **Why native/tiled:** most real film dust sits off the focal
+  plane — soft, faint blobs a few scan-pixels wide. They are ~1 px blips at
+  the 1080 preview and vanished entirely at the old fixed 512-short
+  detection downscale; recall keeps rising up to ~3.2k long side (measured
+  on the example dusty-sky scan), beyond which the time quadruples and the
+  now-huge diffuse blobs start to fragment.
 - **`prob_to_spots(prob, prob_h, prob_w, sensitivity, max_dim) -> list[spot]`**:
   - `thr = 0.85 - 0.60 * (sensitivity/100)` (0 → very selective … 100 →
     aggressive), matching openenlarge.

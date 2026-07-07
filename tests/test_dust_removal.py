@@ -605,6 +605,21 @@ class TestProbToSpots:
         assert dust_detect.prob_to_spots(prob, busy, 60) == []
 
 
+# --- Tiled inference grid (pure) ---------------------------------------------
+class TestTileStarts:
+    def test_short_dim_is_one_tile(self):
+        assert dust_detect._tile_starts(512, 768, 704) == [0]
+        assert dust_detect._tile_starts(768, 768, 704) == [0]
+
+    def test_covers_to_the_end_without_remainder_tile(self):
+        starts = dust_detect._tile_starts(2000, 768, 704)
+        assert starts[0] == 0
+        assert starts[-1] == 2000 - 768        # flush with the end
+        # Full coverage: consecutive windows overlap (no gaps).
+        for a, b in zip(starts, starts[1:]):
+            assert b < a + 768
+
+
 # --- Availability / graceful degradation ------------------------------------
 class TestAvailability:
     def test_unavailable_when_onnxruntime_absent(self, monkeypatch):
