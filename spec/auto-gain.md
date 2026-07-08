@@ -10,6 +10,14 @@ supersedes when on), [`spec/working-space-headroom.md`](working-space-headroom.m
 
 ## 0. Decisions (locked)
 
+- **Retuned 2026-07-07 (maintainer): top-2% → 95%.** Originally the top-0.1%
+  in-bound highlight was placed at 99.8% of the window (`AG_PERCENTILE = 99.9`,
+  `AG_TARGET = 0.998`), which parked highlights against the window top. Now the
+  **98th percentile** is placed at **display 0.95**, leaving a visible safety
+  margin. Consequence: a frame whose highlights already sit at the window top is
+  no longer a no-op — it gets a small pull *down* to the target, and the g = 0.6
+  floor is unreachable for in-bound values (p ≤ 1 → g ≥ 0.95); the clamp stays as
+  a safety net only.
 - **Reference exclusion (req 4) = sampled clear/dense conversion points.** Only
   pixels whose de-windowed display value lies *between* the sampled clear point
   (→ display 0) and the sampled dense point (→ display 1) count toward the
@@ -34,8 +42,8 @@ supersedes when on), [`spec/working-space-headroom.md`](working-space-headroom.m
 ## 1. Summary
 
 Auto Gain is a toggleable (Settings → **General**) convenience that, **without
-moving the Gain slider**, secretly offsets the Gain stage so the top 0.1 % of
-in-bound highlights lands at 99.8 % of the working-space window (display 0.998). It
+moving the Gain slider**, secretly offsets the Gain stage so the top 2 % of
+in-bound highlights lands at 95 % of the working-space window (display 0.95). It
 rides the exact mechanism the legacy default-slope auto-exposure already uses —
 an invisible additive offset on the `exposure` (Gain) parameter — but is general
 (all converted images), live, user-toggleable, and respects the sampled
@@ -50,8 +58,8 @@ clear/dense range when measuring the highlight.
 - A per-image **invisible Gain offset** added to the Gain-stage value
   (`s['exposure'] + offset`) — the UI slider is never touched (mirrors the
   existing `exposure_base`).
-- Reference: the **99.9th percentile** of in-bound luminance is placed at
-  **display 0.998** ("99.8 % of the workspace window value").
+- Reference: the **98th percentile** of in-bound luminance is placed at
+  **display 0.95** ("95 % of the workspace window value").
 - **In-bound** = de-windowed display value in `[0, 1]` (between the sampled
   clear→dense points); headroom/over-range and sub-black pixels are discarded.
 - When ON, **suppress the legacy `exposure_base`** so they don't double-apply;
@@ -115,23 +123,23 @@ keep = (lum >= 0.0) & (lum <= AG_HI)            # in-bound: between clear(0)/den
 vals = lum[keep]
 if vals.size < MIN_CONTENT_FRACTION * lum.size:  # not enough in-bound content
     return 0.0
-p = percentile(vals, AG_PERCENTILE)              # 99.9th
+p = percentile(vals, AG_PERCENTILE)              # 98th
 if p <= AG_EPS:
     return 0.0
-g = AG_TARGET / p                                # gain that puts p at 0.998
+g = AG_TARGET / p                                # gain that puts p at 0.95
 g = clip(g, AG_GMIN, AG_GMAX)                    # [0.6, 3.0] — the stage's range
 v = 300.0 * (1.0 - 1.0/g)                        # inverse of g = 1/(1 - v/300)
 return clip(v, -200.0, 200.0)
 ```
 
-Constants: `AG_PERCENTILE = 99.9`, `AG_TARGET = 0.998`, `AG_HI = 1.0`,
+Constants: `AG_PERCENTILE = 98.0`, `AG_TARGET = 0.95`, `AG_HI = 1.0`,
 `AG_GMIN = 0.6`, `AG_GMAX = 3.0`, `AG_EPS = 1e-4`; reuse `MIN_CONTENT_FRACTION`
 (0.005). The bottom bound (`lum < 0`) is excluded for completeness but never
-affects a top-0.1 % percentile.
+affects a top-2 % percentile.
 
 Why this is the correct inverse: the offset is added to the user's Gain value and
 the **sum** is fed to `g = 1/(1 − v/300)`. With the slider at 0, the sum is `v`
-and the realized gain is exactly the clamped `g`, so `p·g = 0.998`. With the slider
+and the realized gain is exactly the clamped `g`, so `p·g = 0.95`. With the slider
 moved, the user is deliberately deviating (same as `exposure_base` today).
 
 ### 4.2 Wiring in `apply_adjustments`
@@ -149,7 +157,7 @@ adjust_image_opencl(image, ..., s.get('exposure', 0) + eb_eff + ag, ...)
 
 `image` here is the (dust-removed) base actually being rendered — the windowed
 preview base for the preview/thumbnail, the full-res base for export/zoom. The
-99.9th percentile is resolution-robust, so preview and export agree within a
+98th percentile is resolution-robust, so preview and export agree within a
 fraction of a slider unit (imperceptible). `_adjust_for_area` is **not** touched.
 
 ### 4.3 Settings → General
@@ -194,12 +202,14 @@ in `_init_toggles`, staged, and applied on Done in `_apply_pending` by calling
   (no auto-gain) — a converted frame that is almost all over-range is left to the
   user. When Auto Gain is ON this means a default-slope frame gets neither `eb`
   nor `ag`; acceptable (degenerate frame).
-- **Highlights already at the window top** (p99.9 ≈ 0.99): offset ≈ 0 (no-op).
-- **Very dark frame** (p99.9 < 0.33): `g` clamps at 3.0 → offset 200, lifted as
-  far as the stage allows (cannot reach 0.998; flagged by the histogram, not here).
-- **Blown frame in headroom** (p99.9 > 1, ws on): excluded by `AG_HI`, so the
-  *in-bound* p99.9 (just under 1) drives a small pull. With the working space on,
-  the un-clamped gain still pulls the over-range pixels down too.
+- **Highlights already at the window top** (p98 ≈ 0.99): a small pull *down* to
+  the 0.95 target (g ≈ 0.96) — deliberate since the 2026-07-07 retune; the target
+  keeps a visible margin below display white.
+- **Very dark frame** (p98 < ~0.32): `g` clamps at 3.0 → offset 200, lifted as
+  far as the stage allows (cannot reach 0.95; flagged by the histogram, not here).
+- **Blown frame in headroom** (p98 > 1, ws on): excluded by `AG_HI`, so the
+  *in-bound* p98 (just under 1) drives a pull down to 0.95. With the working space
+  on, the un-clamped gain still pulls the over-range pixels down too.
 - **Non-windowed / `FREECCR_WORKING_SPACE=0`**: base is already clamped `[0,1]`;
   over-range pixels are a pile at exactly 1.0 → excluded by `lum <= AG_HI` only
   if strictly above; we keep `<= 1.0`, so the clamp pile counts. Best-effort —
@@ -209,16 +219,17 @@ in `_init_toggles`, staged, and applied on Done in `_apply_pending` by calling
 
 ## 8. Test plan (`tests/test_auto_gain.py`, pure numpy, headless)
 
-- **Placement**: a windowed base whose in-bound p99.9 = 0.5 → offset `v` with
-  `1/(1−v/300) ≈ 1.98`; feeding `exposure=v` through `adjust_image(ws_windowed)`
-  puts the 99.9th percentile of the output at ≈ 0.99·65535.
+- **Placement**: a windowed base whose in-bound p98 = 0.5 → offset `v` with
+  `1/(1−v/300) ≈ 1.9`; feeding `exposure=v` through `adjust_image(ws_windowed)`
+  puts the 98th percentile of the output at ≈ 0.95·65535.
 - **Over-range exclusion (req 4)**: a base with ~5 % pixels at d=1.5 and the rest
   at d=0.5 yields the *same* offset as the all-0.5 base (the 1.5 pixels are
   discarded) — the headroom pixels do not pull the gain down.
-- **Neutral**: in-bound p99.9 already ≈ 0.99 → offset ≈ 0.
+- **Neutral**: in-bound p98 already ≈ 0.95 → offset ≈ 0.
 - **Insufficient content**: < 0.5 % in-bound pixels → offset 0.0.
-- **Clamp**: a very dark base → offset 200 (g capped at 3.0); a bright/blown base
-  → offset floored at −200 (g capped at 0.6) only if in-bound p99.9 > 0.998/0.6.
+- **Clamp**: a very dark base → offset 200 (g capped at 3.0). The g = 0.6 floor
+  would need in-bound p98 > 0.95/0.6 ≈ 1.58 — impossible for in-bound values
+  (≤ 1), so it stays a safety net only.
 - **Suppress-overlap**: with `ccr_backend.auto_gain=True`, a default-slope image's
   render uses `ag` and **not** `eb` (assert eb path is bypassed); with it False,
   `eb` is applied and `ag` is 0.
@@ -229,7 +240,7 @@ in `_init_toggles`, staged, and applied on Done in `_apply_pending` by calling
 
 ## 9. Open questions — RESOLVED
 
-- **Cache vs live → LIVE.** The 99.9th percentile is resolution-robust, so the
+- **Cache vs live → LIVE.** The 98th percentile is resolution-robust, so the
   live recompute in `apply_adjustments` keeps preview and export within a fraction
   of a slider unit while avoiding any per-image field, conversion hook, or
   cache-invalidation. Revisit only if a measurable preview/export mismatch

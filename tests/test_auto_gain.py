@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tests for Auto Gain (spec/auto-gain.md).
 
-Auto Gain is a hidden, live offset on the Gain stage that places the top-0.1%
-*in-bound* highlight at 99.8% of the working-space window without moving the Gain
+Auto Gain is a hidden, live offset on the Gain stage that places the top-2%
+*in-bound* highlight at 95% of the working-space window without moving the Gain
 slider. "In-bound" = a de-windowed display value in [0, 1] (between the sampled
 clear→0 and dense→1 conversion points); over-range/specular (>1) and sub-black
 (<0) pixels are discarded. Pure numpy core, runs headless.
@@ -38,15 +38,15 @@ def _realized_gain(v):
 # --- the offset mapping ---------------------------------------------------
 
 def test_constants():
-    assert AG_PERCENTILE == 99.9
-    assert AG_TARGET == 0.998
+    assert AG_PERCENTILE == 98.0
+    assert AG_TARGET == 0.95
     assert AG_HI == 1.0
     assert (AG_GMIN, AG_GMAX) == (0.6, 3.0)
 
 
 def test_uniform_midtone_targets_top():
     """A flat in-bound 0.5 base → an offset whose realized gain lands 0.5 at the
-    target (0.998)."""
+    target (0.95)."""
     base = _ws_base(np.full((32, 32, 3), 0.5))
     v = compute_auto_gain_offset(base, ws_windowed=True)
     assert 0.5 * _realized_gain(v) == pytest.approx(AG_TARGET, abs=2e-3)
@@ -81,7 +81,7 @@ def test_overrange_highlights_are_excluded():
 
 def test_subblack_pixels_excluded_but_irrelevant_to_highlight():
     """Sub-black pixels (d<0, clearer than the clear sample) are dropped; they
-    can't affect the top-0.1% percentile, so the offset is unchanged."""
+    can't affect the top-2% percentile, so the offset is unchanged."""
     d = np.full((40, 40, 3), 0.5, dtype=np.float32)
     d[:, :4, :] = -0.2                              # clamped to code 0 in the window
     with_floor = compute_auto_gain_offset(_ws_base(d), ws_windowed=True)
@@ -101,9 +101,15 @@ def test_insufficient_inbound_content_returns_zero():
 
 def test_roundtrip_places_highlight_at_target():
     """Feeding the computed offset as the Gain value through adjust_image puts
-    the 99.9th percentile of the output at ≈ AG_TARGET·65535."""
+    the 98th percentile of the output at ≈ AG_TARGET·65535. Pixels are
+    near-neutral (shared gray + small channel jitter): with fully independent
+    random channels the saturated top-2% pixels get single channels clipped at
+    the window, deflating the output luminance percentile below the target —
+    a clip-by-design of super-target headroom, not a placement error."""
     rng = np.random.default_rng(0)
-    d = rng.uniform(0.05, 0.7, size=(80, 80, 3)).astype(np.float32)
+    gray = rng.uniform(0.05, 0.7, size=(80, 80, 1)).astype(np.float32)
+    d = np.clip(gray + rng.normal(0.0, 0.02, size=(80, 80, 3)), 0.0, 1.0
+                ).astype(np.float32)
     base = _ws_base(d)
     v = compute_auto_gain_offset(base, ws_windowed=True)
     out = adjust_image(base, exposure=v, ws_windowed=True).astype(np.float32)
