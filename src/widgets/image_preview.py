@@ -1257,12 +1257,20 @@ class ImagePreview(QWidget):
                         self.scene.addItem(self.reference_rect_item)
 
             elif not ccr_backend.positive_mode:
-                # Show hint when no reference frame exists (negative mode only —
-                # positive mode has no reference frame / conversion step).
-                self.parent().parent().sliders_panel.set_hint(
-                    "<b>Hint:</b><br>Draw a frame around the image + some film base (orange/brown). "
-                    "Avoid white backlight or black film holder areas. Right-drag to draw, right-click to clear."
-                )
+                # Negative mode with no reference frame: recommend the B/W-point
+                # workflow on unconverted images (drawing a reference frame is
+                # the legacy path). Once converted, the instruction is stale —
+                # clear it instead of re-stamping it on every refresh.
+                if getattr(ccr_backend.images[idx], "converted", False):
+                    self.parent().parent().sliders_panel.clear_hint()
+                else:
+                    self.parent().parent().sliders_panel.set_hint(
+                        "<b>Hint:</b><br>Click <b>Set Black Point</b> and draw a rect over the "
+                        "transparent/clear film base, then <b>Convert Current</b>. Optionally "
+                        "<b>Set White Point</b> on a dense/exposed area first for a two-point "
+                        "conversion. (Legacy: right-drag draws a reference frame for the "
+                        "toolbar Convert.)"
+                    )
 
 
             # Apply transformations which will handle fitting consistently
