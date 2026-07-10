@@ -13,7 +13,26 @@ permissions:
   contents: write
 
 jobs:
+  # Gate: a tag must carry release notes for ITS version — v1.2.1 shipped with
+  # v1.1.1 notes because the static body was stale. Fails in seconds, before
+  # any build starts. Non-tag runs (workflow_dispatch) pass through.
+  # If it fires: update RELEASE_NOTES.md on main, then re-tag — the body is
+  # read from the TAGGED commit, not from main.
+  check-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: RELEASE_NOTES.md must mention the tagged version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! grep -qF "FreeCCR ${VERSION}" RELEASE_NOTES.md; then
+            echo "::error file=RELEASE_NOTES.md::Missing 'FreeCCR ${VERSION}' — update the What's New body before tagging v${VERSION}."
+            exit 1
+          fi
+
   build-windows:
+    needs: check-notes
     runs-on: windows-latest
 
     steps:
@@ -55,55 +74,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: win_installer/FreeCCR_Install_*.exe
-          # Release notes shown on every release page.
-          # KEEP IN SYNC with the macOS and Linux jobs' upload steps below.
-          # The body is static. REPLACE "## What's New" with ONLY this release's
-          # changes each time — do not append past versions (git history keeps them).
-          body: |
-            ## What's New
-
-            **FreeCCR 1.2.0** — one-click auto white balance, a major dust-removal upgrade, and the first Linux builds.
-
-            - **Auto White Balance.** New **AWB** button next to the WB picker: one click estimates the neutral colour of the converted frame and sets the Temperature/Tint sliders — no grey spot to hunt for, undoable, and re-clicking gives the same answer. **Settings → General** picks the estimator (Gray World, White Patch, Shades of Gray, Gray Edge) and can run AWB automatically after each conversion (off by default; images that already have a white balance are never touched).
-            - **Linux builds.** Releases now ship a Linux x86_64 **AppImage** and a portable **tar.gz** — install notes below.
-            - **Dust removal overhaul.**
-              - **Dust mode edits the framed image** — the crop you keep, not the full scan — and healing is resolution-independent: **exports now match the preview exactly**.
-              - **Auto-detection finds far more dust.** Detection runs tiled at the scan's native resolution with a noise-relative brightness gate, so the soft out-of-focus specks the old 1080px pass missed are found; it looks only in smooth areas where specks actually show, stays inside your crop, and uses the GPU on Windows when available. Also fixed: detection returned nothing on B/W-point-converted images.
-              - **Cleaner heals.** Source patches are searched nearest-first by texture match, every spot samples its own patch (nearby strokes no longer share one), healed tone anchors to its local surroundings, and feather scales with the brush size.
-              - **Editable heals.** With heal sources shown: right-drag a stroke to move it (it keeps sampling the same patch of film), right-drag a source ring to re-pick where it samples, double right-click deletes a stroke.
-            - **Reference-frame exports are faithful.** Exports now replay the exact reference frame captured at convert time, so changing the reference afterwards can no longer alter an export (#94).
-
-            ## Install
-
-            ### Windows
-            Download the installer (`FreeCCR_Install_*.exe`) from the **Assets** below and run it.
-
-            ### macOS (Apple Silicon)
-            Download `FreeCCR_macOS_*.zip` from the **Assets**, unzip it, and move `FreeCCR.app` into your **Applications** folder.
-
-            ⚠️ **macOS may say the app is "damaged and can't be opened" — it isn't.** FreeCCR isn't notarized by Apple, so Gatekeeper blocks unsigned downloads on first launch. Clear the quarantine flag once by running this in **Terminal**:
-
-            ```
-            xattr -d com.apple.quarantine /Applications/FreeCCR.app
-            ```
-
-            Then open the app normally.
-
-            *Alternative:* right-click the app → **Open** → **Open**. On macOS Sequoia (15), if no "Open" button appears, use the Terminal command above, or go to **System Settings → Privacy & Security → Open Anyway**.
-
-            ### Linux (x86_64)
-            **AppImage (recommended):** download `FreeCCR_Linux_*-x86_64.AppImage` from the **Assets**, make it executable, and run it:
-
-            ```
-            chmod +x FreeCCR_Linux_*-x86_64.AppImage
-            ./FreeCCR_Linux_*-x86_64.AppImage
-            ```
-
-            **Portable folder:** download `FreeCCR_Linux_*-x86_64.tar.gz`, extract it anywhere, and run `FreeCCR/FreeCCR`. Fully self-contained — no Python or packages to install.
-
-            Built on Ubuntu 22.04, so it runs on any x86_64 distro with glibc 2.35 or newer: Ubuntu 22.04+, Linux Mint 21+, Debian 12+, Fedora 36+, openSUSE, Arch, etc.
+          # Release body = RELEASE_NOTES.md at the tagged commit — one copy
+          # shared by all three jobs; check-notes guards it against staleness.
+          body_path: RELEASE_NOTES.md
 
   build-macos:
+    needs: check-notes
     runs-on: macos-latest  # ARM64 (Apple Silicon)
 
     steps:
@@ -176,55 +152,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: FreeCCR_macOS_*.zip
-          # Release notes shown on every release page.
-          # KEEP IN SYNC with the Windows and Linux jobs' upload steps.
-          # The body is static. REPLACE "## What's New" with ONLY this release's
-          # changes each time — do not append past versions (git history keeps them).
-          body: |
-            ## What's New
-
-            **FreeCCR 1.2.0** — one-click auto white balance, a major dust-removal upgrade, and the first Linux builds.
-
-            - **Auto White Balance.** New **AWB** button next to the WB picker: one click estimates the neutral colour of the converted frame and sets the Temperature/Tint sliders — no grey spot to hunt for, undoable, and re-clicking gives the same answer. **Settings → General** picks the estimator (Gray World, White Patch, Shades of Gray, Gray Edge) and can run AWB automatically after each conversion (off by default; images that already have a white balance are never touched).
-            - **Linux builds.** Releases now ship a Linux x86_64 **AppImage** and a portable **tar.gz** — install notes below.
-            - **Dust removal overhaul.**
-              - **Dust mode edits the framed image** — the crop you keep, not the full scan — and healing is resolution-independent: **exports now match the preview exactly**.
-              - **Auto-detection finds far more dust.** Detection runs tiled at the scan's native resolution with a noise-relative brightness gate, so the soft out-of-focus specks the old 1080px pass missed are found; it looks only in smooth areas where specks actually show, stays inside your crop, and uses the GPU on Windows when available. Also fixed: detection returned nothing on B/W-point-converted images.
-              - **Cleaner heals.** Source patches are searched nearest-first by texture match, every spot samples its own patch (nearby strokes no longer share one), healed tone anchors to its local surroundings, and feather scales with the brush size.
-              - **Editable heals.** With heal sources shown: right-drag a stroke to move it (it keeps sampling the same patch of film), right-drag a source ring to re-pick where it samples, double right-click deletes a stroke.
-            - **Reference-frame exports are faithful.** Exports now replay the exact reference frame captured at convert time, so changing the reference afterwards can no longer alter an export (#94).
-
-            ## Install
-
-            ### Windows
-            Download the installer (`FreeCCR_Install_*.exe`) from the **Assets** below and run it.
-
-            ### macOS (Apple Silicon)
-            Download `FreeCCR_macOS_*.zip` from the **Assets**, unzip it, and move `FreeCCR.app` into your **Applications** folder.
-
-            ⚠️ **macOS may say the app is "damaged and can't be opened" — it isn't.** FreeCCR isn't notarized by Apple, so Gatekeeper blocks unsigned downloads on first launch. Clear the quarantine flag once by running this in **Terminal**:
-
-            ```
-            xattr -d com.apple.quarantine /Applications/FreeCCR.app
-            ```
-
-            Then open the app normally.
-
-            *Alternative:* right-click the app → **Open** → **Open**. On macOS Sequoia (15), if no "Open" button appears, use the Terminal command above, or go to **System Settings → Privacy & Security → Open Anyway**.
-
-            ### Linux (x86_64)
-            **AppImage (recommended):** download `FreeCCR_Linux_*-x86_64.AppImage` from the **Assets**, make it executable, and run it:
-
-            ```
-            chmod +x FreeCCR_Linux_*-x86_64.AppImage
-            ./FreeCCR_Linux_*-x86_64.AppImage
-            ```
-
-            **Portable folder:** download `FreeCCR_Linux_*-x86_64.tar.gz`, extract it anywhere, and run `FreeCCR/FreeCCR`. Fully self-contained — no Python or packages to install.
-
-            Built on Ubuntu 22.04, so it runs on any x86_64 distro with glibc 2.35 or newer: Ubuntu 22.04+, Linux Mint 21+, Debian 12+, Fedora 36+, openSUSE, Arch, etc.
+          # Release body = RELEASE_NOTES.md at the tagged commit — one copy
+          # shared by all three jobs; check-notes guards it against staleness.
+          body_path: RELEASE_NOTES.md
 
   build-linux:
+    needs: check-notes
     # Build on the OLDEST supported runner: binaries link against the build
     # machine's glibc, and glibc is only forward-compatible. Ubuntu 22.04
     # (glibc 2.35) covers Ubuntu 22.04+/Mint 21+/Debian 12+/Fedora 36+ etc.
@@ -416,50 +349,6 @@ jobs:
           files: |
             FreeCCR_Linux_*.tar.gz
             FreeCCR_Linux_*.AppImage
-          # Release notes shown on every release page.
-          # KEEP IN SYNC with the Windows and macOS jobs' upload steps above.
-          # The body is static. REPLACE "## What's New" with ONLY this release's
-          # changes each time — do not append past versions (git history keeps them).
-          body: |
-            ## What's New
-
-            **FreeCCR 1.2.0** — one-click auto white balance, a major dust-removal upgrade, and the first Linux builds.
-
-            - **Auto White Balance.** New **AWB** button next to the WB picker: one click estimates the neutral colour of the converted frame and sets the Temperature/Tint sliders — no grey spot to hunt for, undoable, and re-clicking gives the same answer. **Settings → General** picks the estimator (Gray World, White Patch, Shades of Gray, Gray Edge) and can run AWB automatically after each conversion (off by default; images that already have a white balance are never touched).
-            - **Linux builds.** Releases now ship a Linux x86_64 **AppImage** and a portable **tar.gz** — install notes below.
-            - **Dust removal overhaul.**
-              - **Dust mode edits the framed image** — the crop you keep, not the full scan — and healing is resolution-independent: **exports now match the preview exactly**.
-              - **Auto-detection finds far more dust.** Detection runs tiled at the scan's native resolution with a noise-relative brightness gate, so the soft out-of-focus specks the old 1080px pass missed are found; it looks only in smooth areas where specks actually show, stays inside your crop, and uses the GPU on Windows when available. Also fixed: detection returned nothing on B/W-point-converted images.
-              - **Cleaner heals.** Source patches are searched nearest-first by texture match, every spot samples its own patch (nearby strokes no longer share one), healed tone anchors to its local surroundings, and feather scales with the brush size.
-              - **Editable heals.** With heal sources shown: right-drag a stroke to move it (it keeps sampling the same patch of film), right-drag a source ring to re-pick where it samples, double right-click deletes a stroke.
-            - **Reference-frame exports are faithful.** Exports now replay the exact reference frame captured at convert time, so changing the reference afterwards can no longer alter an export (#94).
-
-            ## Install
-
-            ### Windows
-            Download the installer (`FreeCCR_Install_*.exe`) from the **Assets** below and run it.
-
-            ### macOS (Apple Silicon)
-            Download `FreeCCR_macOS_*.zip` from the **Assets**, unzip it, and move `FreeCCR.app` into your **Applications** folder.
-
-            ⚠️ **macOS may say the app is "damaged and can't be opened" — it isn't.** FreeCCR isn't notarized by Apple, so Gatekeeper blocks unsigned downloads on first launch. Clear the quarantine flag once by running this in **Terminal**:
-
-            ```
-            xattr -d com.apple.quarantine /Applications/FreeCCR.app
-            ```
-
-            Then open the app normally.
-
-            *Alternative:* right-click the app → **Open** → **Open**. On macOS Sequoia (15), if no "Open" button appears, use the Terminal command above, or go to **System Settings → Privacy & Security → Open Anyway**.
-
-            ### Linux (x86_64)
-            **AppImage (recommended):** download `FreeCCR_Linux_*-x86_64.AppImage` from the **Assets**, make it executable, and run it:
-
-            ```
-            chmod +x FreeCCR_Linux_*-x86_64.AppImage
-            ./FreeCCR_Linux_*-x86_64.AppImage
-            ```
-
-            **Portable folder:** download `FreeCCR_Linux_*-x86_64.tar.gz`, extract it anywhere, and run `FreeCCR/FreeCCR`. Fully self-contained — no Python or packages to install.
-
-            Built on Ubuntu 22.04, so it runs on any x86_64 distro with glibc 2.35 or newer: Ubuntu 22.04+, Linux Mint 21+, Debian 12+, Fedora 36+, openSUSE, Arch, etc.
+          # Release body = RELEASE_NOTES.md at the tagged commit — one copy
+          # shared by all three jobs; check-notes guards it against staleness.
+          body_path: RELEASE_NOTES.md
