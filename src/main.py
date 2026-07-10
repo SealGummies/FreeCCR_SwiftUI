@@ -63,9 +63,11 @@ def main():
     from ui.main_window import MainWindow
 
     app = QApplication(sys.argv)
-    from ui.theme import apply_theme, apply_windows_dark_titlebar, install_dark_titlebar_filter
+    from ui.theme import (apply_theme, apply_windows_dark_titlebar,
+                          install_dark_titlebar_filter, install_macos_srgb_filter)
     apply_theme(app)  # neutral dark theme (Fusion + palette + global QSS)
     install_dark_titlebar_filter(app)  # dark title bars for dialogs / message boxes
+    install_macos_srgb_filter(app)  # color-managed previews on wide-gamut Macs
     _icon_path = os.path.join(os.path.dirname(__file__), 'icons', 'freeccr_logo.png')
     app.setWindowIcon(QIcon(_icon_path))
     print("Starting FreeCCR...")
