@@ -73,6 +73,8 @@ src/utils/unicode_path_utils.py → Cross-platform Unicode filename handling
 
 **Resource resolution**: `resource_path()` in `image_preview.py` handles both dev and Nuitka-bundled contexts. Nuitka embeds `src/icons/` and `LICENSES/` directories at build time.
 
+**macOS display color management**: Qt raster windows are not color-matched — the Cocoa backing store inherits the NSWindow colorspace (default: the display's own profile), so sRGB-encoded previews render oversaturated on wide-gamut (Display P3) Macs while ICC-tagged exports display correctly. `install_macos_srgb_filter()` in `src/ui/theme.py` tags every top-level NSWindow as sRGB via a ctypes/objc shim so ColorSync matches the whole app to the display profile. Exports embed their ICC profile in `apply_export_colorspace()` (`src/core/color_management.py`) and are unaffected.
+
 **Activation system**: The license verification code in `src/activation/` is present but bypassed — `is_activated()` always returns `True` in this build. Tests in `tests/test_activation_security.py` still validate the HMAC-SHA256 signing logic.
 
 ## Build Output

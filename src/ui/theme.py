@@ -558,3 +558,90 @@ def install_dark_titlebar_filter(app) -> None:
         return
     _dark_titlebar_filter = _DarkTitleBarFilter(app)
     app.installEventFilter(_dark_titlebar_filter)
+
+
+def apply_macos_srgb_colorspace(widget) -> bool:
+    """Tag a top-level window's NSWindow as sRGB on macOS.
+
+    Qt raster content is not color-managed (QTBUG-47660): the Cocoa backing
+    store inherits the NSWindow's colorspace, which defaults to the display's
+    own profile, so our sRGB-encoded preview pixels reach the screen
+    un-matched — visibly oversaturated on the wide-gamut (Display P3) panels
+    of every modern Mac, while exports (ICC-tagged sRGB/ProPhoto) display
+    correctly in ColorSync-managed viewers. Tagging the NSWindow sRGB makes
+    the WindowServer color-match the whole window (previews and UI alike) to
+    whatever profile the display uses.
+
+    Safe to call after show(): Qt observes
+    NSWindowDidChangeBackingPropertiesNotification and re-tags its backing
+    buffers on the change. No-op off macOS. Returns True if the colorspace
+    call was made.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ctypes
+        import ctypes.util
+
+        objc = ctypes.CDLL(ctypes.util.find_library("objc"))
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        # objc_msgSend is variadic — it must be cast to an exact prototype per
+        # call signature (mandatory on arm64). Everything here is id-sized.
+        send = ctypes.cast(objc.objc_msgSend, ctypes.CFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p))
+        send1 = ctypes.cast(objc.objc_msgSend, ctypes.CFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p))
+
+        def sel(name: bytes) -> ctypes.c_void_p:
+            return ctypes.c_void_p(objc.sel_registerName(name))
+
+        # On macOS winId() is the NSView* (and forces native window creation).
+        nsview = ctypes.c_void_p(int(widget.winId()))
+        nswindow = ctypes.c_void_p(send(nsview, sel(b"window")))
+        if not nswindow:
+            return False
+        srgb = ctypes.c_void_p(send(
+            ctypes.c_void_p(objc.objc_getClass(b"NSColorSpace")),
+            sel(b"sRGBColorSpace")))
+        if not srgb:
+            return False
+        send1(nswindow, sel(b"setColorSpace:"), srgb)
+        return True
+    except Exception:
+        return False
+
+
+class _MacSRGBColorSpaceFilter(QObject):
+    """App-level filter that sRGB-tags each top-level window on show.
+
+    Covers dialogs created on demand, like ``_DarkTitleBarFilter``. Re-applies
+    on every Show (no seen-set): setColorSpace is cheap and idempotent, and a
+    platform window Qt re-created in between (new winId) needs re-tagging.
+    macOS-only; inert elsewhere.
+    """
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.Type.Show
+                and isinstance(obj, QWidget) and obj.isWindow()):
+            apply_macos_srgb_colorspace(obj)
+        return False
+
+
+_macos_srgb_filter = None
+
+
+def install_macos_srgb_filter(app) -> None:
+    """Install an app-wide filter so every top-level window is tagged with the
+    sRGB colorspace when shown (see ``apply_macos_srgb_colorspace``).
+
+    No-op off macOS or if already installed. Call once from the app entry
+    point, alongside ``install_dark_titlebar_filter``.
+    """
+    global _macos_srgb_filter
+    if sys.platform != "darwin" or _macos_srgb_filter is not None:
+        return
+    _macos_srgb_filter = _MacSRGBColorSpaceFilter(app)
+    app.installEventFilter(_macos_srgb_filter)
