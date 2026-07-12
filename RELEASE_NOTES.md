@@ -7,10 +7,9 @@
 -->
 ## What's New
 
-**FreeCCR 1.2.1** — an Auto Gain retune and an onboarding fix.
+**FreeCCR 1.2.2** — a macOS color-accuracy fix.
 
-- **Auto Gain leaves headroom.** Converted frames now place the top 2 % of in-bound highlights at 95 % of the visible window (previously the top 0.1 % was pushed to 99.8 %, parking highlights against display white). Frames whose highlights already sat at the top get a slight pull down to the new target.
-- **The startup hint teaches the B/W-point workflow.** The hint shown for a fresh negative used to recommend drawing a reference frame (the legacy path). It now walks through **Set Black Point** → **Convert Current** (with **Set White Point** as the optional two-point refinement), and it no longer keeps re-appearing on images that are already converted.
+- **Previews now match exports on wide-gamut Macs.** On Display P3 screens, the app preview rendered more saturated than the exported TIFF/JPEG — the export was always correct (ICC-tagged and color-managed), but Qt's preview window wasn't color-matched to the display. Every window is now tagged sRGB so macOS color-matches the whole app to the display profile, and preview colors match what you export.
 
 ## Install
 
