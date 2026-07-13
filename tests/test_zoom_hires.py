@@ -116,8 +116,9 @@ class TestRenderHiresBaseRouting:
         stub = _conversion_stub(None, None)
         stub.file_path = path
         stub.converted = False
-        out = stub.render_hires_base()
+        out, alpha = stub.render_hires_base()
         assert out is not None and out.shape == (240, 360, 3)
+        assert alpha is None      # unconverted scan → no clear-film mask
 
     def test_converted_without_conversion_snapshot_returns_none(self, tmp_path):
         import cv2
@@ -128,7 +129,7 @@ class TestRenderHiresBaseRouting:
         stub.file_path = path
         stub.converted = True
         stub.conversion_inputs = None
-        assert stub.render_hires_base() is None
+        assert stub.render_hires_base()[0] is None
 
     def test_bwpoint_replay_includes_fine_rotation(self, tmp_path):
         """The bwpoint pipeline bakes the fine rotation into the preview
@@ -149,7 +150,7 @@ class TestRenderHiresBaseRouting:
         stub.conversion_inputs = {"mode": "bw",
                                   "bw": (black_point, white_point),
                                   "fine_rot": fine_rot}   # bare convert → linear (default)
-        got = stub.render_hires_base()
+        got, _ = stub.render_hires_base()
         np.testing.assert_allclose(got.astype(np.int64),
                                    expected.astype(np.int64), atol=2)
 
@@ -165,10 +166,10 @@ class TestRenderHiresBaseRouting:
         stub.file_path = path
         stub.converted = True
         stub.conversion_inputs = {"mode": "ref", "ref": ref, "fine_rot": 0}
-        baseline = stub.render_hires_base()
+        baseline, _ = stub.render_hires_base()
         stub.reference_frame = (100, 100, 150, 150)   # live edit, no re-convert
         stub.fine_rotation_angle = 900
-        again = stub.render_hires_base()
+        again, _ = stub.render_hires_base()
         np.testing.assert_array_equal(baseline, again)
 
 

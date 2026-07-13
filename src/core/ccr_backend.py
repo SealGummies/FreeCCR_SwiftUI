@@ -76,6 +76,12 @@ class CCRBackend:
         # Global, persisted by MainWindow. See spec/auto-white-balance.md.
         self.auto_awb: bool = False
         self.awb_algorithm: str = "gray_world"
+        # Reversal-look sprocket-hole mask: when True, clear-film regions (sprocket
+        # holes / rebate, brighter than the sampled black point) are painted white
+        # as the LAST render step for B/W-point conversions, on preview and export.
+        # Global display overlay, persisted by MainWindow. See
+        # spec/sprocket-hole-mask.md.
+        self.sprocket_mask_white: bool = False
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Selected film-stock preset for the black-point-only conversion:
@@ -1809,7 +1815,8 @@ class CCRBackend:
     def _reset_one_slice_round(self, template) -> Optional[int]:
         from core.ccr_processor import (apply_reference_normalization,
                                         apply_bwpoint_normalization,
-                                        compute_reference_norm_params)
+                                        compute_reference_norm_params,
+                                        compute_sprocket_alpha)
         group = template.slice_group
         parent_ops = list(template.source_ops[:-1])
         baked_rotation = template.source_ops[-1][0]
@@ -1910,9 +1917,13 @@ class CCRBackend:
                 "mode": "ref_params", "p_lo": norm_params[0],
                 "p_hi": norm_params[1], "od": norm_params[2]}
         elif bw_points is not None:
+            _raw_scan = parent.resized_raw   # pre-inversion raw for the mask
             parent.resized_raw = apply_bwpoint_normalization(
-                parent.resized_raw, *bw_points, density=bw_density,
+                _raw_scan, *bw_points, density=bw_density,
                 slopes_bgr=bw_slopes)
+            # Reversal-look clear-film mask (spec/sprocket-hole-mask.md), so a
+            # sliced strip stays consistent with the parent preview.
+            parent.sprocket_alpha = compute_sprocket_alpha(_raw_scan, bw_points[0])
             parent.converted = True
             parent._ws_windowed = _ws_enabled()   # bw base is windowed when enabled
             parent.conversion_inputs = {"mode": "bw", "bw": bw_points,

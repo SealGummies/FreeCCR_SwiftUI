@@ -219,6 +219,11 @@ class MainWindow(QMainWindow):
         ccr_backend.awb_algorithm = (
             stored_algo if any(a == stored_algo for a, _ in AWB_ALGORITHMS)
             else AWB_DEFAULT)
+        # Restore the reversal-look sprocket-hole mask (default OFF). When on,
+        # clear-film regions are painted white as the last render step for
+        # B/W-point conversions. See spec/sprocket-hole-mask.md.
+        ccr_backend.sprocket_mask_white = self._settings.value(
+            "adjust/sprocket_mask_white", False, type=bool)
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
@@ -757,6 +762,18 @@ class MainWindow(QMainWindow):
         self._rerender_all_for_global_mode(
             "Gamma: hue-preserving (luminance) mode." if checked else
             "Gamma: per-channel mode (standard).")
+
+    def on_sprocket_mask_toggled(self, checked: bool):
+        """Flip the global reversal-look sprocket-hole mask, persist it, and
+        re-render all loaded images. The mask is composited last as a display
+        overlay (the alpha is cached at convert time), so this only re-renders —
+        no re-conversion, no catalog write. Mirrors on_auto_gain_toggled.
+        See spec/sprocket-hole-mask.md."""
+        ccr_backend.sprocket_mask_white = bool(checked)
+        self._settings.setValue("adjust/sprocket_mask_white", bool(checked))
+        self._rerender_all_for_global_mode(
+            "Sprocket holes / clear film shown white (reversal look)." if checked
+            else "Sprocket holes shown as converted (black).")
 
     def show_about_dialog(self):
         QMessageBox.about(

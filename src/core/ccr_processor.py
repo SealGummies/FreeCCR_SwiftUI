@@ -977,6 +977,92 @@ DEFAULT_DENSITY_GAMMA = 1.0
 _DENSITY_FLOOR = 1.0
 
 
+# --- Sprocket-hole / clear-film white mask (spec/sprocket-hole-mask.md) ---
+# On a 135 negative the punched sprocket holes and clear rebate scan BRIGHTER than
+# the sampled film base, so after inversion they clamp to pure black. This optional
+# reversal-film look paints those clear-film regions WHITE as the last render step.
+# The mask is derived from the RAW scan ("clearer than the sampled black point plus
+# a padding"), morphologically cleaned, and feathered. Threshold is resolution-
+# independent; morphology/feather radii scale with the buffer's long side so the
+# preview, hi-res zoom, and export agree geometrically.
+def _sprocket_cfg():
+    """Read the (env-overridable) mask parameters. Fraction/abs padding are per-
+    channel; the *_PX radii are quoted at SPROCKET_REF_LONG and scaled per buffer."""
+    def _f(name, default):
+        try:
+            return float(os.environ.get(name, "").strip() or default)
+        except ValueError:
+            return default
+    return {
+        "pad_frac": _f("FREECCR_SPROCKET_PAD_FRAC", 0.20),
+        "pad_abs":  _f("FREECCR_SPROCKET_PAD_ABS", 0.02),   # fraction of full scale
+        "open_px":  _f("FREECCR_SPROCKET_OPEN_PX", 2.0),
+        "close_px": _f("FREECCR_SPROCKET_CLOSE_PX", 5.0),
+        "feather_px": _f("FREECCR_SPROCKET_FEATHER_PX", 8.0),
+    }
+
+
+SPROCKET_REF_LONG = 1080   # long side the *_PX radii are quoted at
+
+
+def _odd_ksize(radius: float) -> int:
+    """Odd cv2 kernel size (>= 3) covering `radius` px each side of the centre."""
+    return max(3, int(round(radius)) * 2 + 1)
+
+
+def compute_sprocket_alpha(raw_bgr, black_point_bgr):
+    """A feathered white-mask alpha (uint8 H×W, 0..255) marking clear-film
+    (sprocket / rebate) regions — pixels clearer than the sampled film base by a
+    padding — or None if the black point is unset or nothing qualifies.
+
+    `raw_bgr` is the working scan (BGR, the same array the invert helpers consume);
+    `black_point_bgr` is the sampled clear/film-base anchor (BGR, HIGH values).
+    Pure/thread-safe. See spec/sprocket-hole-mask.md §4.1."""
+    if black_point_bgr is None or raw_bgr is None:
+        return None
+    cfg = _sprocket_cfg()
+    d = raw_bgr.astype(np.float32, copy=False)
+    if d.ndim != 3 or d.shape[2] < 3:
+        return None
+    bp = np.asarray(black_point_bgr, dtype=np.float32)[:3]
+    head = np.maximum(65535.0 - bp, 1.0)                 # per-channel headroom above base
+    pad = np.maximum(cfg["pad_frac"] * head, cfg["pad_abs"] * 65535.0)
+    thr = bp + pad                                       # (3,) BGR
+    # AND across channels: clear film is bright in EVERY channel; exposed scene
+    # content (even deep shadow) is denser than the zero-exposure base, so it is
+    # lower than base in every channel and structurally excluded.
+    mask = np.all(d[..., :3] > thr[None, None, :], axis=2)
+    if not mask.any():
+        return None
+    m = (mask.astype(np.uint8)) * 255
+    scale = max(d.shape[0], d.shape[1]) / float(SPROCKET_REF_LONG)
+    open_k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_odd_ksize(cfg["open_px"] * scale),) * 2)
+    close_k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_odd_ksize(cfg["close_px"] * scale),) * 2)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, open_k)      # drop noise specks
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, close_k)    # fill small gaps
+    if not m.any():
+        return None
+    feather = max(1.0, cfg["feather_px"] * scale)
+    ksz = _odd_ksize(feather)
+    return cv2.GaussianBlur(m, (ksz, ksz), feather / 2.0)   # uint8 0..255 ramp
+
+
+def apply_sprocket_mask(rgb_u16, alpha_u8):
+    """Composite the clear-film regions to white (65535): alpha 0 keeps the image,
+    255 is full white, in-between is the feathered blend. Returns the input
+    unchanged when `alpha_u8` is None or shapes don't match. Channel-order-agnostic
+    (paints neutral white). See spec/sprocket-hole-mask.md §4.1."""
+    if alpha_u8 is None or rgb_u16 is None:
+        return rgb_u16
+    if alpha_u8.shape[:2] != rgb_u16.shape[:2]:
+        return rgb_u16
+    a = alpha_u8.astype(np.float32)[..., None] / 255.0
+    out = rgb_u16.astype(np.float32) * (1.0 - a) + 65535.0 * a
+    return np.clip(out, 0, 65535).astype(np.uint16)
+
+
 # --- Working space with headroom (spec/working-space-headroom.md) ---
 # The inverted "base" buffer reserves a narrow DISPLAY WINDOW inside the 16-bit
 # container and keeps out-of-window data as recoverable headroom instead of
@@ -1326,6 +1412,13 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
     if img is None:
         raise ValueError("CCRImage: could not load image data for B/W point conversion")
 
+    # Sprocket-hole / clear-film white mask (reversal look), derived from the RAW
+    # scan relative to the sampled black point while the raw is still in hand.
+    # Computed regardless of the toggle: the preview caches it (so turning the
+    # toggle on later needs no re-conversion) and the export composites it only
+    # when enabled. See spec/sprocket-hole-mask.md.
+    sprocket_alpha = compute_sprocket_alpha(img, black_point_bgr)
+
     # Fine rotation uses DISPLAY semantics, like the reference pipeline: the
     # per-pixel B/W-point mapping is rotation-independent, so the preview
     # result stays un-rotated (the canvas item applies the live angle) and an
@@ -1416,6 +1509,9 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
         ccr_image.contrast_base = 0
         ccr_image.temperature_base = 0
         ccr_image._ws_windowed = ws
+        # Cache the sprocket alpha for the live preview overlay (applied last, and
+        # gated by the toggle, in update_thumbnail_and_preview).
+        ccr_image.sprocket_alpha = sprocket_alpha
     if ws:
         # ASCII only: this prints during EVERY B/W-point conversion, and an
         # em dash here crashed converts on macOS (ASCII stdout, issue #86).
@@ -1438,6 +1534,13 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
         rgb_result = ccr_image.apply_adjustments(rgb_result, contrast_base=0,
                                                  temperature_base=0,
                                                  ws_windowed=ws)
+        # White the sprocket holes / clear film as the last look step — after all
+        # adjustments, before the geometric block (same un-rotated space as the
+        # preview overlay, so it is WYSIWYG). Gated on the live toggle; deferred
+        # import avoids a module cycle. See spec/sprocket-hole-mask.md §4.2.
+        from core.ccr_backend import ccr_backend as _bk
+        if getattr(_bk, "sprocket_mask_white", False):
+            rgb_result = apply_sprocket_mask(rgb_result, sprocket_alpha)
 
     # --- Export path: flips, rotation, file write ---
     if output_path is not None:
