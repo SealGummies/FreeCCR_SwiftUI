@@ -101,8 +101,52 @@ def test_feather_is_soft_ramp_solid_interior():
     alpha = compute_sprocket_alpha(img, bp)
     assert alpha is not None
     assert alpha.max() == 255                      # solid interior
-    # A feather band of intermediate alpha exists around the edge.
+    # A thin feather band of intermediate alpha exists around the edge.
     assert np.any((alpha > 0) & (alpha < 255))
+
+
+# --- sharpness: keep the true hole shape ----------------------------------
+
+def test_interior_hole_is_filled():
+    # A dark speck inside a hole (dust / a printed frame number) must NOT punch
+    # through — the interior fills solid via the flood-fill imfill.
+    bp = (30000, 30000, 30000)
+    img = _base_plate(1080, 1080, bp)
+    img = _with_square(img, 300, 780, 300, 780, (62000, 62000, 62000))   # hole
+    img = _with_square(img, 520, 560, 520, 560, (8000, 8000, 8000))      # dark speck inside
+    alpha = compute_sprocket_alpha(img, bp)
+    assert alpha is not None
+    assert alpha[540, 540] == 255      # filled despite the dark speck at the centre
+
+
+def test_tiny_speckle_removed():
+    # An isolated few-pixel bright speck (noise) far from any hole is dropped by
+    # the connected-component area filter, while the real hole is kept.
+    bp = (30000, 30000, 30000)
+    img = _base_plate(1080, 1080, bp)
+    img = _with_square(img, 300, 780, 300, 780, (62000, 62000, 62000))   # real hole
+    img = _with_square(img, 60, 63, 60, 63, (62000, 62000, 62000))       # 3x3 speck
+    alpha = compute_sprocket_alpha(img, bp)
+    assert alpha is not None
+    assert alpha[540, 540] == 255       # hole kept
+    assert alpha[61, 61] == 0           # speck removed
+
+
+def test_edges_stay_sharp_not_dilated():
+    # No morphological dilation and only a ~1px feather: a few px OUTSIDE the true
+    # boundary stays 0 (the old close + 8px feather glowed here), and the edge
+    # transition is a narrow anti-alias band, not a soft ramp.
+    bp = (30000, 30000, 30000)
+    img = _base_plate(1080, 1080, bp)
+    img = _with_square(img, 400, 680, 400, 680, (62000, 62000, 62000))   # edge at x=400
+    alpha = compute_sprocket_alpha(img, bp)
+    assert alpha is not None
+    assert alpha[540, 540] == 255       # interior solid
+    assert alpha[540, 396] == 0         # 4px outside the edge -> not whitened
+    # The transition band around the left edge is only a pixel or two wide.
+    window = alpha[540, 395:406]
+    intermediate = int(np.sum((window > 0) & (window < 255)))
+    assert intermediate <= 4
 
 
 # --- resolution scaling: preview vs export agree geometrically ------------

@@ -110,38 +110,43 @@ staged checkbox in `SettingsDialog`, and membership in
 
 ```python
 # Baked defaults (env-overridable for field calibration)
-SPROCKET_PAD_FRAC   = 0.20   # a hole must be >= 20% of the way from base -> clip,
-SPROCKET_PAD_ABS    = 0.02   #   or 2% of full scale above base, per channel (max)
-SPROCKET_OPEN_PX    = 2.0    # speckle removal radius   @ 1080 long side
-SPROCKET_CLOSE_PX   = 5.0    # small-gap fill radius     @ 1080 long side
-SPROCKET_FEATHER_PX = 8.0    # edge feather (5-10 px)    @ 1080 long side
-SPROCKET_REF_LONG   = 1080   # reference long side the *_PX are quoted at
+PAD_FRAC     = 0.20   # a hole must be >= 20% of the way from base -> clip,
+PAD_ABS      = 0.02   #   or 2% of full scale above base, per channel (max)
+MIN_AREA_PX  = 24.0   # speckle cutoff (connected-component area) @ 1080 long side
+FEATHER_PX   = 1.0    # edge feather — anti-aliasing only          @ 1080 long side
+REF_LONG     = 1080   # reference long side the px params are quoted at
 
 def compute_sprocket_alpha(raw_bgr, black_point_bgr) -> Optional[np.ndarray]:
-    """A feathered white-mask alpha (uint8 H×W, 0..255) marking clear-film
-    (sprocket / rebate) regions — pixels clearer than the sampled film base by a
-    padding — or None if the black point is unset or no region qualifies.
+    """A white-mask alpha (uint8 H×W, 0..255) marking clear-film (sprocket /
+    rebate) regions — pixels clearer than the sampled film base by a padding — or
+    None if the black point is unset or no region qualifies. Holes are kept SHARP.
 
     `raw_bgr` is the float/uint working scan (BGR, same array the invert helpers
     consume); `black_point_bgr` is the sampled clear/film-base anchor (BGR, HIGH
-    values). Resolution-independent threshold; morphology + feather radii scale
-    with this buffer's long side so preview/zoom/export agree geometrically."""
+    values). Resolution-independent threshold; area cutoff + feather scale with
+    this buffer's long side so preview/zoom/export agree geometrically."""
     if black_point_bgr is None:
         return None
     d = raw_bgr astype float32                       # (H,W,3) BGR
     bp   = float32 array(black_point_bgr)            # (3,)
     head = maximum(65535 - bp, 1.0)                  # per-channel headroom above base
-    pad  = maximum(SPROCKET_PAD_FRAC*head, SPROCKET_PAD_ABS*65535)
+    pad  = maximum(PAD_FRAC*head, PAD_ABS*65535)
     thr  = bp + pad
     mask = all(d > thr[None,None,:], axis=2)         # AND across BGR -> clearer than base
     if not mask.any(): return None
     m = uint8(mask)*255
-    scale = max(H,W) / SPROCKET_REF_LONG
-    m = MORPH_OPEN(m,  ellipse(SPROCKET_OPEN_PX  * scale))   # drop noise specks
-    m = MORPH_CLOSE(m, ellipse(SPROCKET_CLOSE_PX * scale))   # fill small gaps
-    if not m.any(): return None
-    f = max(1.0, SPROCKET_FEATHER_PX * scale)
-    return GaussianBlur(m, ksize=odd(2*f), sigma=f/2)        # uint8 0..255 ramp
+    scale = max(H,W) / REF_LONG
+    # Speckle removal by connected-component AREA — NOT morphological open, which
+    # would erode/round the hole corners. Keeps every component >= min_area sharp.
+    min_area = max(1, round(MIN_AREA_PX * scale*scale))
+    m = keep_components_with_area(m, >= min_area)     # via connectedComponentsWithStats
+    if m is empty: return None
+    # Fill INTERIOR holes only (dust/markings inside a hole) via a border
+    # flood-fill imfill — NOT morphological close, so the outer edge is untouched.
+    m = fill_interior_holes(m)                        # pad 1px bg, floodFill(0,0), OR back
+    f = FEATHER_PX * scale
+    if f >= 0.5: m = GaussianBlur(m, ksize=odd(2*f), sigma=f/2)   # 1px anti-alias
+    return m                                          # uint8 0..255
 ```
 
 Why per-channel **AND** with a headroom-fraction padding: a punched hole is clear
@@ -149,10 +154,19 @@ film → near full transmission in **every** channel → far above `base+pad`
 everywhere. Film-base noise sits at `~base` → below `pad`. Exposed scene content
 (even a deep shadow) is *denser* than the zero-exposure base → **lower** than base
 in every channel → can never exceed it, so scene pixels are structurally excluded.
-The AND biases toward **few false positives** (never whiten real content); the
-CLOSE fills any small missed interior, the OPEN removes stray triggered specks.
-`SPROCKET_PAD_ABS` floors the padding so a base already near clip (tiny headroom)
-doesn't collapse the margin and catch noise.
+The AND biases toward **few false positives** (never whiten real content).
+`PAD_ABS` floors the padding so a base already near clip (tiny headroom) doesn't
+collapse the margin and catch noise.
+
+**Keeping the holes sharp.** Real 135 sprocket holes are crisp rounded rectangles;
+an early build over-softened them with a morphological **open** (rounds corners) +
+**close** (dilates/rounds the outer edge) + an 8 px Gaussian **feather** (a glow).
+The cleanup is instead: (1) a **connected-component area filter** to drop tiny
+noise specks — no erosion, so the true edge is preserved; (2) a **flood-fill
+imfill** to fill only *interior* gaps (a speck of dust or a printed frame number
+inside a hole) while leaving the outer boundary exactly where the threshold put
+it — no dilation/rounding; (3) a **~1 px feather** for anti-aliasing only. All
+three are cheap (linear in pixels) and thread-safe.
 
 ```python
 def apply_sprocket_mask(rgb_u16, alpha_u8) -> np.ndarray:

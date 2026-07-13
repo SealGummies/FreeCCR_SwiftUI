@@ -982,12 +982,16 @@ _DENSITY_FLOOR = 1.0
 # the sampled film base, so after inversion they clamp to pure black. This optional
 # reversal-film look paints those clear-film regions WHITE as the last render step.
 # The mask is derived from the RAW scan ("clearer than the sampled black point plus
-# a padding"), morphologically cleaned, and feathered. Threshold is resolution-
-# independent; morphology/feather radii scale with the buffer's long side so the
-# preview, hi-res zoom, and export agree geometrically.
+# a padding") and cleaned so the holes stay SHARP: noise specks are dropped by
+# connected-component area (no morphological erosion that would round corners),
+# interior gaps (dust/markings inside a hole) are filled by a flood-fill imfill
+# (no dilation that would round/expand the outer edge), and only a light 1 px
+# feather is applied for anti-aliasing. The threshold is resolution-independent;
+# the area cutoff and feather scale with the buffer's long side so the preview,
+# hi-res zoom, and export agree geometrically.
 def _sprocket_cfg():
     """Read the (env-overridable) mask parameters. Fraction/abs padding are per-
-    channel; the *_PX radii are quoted at SPROCKET_REF_LONG and scaled per buffer."""
+    channel; min-area/feather are quoted at SPROCKET_REF_LONG and scaled per buffer."""
     def _f(name, default):
         try:
             return float(os.environ.get(name, "").strip() or default)
@@ -995,14 +999,13 @@ def _sprocket_cfg():
             return default
     return {
         "pad_frac": _f("FREECCR_SPROCKET_PAD_FRAC", 0.20),
-        "pad_abs":  _f("FREECCR_SPROCKET_PAD_ABS", 0.02),   # fraction of full scale
-        "open_px":  _f("FREECCR_SPROCKET_OPEN_PX", 2.0),
-        "close_px": _f("FREECCR_SPROCKET_CLOSE_PX", 5.0),
-        "feather_px": _f("FREECCR_SPROCKET_FEATHER_PX", 8.0),
+        "pad_abs":  _f("FREECCR_SPROCKET_PAD_ABS", 0.02),      # fraction of full scale
+        "min_area_px": _f("FREECCR_SPROCKET_MIN_AREA_PX", 24.0),  # speckle cutoff @1080
+        "feather_px": _f("FREECCR_SPROCKET_FEATHER_PX", 1.0),  # anti-alias only @1080
     }
 
 
-SPROCKET_REF_LONG = 1080   # long side the *_PX radii are quoted at
+SPROCKET_REF_LONG = 1080   # long side the px params are quoted at
 
 
 def _odd_ksize(radius: float) -> int:
@@ -1010,10 +1013,26 @@ def _odd_ksize(radius: float) -> int:
     return max(3, int(round(radius)) * 2 + 1)
 
 
+def _fill_interior_holes(mask_u8):
+    """Fill regions of 0 fully enclosed by 1 (interior holes) WITHOUT touching the
+    outer boundary — classic imfill via a border flood fill. Unlike a
+    morphological close it never dilates or rounds the true edge, so the sprocket
+    holes stay sharp. A 1 px background pad guarantees the flood seed is outside
+    any hole even when a hole touches the frame edge."""
+    padded = cv2.copyMakeBorder(mask_u8, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    ff = padded.copy()
+    ffmask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
+    cv2.floodFill(ff, ffmask, (0, 0), 255)          # reachable-from-border background
+    holes = cv2.bitwise_not(ff)                      # everything NOT reachable = holes
+    filled = cv2.bitwise_or(padded, holes)
+    return filled[1:-1, 1:-1]
+
+
 def compute_sprocket_alpha(raw_bgr, black_point_bgr):
-    """A feathered white-mask alpha (uint8 H×W, 0..255) marking clear-film
-    (sprocket / rebate) regions — pixels clearer than the sampled film base by a
-    padding — or None if the black point is unset or nothing qualifies.
+    """A white-mask alpha (uint8 H×W, 0..255) marking clear-film (sprocket /
+    rebate) regions — pixels clearer than the sampled film base by a padding — or
+    None if the black point is unset or nothing qualifies. The holes are kept
+    sharp (area-based speckle removal + interior-hole fill, only a light feather).
 
     `raw_bgr` is the working scan (BGR, the same array the invert helpers consume);
     `black_point_bgr` is the sampled clear/film-base anchor (BGR, HIGH values).
@@ -1036,17 +1055,27 @@ def compute_sprocket_alpha(raw_bgr, black_point_bgr):
         return None
     m = (mask.astype(np.uint8)) * 255
     scale = max(d.shape[0], d.shape[1]) / float(SPROCKET_REF_LONG)
-    open_k = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (_odd_ksize(cfg["open_px"] * scale),) * 2)
-    close_k = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (_odd_ksize(cfg["close_px"] * scale),) * 2)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, open_k)      # drop noise specks
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, close_k)    # fill small gaps
-    if not m.any():
+    # Drop tiny speckles by connected-component AREA — no morphological erosion,
+    # so hole edges/corners keep their true (sharp) shape.
+    min_area = max(1, int(round(cfg["min_area_px"] * scale * scale)))
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    if num <= 1:
         return None
-    feather = max(1.0, cfg["feather_px"] * scale)
-    ksz = _odd_ksize(feather)
-    return cv2.GaussianBlur(m, (ksz, ksz), feather / 2.0)   # uint8 0..255 ramp
+    areas = stats[:, cv2.CC_STAT_AREA].copy()
+    areas[0] = 0                                         # label 0 is the background
+    keep = np.flatnonzero(areas >= min_area)
+    if keep.size == 0:
+        return None
+    m = np.isin(labels, keep).astype(np.uint8) * 255
+    # Fill interior holes (dust/markings inside a hole) without rounding the outer
+    # boundary — a flood-fill imfill, NOT a morphological close.
+    m = _fill_interior_holes(m)
+    # Light feather for anti-aliasing only (keeps the holes crisp).
+    feather = cfg["feather_px"] * scale
+    if feather >= 0.5:
+        ksz = _odd_ksize(feather)
+        m = cv2.GaussianBlur(m, (ksz, ksz), feather / 2.0)
+    return m
 
 
 def apply_sprocket_mask(rgb_u16, alpha_u8):
