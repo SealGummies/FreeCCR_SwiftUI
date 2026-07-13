@@ -172,6 +172,12 @@ class CCRImage:
         # {"mode": "bw", "bw": ((B,G,R),(B,G,R)|None), "fine_rot": int,
         #  "density": bool}   # density: two-point log inversion (see spec)
         self.conversion_inputs: Optional[Dict[str, Any]] = None
+        # Feathered white-mask alpha (uint8 H×W, 0..255) marking clear-film
+        # (sprocket / rebate) regions, at the preview resolution. Set on every
+        # B/W-point conversion; composited to white as the last preview step when
+        # the global reversal-look toggle is on. None otherwise (not persisted —
+        # a reconvert repopulates it). See spec/sprocket-hole-mask.md.
+        self.sprocket_alpha: Optional[np.ndarray] = None
         # User crop as normalized (x1, y1, x2, y2) fractions of the un-rotated/
         # un-flipped image; None = no crop. Display-level only — resized_raw is
         # never modified, so clearing the crop needs no re-conversion.
@@ -830,9 +836,26 @@ class CCRImage:
                        if (self.converted or self._positive_mode_active())
                        else self._auto_brightness_for_preview(adjusted_img))
 
+        # Sprocket-hole / clear-film white mask (reversal look) — the LAST look
+        # step, so no adjustment can tint the whitened regions. B/W-point
+        # conversions only (sprocket_alpha is set only there); gated on the live
+        # global toggle. Applied to the DISPLAY pixels (thumbnail + preview
+        # pixmap) only — the histogram reads the PRE-mask image below, so a
+        # whitened border doesn't add a misleading spike at white. display_img
+        # shares resized_raw's dims, as does the alpha. See spec §4.2.
+        from core.ccr_backend import ccr_backend
+        _mask_on = (self.converted and not self._positive_mode_active()
+                    and self.sprocket_alpha is not None
+                    and ccr_backend.sprocket_mask_white)
+        if _mask_on:
+            from core.ccr_processor import apply_sprocket_mask
+            display_masked = apply_sprocket_mask(display_img, self.sprocket_alpha)
+        else:
+            display_masked = display_img
+
         # Create thumbnail + preview pixels (8-bit RGB numpy — safe on any thread)
-        thumb_img_8 = to_8bit(self.resize_image_to_max_pixel(display_img, thumbnail_size))
-        preview_img = self.resize_image_to_max_pixel(display_img, preview_size)
+        thumb_img_8 = to_8bit(self.resize_image_to_max_pixel(display_masked, thumbnail_size))
+        preview_img = self.resize_image_to_max_pixel(display_masked, preview_size)
         preview_img_8bit = to_8bit(preview_img)
 
         # QPixmap may only be created on the GUI thread, but the batch paths
@@ -858,8 +881,13 @@ class CCRImage:
         # presentation — the percentile-clipped vertical scale, smoothing,
         # filled curves and clip markers — lives in HistogramWidget, which paints
         # at the widget's real resolution. See widgets/histogram_widget.py.
+        # Pre-mask preview for the histogram (the tones the user edits). Identical
+        # to preview_img_8bit when the sprocket mask is off, so only pay the extra
+        # resize when it is on. See spec/sprocket-hole-mask.md §7.
+        hist_base_8bit = (to_8bit(self.resize_image_to_max_pixel(display_img, preview_size))
+                          if _mask_on else preview_img_8bit)
         hist_source = apply_crop_to_image(
-            preview_img_8bit, self.crop_rect, getattr(self, "crop_angle", 0.0) or 0.0)
+            hist_base_8bit, self.crop_rect, getattr(self, "crop_angle", 0.0) or 0.0)
         counts = np.empty((3, 256), dtype=np.float32)
         for i in range(3):   # 0=R, 1=G, 2=B
             counts[i] = cv2.calcHist([hist_source], [i], None, [256], [0, 256]).flatten()
@@ -1155,7 +1183,7 @@ class CCRImage:
         return adjusted
 
     def render_hires_base(self, max_long_side: Optional[int] = None,
-                          conversion_inputs=None) -> Optional[np.ndarray]:
+                          conversion_inputs=None):
         """
         Re-decode this image and reproduce its conversion at the RAW
         half-size resolution (capped at max_long_side — important for
@@ -1163,17 +1191,22 @@ class CCRImage:
         color-matched to the 1080 preview: the conversion is replayed from
         the snapshot captured at convert time (conversion_inputs), never
         from live editable state, so it always matches what the preview
-        shows. Returns the converted, PRE-adjustment uint16 array (or the
-        raw scan for un-converted images). Runs on a worker thread for the
-        zoom detail view; never touches resized_raw or any preview state.
+        shows. Runs on a worker thread for the zoom detail view; never
+        touches resized_raw or any preview state.
+
+        Returns `(base, sprocket_alpha)`: `base` is the converted, PRE-
+        adjustment uint16 array (or the raw scan for un-converted images, or
+        None when no color-matched replay is possible); `sprocket_alpha` is
+        the hi-res clear-film white-mask alpha for B/W-point conversions
+        (None otherwise). See spec/sprocket-hole-mask.md §4.2.
         """
         ci = conversion_inputs if conversion_inputs is not None else self.conversion_inputs
         if self.converted and ci is None:
-            return None  # converted through an unknown path — no replay possible
+            return None, None  # converted through an unknown path — no replay possible
         t0 = time.time()
         img = self.read_image(self.file_path, preview=True, max_long_side=max_long_side)
         if img is None:
-            return None
+            return None, None
         print(f"Hi-res decode: {time.time() - t0:.2f}s, shape {img.shape}")
         # Decide replay from the (snapshotted) conversion_inputs, NOT the live
         # self.converted flag: a positive-mode toggle can clear self.converted on
@@ -1181,11 +1214,13 @@ class CCRImage:
         # conversion its snapshot describes. ci is None for un-converted scans
         # (incl. positive mode) -> return the decoded image as-is.
         if not ci:
-            return img
+            return img, None
 
         from core.ccr_processor import (compute_reference_norm_params,
                                         apply_reference_normalization,
-                                        apply_bwpoint_normalization)
+                                        apply_bwpoint_normalization,
+                                        compute_sprocket_alpha)
+        sprocket_alpha = None
         t0 = time.time()
         if ci.get("mode") == "ref":
             ref_small = self.resize_image_to_max_pixel(img, 1080)
@@ -1206,10 +1241,13 @@ class CCRImage:
             out = apply_bwpoint_normalization(img, black_point, white_point,
                                               density=ci.get("density", False),
                                               slopes_bgr=ci.get("slopes"))
+            # Hi-res clear-film mask from the re-decoded raw (same threshold as
+            # the preview; morphology/feather scale with this resolution).
+            sprocket_alpha = compute_sprocket_alpha(img, black_point)
         else:
-            return None
+            return None, None
         print(f"Hi-res convert: {time.time() - t0:.2f}s")
-        return out
+        return out, sprocket_alpha
 
     # --- Undo support (Ctrl+Z) ---------------------------------------------
     UNDO_STACK_LIMIT = 50

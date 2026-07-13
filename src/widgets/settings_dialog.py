@@ -147,6 +147,20 @@ class SettingsDialog(QDialog):
             "colors — robust when large areas share one color."))
         lay.addWidget(grp_wb)
 
+        grp_border = QGroupBox("Film border")
+        gb = QVBoxLayout(grp_border)
+        gb.setSpacing(theme.GAP_ROW)
+        self._cb_sprocket = QCheckBox(
+            "White sprocket holes / clear film (reversal look)")
+        gb.addWidget(self._cb_sprocket)
+        gb.addWidget(self._muted(
+            "After you set a Black Point (film base), paint the sprocket holes "
+            "and clear film border white instead of black — the reversal-film "
+            "look. The mask is built from areas brighter than the film base, "
+            "cleaned up and feathered, and applied last on both preview and "
+            "export, so no adjustment tints it. B/W-point conversions only."))
+        lay.addWidget(grp_border)
+
         lay.addStretch(1)
         return page
 
@@ -296,7 +310,8 @@ class SettingsDialog(QDialog):
                         (self._cb_density, ccr_backend.density_bwpoint),
                         (self._cb_auto_gain, ccr_backend.auto_gain),
                         (self._cb_auto_awb, ccr_backend.auto_awb),
-                        (self._cb_gamma_lum, ccr_backend.gamma_luminance)):
+                        (self._cb_gamma_lum, ccr_backend.gamma_luminance),
+                        (self._cb_sprocket, ccr_backend.sprocket_mask_white)):
             cb.blockSignals(True)
             cb.setChecked(bool(val))
             cb.blockSignals(False)
@@ -335,6 +350,8 @@ class SettingsDialog(QDialog):
             self._mw.on_awb_algorithm_changed(staged_algo)
         if bool(self._cb_gamma_lum.isChecked()) != bool(ccr_backend.gamma_luminance):
             self._mw.on_gamma_mode_toggled(bool(self._cb_gamma_lum.isChecked()))
+        if bool(self._cb_sprocket.isChecked()) != bool(ccr_backend.sprocket_mask_white):
+            self._mw.on_sprocket_mask_toggled(bool(self._cb_sprocket.isChecked()))
 
     def accept(self):
         """Done: commit the staged toggles, then close. (Escape/close → reject,

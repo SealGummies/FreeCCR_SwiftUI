@@ -1857,6 +1857,9 @@ class ImagePreview(QWidget):
                 # spec/gamma-luminance-mode.md).
                 bool(getattr(ccr_backend, "gamma_luminance", False)),
                 bool(getattr(ccr_backend, "auto_gain", True)),
+                # Reversal-look sprocket mask is composited last in the hi-res
+                # tile — a toggle must invalidate it (spec/sprocket-hole-mask.md).
+                bool(getattr(ccr_backend, "sprocket_mask_white", False)),
                 areas_sig, dust_sig)
 
     HIRES_MAX_LONG_SIDE = 4500   # bounds non-RAW decodes (RAW half-size passes through)
@@ -1873,6 +1876,7 @@ class ImagePreview(QWidget):
         adj_sig = self._current_adj_sig()
         cache = self._hires
         base = None
+        sprocket_alpha = None
         if cache is not None and cache["img"] is img and cache["sig"] == sig:
             if cache.get("full_pm") is not None and cache.get("adj_sig") == adj_sig:
                 # Cache is current — just make sure it is displayed
@@ -1880,19 +1884,22 @@ class ImagePreview(QWidget):
                 self.apply_transformations()
                 return
             base = cache.get("base")  # re-adjust only; skip decode+convert
+            sprocket_alpha = cache.get("sprocket_alpha")  # reuse with the cached base
         # A matching render may already be in flight; its result is accepted
         # by current-state validation, so waiting for it is always safe.
         for w in self._hires_workers:
             if (w.isRunning() and w.req_img is img
                     and w.req_sig == sig and w.req_adj_sig == adj_sig):
                 return
-        worker = HiResDetailWorker(img, sig, adj_sig, base, self.HIRES_MAX_LONG_SIDE)
+        worker = HiResDetailWorker(img, sig, adj_sig, base,
+                                   self.HIRES_MAX_LONG_SIDE,
+                                   sprocket_alpha=sprocket_alpha)
         worker.finished_hires.connect(self._on_hires_ready)
         worker.finished.connect(lambda w=worker: self._hires_workers.discard(w))
         self._hires_workers.add(worker)
         worker.start()
 
-    def _on_hires_ready(self, img_obj, sig, adj_sig, base, display8):
+    def _on_hires_ready(self, img_obj, sig, adj_sig, base, sprocket_alpha, display8):
         # Accept by validating against CURRENT state (not a generation
         # counter): the result is useful iff the same image object is still
         # displayed, its conversion snapshot still matches, and we are still
@@ -1910,11 +1917,13 @@ class ImagePreview(QWidget):
             # Sliders moved while rendering: the decoded base is still valid,
             # the adjusted display is not — keep the base, re-render shortly.
             self._hires = {"img": img_obj, "sig": sig, "adj_sig": None,
-                           "base": base, "full_pm": None,
+                           "base": base, "sprocket_alpha": sprocket_alpha,
+                           "full_pm": None,
                            "display_pm": None, "crop_sig": None}
             self._hires_timer.start(150)
             return
         self._hires = {"img": img_obj, "sig": sig, "adj_sig": adj_sig, "base": base,
+                       "sprocket_alpha": sprocket_alpha,
                        "full_pm": QPixmap.fromImage(qimg),
                        "display_pm": None, "crop_sig": None}
         self._refresh_item_pixmap()
@@ -2847,7 +2856,10 @@ class ImagePreview(QWidget):
         from core import dust_detect
         raw = None
         try:
-            raw = img.render_hires_base(
+            # render_hires_base returns (base, sprocket_alpha); the detector wants
+            # the converted base only (the mask is a display overlay, irrelevant
+            # to dust detection).
+            raw, _ = img.render_hires_base(
                 max_long_side=dust_detect.DETECT_MAX_LONG)
         except Exception:
             raw = None   # decode/replay failed — the preview buffer still works
@@ -4496,16 +4508,19 @@ class HiResDetailWorker(QThread):
     construction time (on the GUI thread), so concurrent edits cannot bleed
     into the render."""
 
-    finished_hires = Signal(object, object, object, object, object)
-    # img_obj, sig, adj_sig, base (uint16 ndarray), display8 (uint8 ndarray)
+    finished_hires = Signal(object, object, object, object, object, object)
+    # img_obj, sig, adj_sig, base (uint16 ndarray), sprocket_alpha (uint8|None),
+    # display8 (uint8 ndarray)
 
-    def __init__(self, img_obj, sig, adj_sig, base=None, max_long_side=None, parent=None):
+    def __init__(self, img_obj, sig, adj_sig, base=None, max_long_side=None,
+                 sprocket_alpha=None, parent=None):
         super().__init__(parent)
         self._img = img_obj
         self.req_img = img_obj
         self.req_sig = sig
         self.req_adj_sig = adj_sig
         self._base = base
+        self._sprocket_alpha = sprocket_alpha
         self._cap = max_long_side
         # Snapshots taken on the GUI thread at request time:
         self._settings = dict(img_obj.adjustment_settings)
@@ -4520,6 +4535,9 @@ class HiResDetailWorker(QThread):
         # Captured at request time (thread-safe): positive mode skips the
         # negative display auto-brightness, like update_thumbnail_and_preview.
         self._positive_mode = ccr_backend.positive_mode
+        # Snapshot the reversal-look toggle so a mid-render flip can't bleed in
+        # (the flag is also in _current_adj_sig, so a flip invalidates the tile).
+        self._sprocket_white = bool(getattr(ccr_backend, "sprocket_mask_white", False))
         ci = getattr(img_obj, "conversion_inputs", None)
         self._conversion_inputs = dict(ci) if ci else None
 
@@ -4530,8 +4548,9 @@ class HiResDetailWorker(QThread):
             import numpy as _np
             t0 = _time.perf_counter()
             base = self._base
+            sprocket_alpha = self._sprocket_alpha
             if base is None:
-                base = self._img.render_hires_base(
+                base, sprocket_alpha = self._img.render_hires_base(
                     max_long_side=self._cap,
                     conversion_inputs=self._conversion_inputs)
             if base is None or self.isInterruptionRequested():
@@ -4549,6 +4568,11 @@ class HiResDetailWorker(QThread):
                 # display-only auto-brightness stretch for raw negatives
                 # (skipped in positive mode — the decode is already exposed).
                 display = self._img._auto_brightness_for_preview(display)
+            # Reversal-look sprocket mask — the LAST look step, matching the
+            # preview (spec/sprocket-hole-mask.md §4.2).
+            if self._sprocket_white and sprocket_alpha is not None:
+                from core.ccr_processor import apply_sprocket_mask
+                display = apply_sprocket_mask(display, sprocket_alpha)
             display8 = _np.ascontiguousarray(
                 _cv2.convertScaleAbs(display, alpha=255.0 / 65535.0))
             t2 = _time.perf_counter()
@@ -4558,7 +4582,8 @@ class HiResDetailWorker(QThread):
             if self.isInterruptionRequested():
                 return  # app is closing — receiver is being torn down
             self.finished_hires.emit(self.req_img, self.req_sig,
-                                     self.req_adj_sig, base, display8)
+                                     self.req_adj_sig, base, sprocket_alpha,
+                                     display8)
         except Exception as e:
             print(f"Hi-res detail render failed: {e}")
 

@@ -96,8 +96,8 @@ def test_hires_bw_replay_ignores_fine_rot(tmp_path):
               "fine_rot": 300, "density": False}
     ci_flat = {"mode": "bw", "bw": (BLACK_POINT, WHITE_POINT),
                "fine_rot": 0, "density": False}
-    out_rot = img.render_hires_base(max_long_side=256, conversion_inputs=ci_rot)
-    out_flat = img.render_hires_base(max_long_side=256, conversion_inputs=ci_flat)
+    out_rot, _ = img.render_hires_base(max_long_side=256, conversion_inputs=ci_rot)
+    out_flat, _ = img.render_hires_base(max_long_side=256, conversion_inputs=ci_flat)
     assert out_rot is not None
     assert np.array_equal(out_rot, out_flat)
 
