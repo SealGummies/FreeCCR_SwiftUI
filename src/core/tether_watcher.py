@@ -197,7 +197,11 @@ class TetherWatchWorker(QObject):
                     self._convert(img, black, white, slopes)
                 self.captured.emit(img)
         except Exception as e:
-            self.captureError.emit(path, str(e))
+            # Terse form: the GUI shows this inline in the hint strip, so a
+            # tethered capture FreeCCR cannot decode still says why.
+            from core.load_errors import describe_load_failure
+            self.captureError.emit(
+                path, describe_load_failure(path, e, short=True))
 
     @staticmethod
     def _convert(img, black, white, slopes=None):

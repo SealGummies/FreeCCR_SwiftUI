@@ -964,8 +964,22 @@ class MainWindow(QMainWindow):
         if err:
             ccr_backend.last_merge_error = None
             QMessageBox.warning(self, "3-way RGB merge", err)
+        # Files the loader had to drop (undecodable RAW, missing file, …).
+        # Without this they silently never appear — a built exe has no console
+        # to show the loader's print. Read once, then clear.
+        self._report_load_failures()
         # Offer to replace trichrome originals with linear TIFFs, if enabled.
         self._maybe_replace_merged_with_tiff()
+
+    def _report_load_failures(self):
+        """One grouped warning for every file the last load could not open."""
+        failures = getattr(ccr_backend, "last_load_errors", None)
+        if not failures:
+            return
+        ccr_backend.last_load_errors = []
+        from core.load_errors import format_load_failures
+        QMessageBox.warning(self, "Some files could not be loaded",
+                            format_load_failures(failures))
 
     # --- Replace trichrome originals with linear TIFFs -------------------- #
     def _maybe_replace_merged_with_tiff(self):
