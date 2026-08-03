@@ -58,6 +58,12 @@ class CCRBackend:
         # failure), set by the loader and surfaced by the UI after load, then
         # cleared. Reset at the top of every load so it never goes stale.
         self.last_merge_error: Optional[str] = None
+        # Files dropped by the last load, as [(path, reason)] — set by the
+        # loader and surfaced by the UI after load, then cleared. Without this a
+        # file that cannot be decoded (e.g. a Nikon HE NEF, which no
+        # open-source decoder reads) just vanished from the import with only a
+        # stdout print, invisible in a built exe. Reset at the top of every load.
+        self.last_load_errors: List[tuple] = []
         # Two-point B/W conversion mode: True recovers optical density (log
         # space), False uses the legacy linear transmittance stretch. The choice
         # is baked per image into conversion_inputs["density"]; this holds the
@@ -149,6 +155,7 @@ class CCRBackend:
         # Per-load merge error: reset up front so a prior load's message can't
         # carry over and be shown after this (possibly successful) one.
         self.last_merge_error = None
+        self.last_load_errors = []
         # Preserved removal states belong to the previous batch (the open
         # flows save the catalog before loading a new one)
         self._catalog_preserved = {}
@@ -176,6 +183,7 @@ class CCRBackend:
         # Read the catalog ONCE for the whole batch — per-file reads would
         # re-parse the entire JSON N times across the loader threads.
         from core.catalog import create_images_for_path, load_catalog
+        from core import load_errors
         try:
             catalog_data = load_catalog()
         except Exception:
@@ -195,6 +203,12 @@ class CCRBackend:
                 return path, imgs
             except Exception as e:
                 print(f"Failed to load {os.path.basename(path)}: {e}")
+                # Recorded so the UI can say WHY the file is missing from the
+                # import. list.append is atomic, so the worker threads can
+                # record without a lock; order is arbitrary and irrelevant
+                # (the summary groups by reason).
+                failures.append(
+                    (path, load_errors.describe_load_failure(path, e)))
                 return path, None
         
         # Use parallel loading with ThreadPoolExecutor
@@ -204,6 +218,11 @@ class CCRBackend:
         # Collect into a local list (both branches) and publish once at the
         # end — the backend lists must never hold a half-loaded batch.
         results = []
+        # Same for the per-file failures: publishing them only alongside a
+        # successful commit means a cancelled or superseded load reports
+        # nothing, and a stale thread can never pop a dialog over the batch
+        # that replaced it.
+        failures = []
         if max_workers == 1:
             # Sequential fallback
             for path in file_paths:
@@ -234,6 +253,7 @@ class CCRBackend:
         # clobber the newer batch.
         if not self._commit_load(gen, results, cancel_flag):
             return 0
+        self.last_load_errors = failures
         return loaded_file_count
 
     def _commit_load(self, gen, results, cancel_flag=None) -> bool:
@@ -340,8 +360,10 @@ class CCRBackend:
         # Marked FreeCCR merge TIFFs selected alongside the RAWs: load them as
         # normal images (with catalog restore) so a mixed import opens them
         # without toggling merge mode off. See spec/merge-linear-tiff-replace.md.
+        failures = []
         if passthrough_paths:
             from core.catalog import create_images_for_path
+            from core import load_errors
             for p in passthrough_paths:
                 if cancel_flag and cancel_flag():
                     break
@@ -352,6 +374,8 @@ class CCRBackend:
                     results.extend(imgs)
                 except Exception as e:
                     print(f"Failed to load merge TIFF {os.path.basename(p)}: {e}")
+                    failures.append(
+                        (p, load_errors.describe_load_failure(p, e)))
 
         # User cancelled mid-load: suppress any decode error a worker recorded
         # for the aborted import (the pool above has joined, so every write has
@@ -366,6 +390,7 @@ class CCRBackend:
         self._dedupe_display_names(results)
         if not self._commit_load(gen, results, cancel_flag):
             return 0
+        self.last_load_errors = failures
         return len(results)
 
     @staticmethod

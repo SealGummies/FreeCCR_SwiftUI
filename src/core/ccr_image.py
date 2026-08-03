@@ -148,6 +148,11 @@ class CCRImage:
         self.slice_parent: Optional[Dict[str, Any]] = slice_parent
         self.thumbnail = thumbnail
         self.resized_raw = resized_raw
+        # Underlying exception from the last failed decode, kept because
+        # read_image reports failure as None and would otherwise throw the
+        # cause away. The load path chains it onto the ValueError it raises so
+        # the loader can explain WHY a file was dropped (see core/load_errors).
+        self.last_read_error: Optional[BaseException] = None
         # Camera profile (ICC/DCP/none) this image's decode was graded under;
         # stamped on every working decode so the thumbnail can flag a mismatch
         # when the active profile changes. Not persisted (a reload re-stamps).
@@ -259,7 +264,12 @@ class CCRImage:
             # Populate thumbnail and preview
             self.update_thumbnail_and_preview()
         else:
-            raise ValueError(f"Could not read image from file: {self.file_path}")
+            # Chained, not swallowed: the loader classifies the ROOT cause (a
+            # LibRaw "unsupported format" vs a missing file) to tell the user
+            # why this file was dropped from the import.
+            raise ValueError(
+                f"Could not read image from file: {self.file_path}"
+            ) from self.last_read_error
         print(f"CCRImage initialized: {self.file_path}, info: {self.info}")
 
 
@@ -696,6 +706,9 @@ class CCRImage:
                 return self._apply_input_icc(rgb, as_shot_wb)
             except Exception as e:
                 logging.exception(f"Failed to read RAW image: {file_path}")
+                # Keep the LibRaw error itself — "unsupported compression" and
+                # "damaged file" are indistinguishable once it becomes None.
+                self.last_read_error = e
                 return None
         else:
             # Handle Unicode file paths and OpenCV TIFF issues properly
@@ -779,6 +792,8 @@ class CCRImage:
             
             if img is None:
                 logging.error(f"All reading methods failed for: {file_path}")
+                self.last_read_error = RuntimeError(
+                    "no decoder (OpenCV, tifffile, PIL) could read this file")
                 return None
             # Normalize the sample format FIRST (cvtColor can't take
             # float64/int16 input, and float 0..1 data used to slip through
