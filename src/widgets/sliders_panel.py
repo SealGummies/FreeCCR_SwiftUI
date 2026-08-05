@@ -21,9 +21,9 @@ from datetime import date
 # DEFAULT_DENSITY_SLOPE (no preset). See spec/film-stock-slopes.md.
 FILM_STOCK_DEFAULT_LABEL = "Default"
 
-# Setting groups offered by the "Sync to All" dialog. The adjustment-key
-# groups partition SlidersPanel.ADJUSTMENT_KEYS exactly; "crop" syncs the
-# image's crop box (rect + angle) instead of adjustment keys.
+# Setting groups offered by the "Sync to All" and "Copy Settings" dialogs. The
+# adjustment-key groups partition SlidersPanel.ADJUSTMENT_KEYS exactly; "crop"
+# syncs the image's crop box (rect + angle) instead of adjustment keys.
 SYNC_GROUPS = [
     ("profile", "Color Profile (Color / B&W)", ()),
     ("wb", "White Balance / Tint", ("temperature", "tint")),
@@ -49,15 +49,21 @@ SYNC_GROUPS = [
 
 
 class SyncSettingsDialog(QDialog):
-    """Pick which setting groups 'Sync to All' copies to every image."""
+    """Pick which setting groups an apply-to-many action covers.
 
-    def __init__(self, parent=None, selection=None):
+    Used by both 'Sync to All' (its defaults) and Ctrl/Cmd+C's 'Copy
+    Settings' — same layout and group list, only the wording differs, so the
+    two share one visual language for "choose what to apply"."""
+
+    def __init__(self, parent=None, selection=None, title="Sync to All",
+                 prompt="Sync these settings to all images:",
+                 action_label="Sync"):
         super().__init__(parent)
-        self.setWindowTitle("Sync to All")
+        self.setWindowTitle(title)
         self.setMinimumWidth(theme.DIALOG_W_SM)
         layout = QVBoxLayout(self)
         theme.apply_panel_spacing(layout)
-        layout.addWidget(QLabel("Sync these settings to all images:"))
+        layout.addWidget(QLabel(prompt))
 
         self._checkboxes = {}
         for gid, label, _keys in SYNC_GROUPS:
@@ -84,7 +90,7 @@ class SyncSettingsDialog(QDialog):
         layout.addWidget(theme.section_separator())
 
         button_row = theme.apply_button_row(QHBoxLayout())
-        sync_btn = QPushButton("Sync")
+        sync_btn = QPushButton(action_label)
         cancel_btn = QPushButton("Cancel")
         theme.style_button(sync_btn, "primary", default=True)
         theme.style_button(cancel_btn, "secondary")
@@ -296,7 +302,15 @@ class SlidersPanel(QWidget):
         self._layers_sig = None  # cheap signature to avoid needless rebuilds
         self.adjustment_keys = list(self.ADJUSTMENT_KEYS)
         self._sync_group_selection = None  # remembered while the app is open
-        self.copied_adjustment = None  # Store copied adjustment settings
+        self._copy_group_selection = None  # Ctrl+C's own remembered choice
+        # Ctrl+C clipboard — a PARTIAL adjustment dict (only the copied
+        # groups' keys) plus the whole-image groups that live outside it.
+        # paste_adjustment_settings is the only consumer. See
+        # spec/copy-settings-dialog.md.
+        self.copied_adjustment = None
+        self.copied_selection = None   # {gid: bool} used for this clipboard
+        self.copied_profile = None     # "color"/"bw" when the profile group was copied
+        self.copied_crop = None        # (crop_rect, crop_angle) when crop was copied
         self._hint_timer = QTimer(self)  # Timer for temporary hints
         self._hint_timer.setSingleShot(True)
         
@@ -1852,62 +1866,145 @@ class SlidersPanel(QWidget):
         ccr_backend.save_catalog()
         self.set_temporary_hint("B/W Point conversion complete!", duration=3000)
 
+    @staticmethod
+    def _group_count_phrase(verb: str, selection: dict) -> str:
+        """'Copied all settings.' / 'Pasted 2 of 8 setting groups.' — the
+        group LABELS are too long to list, so report the count."""
+        n = sum(1 for gid, _l, _k in SYNC_GROUPS if selection.get(gid))
+        total = len(SYNC_GROUPS)
+        if n == total:
+            return f"{verb} all settings."
+        return f"{verb} {n} of {total} setting group{'' if n == 1 else 's'}."
+
     def copy_adjustment_settings(self):
         """
-        Copy the current adjustment settings to clipboard.
+        Copy the current image's settings to the in-panel clipboard. A dialog
+        picks which setting groups to copy (the same groups Sync to All
+        offers); the choice is remembered while the app is open.
         """
-        if self.current_idx is not None:
-            # Get the current adjustment settings from sliders
-            self.copied_adjustment = {key: slider.value() for key, slider in zip(self.adjustment_keys, self.sliders)}
-            self._attach_curves(self.copied_adjustment)
-            self._attach_cineon(self.copied_adjustment)
-            print(f"Copied adjustment settings: {self.copied_adjustment}")
-            self.set_temporary_hint("Adjustments Copied!", duration=4000)
-        else:
+        if self.current_idx is None:
             print("No image selected to copy adjustment settings from.")
             self.set_temporary_hint("No image selected to copy from", duration=4000)
+            return
+
+        dialog = SyncSettingsDialog(
+            self, self._copy_group_selection, title="Copy Settings",
+            prompt="Copy these settings:", action_label="Copy")
+        if dialog.exec_() != QDialog.Accepted:
+            return  # cancelled — leave any previously copied settings alone
+        selection = dialog.selection()
+        self._copy_group_selection = selection
+        if not any(selection.values()):
+            self.set_temporary_hint("Nothing selected to copy.", duration=3000)
+            return
+
+        keys = [k for gid, _label, group_keys in SYNC_GROUPS
+                if selection.get(gid) for k in group_keys]
+        # Adjustment keys and curves come from the LIVE UI, i.e. the active
+        # layer (global or area) — that keeps area→area copying useful. The
+        # whole-image groups below have no per-area meaning, so they're read
+        # off the image itself.
+        live = {key: slider.value()
+                for key, slider in zip(self.adjustment_keys, self.sliders)}
+        self._attach_curves(live)
+        self._attach_cineon(live)
+        self.copied_adjustment = {k: live[k] for k in keys if k in live}
+        if selection.get("curves") and live.get("curves"):
+            self.copied_adjustment["curves"] = copy.deepcopy(live["curves"])
+
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        self.copied_profile = (getattr(img, "color_profile", "color")
+                               if selection.get("profile") and img is not None else None)
+        self.copied_crop = ((img.crop_rect, getattr(img, "crop_angle", 0.0))
+                            if selection.get("crop") and img is not None else None)
+        self.copied_selection = selection
+        print(f"Copied groups {sorted(g for g, on in selection.items() if on)}: "
+              f"{self.copied_adjustment}")
+        self.set_temporary_hint(
+            self._group_count_phrase("Copied", selection), duration=4000)
 
     def paste_adjustment_settings(self):
         """
-        Paste the copied adjustment settings to the current image.
+        Apply the copied setting groups to the current image, leaving every
+        setting that was NOT copied untouched.
         """
-        if self.current_idx is not None and self.copied_adjustment is not None:
-            print(f"Pasting adjustment settings: {self.copied_adjustment}")
-            self.end_undo_burst()
-            img = ccr_backend.get_image_by_index(self.current_idx)
-            if img is not None:
-                img.push_undo_state()
-
-            # Apply the copied settings to the current sliders
-            for i, key in enumerate(self.adjustment_keys):
-                if key in self.copied_adjustment and i < len(self.sliders):
-                    self.sliders[i].blockSignals(True)
-                    self.sliders[i].setValue(self.copied_adjustment[key])
-                    self.sliders[i].blockSignals(False)
-                    self.slider_value_labels[i].setText(str(self.copied_adjustment[key]))
-            # Mirror the pasted tone curves into the editor (set_curves does not
-            # emit, so it won't re-trigger a save).
-            self.curve_editor.set_curves(self.copied_adjustment.get("curves"))
-
-            # Save the adjustment to the ACTIVE layer and update preview. Copy
-            # the dict so the clipboard isn't aliased by the image's settings.
-            pasted = copy.deepcopy(self.copied_adjustment)
-            img = ccr_backend.get_image_by_index(self.current_idx)
-            if img is not None and img.active_area_id is not None:
-                # The Cineon display conversion is whole-image only — never
-                # paste it into an area layer's dict.
-                pasted.pop("cineon_log", None)
-            ccr_backend.set_active_settings_by_index(
-                self.current_idx, pasted, reprocess=True)
-            self.parent().parent().image_preview.update_preview(self.current_idx)
-            self.set_temporary_hint("Adjustments Pasted!", duration=2000)
-            
-        elif self.copied_adjustment is None:
-            print("No adjustment settings to paste. Copy settings first with Cmd+C (or Ctrl+C).")
-            self.set_temporary_hint("No adjustments to paste. Copy first with Cmd+C", duration=3000)
-        else:
+        if self.copied_selection is None:
+            print("No settings to paste. Copy settings first with Cmd+C (or Ctrl+C).")
+            self.set_temporary_hint("No settings to paste. Copy first with Cmd+C", duration=3000)
+            return
+        if self.current_idx is None:
             print("No image selected to paste adjustment settings to.")
             self.set_temporary_hint("No image selected to paste to", duration=2000)
+            return
+
+        selection = self.copied_selection
+        print(f"Pasting groups {sorted(g for g, on in selection.items() if on)}: "
+              f"{self.copied_adjustment}")
+        self.end_undo_burst()
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is not None:
+            img.push_undo_state()
+
+        # Build a COMPLETE dict from the TARGET's active layer (missing keys
+        # filled with their defaults) and overwrite only the copied keys, so
+        # un-copied settings survive and the app-wide "a non-empty adjustment
+        # dict carries every key" invariant holds. Same shape as
+        # _perform_sync_to_all's merge.
+        target = self._read_active_settings(self.current_idx)
+        merged = {k: target.get(k, self._default_for(k)) for k in self.adjustment_keys}
+        for k, v in self.copied_adjustment.items():
+            if k in merged:
+                merged[k] = v
+        # Curves and the Cineon flag live outside adjustment_keys: follow the
+        # clipboard when their group was copied, else carry the target's own
+        # value across the slider-only rebuild.
+        if selection.get("curves"):
+            src_curves = self.copied_adjustment.get("curves")
+            if src_curves:
+                merged["curves"] = copy.deepcopy(src_curves)
+        elif target.get("curves") is not None:
+            merged["curves"] = target["curves"]
+        if selection.get("channels"):
+            if self.copied_adjustment.get("cineon_log"):
+                merged["cineon_log"] = True
+        elif target.get("cineon_log"):
+            merged["cineon_log"] = True
+        if img is not None and img.active_area_id is not None:
+            # The Cineon display conversion is whole-image only — never
+            # paste it into an area layer's dict.
+            merged.pop("cineon_log", None)
+
+        # Mirror the result into the UI (from the MERGE, not the clipboard, so
+        # un-copied sliders keep showing the target's values).
+        for i, key in enumerate(self.adjustment_keys):
+            if i < len(self.sliders):
+                self.sliders[i].blockSignals(True)
+                self.sliders[i].setValue(merged[key])
+                self.sliders[i].blockSignals(False)
+                self.slider_value_labels[i].setText(str(merged[key]))
+        # set_curves does not emit, so it won't re-trigger a save.
+        self.curve_editor.set_curves(merged.get("curves"))
+
+        if img is not None:
+            if selection.get("profile") and self.copied_profile is not None:
+                img.color_profile = self.copied_profile
+                self._sync_color_profile_combo(self.current_idx)
+            if selection.get("crop") and self.copied_crop is not None:
+                # A copied "no crop" is a real value — pasting it clears the
+                # target's crop. The reprocess below refreshes the crop-aware
+                # histogram.
+                img.crop_rect, img.crop_angle = self.copied_crop
+
+        ccr_backend.set_active_settings_by_index(
+            self.current_idx, merged, reprocess=True)
+        mw = self.parent().parent()
+        try:
+            mw.thumbnail_list.update_thumbnail(self.current_idx)
+        except AttributeError:
+            pass
+        mw.image_preview.update_preview(self.current_idx)
+        self.set_temporary_hint(
+            self._group_count_phrase("Pasted", selection), duration=2000)
 
     # --- Dynamic Hint Management Methods ---
     def set_hint(self, message, temporary=False, duration=3000):
