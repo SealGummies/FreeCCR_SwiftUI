@@ -44,8 +44,10 @@ public struct BandAdjustment: Sendable, Equatable {
     public init() {}
 }
 
-/// Mirrors sliders_panel.py's `ADJUSTMENT_KEYS` (minus curve keys — a later
-/// milestone). Field names match the Python dict keys
+/// Mirrors sliders_panel.py's `ADJUSTMENT_KEYS` plus `curves` (from
+/// `CurveEditor.get_curves()` — see `ccr_image.apply_adjustments`'s
+/// `s.get('curves')`, the SAME `adjustment_settings` dict as everything
+/// else). Field names match the Python dict keys
 /// `core.ccr_backend.set_adjustment_by_index` expects, via `asPythonDict`.
 public struct AdjustmentParams: Sendable, Equatable {
     public var temperature: Double = 0
@@ -89,6 +91,15 @@ public struct AdjustmentParams: Sendable, Equatable {
     /// non-zero default among every field in this struct.
     public var bandFeather: Double = 10
 
+    /// `CurveEditor.get_curves()`'s result — see `curve_editor.py`'s
+    /// `CURVE_CHANNELS`/`identity_curves()`. Unlike the Qt app (which omits
+    /// the `curves` key entirely when every channel is identity, via
+    /// `get_curves()` returning `None`), this always sends all 4 channels;
+    /// `ccr_processor.apply_curves`'s own `_is_identity_curves` guard makes
+    /// that a no-op, so there's no behavioral difference, just a slightly
+    /// less minimal dict.
+    public var curves = CurveSet()
+
     public init() {}
 
     fileprivate var asPythonDict: PythonObject {
@@ -118,6 +129,12 @@ public struct AdjustmentParams: Sendable, Equatable {
         if cineonLog {
             dict[PythonObject("cineon_log")] = PythonObject(true)
         }
+        let curvesDict = Python.dict()
+        for channel in CurveChannel.allCases {
+            let points = curves[channel].map { PythonObject([PythonObject($0.x), PythonObject($0.y)]) }
+            curvesDict[PythonObject(channel.rawValue)] = PythonObject(points)
+        }
+        dict[PythonObject("curves")] = curvesDict
         return dict
     }
 }

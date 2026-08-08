@@ -115,6 +115,11 @@ struct SlidersPanel: View {
                     adjustmentSlider("Subtracted Sat", $state.params.subSaturation)
                 }
 
+                DisclosureGroup("Curves") {
+                    CurveEditorControl(curves: $state.params.curves)
+                        .padding(.top, 8)
+                }
+
                 DisclosureGroup("Subtractive Saturations") {
                     BandSaturationsSection(state: state)
                         .padding(.top, 8)

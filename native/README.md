@@ -1,4 +1,4 @@
-# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom, M3: full sliders incl. Subtractive Saturations)
+# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom, M3: full sliders, M4: curves)
 
 A real, runnable SwiftUI app (not a CLI PoC like `swiftui_poc/`) demonstrating
 the architecture's interactive loop: a Metal preview canvas plus a sliders
@@ -8,11 +8,11 @@ call chain through an embedded CPython via PythonKit — the same
 path `sliders_panel.py` drives, not a hand-rolled reimplementation.
 
 This covers milestones **M1** (real image loading), **M2** (pan/zoom + the
-coordinate-transform stack), and **M3** (the full `sliders_panel.py` control
-set, including the per-color-band "Subtractive Saturations" sliders) of the
-Phase 3 plan (`/Users/seal/.claude/plans/unified-foraging-candy.md`). Curve
-editing, thumbnails, dust removal, and the rest are later milestones (M4–M8)
-in that plan.
+coordinate-transform stack), **M3** (the full `sliders_panel.py` control set,
+including per-color-band "Subtractive Saturations" sliders), and **M4**
+(curve editing) of the Phase 3 plan
+(`/Users/seal/.claude/plans/unified-foraging-candy.md`). Thumbnails, dust
+removal, and the rest are later milestones (M5–M8) in that plan.
 
 ## Layout
 
@@ -39,7 +39,15 @@ in that plan.
     None)` — it reads off the whole dict, there's no separate call).
     `ColorProfile` is the one exception: it's separate because
     `CCRImage.color_profile` is its own attribute, not an
-    `adjustment_settings` key.
+    `adjustment_settings` key. `curves: CurveSet` (M4) rides the same dict
+    too, under the `curves` key.
+  - `CurveMath.swift`: `CurvePoint`/`CurveChannel`/`CurveSet` plus
+    `monotoneCubic` — a line-for-line port of `curve_editor.py`'s
+    `_monotone_cubic` (Fritsch-Carlson monotone cubic Hermite
+    interpolation), verified byte-for-byte against the actual Python
+    implementation's output (see `monotoneCubicMatchesThePythonReferenceImplementation`).
+    Lives in `PythonBridge`, not `FreeCCRNative`, since `AdjustmentParams`
+    needs these types too (same reasoning as `ColorBand`/`BandAdjustment`).
 - `Sources/FreeCCRNative/` — the SwiftUI app:
   - `CanvasTransform.swift`: the screen ↔ canvas ↔ image-normalized
     coordinate stack (the Swift analog of `image_preview.py`'s
@@ -56,6 +64,13 @@ in that plan.
     API for these on macOS, so they're plain AppKit overrides), `Shaders.metal`
     (draws the preview texture into whatever quad `CanvasTransform` computes,
     not a fixed full-viewport quad anymore).
+  - `CurveEditorView.swift`: `CurveEditorControl` (channel buttons + canvas +
+    Reset, mirrors `CurveEditor(QWidget)`) and `CurveCanvasNSView`, a plain
+    `NSView` (not Metal — this is 2D vector drawing, Core Graphics is the
+    right tool) that is a line-for-line port of `CurveCanvas(QWidget)`: same
+    hit-test constants, same click-on-line-inserts-a-point /
+    click-on-point-grabs-it / right-click-deletes-an-interior-point / drag
+    rules (endpoints X-locked, interior points clamped between neighbors).
   - `ContentView` (toolbar + canvas + sliders split view), `PreviewState`
     (the Phase-2-flavored `ObservableObject` standing in for `ccr_backend`'s
     role in the Qt app — holds the loaded image's `ImageHandle` and the live
@@ -90,7 +105,11 @@ Levels" section (Input/Master/R/G/B gain-shift-blackpoint controls), a
 Cineon Log → Rec.709 toggle, and a Reset All button. Every slider shows a
 small reset arrow next to its value when it's off its default — the SwiftUI
 stand-in for `ResettableSlider`'s double-click-to-reset, since a real
-double-click on a ~20pt slider track isn't a reliable target.
+double-click on a ~20pt slider track isn't a reliable target. There's also a
+collapsible **Curves** section: All/R/G/B channel buttons, a draggable tone
+curve (click the line to add a point, drag a point to reshape, right-click
+an interior point to delete it — the endpoints can't be deleted or moved off
+x=0/x=255), and a Reset Curve button.
 
 - On launch the canvas shows a synthetic coordinate-gradient test frame (no
   file loaded yet) — dragging sliders adjusts it via
@@ -128,6 +147,13 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
   negatives and re-normalizes to the same result regardless of the band
   push. Real finding, wrong test fixture; switched to a gradient.
 - `bandFeatherDefaultsToTen`: matches `SLIDER_DEFAULTS["band_feather"]`.
+- `nonIdentityCurveChangesTheOutput`: a real curve visibly changes
+  `adjust_image`'s result (this one used a gradient fixture from the start —
+  learned that lesson from the band-adjustment test above).
+- `monotoneCubicMatchesThePythonReferenceImplementation`: the Swift port's
+  output matches `curve_editor.py`'s actual `_monotone_cubic`, run on the
+  same inputs, to within `1e-9`.
+- `curveSetDefaultsToIdentity`: sanity check on `CurveSet`'s default state.
 - `CanvasTransform`'s pure-math tests (`fitScaleFillsTheSmallerDimension`,
   `zoomAnchoredAtCenterKeepsImageCentered`,
   `zoomAnchoredAtArbitraryPointStaysUnderTheAnchor`, `zoomClampsToMinAndMax`,
@@ -136,10 +162,6 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
 
 ## Known rough edges (expected at this stage)
 
-- **Curves are not in this milestone** — needs a Swift reimplementation of
-  the Fritsch-Carlson monotone-cubic interpolation to match
-  `ccr_processor.apply_curves`'s math, plus a draggable-control-point canvas.
-  That's M4.
 - Pan/zoom (M2) has no keyboard shortcuts and no on-canvas overlays yet
   (crop box, area layers, dust brush — later milestones that build on
   `CanvasTransform`).
