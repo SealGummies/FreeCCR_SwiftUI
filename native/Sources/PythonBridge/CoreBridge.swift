@@ -12,10 +12,41 @@
 import Foundation
 import PythonKit
 
-/// Mirrors sliders_panel.py's `ADJUSTMENT_KEYS` (minus the per-color-band and
-/// curve keys — those are later milestones). Field names match the Python
-/// dict keys `core.ccr_backend.set_adjustment_by_index` expects, via
-/// `pythonKey`.
+/// Mirrors `core.ccr_processor.COLOR_BANDS`. Order matches
+/// `BAND_ADJUSTMENT_KEYS`'s outer loop (not that order matters here — dict
+/// keys, not positional args).
+public enum ColorBand: String, CaseIterable, Sendable {
+    case red, skin, yellow, green, cyan, blue, purple
+
+    /// `theme.BAND_COLORS`' swatch colors, so the picker matches the Qt app.
+    public var swatchHex: String {
+        switch self {
+        case .red: return "#c0392b"
+        case .skin: return "#d8956b"
+        case .yellow: return "#c8b900"
+        case .green: return "#27ae60"
+        case .cyan: return "#17a8b4"
+        case .blue: return "#2f6fd0"
+        case .purple: return "#8e44ad"
+        }
+    }
+}
+
+/// One color band's 4 sliders — mirrors `core.ccr_processor.BAND_PARAMS`
+/// ("subsat", "sat", "bright", "hue"), sliders_panel.py's labels ("Sub Sat",
+/// "Sat", "Brightness", "Hue").
+public struct BandAdjustment: Sendable, Equatable {
+    public var subSat: Double = 0
+    public var sat: Double = 0
+    public var brightness: Double = 0
+    public var hue: Double = 0
+
+    public init() {}
+}
+
+/// Mirrors sliders_panel.py's `ADJUSTMENT_KEYS` (minus curve keys — a later
+/// milestone). Field names match the Python dict keys
+/// `core.ccr_backend.set_adjustment_by_index` expects, via `asPythonDict`.
 public struct AdjustmentParams: Sendable, Equatable {
     public var temperature: Double = 0
     public var tint: Double = 0
@@ -47,6 +78,17 @@ public struct AdjustmentParams: Sendable, Equatable {
     /// separate `CCRImage.color_profile` attribute entirely.
     public var cineonLog: Bool = false
 
+    /// Subtractive Saturations: per-color-band correction. Empty/missing
+    /// bands are equivalent to all-zero (`BandAdjustment()`) — matches
+    /// `ccr_image.apply_adjustments`'s `s.get(k, 0)` default. Rides the SAME
+    /// `adjustment_settings` dict as everything else above (see
+    /// `apply_adjustments`'s `band_settings=(s if any(...) else None)`) —
+    /// there is no separate call for this, unlike `colorProfile`.
+    public var bands: [ColorBand: BandAdjustment] = [:]
+    /// `SLIDER_DEFAULTS["band_feather"] = 10` in sliders_panel.py — the only
+    /// non-zero default among every field in this struct.
+    public var bandFeather: Double = 10
+
     public init() {}
 
     fileprivate var asPythonDict: PythonObject {
@@ -60,10 +102,18 @@ public struct AdjustmentParams: Sendable, Equatable {
             ("ch_r_shift", chRShift), ("ch_r_gain", chRGain), ("ch_r_blackpoint", chRBlackpoint),
             ("ch_g_shift", chGShift), ("ch_g_gain", chGGain), ("ch_g_blackpoint", chGBlackpoint),
             ("ch_b_shift", chBShift), ("ch_b_gain", chBGain), ("ch_b_blackpoint", chBBlackpoint),
+            ("band_feather", bandFeather),
         ]
         let dict = Python.dict()
         for (key, value) in pairs {
             dict[PythonObject(key)] = PythonObject(value)
+        }
+        for band in ColorBand.allCases {
+            let adj = bands[band] ?? BandAdjustment()
+            dict[PythonObject("band_\(band.rawValue)_subsat")] = PythonObject(adj.subSat)
+            dict[PythonObject("band_\(band.rawValue)_sat")] = PythonObject(adj.sat)
+            dict[PythonObject("band_\(band.rawValue)_bright")] = PythonObject(adj.brightness)
+            dict[PythonObject("band_\(band.rawValue)_hue")] = PythonObject(adj.hue)
         }
         if cineonLog {
             dict[PythonObject("cineon_log")] = PythonObject(true)

@@ -115,6 +115,11 @@ struct SlidersPanel: View {
                     adjustmentSlider("Subtracted Sat", $state.params.subSaturation)
                 }
 
+                DisclosureGroup("Subtractive Saturations") {
+                    BandSaturationsSection(state: state)
+                        .padding(.top, 8)
+                }
+
                 DisclosureGroup("Channel Levels") {
                     VStack(alignment: .leading, spacing: 16) {
                         adjustmentSlider("Input Gain", $state.params.chInputGain)
@@ -178,6 +183,22 @@ struct SlidersPanel: View {
 
     private func adjustmentSlider(_ label: String, _ value: Binding<Double>,
                                    range: ClosedRange<Double> = -100...100) -> some View {
+        AdjustmentSliderRow(label: label, value: value, range: range)
+    }
+}
+
+/// One labeled slider row, shared by `SlidersPanel` and
+/// `BandSaturationsSection` — value readout, a reset-to-default arrow when
+/// off `defaultValue` (SwiftUI stand-in for `ResettableSlider`'s
+/// double-click-to-reset, unreliable to hit on a ~20pt slider track), and
+/// the slider itself.
+struct AdjustmentSliderRow: View {
+    let label: String
+    let value: Binding<Double>
+    var range: ClosedRange<Double> = -100...100
+    var defaultValue: Double = 0
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(label)
@@ -185,12 +206,9 @@ struct SlidersPanel: View {
                 Text(String(format: "%.0f", value.wrappedValue))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
-                // Stand-in for ResettableSlider's double-click-to-reset (a
-                // real double-click on a ~20pt-tall SwiftUI Slider is not a
-                // reliable target) — same effect via an explicit button.
-                if value.wrappedValue != 0 {
+                if value.wrappedValue != defaultValue {
                     Button {
-                        value.wrappedValue = 0
+                        value.wrappedValue = defaultValue
                     } label: {
                         Image(systemName: "arrow.uturn.backward.circle")
                     }
@@ -200,5 +218,72 @@ struct SlidersPanel: View {
             }
             Slider(value: value, in: range)
         }
+    }
+}
+
+/// Analog of sliders_panel.py's "Subtractive Saturations" section: a swatch
+/// button per `ColorBand` selects which band's 4 sliders (Sub Sat, Sat,
+/// Brightness, Hue) are shown — all 7 bands' values exist and feed
+/// `AdjustmentParams.bands` regardless of which page is visible, mirroring
+/// the Qt app's "_band_pages stay populated, only visibility toggles"
+/// design. The Feather slider is global (not per-band), created last to
+/// match `ADJUSTMENT_KEYS`' trailing `band_feather`.
+struct BandSaturationsSection: View {
+    @ObservedObject var state: PreviewState
+    @State private var selectedBand: ColorBand = .red
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 6) {
+                ForEach(ColorBand.allCases, id: \.self) { band in
+                    swatch(for: band)
+                }
+                Spacer()
+            }
+
+            AdjustmentSliderRow(label: "Sub Sat", value: binding(\.subSat))
+            AdjustmentSliderRow(label: "Sat", value: binding(\.sat))
+            AdjustmentSliderRow(label: "Brightness", value: binding(\.brightness))
+            AdjustmentSliderRow(label: "Hue", value: binding(\.hue))
+
+            AdjustmentSliderRow(
+                label: "Feather", value: $state.params.bandFeather,
+                range: 0...100, defaultValue: 10)
+        }
+    }
+
+    private func swatch(for band: ColorBand) -> some View {
+        Circle()
+            .fill(Color(hex: band.swatchHex))
+            .frame(width: 22, height: 22)
+            .overlay(
+                Circle().stroke(Color.accentColor, lineWidth: selectedBand == band ? 2 : 0)
+            )
+            .help(band.rawValue.capitalized)
+            .onTapGesture { selectedBand = band }
+    }
+
+    private func binding(_ keyPath: WritableKeyPath<BandAdjustment, Double>) -> Binding<Double> {
+        Binding(
+            get: { state.params.bands[selectedBand, default: BandAdjustment()][keyPath: keyPath] },
+            set: { newValue in
+                var adjustment = state.params.bands[selectedBand, default: BandAdjustment()]
+                adjustment[keyPath: keyPath] = newValue
+                state.params.bands[selectedBand] = adjustment
+            })
+    }
+}
+
+extension Color {
+    /// Parses a `"#rrggbb"` string — `theme.BAND_COLORS`' format exactly, so
+    /// the swatch picker matches the Qt app's colors.
+    init(hex: String) {
+        var value: UInt64 = 0
+        Scanner(string: hex.trimmingCharacters(in: CharacterSet(charactersIn: "#")))
+            .scanHexInt64(&value)
+        let r = Double((value >> 16) & 0xFF) / 255
+        let g = Double((value >> 8) & 0xFF) / 255
+        let b = Double(value & 0xFF) / 255
+        self.init(red: r, green: g, blue: b)
     }
 }

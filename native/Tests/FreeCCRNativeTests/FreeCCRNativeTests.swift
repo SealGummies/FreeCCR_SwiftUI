@@ -29,6 +29,47 @@ import UniformTypeIdentifiers
     }
 }
 
+/// M3 (Subtractive Saturations) regression: a big band_red_bright push on a
+/// red-dominant test image must visibly change the result — proves
+/// AdjustmentParams.bands actually reaches ccr_processor's band_settings
+/// (routed through the SAME adjustment_settings dict as every other slider,
+/// gated by ccr_image.apply_adjustments' `any(s.get(k, 0) for k in
+/// BAND_ADJUSTMENT_KEYS)`), not silently dropped.
+///
+/// Deliberately a GRADIENT (makeTestPNG), not a solid color: a flat
+/// single-color image round-trips through
+/// update_thumbnail_and_preview's un-converted-negative auto-brightness
+/// stretch (a legitimate feature — see ccr_image.py's
+/// `_auto_brightness_for_preview`) and comes out bit-identical regardless of
+/// the band push, since a percentile-based stretch on a perfectly uniform
+/// image just re-normalizes to the same result either way. Hit this for
+/// real while writing this test; false failure, not a product bug.
+@Test func bandAdjustmentChangesTheMatchingColor() async throws {
+    let testPNGPath = NSTemporaryDirectory() + "freeccr_native_test_scan_red.png"
+    try makeTestPNG(at: testPNGPath, width: 64, height: 48)
+    let handle = await PythonCoreBridge.shared.loadImage(path: testPNGPath)
+    #expect(handle != nil)
+
+    let baseline = await PythonCoreBridge.shared.adjustedPreview(
+        handle: handle, params: AdjustmentParams())
+    #expect(baseline != nil)
+
+    var redBand = BandAdjustment()
+    redBand.brightness = 80
+    var banded = AdjustmentParams()
+    banded.bands[.red] = redBand
+    let bandedImage = await PythonCoreBridge.shared.adjustedPreview(handle: handle, params: banded)
+    #expect(bandedImage != nil)
+
+    guard let baseline, let bandedImage else { return }
+    #expect(baseline.data != bandedImage.data,
+            "a strong band_red_bright push should visibly change a red-dominant image")
+}
+
+@Test func bandFeatherDefaultsToTen() {
+    #expect(AdjustmentParams().bandFeather == 10)
+}
+
 /// M3 regression: colorProfile is a separate CCRImage attribute, not an
 /// adjustment_settings key (see CoreBridge.swift's doc comment on
 /// ColorProfile) — verify it actually reaches core.ccr_image._to_grayscale
@@ -160,6 +201,10 @@ private func makeTestPNG(at path: String, width: Int, height: Int) throws {
         }
     }
     guard let cgImage = context.makeImage() else { throw TestFixtureError.imageCreationFailed }
+    try writePNG(cgImage, to: path)
+}
+
+private func writePNG(_ cgImage: CGImage, to path: String) throws {
     guard let destination = CGImageDestinationCreateWithURL(
         URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil) else {
         throw TestFixtureError.destinationCreationFailed
