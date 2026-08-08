@@ -1,4 +1,4 @@
-# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom + hi-res-on-zoom, M3: full sliders, M4: curves, M5: thumbnail list, M6: manual dust removal)
+# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom + hi-res-on-zoom, M3: full sliders, M4: curves, M5: thumbnail list, M6: manual dust removal, M7: histogram + crop presets)
 
 A real, runnable SwiftUI app (not a CLI PoC like `swiftui_poc/`) demonstrating
 the architecture's interactive loop: a Metal preview canvas plus a sliders
@@ -10,11 +10,12 @@ path `sliders_panel.py` drives, not a hand-rolled reimplementation.
 This covers milestones **M1** (real image loading), **M2** (pan/zoom + the
 coordinate-transform stack), **M3** (the full `sliders_panel.py` control set,
 including per-color-band "Subtractive Saturations" sliders), **M4** (curve
-editing), **M5** (the thumbnail list, multi-image support), and **M6**
-(manual-brush dust removal) of the Phase 3 plan
+editing), **M5** (the thumbnail list, multi-image support), **M6**
+(manual-brush dust removal), and the first slice of **M7** — a live RGB
+histogram and preset-based, non-destructive crop — of the Phase 3 plan
 (`/Users/seal/.claude/plans/unified-foraging-candy.md`). AI dust detection
-and the remaining panels are later milestones (M6's AI section, M7–M8) in
-that plan.
+and the rest of M7's minor panels (export/settings/field-correction/IT8
+profiling/scopes/tether) are still ahead (see "Known rough edges").
 
 ## Layout
 
@@ -173,7 +174,12 @@ holds manual-brush spot healing: a "Paint Mode" checkbox (while on,
 left-click-drag on the canvas paints a brush stroke instead of panning — see
 below), a log-scaled Brush Size slider, a Feather slider, and Undo
 Last Spot/Clear All buttons. AI-assisted detection (`dust_detect.py`'s ONNX
-model) isn't ported yet — see "Known rough edges".
+model) isn't ported yet — see "Known rough edges". A live RGB histogram sits
+at the top of the panel, above Color Profile, updating with every adjustment.
+A collapsible **Crop** section offers `crop_aspect.py`'s aspect-ratio presets
+(Free/Original/1:1/.../2.39:1 Scope), a Landscape/Portrait toggle (disabled
+for orientation-fixed presets), a Straighten slider, and Reset — picking a
+preset draws a dashed box (dimmed surround) directly on the canvas.
 
 - On launch the canvas shows a synthetic coordinate-gradient test frame (no
   file loaded yet) — dragging sliders adjusts it via
@@ -203,6 +209,15 @@ model) isn't ported yet — see "Known rough edges".
   below on why CoreBridge always defers pixel math to the real Python core).
   Brush Size and Feather match `dust_panel.py`'s ranges. Undo Last
   Spot/Clear All remove spots without touching any other slider.
+- **Crop**: pick an aspect preset in the Crop section — a dashed box appears
+  on the canvas, centered on the image at that ratio. This is **non-destructive
+  and display-only**, exactly like the Qt app: the preview keeps showing the
+  full frame, the box is just a reference overlay, and `crop_rect`/
+  `crop_angle` are pushed to the real `CCRImage` so dust removal's "sources
+  must come from inside the confirmed crop" rule sees the current crop. There's
+  no actual pixel cropping yet (that happens at export time in the Qt app —
+  export isn't ported), and no drag-to-move/resize (presets only — see
+  "Known rough edges").
 - **Zoom**: pinch on a trackpad (anchored under your fingers — the same
   image point stays put as you zoom; this deselects the segmented control,
   since a pinch lands on an arbitrary ratio), or tap **Full**/**100%**/**200%**
@@ -284,6 +299,18 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
   `perImageAdjustmentsPersistIndependently`, but for dust spots — each
   loaded image keeps its own spot list across `selectImage` switches, and
   `undoLastDustSpot`/`clearDustSpots` mutate only the current image's list.
+- `originalRatioResolvesToTheImagesOwnAspect`, `freeHasNoRatioOrRect`,
+  `orientedRatioFlipsForPortrait`, `oneToOneCropOnAWideImageIsACenteredSquare`,
+  `orientationFixedKeysDisallowLandscapePortraitToggle`: `CropAspect`'s pure
+  ratio/box math (ported from `crop_aspect.py`) against known geometry —
+  no Python/DYLD_LIBRARY_PATH needed for these either.
+- `cropStatePersistsPerImageAndSupportsReset`: crop preset/orientation/angle
+  are per-image (like dust/adjustment state) and `resetCrop` returns to Free.
+- `cropAndDustSpotsTogetherRenderWithoutCrashing`: a crop + dust spots
+  together reach `_apply_dust_removal`'s crop-awareness without erroring —
+  the first time both M6 and M7 state flow through the same call.
+- `histogramCountsMatchKnownPixels`: `Histogram.compute` produces exact
+  per-channel bin counts for a tiny synthetic buffer with known pixel values.
 
 ## Known rough edges (expected at this stage)
 
@@ -309,10 +336,23 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
   overlay while dragging (the healed result only appears once you release
   the mouse and the re-render lands), no right-click "move stroke / reselect
   heal source" (`image_preview.py`'s `dust_right_press` family — sticky
-  source pinning), no "show heal sources" debug overlay, and no
-  crop-awareness (moot for now since this port has no crop feature yet
-  either). Undo is a plain stack pop (`undoLastDustSpot`), not the Qt
-  app's 800ms-idle-burst-merged undo history shared with the sliders.
+  source pinning), and no "show heal sources" debug overlay. Undo is a plain
+  stack pop (`undoLastDustSpot`), not the Qt app's 800ms-idle-burst-merged
+  undo history shared with the sliders.
+- Crop (M7, first slice) is presets-only: no draggable corner/edge handles
+  (`crop_aspect.py`'s `enforce_ratio_size`), no manual W:H "Custom…" entry,
+  and the on-canvas box doesn't visually rotate with the Straighten slider
+  (`crop_angle` is still pushed to `CCRImage` correctly — only the overlay
+  rendering is axis-aligned). Crop is non-destructive/display-only, matching
+  the Qt app — there's no pixel cropping yet since that only happens at
+  export time (not ported) or in histogram computation (this port's
+  `Histogram` is computed from the full uncropped preview, unlike
+  `histogram_widget.py`'s crop-aware input).
+  `cropAndDustSpotsTogetherRenderWithoutCrashing` only proves the combination
+  doesn't error, not that dust healing's source selection actually respects
+  the crop boundary pixel-for-pixel the way `ccr_processor.py`'s clone-heal
+  does — that would need a dedicated fixture with a source patch
+  deliberately placed outside the crop.
 - No debouncing beyond "cancel the previous in-flight call" — fine at
   preview resolution (~1080px long side, matches the Qt app's own preview
   size), would need real throttling for full-res/export-size/hi-res frames.

@@ -170,6 +170,12 @@ public struct RGBAImage: Sendable {
     public let width: Int
     public let height: Int
     public let data: Data // width * height * 4 bytes, RGBA8
+
+    public init(width: Int, height: Int, data: Data) {
+        self.width = width
+        self.height = height
+        self.data = data
+    }
 }
 
 /// Opaque handle to a loaded image: an index into `ccr_backend.images`, the
@@ -237,12 +243,14 @@ public final class PythonCoreBridge: @unchecked Sendable {
     /// a synthetic gradient frame (no image loaded yet).
     public func adjustedPreview(handle: ImageHandle?, params: AdjustmentParams,
                                  colorProfile: ColorProfile = .color,
-                                 dustSpots: [DustSpot] = [], dustFeather: Double = 0.25) async -> RGBAImage? {
+                                 dustSpots: [DustSpot] = [], dustFeather: Double = 0.25,
+                                 cropRect: CGRect? = nil, cropAngle: Double = 0) async -> RGBAImage? {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(returning: self.adjustedPreviewOnQueue(
                     handle: handle, params: params, colorProfile: colorProfile,
-                    dustSpots: dustSpots, dustFeather: dustFeather))
+                    dustSpots: dustSpots, dustFeather: dustFeather,
+                    cropRect: cropRect, cropAngle: cropAngle))
             }
         }
     }
@@ -259,12 +267,14 @@ public final class PythonCoreBridge: @unchecked Sendable {
     /// `adjustedPreview` already returned — see `PreviewState.runAdjustment`).
     public func hiResPreview(handle: ImageHandle, params: AdjustmentParams,
                               colorProfile: ColorProfile, maxLongSide: Int,
-                              dustSpots: [DustSpot] = [], dustFeather: Double = 0.25) async -> RGBAImage? {
+                              dustSpots: [DustSpot] = [], dustFeather: Double = 0.25,
+                              cropRect: CGRect? = nil, cropAngle: Double = 0) async -> RGBAImage? {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(returning: self.hiResPreviewOnQueue(
                     handle: handle, params: params, colorProfile: colorProfile, maxLongSide: maxLongSide,
-                    dustSpots: dustSpots, dustFeather: dustFeather))
+                    dustSpots: dustSpots, dustFeather: dustFeather,
+                    cropRect: cropRect, cropAngle: cropAngle))
             }
         }
     }
@@ -279,6 +289,26 @@ public final class PythonCoreBridge: @unchecked Sendable {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(returning: self.originalSizeOnQueue(handle: handle))
+            }
+        }
+    }
+
+    /// Sets `CCRImage.crop_rect`/`crop_angle` directly — plain attributes
+    /// (see `ccr_image.py`'s `__init__`), like `dust_spots`/`dust_feather`.
+    /// Non-destructive and display-only in the Qt app (`resized_raw` is
+    /// never modified), so this port doesn't need to re-render the preview
+    /// after a crop change either — the only current consumer is
+    /// `_apply_dust_removal`'s "sources must come from inside the confirmed
+    /// crop" rule, which reads the attribute fresh on the next adjustment
+    /// (see `adjustedPreviewOnQueue`/`hiResPreviewOnQueue`, which also set
+    /// these two attributes so that rule sees the current crop). `rect` is
+    /// normalized `(x1, y1, x2, y2)`, matching `crop_rect`'s own convention
+    /// exactly; `nil` clears the crop (`crop_rect = None`).
+    public func setCrop(handle: ImageHandle, rect: CGRect?, angle: Double) async {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                self.setCropOnQueue(handle: handle, rect: rect, angle: angle)
+                continuation.resume()
             }
         }
     }
@@ -313,7 +343,8 @@ public final class PythonCoreBridge: @unchecked Sendable {
 
     private func adjustedPreviewOnQueue(handle: ImageHandle?, params: AdjustmentParams,
                                          colorProfile: ColorProfile,
-                                         dustSpots: [DustSpot], dustFeather: Double) -> RGBAImage? {
+                                         dustSpots: [DustSpot], dustFeather: Double,
+                                         cropRect: CGRect?, cropAngle: Double) -> RGBAImage? {
         bootIfNeeded()
 
         let previewRGB: PythonObject
@@ -331,6 +362,7 @@ public final class PythonCoreBridge: @unchecked Sendable {
             // an undo snapshot first (no undo/redo in this port yet).
             image.dust_spots = dustSpotsPythonList(dustSpots)
             image.dust_feather = PythonObject(dustFeather)
+            setCropAttributes(on: image, rect: cropRect, angle: cropAngle)
             image.update_thumbnail_and_preview()
             guard let preview = numpyRGB8(image._preview_np8) else { return nil }
             previewRGB = preview
@@ -346,13 +378,15 @@ public final class PythonCoreBridge: @unchecked Sendable {
     /// preview buffer.
     private func hiResPreviewOnQueue(handle: ImageHandle, params: AdjustmentParams,
                                       colorProfile: ColorProfile, maxLongSide: Int,
-                                      dustSpots: [DustSpot], dustFeather: Double) -> RGBAImage? {
+                                      dustSpots: [DustSpot], dustFeather: Double,
+                                      cropRect: CGRect?, cropAngle: Double) -> RGBAImage? {
         bootIfNeeded()
         let image = ccrBackend.images[handle.index]
         image.color_profile = PythonObject(colorProfile.rawValue)
         image.adjustment_settings = params.asPythonDict
         image.dust_spots = dustSpotsPythonList(dustSpots)
         image.dust_feather = PythonObject(dustFeather)
+        setCropAttributes(on: image, rect: cropRect, angle: cropAngle)
 
         let result = image.render_hires_base(max_long_side: PythonObject(maxLongSide))
         guard let base = numpyRGB8(result[0]) else { return nil }
@@ -371,6 +405,28 @@ public final class PythonCoreBridge: @unchecked Sendable {
         }
         let display8 = np.ascontiguousarray(cv2.convertScaleAbs(display, alpha: PythonObject(255.0 / 65535.0)))
         return rgbaImage(fromRGB: display8)
+    }
+
+    private func setCropOnQueue(handle: ImageHandle, rect: CGRect?, angle: Double) {
+        bootIfNeeded()
+        setCropAttributes(on: ccrBackend.images[handle.index], rect: rect, angle: angle)
+    }
+
+    /// `crop_rect`'s convention is `(x1, y1, x2, y2)` normalized fractions
+    /// (see `ccr_image.py`'s `__init__` doc comment) — a plain 4-element
+    /// Python list works identically to a tuple for every consumer (`x1, y1,
+    /// x2, y2 = crop_rect` unpacking, `crop_rect[i]` indexing), same as how
+    /// dust spot points already ride as `[x, y]` lists.
+    private func setCropAttributes(on image: PythonObject, rect: CGRect?, angle: Double) {
+        if let rect {
+            image.crop_rect = PythonObject([
+                PythonObject(Double(rect.minX)), PythonObject(Double(rect.minY)),
+                PythonObject(Double(rect.maxX)), PythonObject(Double(rect.maxY)),
+            ])
+        } else {
+            image.crop_rect = Python.None
+        }
+        image.crop_angle = PythonObject(angle)
     }
 
     private func thumbnailOnQueue(handle: ImageHandle) -> RGBAImage? {

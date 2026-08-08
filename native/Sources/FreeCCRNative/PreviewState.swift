@@ -93,7 +93,34 @@ final class PreviewState: ObservableObject {
     /// `MetalCanvasView`/`ZoomPanMTKView`'s `isDustMode`-gated mouse handling.
     @Published var isDustMode = false
 
+    /// Crop state — mirrors `CCRImage.crop_rect`/`crop_angle` (per-image,
+    /// like the dust/adjustment state above). Non-destructive in the Qt app
+    /// (`resized_raw` is never modified) — the preview stays full-frame; a
+    /// `cropRect` here only drives `CropOverlayView`'s on-canvas box and,
+    /// via `pushCropToPython`, `_apply_dust_removal`'s "sources must come
+    /// from inside the confirmed crop" rule. So unlike every other
+    /// `@Published` field above, changing these does NOT call
+    /// `requestUpdate()` — there's no new preview to render, just a
+    /// different overlay box and an attribute push.
+    @Published var cropAspectKey: CropAspectKey = .free {
+        didSet { recomputeCropRect() }
+    }
+    @Published var cropLandscape = true {
+        didSet { recomputeCropRect() }
+    }
+    @Published var cropAngle: Double = 0 {
+        didSet { pushCropToPython() }
+    }
+    /// Normalized (0...1) crop box, or `nil` for Free/no image —
+    /// `CropOverlayView` reads this directly.
+    @Published private(set) var cropRect: CGRect?
+
     @Published private(set) var texture: MTLTexture?
+    /// Computed from the fast ~1080px preview (not whatever hi-res buffer
+    /// might also be on screen) every adjustment — matches
+    /// `histogram_widget.py` reflecting the whole adjusted image, not a
+    /// zoomed-in detail crop. See `Histogram.compute`.
+    @Published private(set) var histogram: Histogram?
     @Published private(set) var isBusy = false
     @Published private(set) var lastLatencyMs: Double = 0
     @Published private(set) var loadError: String?
@@ -205,7 +232,8 @@ final class PreviewState: ObservableObject {
     /// are shared @Published storage for whichever image is current.
     private var perImageState: [ImageHandle: (
         params: AdjustmentParams, colorProfile: ColorProfile,
-        dustSpots: [DustSpot], dustFeather: Double)] = [:]
+        dustSpots: [DustSpot], dustFeather: Double,
+        cropAspectKey: CropAspectKey, cropLandscape: Bool, cropAngle: Double)] = [:]
     private var pendingTask: Task<Void, Never>?
 
     init(device: MTLDevice) {
@@ -234,7 +262,7 @@ final class PreviewState: ObservableObject {
                     .map { CGSize(width: $0.width, height: $0.height) } ?? .zero
                 self.images.append(LoadedImage(
                     id: handle, fileName: url.lastPathComponent, thumbnail: thumbnail, originalSize: originalSize))
-                self.perImageState[handle] = (AdjustmentParams(), ColorProfile.color, [], 0.25)
+                self.perImageState[handle] = (AdjustmentParams(), ColorProfile.color, [], 0.25, .free, true, 0)
                 lastGoodIndex = self.images.count - 1
             }
             if let lastGoodIndex {
@@ -252,14 +280,20 @@ final class PreviewState: ObservableObject {
     func selectImage(at index: Int) {
         guard images.indices.contains(index) else { return }
         if let previousIndex = currentIndex, images.indices.contains(previousIndex) {
-            perImageState[images[previousIndex].id] = (params, colorProfile, dustSpots, dustFeather)
+            perImageState[images[previousIndex].id] = (
+                params, colorProfile, dustSpots, dustFeather,
+                cropAspectKey, cropLandscape, cropAngle)
         }
         currentIndex = index
-        let saved = perImageState[images[index].id] ?? (AdjustmentParams(), ColorProfile.color, [], 0.25)
+        let saved = perImageState[images[index].id]
+            ?? (AdjustmentParams(), ColorProfile.color, [], 0.25, .free, true, 0)
         params = saved.params
         colorProfile = saved.colorProfile
         dustSpots = saved.dustSpots
         dustFeather = saved.dustFeather
+        cropAspectKey = saved.cropAspectKey
+        cropLandscape = saved.cropLandscape
+        cropAngle = saved.cropAngle
         fitToView() // new image: back to a fitted view (mirrors image_preview.py); also calls requestUpdate()
     }
 
@@ -295,6 +329,35 @@ final class PreviewState: ObservableObject {
         guard !dustSpots.isEmpty else { return }
         dustSpots.removeAll()
         requestUpdate()
+    }
+
+    /// Recomputes `cropRect` from the current preset/orientation and image
+    /// size (see `CropAspect.normalizedRect`) — called whenever either
+    /// input changes. Always re-centers rather than trying to fit within
+    /// whatever box was already there (this port has no draggable box to
+    /// preserve yet — see `CropAspect`'s doc comment).
+    private func recomputeCropRect() {
+        cropRect = CropAspect.normalizedRect(
+            for: cropAspectKey, landscape: cropLandscape, imageSize: originalImageSize)
+        pushCropToPython()
+    }
+
+    /// Crop is non-destructive display/metadata (see the `cropRect` doc
+    /// comment above), so this just forwards the current box + angle to the
+    /// loaded `CCRImage` for `_apply_dust_removal`'s crop-awareness — no
+    /// `requestUpdate()`, there's no new preview pixels to fetch.
+    private func pushCropToPython() {
+        guard let handle = imageHandle else { return }
+        let rect = cropRect
+        let angle = cropAngle
+        Task { await PythonCoreBridge.shared.setCrop(handle: handle, rect: rect, angle: angle) }
+    }
+
+    /// Mirrors crop_panel.py's Reset button.
+    func resetCrop() {
+        cropAspectKey = .free
+        cropLandscape = true
+        cropAngle = 0
     }
 
     func requestUpdate() {
@@ -340,7 +403,8 @@ final class PreviewState: ObservableObject {
         // HiResDetailWorker both run, independently, when zoomed in.
         guard let fastImage = await PythonCoreBridge.shared.adjustedPreview(
             handle: handle, params: params, colorProfile: colorProfile,
-            dustSpots: dustSpots, dustFeather: dustFeather) else {
+            dustSpots: dustSpots, dustFeather: dustFeather,
+            cropRect: cropRect, cropAngle: cropAngle) else {
             self.isBusy = false
             return
         }
@@ -352,13 +416,15 @@ final class PreviewState: ObservableObject {
             let cap = nativeLongSide > 0 ? min(nativeLongSide, Self.hiResMaxLongSide) : Self.hiResMaxLongSide
             if let hiRes = await PythonCoreBridge.shared.hiResPreview(
                 handle: handle, params: params, colorProfile: colorProfile, maxLongSide: cap,
-                dustSpots: dustSpots, dustFeather: dustFeather) {
+                dustSpots: dustSpots, dustFeather: dustFeather,
+                cropRect: cropRect, cropAngle: cropAngle) {
                 displayImage = hiRes
             }
             if Task.isCancelled { return }
         }
 
         self.texture = Self.makeTexture(device: device, image: displayImage)
+        self.histogram = Histogram.compute(from: fastImage)
         self.isBusy = false
         self.lastLatencyMs = Double(
             DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000

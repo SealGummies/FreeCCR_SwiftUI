@@ -21,8 +21,11 @@ struct ContentView: View {
             HSplitView {
                 ThumbnailListView(state: state)
                     .frame(minWidth: 140, idealWidth: 160, maxWidth: 220)
-                MetalCanvasView(state: state)
-                    .frame(minWidth: 512, minHeight: 384)
+                ZStack {
+                    MetalCanvasView(state: state)
+                    CropOverlayView(state: state)
+                }
+                .frame(minWidth: 512, minHeight: 384)
                 SlidersPanel(state: state)
                     .frame(minWidth: 280, idealWidth: 300, maxWidth: 360)
             }
@@ -188,6 +191,8 @@ struct SlidersPanel: View {
             VStack(alignment: .leading, spacing: 16) {
                 header
 
+                HistogramView(histogram: state.histogram)
+
                 colorProfileRow
 
                 Group {
@@ -217,6 +222,11 @@ struct SlidersPanel: View {
 
                 DisclosureGroup("Dust Removal") {
                     DustRemovalSection(state: state)
+                        .padding(.top, 8)
+                }
+
+                DisclosureGroup("Crop") {
+                    CropSection(state: state)
                         .padding(.top, 8)
                 }
 
@@ -425,6 +435,72 @@ struct DustRemovalSection: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+/// Analog of `crop_panel.py`'s aspect/straighten controls (see
+/// `CropAspect`'s doc comment for what's NOT ported: no draggable
+/// corner/edge handles, presets only). Picking a preset or flipping
+/// Landscape/Portrait re-centers a box of that ratio on the full image;
+/// Straighten writes `crop_angle` directly (no separate "fine rotation" to
+/// fold against, unlike the Qt app). The box itself renders in
+/// `CropOverlayView`, layered over `MetalCanvasView` in `ContentView`.
+struct CropSection: View {
+    @ObservedObject var state: PreviewState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("Aspect", selection: $state.cropAspectKey) {
+                ForEach(CropAspectKey.allCases) { key in
+                    Text(key.label).tag(key)
+                }
+            }
+            .pickerStyle(.menu)
+
+            Picker("Orientation", selection: $state.cropLandscape) {
+                Text("Landscape").tag(true)
+                Text("Portrait").tag(false)
+            }
+            .pickerStyle(.segmented)
+            .disabled(state.cropAspectKey.isOrientationFixed)
+
+            AdjustmentSliderRow(
+                label: "Straighten", value: $state.cropAngle,
+                range: -45...45, defaultValue: 0)
+
+            Button("Reset") { state.resetCrop() }
+        }
+    }
+}
+
+/// Draws the current crop box (see `PreviewState.cropRect`) over the Metal
+/// canvas: a dashed outline plus a dimmed surround, matching the "you see
+/// the whole photo, the box marks what a future export would keep" model —
+/// non-destructive, no pixels are actually removed here (see
+/// `CoreBridge.setCrop`'s doc comment). Doesn't render `cropAngle` (the box
+/// stays axis-aligned) — a known limitation, see native/README.md.
+struct CropOverlayView: View {
+    @ObservedObject var state: PreviewState
+
+    var body: some View {
+        Canvas { context, size in
+            guard let cropRect = state.cropRect else { return }
+            let imageRect = state.transform.quadRect(viewSize: size, imageSize: state.originalImageSize)
+            let boxRect = CGRect(
+                x: imageRect.minX + cropRect.minX * imageRect.width,
+                y: imageRect.minY + cropRect.minY * imageRect.height,
+                width: cropRect.width * imageRect.width,
+                height: cropRect.height * imageRect.height)
+
+            var dimmed = Path(CGRect(origin: .zero, size: size))
+            dimmed.addRect(boxRect)
+            context.fill(dimmed, with: .color(.black.opacity(0.35)), style: FillStyle(eoFill: true))
+
+            context.stroke(
+                Path(boxRect), with: .color(.white),
+                style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+        }
+        .allowsHitTesting(false)
     }
 }
 

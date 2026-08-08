@@ -160,6 +160,67 @@ struct FreeCCRNativeTests {
         #expect(state.dustSpots.isEmpty)
     }
 
+    /// M7 (Crop): like the dust-spot test above, crop preset/orientation/
+    /// straighten state is per-image and follows `selectImage` switches;
+    /// `resetCrop` returns to Free (no box) on whichever image is current.
+    @MainActor
+    @Test func cropStatePersistsPerImageAndSupportsReset() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("no Metal device on this machine")
+            return
+        }
+        let state = PreviewState(device: device)
+
+        let path1 = NSTemporaryDirectory() + "freeccr_native_test_crop_1.png"
+        let path2 = NSTemporaryDirectory() + "freeccr_native_test_crop_2.png"
+        try makeTestPNG(at: path1, width: 48, height: 32)
+        try makeTestPNG(at: path2, width: 48, height: 32)
+
+        state.loadImages(urls: [URL(fileURLWithPath: path1), URL(fileURLWithPath: path2)])
+        try await waitUntil { state.images.count == 2 }
+
+        state.selectImage(at: 0)
+        try await waitUntil { !state.isBusy }
+        state.cropAspectKey = .oneToOne
+        state.cropAngle = 12
+        #expect(state.cropRect != nil)
+
+        state.selectImage(at: 1)
+        try await waitUntil { !state.isBusy }
+        #expect(state.cropAspectKey == .free, "image 1 should start uncropped")
+        #expect(state.cropRect == nil)
+
+        state.selectImage(at: 0)
+        try await waitUntil { !state.isBusy }
+        #expect(state.cropAspectKey == .oneToOne, "switching back to image 0 should restore its own crop")
+        #expect(state.cropAngle == 12)
+        #expect(state.cropRect != nil)
+
+        state.resetCrop()
+        #expect(state.cropAspectKey == .free)
+        #expect(state.cropAngle == 0)
+        #expect(state.cropRect == nil)
+    }
+
+    /// M7 (Crop): `CoreBridge.setCrop` plus dust spots together shouldn't
+    /// crash `_apply_dust_removal`'s "sources must come from inside the
+    /// confirmed crop" logic (`ccr_image.py`'s `_apply_dust_removal`, ~line
+    /// 1069) — a real combination once both features are wired to the same
+    /// `adjustedPreview` call.
+    @Test func cropAndDustSpotsTogetherRenderWithoutCrashing() async throws {
+        let testPNGPath = NSTemporaryDirectory() + "freeccr_native_test_crop_dust.png"
+        try makeTestPNG(at: testPNGPath, width: 200, height: 150)
+        let handle = await PythonCoreBridge.shared.loadImage(path: testPNGPath)
+        #expect(handle != nil)
+
+        let spot = DustSpot(points: [CGPoint(x: 0.5, y: 0.5)], radius: 0.1)
+        let image = await PythonCoreBridge.shared.adjustedPreview(
+            handle: handle, params: AdjustmentParams(),
+            dustSpots: [spot], dustFeather: 0.25,
+            cropRect: CGRect(x: 0.1, y: 0.1, width: 0.5, height: 0.5), cropAngle: 5)
+        #expect(image != nil)
+    }
+
     /// Regression for a user-reported "preview looks like a blown-up thumbnail"
     /// report: confirms the full PreviewState pipeline (not just CoreBridge)
     /// puts a properly ~1080px-long-side MTLTexture on the canvas for a large
@@ -555,6 +616,65 @@ struct FreeCCRNativeTests {
         #expect(t.panOffset.width > 0) // clamped, but still allowed to move
         let rect = t.quadRect(viewSize: viewSize, imageSize: imageSize)
         #expect(rect.minX <= 0) // clamped so no gap opens up on the width axis
+    }
+
+    // MARK: - CropAspect (M7)
+
+    @Test func originalRatioResolvesToTheImagesOwnAspect() {
+        let imageSize = CGSize(width: 400, height: 200) // 2:1
+        let ratio = CropAspect.effectiveRatio(for: .original, landscape: true, imageSize: imageSize)
+        #expect(ratio != nil)
+        #expect(abs(ratio! - 2.0) < 1e-9)
+    }
+
+    @Test func freeHasNoRatioOrRect() {
+        let imageSize = CGSize(width: 400, height: 200)
+        #expect(CropAspect.effectiveRatio(for: .free, landscape: true, imageSize: imageSize) == nil)
+        #expect(CropAspect.normalizedRect(for: .free, landscape: true, imageSize: imageSize) == nil)
+    }
+
+    @Test func orientedRatioFlipsForPortrait() {
+        #expect(CropAspect.orientedRatio(4.0 / 3.0, landscape: true) == 4.0 / 3.0)
+        let portrait = CropAspect.orientedRatio(4.0 / 3.0, landscape: false)
+        #expect(abs(portrait! - 3.0 / 4.0) < 1e-9)
+    }
+
+    /// A 1:1 crop on a 400x200 (2:1) image should be the largest centered
+    /// square that fits: 200x200, centered horizontally.
+    @Test func oneToOneCropOnAWideImageIsACenteredSquare() {
+        let imageSize = CGSize(width: 400, height: 200)
+        let rect = CropAspect.normalizedRect(for: .oneToOne, landscape: true, imageSize: imageSize)
+        #expect(rect != nil)
+        guard let rect else { return }
+        #expect(abs(rect.width * 400 - 200) < 1e-9, "box should be 200px wide (== image height)")
+        #expect(abs(rect.height * 200 - 200) < 1e-9, "box should fill the full height")
+        #expect(abs(rect.midX - 0.5) < 1e-9, "box should be centered horizontally")
+        #expect(abs(rect.midY - 0.5) < 1e-9)
+    }
+
+    @Test func orientationFixedKeysDisallowLandscapePortraitToggle() {
+        #expect(CropAspectKey.free.isOrientationFixed)
+        #expect(CropAspectKey.original.isOrientationFixed)
+        #expect(!CropAspectKey.oneToOne.isOrientationFixed)
+        #expect(!CropAspectKey.sixteenToNine.isOrientationFixed)
+    }
+
+    // MARK: - Histogram (M7)
+
+    /// A tiny synthetic RGBA buffer with known pixel values should produce
+    /// exact bin counts — no percentile scaling involved here, just the
+    /// raw `compute` step.
+    @Test func histogramCountsMatchKnownPixels() {
+        // 2x1 image: pixel 0 = (10, 20, 30), pixel 1 = (10, 200, 30).
+        var bytes: [UInt8] = [10, 20, 30, 255, 10, 200, 30, 255]
+        let data = Data(bytes: &bytes, count: bytes.count)
+        let image = RGBAImage(width: 2, height: 1, data: data)
+        let histogram = Histogram.compute(from: image)
+        #expect(histogram.red[10] == 2)
+        #expect(histogram.green[20] == 1)
+        #expect(histogram.green[200] == 1)
+        #expect(histogram.blue[30] == 2)
+        #expect(histogram.red.reduce(0, +) == 2)
     }
 }
 
