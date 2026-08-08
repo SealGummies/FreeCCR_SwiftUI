@@ -29,6 +29,72 @@ import UniformTypeIdentifiers
     }
 }
 
+// MARK: - M2: CanvasTransform coordinate-stack checks (pure math, no Python)
+
+@Test func fitScaleFillsTheSmallerDimension() {
+    let t = CanvasTransform()
+    // A 500x500 image in a 1000x500 view: fit scale is limited by height.
+    let scale = t.fitScale(viewSize: CGSize(width: 1000, height: 500),
+                            imageSize: CGSize(width: 500, height: 500))
+    #expect(scale == 1.0)
+    let rect = t.quadRect(viewSize: CGSize(width: 1000, height: 500),
+                           imageSize: CGSize(width: 500, height: 500))
+    #expect(rect == CGRect(x: 250, y: 0, width: 500, height: 500))
+}
+
+@Test func zoomAnchoredAtCenterKeepsImageCentered() {
+    var t = CanvasTransform()
+    let viewSize = CGSize(width: 1000, height: 500)
+    let imageSize = CGSize(width: 500, height: 500)
+    let center = CGPoint(x: viewSize.width / 2, y: viewSize.height / 2)
+    t.zoom(by: 2, anchor: center, viewSize: viewSize, imageSize: imageSize)
+    let rect = t.quadRect(viewSize: viewSize, imageSize: imageSize)
+    #expect(abs(rect.midX - center.x) < 0.001)
+    #expect(abs(rect.midY - center.y) < 0.001)
+    #expect(abs(rect.width - 1000) < 0.001) // fitScale(1) * zoom(2) * 500
+}
+
+/// The actual point of scroll-to-zoom: whatever image location was under the
+/// cursor before zooming must still be under the cursor after — otherwise
+/// every zoom gesture would visibly "slide" the image out from under you.
+@Test func zoomAnchoredAtArbitraryPointStaysUnderTheAnchor() {
+    var t = CanvasTransform()
+    let viewSize = CGSize(width: 800, height: 600)
+    let imageSize = CGSize(width: 400, height: 300)
+    let anchor = CGPoint(x: 300, y: 150) // an arbitrary point, not the center
+    let before = t.imageNormalizedPoint(screen: anchor, viewSize: viewSize, imageSize: imageSize)
+    #expect(before != nil)
+
+    t.zoom(by: 3.7, anchor: anchor, viewSize: viewSize, imageSize: imageSize)
+    let after = t.imageNormalizedPoint(screen: anchor, viewSize: viewSize, imageSize: imageSize)
+    #expect(after != nil)
+    if let before, let after {
+        #expect(abs(before.x - after.x) < 0.0001)
+        #expect(abs(before.y - after.y) < 0.0001)
+    }
+}
+
+@Test func zoomClampsToMinAndMax() {
+    var t = CanvasTransform()
+    let viewSize = CGSize(width: 800, height: 600)
+    let imageSize = CGSize(width: 400, height: 300)
+    let anchor = CGPoint(x: 400, y: 300)
+    t.zoom(by: 0.0001, anchor: anchor, viewSize: viewSize, imageSize: imageSize)
+    #expect(t.zoom == CanvasTransform.minZoom)
+    t.zoom = 1
+    t.zoom(by: 10_000, anchor: anchor, viewSize: viewSize, imageSize: imageSize)
+    #expect(t.zoom == CanvasTransform.maxZoom)
+}
+
+@Test func resetToFitClearsZoomAndPan() {
+    var t = CanvasTransform()
+    t.zoom = 5
+    t.panOffset = CGSize(width: 123, height: -45)
+    t.resetToFit()
+    #expect(t.zoom == 1.0)
+    #expect(t.panOffset == .zero)
+}
+
 /// A plain 8-bit RGB gradient PNG, written with CoreGraphics/ImageIO —
 /// no Python/numpy needed just to produce a decodable fixture.
 private func makeTestPNG(at path: String, width: Int, height: Int) throws {

@@ -24,6 +24,28 @@ final class PreviewState: ObservableObject {
     @Published private(set) var loadedFileName: String?
     @Published private(set) var loadError: String?
 
+    // M2: pan/zoom state (CanvasTransform.swift) + the sizes it needs to turn
+    // "zoom" into an actual on-screen rect. canvasViewSize is kept in sync by
+    // MetalCanvasView (its NSView's bounds, in points); currentImageSize
+    // comes straight from the live texture, so both stay correct across
+    // window resizes and image reloads without any extra plumbing.
+    @Published var transform = CanvasTransform()
+    @Published var canvasViewSize: CGSize = .zero
+
+    var currentImageSize: CGSize {
+        guard let texture else { return .zero }
+        return CGSize(width: texture.width, height: texture.height)
+    }
+
+    var zoomPercent: Int {
+        let scale = transform.effectiveScale(viewSize: canvasViewSize, imageSize: currentImageSize)
+        return Int((scale * 100).rounded())
+    }
+
+    func fitToView() {
+        transform.resetToFit()
+    }
+
     let device: MTLDevice
     private var imageHandle: ImageHandle?
     private var pendingTask: Task<Void, Never>?
@@ -47,6 +69,7 @@ final class PreviewState: ObservableObject {
             if Task.isCancelled { return }
             self.imageHandle = handle
             self.loadedFileName = url.lastPathComponent
+            self.transform.resetToFit() // new image: back to a fitted view (mirrors image_preview.py)
             await self.runAdjustment(device: device)
         }
     }

@@ -54,7 +54,30 @@ struct Toolbar: View {
             if let error = state.loadError {
                 Text(error).foregroundStyle(.red)
             }
+
             Spacer()
+
+            // Pan: two-finger scroll / scroll wheel. Zoom: pinch, or the
+            // stepper buttons below. Double-click the canvas to fit.
+            Text("\(state.zoomPercent)%")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 44, alignment: .trailing)
+            Button {
+                state.transform.zoom(
+                    by: 0.8, anchor: CGPoint(x: state.canvasViewSize.width / 2, y: state.canvasViewSize.height / 2),
+                    viewSize: state.canvasViewSize, imageSize: state.currentImageSize)
+            } label: {
+                Image(systemName: "minus.magnifyingglass")
+            }
+            Button {
+                state.transform.zoom(
+                    by: 1.25, anchor: CGPoint(x: state.canvasViewSize.width / 2, y: state.canvasViewSize.height / 2),
+                    viewSize: state.canvasViewSize, imageSize: state.currentImageSize)
+            } label: {
+                Image(systemName: "plus.magnifyingglass")
+            }
+            Button("Fit") { state.fitToView() }
         }
         .padding(8)
     }

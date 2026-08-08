@@ -1,26 +1,51 @@
+import AppKit
 import Metal
 import MetalKit
 import SwiftUI
 
 /// AppKit bridge for the SwiftUI canvas — the closest analog here to
-/// `widgets/image_preview.py`'s Qt `QGraphicsView`. Owns nothing stateful
-/// beyond the render pipeline; the texture to draw comes from `PreviewState`.
+/// `widgets/image_preview.py`'s `GraphicsImageView(QGraphicsView)`. Owns the
+/// render pipeline; pan/zoom state lives in `PreviewState.transform`
+/// (`CanvasTransform`), gestures here just mutate it.
 struct MetalCanvasView: NSViewRepresentable {
     @ObservedObject var state: PreviewState
 
-    func makeNSView(context: Context) -> MTKView {
-        let view = MTKView()
+    func makeNSView(context: Context) -> ZoomPanMTKView {
+        let view = ZoomPanMTKView()
         view.device = state.device
         view.delegate = context.coordinator
         view.colorPixelFormat = .bgra8Unorm
         view.enableSetNeedsDisplay = true
         view.isPaused = true
         view.clearColor = MTLClearColorMake(0.12, 0.12, 0.12, 1.0)
+
+        view.onScroll = { [weak state] delta in
+            guard let state else { return }
+            state.transform.pan(by: delta)
+        }
+        view.onMagnify = { [weak state] magnification, anchor in
+            guard let state else { return }
+            state.transform.zoom(
+                by: 1 + magnification, anchor: anchor,
+                viewSize: state.canvasViewSize, imageSize: state.currentImageSize)
+        }
+        view.onDoubleClick = { [weak state] in
+            state?.fitToView()
+        }
+        view.onBoundsChange = { [weak state] size in
+            state?.canvasViewSize = size
+        }
         return view
     }
 
-    func updateNSView(_ nsView: MTKView, context: Context) {
+    func updateNSView(_ nsView: ZoomPanMTKView, context: Context) {
         context.coordinator.texture = state.texture
+        context.coordinator.transform = state.transform
+        if state.canvasViewSize != nsView.bounds.size {
+            // First layout / SwiftUI-driven resize the AppKit callback might
+            // not have observed yet.
+            DispatchQueue.main.async { state.canvasViewSize = nsView.bounds.size }
+        }
         nsView.needsDisplay = true
     }
 
@@ -29,10 +54,54 @@ struct MetalCanvasView: NSViewRepresentable {
     }
 }
 
+/// MTKView subclass owning the AppKit event overrides SwiftUI has no gesture
+/// API for: trackpad/scroll-wheel pan and pinch-to-zoom anchored at the
+/// cursor. `isFlipped == true` so its coordinate space (origin top-left, y
+/// down) matches `CanvasTransform`'s convention and ordinary screen reasoning
+/// about images.
+final class ZoomPanMTKView: MTKView {
+    var onScroll: ((CGSize) -> Void)?
+    var onMagnify: ((CGFloat, CGPoint) -> Void)?
+    var onDoubleClick: (() -> Void)?
+    var onBoundsChange: ((CGSize) -> Void)?
+
+    override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(boundsDidChange),
+            name: NSView.boundsDidChangeNotification, object: self)
+        onBoundsChange?(bounds.size)
+    }
+
+    @objc private func boundsDidChange() {
+        onBoundsChange?(bounds.size)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        onScroll?(CGSize(width: event.scrollingDeltaX, height: event.scrollingDeltaY))
+    }
+
+    override func magnify(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        onMagnify?(event.magnification, location)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount >= 2 {
+            onDoubleClick?()
+        }
+    }
+}
+
 final class MetalRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
     var texture: MTLTexture?
+    var transform = CanvasTransform()
 
     init(device: MTLDevice) {
         guard let queue = device.makeCommandQueue() else {
@@ -58,19 +127,40 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        guard let drawable = view.currentDrawable,
+        guard let texture,
+              let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
         else { return }
 
-        if let texture {
-            encoder.setRenderPipelineState(pipelineState)
-            encoder.setFragmentTexture(texture, index: 0)
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        }
+        let viewSize = view.bounds.size // points — see MetalCanvasView's doc comment
+        let imageSize = CGSize(width: texture.width, height: texture.height)
+        let rect = transform.quadRect(viewSize: viewSize, imageSize: imageSize)
+
+        // rect is in view points (top-left origin, y down); convert to NDC
+        // (x: -1...1 left-to-right, y: -1...1 bottom-to-top). Derivation is
+        // in Shaders.metal's doc comment.
+        var uniforms = QuadUniforms(
+            origin: SIMD2<Float>(
+                Float(rect.minX / viewSize.width * 2 - 1),
+                Float(1 - rect.minY / viewSize.height * 2)),
+            size: SIMD2<Float>(
+                Float(rect.width / viewSize.width * 2),
+                Float(-rect.height / viewSize.height * 2)))
+
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<QuadUniforms>.stride, index: 0)
+        encoder.setFragmentTexture(texture, index: 0)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
+}
+
+/// Layout must match Shaders.metal's `QuadUniforms` exactly.
+private struct QuadUniforms {
+    var origin: SIMD2<Float>
+    var size: SIMD2<Float>
 }
