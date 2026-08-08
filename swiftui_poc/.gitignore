@@ -1,0 +1,6 @@
+# Embedded CPython distribution (fetched by setup_embedded_python.sh, ~360MB)
+/python/
+# Swift build artifacts
+**/.build/
+# Downloaded archives
+*.tar.gz
