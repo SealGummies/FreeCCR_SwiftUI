@@ -7,9 +7,19 @@ import exifread
 import cv2
 import logging
 import time
-from PySide6.QtCore import QCoreApplication, QThread
-from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage, QPixmap if you use PySide
 #import lensfunpy  # Make sure lensfunpy is installed
+# Qt is optional here: the thumbnail/preview properties build QPixmap/QImage
+# for the PySide6 UI, but the rest of this module (decode, adjustments, dust
+# removal, ...) is plain numpy and must stay importable/callable without a Qt
+# runtime present (e.g. embedded outside the Qt app). Only the QPixmap-facing
+# methods below require Qt to actually be installed at call time.
+try:
+    from PySide6.QtCore import QCoreApplication, QThread
+    from PySide6.QtGui import QImage, QPixmap
+    QT_AVAILABLE = True
+except ImportError:
+    QT_AVAILABLE = False
+    QCoreApplication = QThread = QImage = QPixmap = None
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
                                 apply_gamma_curve, apply_cineon_to_rec709,
@@ -970,8 +980,11 @@ class CCRImage:
 
     @staticmethod
     def _on_gui_thread() -> bool:
-        """True on the Qt GUI thread — or with no app at all, where eager
-        QPixmap creation matches the historical (pre-deferral) behaviour."""
+        """True on the Qt GUI thread — or with no app (or no Qt at all)
+        present, where eager QPixmap creation matches the historical
+        (pre-deferral) behaviour."""
+        if not QT_AVAILABLE:
+            return True
         app = QCoreApplication.instance()
         return app is None or QThread.currentThread() is app.thread()
 

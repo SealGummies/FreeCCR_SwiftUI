@@ -13,7 +13,24 @@ Qt signals so it can run on its own thread.
 import json
 import os
 
-from PySide6.QtCore import QObject, Signal, Slot
+# Qt is optional here: FolderScanner and the encode/decode helpers below are
+# pure and must stay importable without a Qt runtime present. Only
+# TetherWatchWorker (which needs a real QThread + signals to run) requires Qt
+# to actually be installed; without it the class still defines but is inert.
+try:
+    from PySide6.QtCore import QObject, Signal, Slot
+    QT_AVAILABLE = True
+except ImportError:
+    QT_AVAILABLE = False
+    QObject = object
+
+    def Signal(*_args, **_kwargs):
+        return None
+
+    def Slot(*_args, **_kwargs):
+        def _decorator(fn):
+            return fn
+        return _decorator
 
 from core.ccr_backend import ccr_backend
 
