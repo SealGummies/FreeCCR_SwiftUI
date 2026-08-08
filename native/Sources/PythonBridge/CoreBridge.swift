@@ -41,6 +41,11 @@ public struct AdjustmentParams: Sendable, Equatable {
     public var chBShift: Double = 0
     public var chBGain: Double = 0
     public var chBBlackpoint: Double = 0
+    /// Whole-image flag, not a slider — lives inside `adjustment_settings`
+    /// as `cineon_log` (see `ccr_image.apply_adjustments`'s
+    /// `s.get("cineon_log")`), unlike `colorProfile` below which is a
+    /// separate `CCRImage.color_profile` attribute entirely.
+    public var cineonLog: Bool = false
 
     public init() {}
 
@@ -60,8 +65,19 @@ public struct AdjustmentParams: Sendable, Equatable {
         for (key, value) in pairs {
             dict[PythonObject(key)] = PythonObject(value)
         }
+        if cineonLog {
+            dict[PythonObject("cineon_log")] = PythonObject(true)
+        }
         return dict
     }
+}
+
+/// Mirrors `CCRImage.color_profile` ("color"/"bw") — a per-image attribute,
+/// not an `adjustment_settings` key, so it travels alongside `AdjustmentParams`
+/// rather than inside it.
+public enum ColorProfile: String, Sendable {
+    case color
+    case blackAndWhite = "bw"
 }
 
 public struct RGBAImage: Sendable {
@@ -117,11 +133,12 @@ public final class PythonCoreBridge: @unchecked Sendable {
     /// `adjustment_settings` and calls `update_thumbnail_and_preview`) — then
     /// reads back the resulting preview pixels. If `handle` is nil, falls
     /// back to adjusting a synthetic gradient frame (no image loaded yet).
-    public func adjustedPreview(handle: ImageHandle?,
-                                 params: AdjustmentParams) async -> RGBAImage? {
+    public func adjustedPreview(handle: ImageHandle?, params: AdjustmentParams,
+                                 colorProfile: ColorProfile = .color) async -> RGBAImage? {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
-                continuation.resume(returning: self.adjustedPreviewOnQueue(handle: handle, params: params))
+                continuation.resume(returning: self.adjustedPreviewOnQueue(
+                    handle: handle, params: params, colorProfile: colorProfile))
             }
         }
     }
@@ -154,14 +171,18 @@ public final class PythonCoreBridge: @unchecked Sendable {
         }
     }
 
-    private func adjustedPreviewOnQueue(handle: ImageHandle?,
-                                         params: AdjustmentParams) -> RGBAImage? {
+    private func adjustedPreviewOnQueue(handle: ImageHandle?, params: AdjustmentParams,
+                                         colorProfile: ColorProfile) -> RGBAImage? {
         bootIfNeeded()
 
         let previewRGB: PythonObject
         if let handle {
-            ccrBackend.set_adjustment_by_index(handle.index, params.asPythonDict)
             let image = ccrBackend.images[handle.index]
+            // Mirrors sliders_panel.py's on_color_profile_changed: set the
+            // attribute, THEN reprocess (set_adjustment_by_index below does
+            // the reprocess for us).
+            image.color_profile = PythonObject(colorProfile.rawValue)
+            ccrBackend.set_adjustment_by_index(handle.index, params.asPythonDict)
             let preview = image._preview_np8
             // NOT `preview != Python.None`: numpy overloads `!=` to compare
             // element-wise, returning an array instead of a scalar bool, and

@@ -1,4 +1,5 @@
 import Metal
+import PythonBridge
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -21,7 +22,7 @@ struct ContentView: View {
                 MetalCanvasView(state: state)
                     .frame(minWidth: 512, minHeight: 384)
                 SlidersPanel(state: state)
-                    .frame(minWidth: 260, idealWidth: 280, maxWidth: 340)
+                    .frame(minWidth: 280, idealWidth: 300, maxWidth: 360)
             }
         }
         .onAppear { state.requestUpdate() }
@@ -83,45 +84,100 @@ struct Toolbar: View {
     }
 }
 
-/// Miniature analog of `widgets/sliders_panel.py` — four adjustment sliders
-/// wired straight to `PreviewState`, which serializes every change through
-/// PythonKit onto the real `core.ccr_backend`/`core.ccr_image` call chain.
+/// Analog of `widgets/sliders_panel.py`'s main controls: the full
+/// `ADJUSTMENT_KEYS` slider set (minus per-color-band/curves — later
+/// milestones), Color Profile, and the Cineon toggle. Every field writes
+/// straight into `PreviewState.params`/`.colorProfile`, whose `didSet`
+/// serializes the resulting PythonKit call — no per-slider plumbing needed
+/// here beyond the `Binding`.
 struct SlidersPanel: View {
     @ObservedObject var state: PreviewState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("Adjustments").font(.headline)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                header
 
-            adjustmentSlider("Temperature", $state.temperature)
-            adjustmentSlider("Exposure", $state.exposure)
-            adjustmentSlider("Contrast", $state.contrast)
-            adjustmentSlider("Saturation", $state.saturation)
+                colorProfileRow
 
-            Divider()
-
-            HStack(spacing: 6) {
-                if state.isBusy {
-                    ProgressView().controlSize(.small)
-                    Text("Python running…")
-                } else {
-                    Image(systemName: "checkmark.circle").foregroundStyle(.green)
-                    Text(String(format: "adjust_image: %.1f ms", state.lastLatencyMs))
+                Group {
+                    adjustmentSlider("Temperature", $state.params.temperature)
+                    adjustmentSlider("Tint", $state.params.tint)
+                    adjustmentSlider("Gain (Exposure)", $state.params.exposure, range: -200...200)
+                    adjustmentSlider("Brightness", $state.params.brightness)
+                    adjustmentSlider("Gamma", $state.params.gamma)
+                    adjustmentSlider("Highlights", $state.params.highlights)
+                    adjustmentSlider("White Point", $state.params.whitePoint)
+                    adjustmentSlider("Shadows", $state.params.shadows)
+                    adjustmentSlider("Black Point", $state.params.blackPoint)
+                    adjustmentSlider("Contrast", $state.params.contrast)
+                    adjustmentSlider("Saturation", $state.params.saturation)
+                    adjustmentSlider("Subtracted Sat", $state.params.subSaturation)
                 }
+
+                DisclosureGroup("Channel Levels") {
+                    VStack(alignment: .leading, spacing: 16) {
+                        adjustmentSlider("Input Gain", $state.params.chInputGain)
+                        adjustmentSlider("Master Shift", $state.params.chMasterShift)
+                        adjustmentSlider("Master Gain", $state.params.chMasterGain)
+                        adjustmentSlider("R Shift", $state.params.chRShift)
+                        adjustmentSlider("R Gain", $state.params.chRGain)
+                        adjustmentSlider("R Blackpoint", $state.params.chRBlackpoint)
+                        adjustmentSlider("G Shift", $state.params.chGShift)
+                        adjustmentSlider("G Gain", $state.params.chGGain)
+                        adjustmentSlider("G Blackpoint", $state.params.chGBlackpoint)
+                        adjustmentSlider("B Shift", $state.params.chBShift)
+                        adjustmentSlider("B Gain", $state.params.chBGain)
+                        adjustmentSlider("B Blackpoint", $state.params.chBBlackpoint)
+                    }
+                    .padding(.top, 8)
+                }
+
+                Toggle("Cineon Log → Rec.709 (γ 2.2)", isOn: $state.params.cineonLog)
+                    .toggleStyle(.checkbox)
+
+                Button("Reset All") { state.resetAdjustments() }
+
+                Divider()
+
+                statusLine
+
+                Text("Every change writes into PreviewState.params, whose didSet calls PythonKit -> core.ccr_backend/core.ccr_image on FreeCCR's real color-math module, running in an embedded CPython with zero PySide6 on sys.path.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-
-            Spacer()
-
-            Text("Every drag calls PythonKit -> core.ccr_backend/core.ccr_image on FreeCCR's real color-math module, running in an embedded CPython with zero PySide6 on sys.path.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            .padding()
         }
-        .padding()
     }
 
-    private func adjustmentSlider(_ label: String, _ value: Binding<Double>) -> some View {
+    private var header: some View {
+        Text("Adjustments").font(.headline)
+    }
+
+    private var colorProfileRow: some View {
+        Picker("Color Profile", selection: $state.colorProfile) {
+            Text("Color").tag(ColorProfile.color)
+            Text("Black & White").tag(ColorProfile.blackAndWhite)
+        }
+        .pickerStyle(.menu)
+    }
+
+    private var statusLine: some View {
+        HStack(spacing: 6) {
+            if state.isBusy {
+                ProgressView().controlSize(.small)
+                Text("Python running…")
+            } else {
+                Image(systemName: "checkmark.circle").foregroundStyle(.green)
+                Text(String(format: "adjust_image: %.1f ms", state.lastLatencyMs))
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    private func adjustmentSlider(_ label: String, _ value: Binding<Double>,
+                                   range: ClosedRange<Double> = -100...100) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(label)
@@ -129,11 +185,20 @@ struct SlidersPanel: View {
                 Text(String(format: "%.0f", value.wrappedValue))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
-            }
-            Slider(value: value, in: -100...100)
-                .onChange(of: value.wrappedValue) {
-                    state.requestUpdate()
+                // Stand-in for ResettableSlider's double-click-to-reset (a
+                // real double-click on a ~20pt-tall SwiftUI Slider is not a
+                // reliable target) — same effect via an explicit button.
+                if value.wrappedValue != 0 {
+                    Button {
+                        value.wrappedValue = 0
+                    } label: {
+                        Image(systemName: "arrow.uturn.backward.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
                 }
+            }
+            Slider(value: value, in: range)
         }
     }
 }

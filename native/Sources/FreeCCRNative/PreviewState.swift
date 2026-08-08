@@ -8,15 +8,17 @@ import SwiftUI
 /// (through `PythonCoreBridge`, which owns the actual GIL-safe serial queue).
 @MainActor
 final class PreviewState: ObservableObject {
-    // Still the first-slice 4 sliders (M3 in the Phase 3 plan adds the rest
-    // of sliders_panel.py's controls) — "Kelvin Shift" is now "Temperature"
-    // since adjustments route through the real ccr_image.apply_adjustments
-    // path, whose parameter is `temperature`, not the raw ccr_processor
-    // `kelvin_shift` the earlier synthetic-frame-only version used.
-    @Published var exposure: Double = 0
-    @Published var contrast: Double = 0
-    @Published var saturation: Double = 0
-    @Published var temperature: Double = 0
+    /// The full sliders_panel.py `ADJUSTMENT_KEYS` set (minus per-color-band
+    /// and curve keys — later milestones), plus `cineonLog`. One struct
+    /// instead of ~24 separate `@Published` fields so every slider can share
+    /// a single `didSet`-triggered update instead of wiring up its own
+    /// `onChange`.
+    @Published var params = AdjustmentParams() {
+        didSet { requestUpdate() }
+    }
+    @Published var colorProfile: ColorProfile = .color {
+        didSet { requestUpdate() }
+    }
 
     @Published private(set) var texture: MTLTexture?
     @Published private(set) var isBusy = false
@@ -74,6 +76,14 @@ final class PreviewState: ObservableObject {
         }
     }
 
+    /// Resets every slider (and Color Profile) to its default — mirrors
+    /// sliders_panel.py's on_reset_clicked (minus curves/crop/areas, not
+    /// wired up yet).
+    func resetAdjustments() {
+        params = AdjustmentParams()
+        colorProfile = .color
+    }
+
     func requestUpdate() {
         pendingTask?.cancel()
         isBusy = true
@@ -85,13 +95,8 @@ final class PreviewState: ObservableObject {
 
     private func runAdjustment(device: MTLDevice) async {
         let start = DispatchTime.now()
-        var params = AdjustmentParams()
-        params.temperature = temperature
-        params.exposure = exposure
-        params.contrast = contrast
-        params.saturation = saturation
         guard let image = await PythonCoreBridge.shared.adjustedPreview(
-            handle: imageHandle, params: params) else {
+            handle: imageHandle, params: params, colorProfile: colorProfile) else {
             self.isBusy = false
             return
         }

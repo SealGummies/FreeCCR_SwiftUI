@@ -1,4 +1,4 @@
-# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom)
+# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom, M3: full sliders)
 
 A real, runnable SwiftUI app (not a CLI PoC like `swiftui_poc/`) demonstrating
 the architecture's interactive loop: a Metal preview canvas plus a sliders
@@ -7,11 +7,13 @@ call chain through an embedded CPython via PythonKit — the same
 `ccr_backend.set_adjustment_by_index` → `ccr_image.update_thumbnail_and_preview`
 path `sliders_panel.py` drives, not a hand-rolled reimplementation.
 
-This covers milestones **M1** (real image loading) and **M2** (pan/zoom +
-the coordinate-transform stack) of the Phase 3 plan
-(`/Users/seal/.claude/plans/unified-foraging-candy.md`). The rest of
-`sliders_panel.py`'s controls, curve editing, thumbnails, dust removal, etc.
-are later milestones (M3–M8) in that plan.
+This covers milestones **M1** (real image loading), **M2** (pan/zoom + the
+coordinate-transform stack), and **M3** (the full `sliders_panel.py` main
+control set) of the Phase 3 plan
+(`/Users/seal/.claude/plans/unified-foraging-candy.md`). Curve editing,
+thumbnails, dust removal, per-color-band ("Subtractive Saturations") sliders,
+and the rest are later milestones (M4–M8, plus the deferred per-band section
+— see "Known rough edges" below) in that plan.
 
 ## Layout
 
@@ -25,11 +27,15 @@ are later milestones (M3–M8) in that plan.
     `DispatchQueue`.
   - `CoreBridge.swift`: `loadImage(path:)` decodes via the real
     `core.ccr_image.CCRImage` and registers it on `ccr_backend.images`;
-    `adjustedPreview(handle:params:)` calls
+    `adjustedPreview(handle:params:colorProfile:)` calls
     `ccr_backend.set_adjustment_by_index` (exactly what a Qt slider does) and
     reads back `_preview_np8` directly — not the `.thumbnail`/
     `.resized_preview` properties, which return `QPixmap` and are `None` in a
     no-Qt environment (see `src/core/ccr_image.py`'s `QT_AVAILABLE` guards).
+    `AdjustmentParams` now carries the full `sliders_panel.py` `ADJUSTMENT_KEYS`
+    set (main sliders + all 12 Channel Levels controls + `cineonLog`);
+    `ColorProfile` is separate because `CCRImage.color_profile` is its own
+    attribute, not an `adjustment_settings` key.
 - `Sources/FreeCCRNative/` — the SwiftUI app:
   - `CanvasTransform.swift`: the screen ↔ canvas ↔ image-normalized
     coordinate stack (the Swift analog of `image_preview.py`'s
@@ -70,8 +76,15 @@ DYLD_LIBRARY_PATH="$(pwd)/../swiftui_poc/python/lib" .build/debug/FreeCCRNative
 ```
 
 A window opens with a toolbar ("Open Image…", zoom%, +/− buttons, Fit), a
-dark canvas, and four sliders (Temperature, Exposure, Contrast, Saturation)
-on the right:
+dark canvas, and a scrollable sliders panel on the right: Color Profile,
+the 12 main sliders (Temperature, Tint, Gain/Exposure, Brightness, Gamma,
+Highlights, White Point, Shadows, Black Point, Contrast, Saturation,
+Subtracted Sat), a collapsible "Channel Levels" section (Input/Master/R/G/B
+gain-shift-blackpoint controls), a Cineon Log → Rec.709 toggle, and a Reset
+All button. Every slider shows a small reset arrow next to its value when
+it's off its default (0) — the SwiftUI stand-in for `ResettableSlider`'s
+double-click-to-reset, since a real double-click on a ~20pt slider track
+isn't a reliable target.
 
 - On launch the canvas shows a synthetic coordinate-gradient test frame (no
   file loaded yet) — dragging sliders adjusts it via
@@ -95,6 +108,12 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
 `swift test` (needs the same `DYLD_LIBRARY_PATH`) runs:
 - `loadsRealImageAndAdjustsIt`: the same `loadImage`/`adjustedPreview` path
   headlessly against a generated test PNG.
+- `blackAndWhiteColorProfileGraysOutThePreview`: confirms `colorProfile`
+  actually reaches `CCRImage._to_grayscale` (every returned pixel's R/G/B
+  equal) rather than silently being ignored.
+- `cineonLogFlagDoesNotCrashThePipeline`: `cineon_log` round-trips through
+  `adjustment_settings` without error (no numeric assertion — that math
+  belongs with `ccr_processor`'s own Python tests).
 - `CanvasTransform`'s pure-math tests (`fitScaleFillsTheSmallerDimension`,
   `zoomAnchoredAtCenterKeepsImageCentered`,
   `zoomAnchoredAtArbitraryPointStaysUnderTheAnchor`, `zoomClampsToMinAndMax`,
@@ -103,9 +122,13 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
 
 ## Known rough edges (expected at this stage)
 
-- Only 4 of `sliders_panel.py`'s ~30 controls are wired up (M3 adds the rest;
-  `AdjustmentParams` in `CoreBridge.swift` already carries the full parameter
-  set the UI will eventually expose).
+- **Per-color-band sliders ("Subtractive Saturations": 7 bands × 4 params +
+  Feather) and Curves are NOT in this milestone**, despite being listed under
+  M3 in the plan — they need their own backend wiring (`band_settings` dict,
+  band-selection UI) and, for Curves, a Swift reimplementation of the
+  Fritsch-Carlson monotone-cubic interpolation to match `ccr_processor`'s
+  math. Deferred to M4 (Curves) and a follow-up to M3 for the per-band
+  section, rather than half-wiring them now.
 - Pan/zoom (M2) has no keyboard shortcuts and no on-canvas overlays yet
   (crop box, area layers, dust brush — later milestones that build on
   `CanvasTransform`).

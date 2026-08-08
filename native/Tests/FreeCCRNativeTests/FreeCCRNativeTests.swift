@@ -29,6 +29,51 @@ import UniformTypeIdentifiers
     }
 }
 
+/// M3 regression: colorProfile is a separate CCRImage attribute, not an
+/// adjustment_settings key (see CoreBridge.swift's doc comment on
+/// ColorProfile) — verify it actually reaches core.ccr_image._to_grayscale
+/// by checking the returned pixels are colorless (R == G == B everywhere),
+/// which a plain color adjustment on this red/green test gradient would not
+/// produce.
+@Test func blackAndWhiteColorProfileGraysOutThePreview() async throws {
+    let testPNGPath = NSTemporaryDirectory() + "freeccr_native_test_scan_bw.png"
+    try makeTestPNG(at: testPNGPath, width: 64, height: 48)
+    let handle = await PythonCoreBridge.shared.loadImage(path: testPNGPath)
+    #expect(handle != nil)
+
+    let image = await PythonCoreBridge.shared.adjustedPreview(
+        handle: handle, params: AdjustmentParams(), colorProfile: .blackAndWhite)
+    #expect(image != nil)
+    guard let image else { return }
+    var allNeutral = true
+    image.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+        let bytes = raw.bindMemory(to: UInt8.self)
+        for pixel in stride(from: 0, to: bytes.count, by: 4) {
+            if bytes[pixel] != bytes[pixel + 1] || bytes[pixel + 1] != bytes[pixel + 2] {
+                allNeutral = false
+                break
+            }
+        }
+    }
+    #expect(allNeutral, "Black & White color profile should make every pixel's R/G/B equal")
+}
+
+/// cineonLog just needs to not crash the pipeline (it's a boolean flag inside
+/// adjustment_settings, not a separate call path) — a real numeric assertion
+/// on the Cineon->Rec.709 curve belongs with ccr_processor's own Python
+/// tests, not here.
+@Test func cineonLogFlagDoesNotCrashThePipeline() async throws {
+    let testPNGPath = NSTemporaryDirectory() + "freeccr_native_test_scan_cineon.png"
+    try makeTestPNG(at: testPNGPath, width: 64, height: 48)
+    let handle = await PythonCoreBridge.shared.loadImage(path: testPNGPath)
+    #expect(handle != nil)
+
+    var params = AdjustmentParams()
+    params.cineonLog = true
+    let image = await PythonCoreBridge.shared.adjustedPreview(handle: handle, params: params)
+    #expect(image != nil)
+}
+
 // MARK: - M2: CanvasTransform coordinate-stack checks (pure math, no Python)
 
 @Test func fitScaleFillsTheSmallerDimension() {
