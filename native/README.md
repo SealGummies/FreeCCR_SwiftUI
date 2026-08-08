@@ -1,4 +1,4 @@
-# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom + hi-res-on-zoom, M3: full sliders, M4: curves, M5: thumbnail list)
+# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom + hi-res-on-zoom, M3: full sliders, M4: curves, M5: thumbnail list, M6: manual dust removal)
 
 A real, runnable SwiftUI app (not a CLI PoC like `swiftui_poc/`) demonstrating
 the architecture's interactive loop: a Metal preview canvas plus a sliders
@@ -10,9 +10,11 @@ path `sliders_panel.py` drives, not a hand-rolled reimplementation.
 This covers milestones **M1** (real image loading), **M2** (pan/zoom + the
 coordinate-transform stack), **M3** (the full `sliders_panel.py` control set,
 including per-color-band "Subtractive Saturations" sliders), **M4** (curve
-editing), and **M5** (the thumbnail list, multi-image support) of the
-Phase 3 plan (`/Users/seal/.claude/plans/unified-foraging-candy.md`). Dust
-removal and the rest are later milestones (M6–M8) in that plan.
+editing), **M5** (the thumbnail list, multi-image support), and **M6**
+(manual-brush dust removal) of the Phase 3 plan
+(`/Users/seal/.claude/plans/unified-foraging-candy.md`). AI dust detection
+and the remaining panels are later milestones (M6's AI section, M7–M8) in
+that plan.
 
 ## Layout
 
@@ -166,7 +168,12 @@ double-click on a ~20pt slider track isn't a reliable target. There's also a
 collapsible **Curves** section: All/R/G/B channel buttons, a draggable tone
 curve (click the line to add a point, drag a point to reshape, right-click
 an interior point to delete it — the endpoints can't be deleted or moved off
-x=0/x=255), and a Reset Curve button.
+x=0/x=255), and a Reset Curve button. A collapsible **Dust Removal** section
+holds manual-brush spot healing: a "Paint Mode" checkbox (while on,
+left-click-drag on the canvas paints a brush stroke instead of panning — see
+below), a log-scaled Brush Size slider, a Feather slider, and Undo
+Last Spot/Clear All buttons. AI-assisted detection (`dust_detect.py`'s ONNX
+model) isn't ported yet — see "Known rough edges".
 
 - On launch the canvas shows a synthetic coordinate-gradient test frame (no
   file loaded yet) — dragging sliders adjusts it via
@@ -181,11 +188,21 @@ x=0/x=255), and a Reset Curve button.
   any file that failed to decode (check the terminal for the Python
   traceback).
 - **Pan**: two-finger scroll on a trackpad, a mouse scroll wheel, or left-click
-  and drag directly on the canvas (the image follows the cursor 1:1). All
-  three share the same bounds clamp: you can never drag/scroll so far that
+  and drag directly on the canvas (the image follows the cursor 1:1) — unless
+  **Paint Mode** is on, in which case left-click-drag paints a dust spot
+  instead (scroll/pinch still pan/zoom normally either way). All pan sources
+  share the same bounds clamp: you can never drag/scroll so far that
   empty space shows up inside the canvas, and at **Full** zoom the image
   already fits the canvas on both axes, so panning is a no-op there — not a
   special case, just what the clamp resolves to.
+- **Dust removal**: turn on **Paint Mode** in the Dust Removal section, then
+  left-click-drag over a dust speck/scratch on the canvas — releasing the
+  mouse commits the stroke and re-renders through the real
+  `core.ccr_processor.apply_dust_removal` clone-heal (the same algorithm and
+  code path the Qt app uses, not a reimplementation — see "Zoom model" note
+  below on why CoreBridge always defers pixel math to the real Python core).
+  Brush Size and Feather match `dust_panel.py`'s ranges. Undo Last
+  Spot/Clear All remove spots without touching any other slider.
 - **Zoom**: pinch on a trackpad (anchored under your fingers — the same
   image point stays put as you zoom; this deselects the segmented control,
   since a pinch lands on an arbitrary ratio), or tap **Full**/**100%**/**200%**
@@ -256,6 +273,17 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
 - `clampPanLocksOnlyTheAxisThatFits`: a wide/short image zoomed so only its
   width exceeds the viewport — the height axis locks to 0 while width still
   allows (clamped) panning.
+- `dustSpotChangesThePixelsItCovers`: a brush spot passed through
+  `CoreBridge.adjustedPreview`'s `dustSpots` parameter visibly changes the
+  rendered pixels vs. no spots — confirms it actually reaches
+  `CCRImage.dust_spots`/`apply_adjustments`' `_apply_dust_removal` step (the
+  real clone-heal in `ccr_processor.py`), not silently dropped.
+- `dustBrushSliderMappingRoundTrips`: `DustBrush`'s log-scaled slider mapping
+  hits its documented min/max endpoints and round-trips radius -> step -> radius.
+- `dustSpotsPersistPerImageAndSupportUndoClear`: like
+  `perImageAdjustmentsPersistIndependently`, but for dust spots — each
+  loaded image keeps its own spot list across `selectImage` switches, and
+  `undoLastDustSpot`/`clearDustSpots` mutate only the current image's list.
 
 ## Known rough edges (expected at this stage)
 
@@ -272,8 +300,19 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
   No async/background thumbnail loading either (each file is decoded and
   thumbnailed sequentially in `loadImages`' loop before the next starts).
 - Pan/zoom (M2) has no keyboard shortcuts and no on-canvas overlays yet
-  (crop box, area layers, dust brush — later milestones that build on
-  `CanvasTransform`).
+  (crop box, area layers — later milestones that build on `CanvasTransform`).
+- Dust removal (M6) is manual-brush only: `dust_detect.py`'s ONNX/CoreML AI
+  detection isn't ported (onnxruntime import + CoreML provider listing were
+  confirmed working in the Phase 1 PoC, but an actual inference call never
+  was — real scope, deferred rather than shipped half-verified). Also
+  missing vs. the Qt app: no live brush-size cursor or in-progress-stroke
+  overlay while dragging (the healed result only appears once you release
+  the mouse and the re-render lands), no right-click "move stroke / reselect
+  heal source" (`image_preview.py`'s `dust_right_press` family — sticky
+  source pinning), no "show heal sources" debug overlay, and no
+  crop-awareness (moot for now since this port has no crop feature yet
+  either). Undo is a plain stack pop (`undoLastDustSpot`), not the Qt
+  app's 800ms-idle-burst-merged undo history shared with the sliders.
 - No debouncing beyond "cancel the previous in-flight call" — fine at
   preview resolution (~1080px long side, matches the Qt app's own preview
   size), would need real throttling for full-res/export-size/hi-res frames.

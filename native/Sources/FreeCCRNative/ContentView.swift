@@ -215,6 +215,11 @@ struct SlidersPanel: View {
                         .padding(.top, 8)
                 }
 
+                DisclosureGroup("Dust Removal") {
+                    DustRemovalSection(state: state)
+                        .padding(.top, 8)
+                }
+
                 DisclosureGroup("Channel Levels") {
                     VStack(alignment: .leading, spacing: 16) {
                         adjustmentSlider("Input Gain", $state.params.chInputGain)
@@ -366,6 +371,60 @@ struct BandSaturationsSection: View {
                 adjustment[keyPath: keyPath] = newValue
                 state.params.bands[selectedBand] = adjustment
             })
+    }
+}
+
+/// Analog of `dust_panel.py`'s manual-brush section (AI detection isn't
+/// ported yet — see native/README.md's known rough edges). "Paint Mode"
+/// repurposes left-click-drag on the canvas from panning to brush strokes
+/// (`MetalCanvasView`/`ZoomPanMTKView`); the brush slider is log-scaled via
+/// `DustBrush`, matching `dust_panel.py`'s fine-steps-at-the-small-end
+/// rationale exactly. Feather and spots are per-image (`PreviewState`
+/// snapshots/restores them in `selectImage`, like `params`); brush size is a
+/// session-wide tool setting, not per-image.
+struct DustRemovalSection: View {
+    @ObservedObject var state: PreviewState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle("Paint Mode (left-drag on canvas)", isOn: $state.isDustMode)
+                .toggleStyle(.checkbox)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Brush Size")
+                    Spacer()
+                    Text(String(format: "%.2f%%", state.dustBrushRadius * 100))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                Slider(
+                    value: Binding(
+                        get: { Double(DustBrush.sliderStep(forRadius: state.dustBrushRadius)) },
+                        set: { state.dustBrushRadius = DustBrush.radius(forSliderStep: Int($0.rounded())) }),
+                    in: 0...Double(DustBrush.steps))
+            }
+
+            AdjustmentSliderRow(
+                label: "Feather",
+                value: Binding(
+                    get: { state.dustFeather * 100 },
+                    set: { state.dustFeather = $0 / 100 }),
+                range: 0...100, defaultValue: 25)
+
+            HStack(spacing: 8) {
+                Button("Undo Last Spot") { state.undoLastDustSpot() }
+                    .disabled(state.dustSpots.isEmpty)
+                Button("Clear All") { state.clearDustSpots() }
+                    .disabled(state.dustSpots.isEmpty)
+            }
+
+            if !state.dustSpots.isEmpty {
+                Text("\(state.dustSpots.count) spot\(state.dustSpots.count == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 

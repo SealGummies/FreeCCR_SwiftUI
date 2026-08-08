@@ -24,6 +24,29 @@ enum ZoomPreset: CaseIterable {
     case full, oneHundred, twoHundred
 }
 
+/// Brush-radius <-> slider-step mapping, ported line-for-line from
+/// `dust_panel.py`'s `slider_to_brush_r`/`brush_r_to_slider`: dust spotting
+/// needs fine steps at the small end (0.05% is ~3px on a 6000px scan)
+/// without giving up big scratch-covering sizes at the top, so the slider's
+/// integer steps map onto the radius range LOG-scaled rather than linearly.
+enum DustBrush {
+    static let minRadius = 0.0005
+    static let maxRadius = 0.2
+    static let steps = 300
+    static let defaultRadius = 0.012 // matches dust_panel.py's 1.2% default
+    private static let logSpan = log(maxRadius / minRadius)
+
+    static func radius(forSliderStep step: Int) -> Double {
+        let v = Double(max(0, min(steps, step)))
+        return minRadius * exp(logSpan * v / Double(steps))
+    }
+
+    static func sliderStep(forRadius r: Double) -> Int {
+        let clamped = max(minRadius, min(maxRadius, r))
+        return Int((Double(steps) * log(clamped / minRadius) / logSpan).rounded())
+    }
+}
+
 /// Miniature stand-in for the Phase 2 `ProjectState` — this is a SwiftUI
 /// `ObservableObject`, not `ccr_backend`'s global singleton. Every adjustment
 /// slider writes here; here is the only place that talks to PythonKit
@@ -50,6 +73,25 @@ final class PreviewState: ObservableObject {
     @Published var colorProfile: ColorProfile = .color {
         didSet { requestUpdate() }
     }
+
+    /// Manual dust-removal state — mirrors `CCRImage.dust_spots`/
+    /// `dust_feather` (per-image, like `params`/`colorProfile` above: switching
+    /// images snapshots/restores these too, see `selectImage`).
+    /// `dustSpots` is committed by `appendDustStroke` (once per finished
+    /// stroke, not per mouse-move sample) rather than a `didSet`, since a
+    /// stroke's in-progress points live locally in `ZoomPanMTKView` until
+    /// release — there's nothing to re-render until then.
+    @Published private(set) var dustSpots: [DustSpot] = []
+    @Published var dustFeather: Double = 0.25 {
+        didSet { requestUpdate() }
+    }
+    /// Brush radius, normalized (fraction of image width) — a session-wide
+    /// tool setting like the Qt canvas's `_dust_brush_r`, not per-image.
+    @Published var dustBrushRadius: Double = DustBrush.defaultRadius
+    /// Whether left-click-drag on the canvas paints dust strokes (true) or
+    /// pans the image (false, the default from M2). See
+    /// `MetalCanvasView`/`ZoomPanMTKView`'s `isDustMode`-gated mouse handling.
+    @Published var isDustMode = false
 
     @Published private(set) var texture: MTLTexture?
     @Published private(set) var isBusy = false
@@ -161,7 +203,9 @@ final class PreviewState: ObservableObject {
     /// `CCRImage` instance owning its own `adjustment_settings`/
     /// `color_profile` in the real app, since here `params`/`colorProfile`
     /// are shared @Published storage for whichever image is current.
-    private var perImageState: [ImageHandle: (params: AdjustmentParams, colorProfile: ColorProfile)] = [:]
+    private var perImageState: [ImageHandle: (
+        params: AdjustmentParams, colorProfile: ColorProfile,
+        dustSpots: [DustSpot], dustFeather: Double)] = [:]
     private var pendingTask: Task<Void, Never>?
 
     init(device: MTLDevice) {
@@ -190,7 +234,7 @@ final class PreviewState: ObservableObject {
                     .map { CGSize(width: $0.width, height: $0.height) } ?? .zero
                 self.images.append(LoadedImage(
                     id: handle, fileName: url.lastPathComponent, thumbnail: thumbnail, originalSize: originalSize))
-                self.perImageState[handle] = (AdjustmentParams(), ColorProfile.color)
+                self.perImageState[handle] = (AdjustmentParams(), ColorProfile.color, [], 0.25)
                 lastGoodIndex = self.images.count - 1
             }
             if let lastGoodIndex {
@@ -208,12 +252,14 @@ final class PreviewState: ObservableObject {
     func selectImage(at index: Int) {
         guard images.indices.contains(index) else { return }
         if let previousIndex = currentIndex, images.indices.contains(previousIndex) {
-            perImageState[images[previousIndex].id] = (params, colorProfile)
+            perImageState[images[previousIndex].id] = (params, colorProfile, dustSpots, dustFeather)
         }
         currentIndex = index
-        let saved = perImageState[images[index].id] ?? (AdjustmentParams(), ColorProfile.color)
+        let saved = perImageState[images[index].id] ?? (AdjustmentParams(), ColorProfile.color, [], 0.25)
         params = saved.params
         colorProfile = saved.colorProfile
+        dustSpots = saved.dustSpots
+        dustFeather = saved.dustFeather
         fitToView() // new image: back to a fitted view (mirrors image_preview.py); also calls requestUpdate()
     }
 
@@ -224,6 +270,31 @@ final class PreviewState: ObservableObject {
     func resetAdjustments() {
         params = AdjustmentParams()
         colorProfile = .color
+    }
+
+    /// Commits one finished brush stroke — called by `MetalCanvasView` on
+    /// mouse-up while `isDustMode` is set, mirroring `image_preview.py`'s
+    /// `dust_release` appending a `{"kind": "brush", ...}` dict to
+    /// `img.dust_spots`. `points` are already normalized (0...1) image
+    /// coordinates (see `CanvasTransform.imageNormalizedPoint`).
+    func appendDustStroke(points: [CGPoint], radius: Double) {
+        guard !points.isEmpty else { return }
+        dustSpots.append(DustSpot(points: points, radius: radius))
+        requestUpdate()
+    }
+
+    /// Mirrors dust_panel.py's "Undo last spot" button.
+    func undoLastDustSpot() {
+        guard !dustSpots.isEmpty else { return }
+        dustSpots.removeLast()
+        requestUpdate()
+    }
+
+    /// Mirrors dust_panel.py's "Clear all" button.
+    func clearDustSpots() {
+        guard !dustSpots.isEmpty else { return }
+        dustSpots.removeAll()
+        requestUpdate()
     }
 
     func requestUpdate() {
@@ -268,7 +339,8 @@ final class PreviewState: ObservableObject {
         // architecture — sliders_panel's normal update path and
         // HiResDetailWorker both run, independently, when zoomed in.
         guard let fastImage = await PythonCoreBridge.shared.adjustedPreview(
-            handle: handle, params: params, colorProfile: colorProfile) else {
+            handle: handle, params: params, colorProfile: colorProfile,
+            dustSpots: dustSpots, dustFeather: dustFeather) else {
             self.isBusy = false
             return
         }
@@ -279,7 +351,8 @@ final class PreviewState: ObservableObject {
             let nativeLongSide = Int(max(originalImageSize.width, originalImageSize.height).rounded())
             let cap = nativeLongSide > 0 ? min(nativeLongSide, Self.hiResMaxLongSide) : Self.hiResMaxLongSide
             if let hiRes = await PythonCoreBridge.shared.hiResPreview(
-                handle: handle, params: params, colorProfile: colorProfile, maxLongSide: cap) {
+                handle: handle, params: params, colorProfile: colorProfile, maxLongSide: cap,
+                dustSpots: dustSpots, dustFeather: dustFeather) {
                 displayImage = hiRes
             }
             if Task.isCancelled { return }

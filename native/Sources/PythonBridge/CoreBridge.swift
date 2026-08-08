@@ -9,6 +9,7 @@
 // see that file's doc comment for why) — nothing else in the app is allowed
 // to touch PythonKit directly.
 
+import CoreGraphics
 import Foundation
 import PythonKit
 
@@ -147,6 +148,24 @@ public enum ColorProfile: String, Sendable {
     case blackAndWhite = "bw"
 }
 
+/// One manual dust-removal brush stroke — mirrors `dust_panel.py`/
+/// `image_preview.py`'s `img.dust_spots` entries: `{"kind": "brush", "pts":
+/// [[x,y],...], "r": r}`. `points` are normalized (0...1) over the full,
+/// un-cropped image — crop-independent, same as the Qt app, though this port
+/// has no crop feature yet so that distinction is moot for now. `radius` is
+/// a fraction of image WIDTH (matches `DUST_BRUSH_R_MIN`/`MAX` in
+/// `dust_panel.py`, 0.0005...0.2). AI-detected ("auto") spots aren't
+/// supported yet — see CoreBridge's dust-removal doc comment.
+public struct DustSpot: Sendable, Equatable {
+    public var points: [CGPoint]
+    public var radius: Double
+
+    public init(points: [CGPoint], radius: Double) {
+        self.points = points
+        self.radius = radius
+    }
+}
+
 public struct RGBAImage: Sendable {
     public let width: Int
     public let height: Int
@@ -217,11 +236,13 @@ public final class PythonCoreBridge: @unchecked Sendable {
     /// resulting preview pixels. If `handle` is nil, falls back to adjusting
     /// a synthetic gradient frame (no image loaded yet).
     public func adjustedPreview(handle: ImageHandle?, params: AdjustmentParams,
-                                 colorProfile: ColorProfile = .color) async -> RGBAImage? {
+                                 colorProfile: ColorProfile = .color,
+                                 dustSpots: [DustSpot] = [], dustFeather: Double = 0.25) async -> RGBAImage? {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(returning: self.adjustedPreviewOnQueue(
-                    handle: handle, params: params, colorProfile: colorProfile))
+                    handle: handle, params: params, colorProfile: colorProfile,
+                    dustSpots: dustSpots, dustFeather: dustFeather))
             }
         }
     }
@@ -237,11 +258,13 @@ public final class PythonCoreBridge: @unchecked Sendable {
     /// higher-resolution base. `nil` on failure (falls back to whatever
     /// `adjustedPreview` already returned — see `PreviewState.runAdjustment`).
     public func hiResPreview(handle: ImageHandle, params: AdjustmentParams,
-                              colorProfile: ColorProfile, maxLongSide: Int) async -> RGBAImage? {
+                              colorProfile: ColorProfile, maxLongSide: Int,
+                              dustSpots: [DustSpot] = [], dustFeather: Double = 0.25) async -> RGBAImage? {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(returning: self.hiResPreviewOnQueue(
-                    handle: handle, params: params, colorProfile: colorProfile, maxLongSide: maxLongSide))
+                    handle: handle, params: params, colorProfile: colorProfile, maxLongSide: maxLongSide,
+                    dustSpots: dustSpots, dustFeather: dustFeather))
             }
         }
     }
@@ -289,7 +312,8 @@ public final class PythonCoreBridge: @unchecked Sendable {
     }
 
     private func adjustedPreviewOnQueue(handle: ImageHandle?, params: AdjustmentParams,
-                                         colorProfile: ColorProfile) -> RGBAImage? {
+                                         colorProfile: ColorProfile,
+                                         dustSpots: [DustSpot], dustFeather: Double) -> RGBAImage? {
         bootIfNeeded()
 
         let previewRGB: PythonObject
@@ -300,6 +324,13 @@ public final class PythonCoreBridge: @unchecked Sendable {
             // adjustment_settings, then reprocess) inlined together.
             image.color_profile = PythonObject(colorProfile.rawValue)
             image.adjustment_settings = params.asPythonDict
+            // `dust_spots`/`dust_feather` are plain CCRImage attributes (see
+            // ccr_image.py's `_apply_dust_removal`, which reads them fresh
+            // via getattr on every `apply_adjustments` call) — no separate
+            // "commit" call needed, unlike Qt's dust_panel.py which pushes
+            // an undo snapshot first (no undo/redo in this port yet).
+            image.dust_spots = dustSpotsPythonList(dustSpots)
+            image.dust_feather = PythonObject(dustFeather)
             image.update_thumbnail_and_preview()
             guard let preview = numpyRGB8(image._preview_np8) else { return nil }
             previewRGB = preview
@@ -314,11 +345,14 @@ public final class PythonCoreBridge: @unchecked Sendable {
     /// separate from (and not capped by) `resized_raw`'s fixed 1080px
     /// preview buffer.
     private func hiResPreviewOnQueue(handle: ImageHandle, params: AdjustmentParams,
-                                      colorProfile: ColorProfile, maxLongSide: Int) -> RGBAImage? {
+                                      colorProfile: ColorProfile, maxLongSide: Int,
+                                      dustSpots: [DustSpot], dustFeather: Double) -> RGBAImage? {
         bootIfNeeded()
         let image = ccrBackend.images[handle.index]
         image.color_profile = PythonObject(colorProfile.rawValue)
         image.adjustment_settings = params.asPythonDict
+        image.dust_spots = dustSpotsPythonList(dustSpots)
+        image.dust_feather = PythonObject(dustFeather)
 
         let result = image.render_hires_base(max_long_side: PythonObject(maxLongSide))
         guard let base = numpyRGB8(result[0]) else { return nil }
@@ -355,6 +389,20 @@ public final class PythonCoreBridge: @unchecked Sendable {
             return nil
         }
         return (width: width, height: height)
+    }
+
+    /// Mirrors the `{"kind": "brush", "pts": [[x,y],...], "r": r}` dict shape
+    /// `image_preview.py`'s `dust_release` appends to `img.dust_spots`.
+    private func dustSpotsPythonList(_ spots: [DustSpot]) -> PythonObject {
+        let list = spots.map { spot -> PythonObject in
+            let pts = spot.points.map { PythonObject([PythonObject(Double($0.x)), PythonObject(Double($0.y))]) }
+            let dict = Python.dict()
+            dict[PythonObject("kind")] = PythonObject("brush")
+            dict[PythonObject("pts")] = PythonObject(pts)
+            dict[PythonObject("r")] = PythonObject(spot.radius)
+            return dict
+        }
+        return PythonObject(list)
     }
 
     /// `arr != Python.None` is NOT safe here: numpy overloads `!=` to

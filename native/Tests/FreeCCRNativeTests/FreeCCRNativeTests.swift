@@ -120,6 +120,46 @@ struct FreeCCRNativeTests {
         #expect(state.params.exposure == -17, "image 1's own exposure should have survived the round trip")
     }
 
+    /// M6 (dust removal): `appendDustStroke`/`undoLastDustSpot`/
+    /// `clearDustSpots` mutate `PreviewState.dustSpots`, and — like
+    /// `params`/`colorProfile` above — each loaded image keeps its own spot
+    /// list across `selectImage` switches.
+    @MainActor
+    @Test func dustSpotsPersistPerImageAndSupportUndoClear() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("no Metal device on this machine")
+            return
+        }
+        let state = PreviewState(device: device)
+
+        let path1 = NSTemporaryDirectory() + "freeccr_native_test_dust_1.png"
+        let path2 = NSTemporaryDirectory() + "freeccr_native_test_dust_2.png"
+        try makeTestPNG(at: path1, width: 48, height: 32)
+        try makeTestPNG(at: path2, width: 48, height: 32)
+
+        state.loadImages(urls: [URL(fileURLWithPath: path1), URL(fileURLWithPath: path2)])
+        try await waitUntil { state.images.count == 2 }
+
+        state.selectImage(at: 0)
+        try await waitUntil { !state.isBusy }
+        state.appendDustStroke(points: [CGPoint(x: 0.3, y: 0.3)], radius: 0.02)
+        state.appendDustStroke(points: [CGPoint(x: 0.6, y: 0.6)], radius: 0.02)
+        #expect(state.dustSpots.count == 2)
+
+        state.selectImage(at: 1)
+        try await waitUntil { !state.isBusy }
+        #expect(state.dustSpots.isEmpty, "image 1 should start with no dust spots of its own")
+
+        state.selectImage(at: 0)
+        try await waitUntil { !state.isBusy }
+        #expect(state.dustSpots.count == 2, "switching back to image 0 should restore its own spots")
+
+        state.undoLastDustSpot()
+        #expect(state.dustSpots.count == 1)
+        state.clearDustSpots()
+        #expect(state.dustSpots.isEmpty)
+    }
+
     /// Regression for a user-reported "preview looks like a blown-up thumbnail"
     /// report: confirms the full PreviewState pipeline (not just CoreBridge)
     /// puts a properly ~1080px-long-side MTLTexture on the canvas for a large
@@ -307,6 +347,47 @@ struct FreeCCRNativeTests {
 
     @Test func bandFeatherDefaultsToTen() {
         #expect(AdjustmentParams().bandFeather == 10)
+    }
+
+    /// M6 (dust removal) regression: a manual brush spot set via
+    /// `CoreBridge.adjustedPreview`'s `dustSpots` parameter must actually
+    /// reach `CCRImage.dust_spots`/`apply_adjustments`' `_apply_dust_removal`
+    /// step and change the rendered pixels — not silently ignored. Uses the
+    /// same gradient fixture as the band test above for the same reason
+    /// (`bandAdjustmentChangesTheMatchingColor`'s doc comment): a flat image
+    /// can mask a real effect behind the preview's own auto-brightness
+    /// re-normalization.
+    @Test func dustSpotChangesThePixelsItCovers() async throws {
+        let testPNGPath = NSTemporaryDirectory() + "freeccr_native_test_scan_dust.png"
+        try makeTestPNG(at: testPNGPath, width: 200, height: 150)
+        let handle = await PythonCoreBridge.shared.loadImage(path: testPNGPath)
+        #expect(handle != nil)
+
+        let baseline = await PythonCoreBridge.shared.adjustedPreview(
+            handle: handle, params: AdjustmentParams())
+        #expect(baseline != nil)
+
+        let spot = DustSpot(points: [CGPoint(x: 0.5, y: 0.5)], radius: 0.15)
+        let healed = await PythonCoreBridge.shared.adjustedPreview(
+            handle: handle, params: AdjustmentParams(), dustSpots: [spot], dustFeather: 0.25)
+        #expect(healed != nil)
+
+        guard let baseline, let healed else { return }
+        #expect(baseline.data != healed.data,
+                "a dust spot covering 15% of the image should visibly change the healed pixels")
+    }
+
+    /// `DustBrush`'s log-scale slider mapping (ported from dust_panel.py's
+    /// `slider_to_brush_r`/`brush_r_to_slider`) should round-trip and hit its
+    /// documented endpoints/default exactly.
+    @Test func dustBrushSliderMappingRoundTrips() {
+        #expect(DustBrush.radius(forSliderStep: 0) == DustBrush.minRadius)
+        #expect(abs(DustBrush.radius(forSliderStep: DustBrush.steps) - DustBrush.maxRadius) < 1e-9)
+        #expect(DustBrush.sliderStep(forRadius: DustBrush.defaultRadius) >= 0)
+        for step in [0, 50, 150, 300] {
+            let radius = DustBrush.radius(forSliderStep: step)
+            #expect(DustBrush.sliderStep(forRadius: radius) == step)
+        }
     }
 
     /// M3 regression: colorProfile is a separate CCRImage attribute, not an

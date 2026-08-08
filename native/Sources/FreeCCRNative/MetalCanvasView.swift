@@ -31,6 +31,26 @@ struct MetalCanvasView: NSViewRepresentable {
         view.onBoundsChange = { [weak state] size in
             state?.updateCanvasViewSize(size)
         }
+
+        // Dust-mode brush painting: the view reports raw screen-point
+        // samples (it has no notion of image geometry), and this closure —
+        // which DOES have `state`, hence `CanvasTransform` — converts each
+        // to a normalized image point and buffers it until the stroke ends.
+        // Points outside the image quad are dropped (`imageNormalizedPoint`
+        // returns nil there), matching a brush that only paints on the photo.
+        var strokePoints: [CGPoint] = []
+        view.onDustStrokePoint = { [weak state] location in
+            guard let state,
+                  let norm = state.transform.imageNormalizedPoint(
+                    screen: location, viewSize: state.canvasViewSize, imageSize: state.originalImageSize)
+            else { return }
+            strokePoints.append(norm)
+        }
+        view.onDustStrokeEnd = { [weak state] in
+            guard let state else { return }
+            state.appendDustStroke(points: strokePoints, radius: state.dustBrushRadius)
+            strokePoints = []
+        }
         return view
     }
 
@@ -38,6 +58,7 @@ struct MetalCanvasView: NSViewRepresentable {
         context.coordinator.texture = state.texture
         context.coordinator.transform = state.transform
         context.coordinator.originalImageSize = state.originalImageSize
+        nsView.isDustMode = state.isDustMode
         if state.canvasViewSize != nsView.bounds.size {
             // First layout / SwiftUI-driven resize the AppKit callback might
             // not have observed yet.
@@ -66,10 +87,28 @@ final class ZoomPanMTKView: MTKView {
     var onDoubleClick: (() -> Void)?
     var onBoundsChange: ((CGSize) -> Void)?
 
-    /// Tracks the drag in progress; `nil` when the left button isn't down.
-    /// Set in `mouseDown`, updated/consumed in `mouseDragged`, cleared in
-    /// `mouseUp`.
+    /// Kept in sync from `PreviewState.isDustMode` each `updateNSView` —
+    /// while true, left-click-drag paints a dust-removal brush stroke
+    /// instead of panning the canvas (see `mouseDown`/`mouseDragged`).
+    var isDustMode = false
+    /// Fires once per mouse-move sample while painting a stroke, with the
+    /// raw view-point location (this view has no image-geometry knowledge —
+    /// `MetalCanvasView` converts to normalized image coordinates).
+    var onDustStrokePoint: ((CGPoint) -> Void)?
+    /// Fires once when a stroke's mouse button is released, after its last
+    /// `onDustStrokePoint` — the cue to commit the accumulated points as one
+    /// spot (mirrors `image_preview.py`'s `dust_release`).
+    var onDustStrokeEnd: (() -> Void)?
+
+    /// Tracks the pan drag in progress; `nil` when the left button isn't
+    /// down or a dust stroke is in progress instead. Set in `mouseDown`,
+    /// updated/consumed in `mouseDragged`, cleared in `mouseUp`.
     private var lastDragLocation: CGPoint?
+    /// Whether the CURRENT mouse-down/drag/up sequence is painting a dust
+    /// stroke — decided once in `mouseDown` from `isDustMode`, so toggling
+    /// dust mode mid-drag can't switch behavior underneath an active
+    /// gesture.
+    private var isPaintingStroke = false
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -100,11 +139,21 @@ final class ZoomPanMTKView: MTKView {
         if event.clickCount >= 2 {
             onDoubleClick?()
         }
-        lastDragLocation = convert(event.locationInWindow, from: nil)
+        isPaintingStroke = isDustMode
+        let location = convert(event.locationInWindow, from: nil)
+        if isPaintingStroke {
+            onDustStrokePoint?(location)
+        } else {
+            lastDragLocation = location
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
+        if isPaintingStroke {
+            onDustStrokePoint?(location)
+            return
+        }
         if let last = lastDragLocation {
             // Direct manipulation, not "scroll" semantics: the image follows
             // the cursor 1:1, which is what `CanvasTransform.pan`'s
@@ -117,6 +166,10 @@ final class ZoomPanMTKView: MTKView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if isPaintingStroke {
+            onDustStrokeEnd?()
+        }
+        isPaintingStroke = false
         lastDragLocation = nil
     }
 }
