@@ -473,8 +473,13 @@ class SlidersPanel(QWidget):
         stock_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         stock_label.setFixedHeight(theme.CONTROL_H)
         stock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.film_stock_combo = QComboBox()
+        # Stock names are user-supplied and can be long: shrinkable_combo keeps
+        # the longest one from setting the panel's minimum width, and the
+        # eliding combo ends the displayed name in "…" instead of letting it run
+        # under the arrow half-drawn.
+        self.film_stock_combo = theme.ElidingComboBox()
         self.film_stock_combo.setFixedHeight(theme.CONTROL_H)
+        theme.shrinkable_combo(self.film_stock_combo)
         self.save_film_stock_btn = QPushButton("＋")
         self.save_film_stock_btn.setFixedWidth(theme.GLYPH_W)
         self.save_film_stock_btn.setFixedHeight(theme.CONTROL_H)
@@ -505,8 +510,11 @@ class SlidersPanel(QWidget):
         self._settings.remove("convert/film_stock_selected")
         self._reload_film_stock_combo(select="")
 
-        # Shows which slope source the next conversion will use.
-        self.bwp_mode_label = QLabel("")
+        # Shows which slope source the next conversion will use. Eliding: this
+        # line names the selected film stock, and a user-supplied name is
+        # arbitrarily long — as a plain QLabel it would set a minimum width the
+        # whole scroll content has to honour, clipping every row in the panel.
+        self.bwp_mode_label = theme.ElidingLabel("")
         self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         # Starts empty (no black point yet); an empty label would still reserve a
         # line of height + spacing, leaving a gap between this and the Convert row,
@@ -781,6 +789,12 @@ class SlidersPanel(QWidget):
         # --- Hint label — fixed at bottom, outside scroll area ---
         self.hint_label = QLabel()
         self.hint_label.setWordWrap(True)
+        # Hints quote film-stock names ('Film stock "…" deleted.'), and word
+        # wrap only lowers a label's minimum width to its longest WORD — an
+        # unbroken name is one word, and one long enough would widen the panel
+        # past its fixed width. This drops the minimum to nothing; a name that
+        # cannot wrap is clipped instead of taking the panel with it.
+        theme.keep_out_of_minimum_width(self.hint_label)
         self.hint_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 12px; margin-top: 8px;")
         self.hint_label.setText("")
         layout.addWidget(self.hint_label)
@@ -860,6 +874,7 @@ class SlidersPanel(QWidget):
         self.color_profile_combo = QComboBox()
         self.color_profile_combo.addItems(["Color", "Black & White"])
         self.color_profile_combo.setFixedHeight(theme.CONTROL_H)
+        theme.shrinkable_combo(self.color_profile_combo)
         self.color_profile_combo.currentIndexChanged.connect(self.on_color_profile_changed)
 
         row = QHBoxLayout()
@@ -1665,7 +1680,10 @@ class SlidersPanel(QWidget):
         elif wp_set:
             text = "Anchor source: white point (two-point)"
         elif stock:
-            text = f'Anchor source: film stock "{stock}" (black point only)'
+            # Stock name LAST: the label elides from the right, and the mode is
+            # the part worth keeping — a name in the middle would eat
+            # "(black point only)" and leave the line saying nothing useful.
+            text = f'Anchor source: film stock (black point only) — {stock}'
         else:
             text = "Anchor source: default slope (black point only)"
         self.bwp_mode_label.setText(text)

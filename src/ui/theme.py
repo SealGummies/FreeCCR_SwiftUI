@@ -14,7 +14,7 @@ import tempfile
 
 from PySide6.QtCore import Qt, QObject, QEvent
 from PySide6.QtGui import QColor, QPalette, QIcon, QPixmap, QPainter, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QComboBox, QLabel, QWidget
 
 # --------------------------------------------------------------------------- #
 # 3.1 Surfaces (neutral grays — zero hue)
@@ -85,8 +85,17 @@ GAP_SECTION = SPACE_XL    # 12 — between functional groups (usually with a sep
 CONTROL_H = 28            # sliders, combos, labels, normal & secondary buttons, tabs
 CONTROL_H_LG = 36         # weighty primary commits (Done, Export)
 GLYPH_W = 28             # square glyph buttons (✕ remove / clear) — one width
-LABEL_COL_W = 90          # right-aligned label gutter — fits the longest label ("Subtracted Sat")
+LABEL_COL_W = 100         # right-aligned label gutter — the longest label
+                          # ("Subtracted Sat") measures 89px in the macOS system
+                          # font, so 90 left it flush against the panel border and
+                          # one font step away from clipping. Keep slack here.
 VALUE_COL_W = 40          # left-aligned value gutter in a 3-column row
+PANEL_W = 340             # the right-hand side panels (sliders / dust / crop).
+                          # Widest row is WB Picker|AWB|Crop|Slice at ~293px, so
+                          # this must stay >= that + 2*GAP_PANEL, with slack for
+                          # systems whose UI font is wider than the one it was
+                          # measured on — a panel that is too narrow silently
+                          # CLIPS its content (horizontal scrolling is off).
 DIALOG_W_SM = 280         # progress / simple dialogs
 DIALOG_W_MD = 440         # forms (export, update, sync)
 
@@ -431,6 +440,123 @@ def apply_button_row(layout, *, spacing=GAP_BTN):
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(spacing)
     return layout
+
+
+def shrinkable_combo(combo, *, min_chars=6):
+    """Stop a QComboBox from dictating its panel's width.
+
+    A QComboBox's default minimumSizeHint is wide enough for its LONGEST ITEM,
+    which propagates all the way out as a hard minimum on the containing panel —
+    adding one long preset name (a film stock, a colour profile) is then enough
+    to push a fixed-width panel's content past its edge and clip it. Sizing to a
+    short contents length instead lets the combo shrink to the space the row can
+    spare, which is what a narrow side panel needs.
+
+    This governs the combo's WIDTH only. Text too long for the resulting box is
+    hard-clipped by Qt unless the combo also elides — see ElidingComboBox.
+    """
+    from PySide6.QtWidgets import QComboBox
+    combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumContentsLength(min_chars)
+    return combo
+
+
+class ElidingComboBox(QComboBox):
+    """A combo whose closed-state text ends in "…" when it doesn't fit.
+
+    Qt does not elide a non-editable QComboBox: it draws the label into the
+    edit-field rect and lets the glyphs run under the arrow, so a long
+    user-supplied name (a film stock, a camera profile) reads as
+    ``Fuji Superia X-TRA 40`` with no sign that anything was cut. Nothing in the
+    UI then says the selection is longer than what's shown.
+
+    The frame and arrow are still painted by the active style, so the app's
+    global QSS applies unchanged; only the label is drawn here, elided to the
+    edit-field rect. The popup list is untouched, so the full names are always
+    one click away. Tooltips are left alone — callers set their own.
+    """
+
+    def paintEvent(self, _event):
+        from PySide6.QtWidgets import (QStyle, QStyleOptionComboBox,
+                                       QStylePainter)
+        painter = QStylePainter(self)
+        # Pick the colour group explicitly: the global QSS has no
+        # QComboBox:disabled rule, so a disabled combo's dimmed text comes from
+        # the palette's Disabled group. Drawing the label ourselves would
+        # otherwise render it at full strength and lose the disabled look.
+        group = QPalette.Active if self.isEnabled() else QPalette.Disabled
+        painter.setPen(self.palette().color(group, QPalette.Text))
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        full = opt.currentText
+        # Blank the text so the style paints frame + arrow only; drawing the
+        # label twice would leave the un-elided version showing underneath.
+        opt.currentText = ""
+        painter.drawComplexControl(QStyle.CC_ComboBox, opt)
+        # The edit-field sub-control rect already carries the style's padding —
+        # do NOT inset it further, or short labels shift a few px right of where
+        # Qt would have drawn them and the combo stops matching its neighbours.
+        rect = self.style().subControlRect(
+            QStyle.CC_ComboBox, opt, QStyle.SC_ComboBoxEditField, self)
+        painter.drawText(
+            rect, Qt.AlignLeft | Qt.AlignVCenter,
+            self.fontMetrics().elidedText(full, Qt.ElideRight, rect.width()))
+
+
+def keep_out_of_minimum_width(widget):
+    """Stop a widget's own text from setting its panel's minimum width.
+
+    ``qSmartMinSize`` — what a layout asks each item for — skips the width
+    entirely when the horizontal policy is Ignored, and only then. Mutate the
+    policy already on the widget rather than building a fresh one: QLabel keeps
+    its height-for-width bit in there, and dropping that stops a word-wrapped
+    label from reporting the taller height its wrapped text needs.
+    """
+    from PySide6.QtWidgets import QSizePolicy
+    policy = widget.sizePolicy()
+    policy.setHorizontalPolicy(QSizePolicy.Ignored)
+    widget.setSizePolicy(policy)
+    return widget
+
+
+class ElidingLabel(QLabel):
+    """A single-line label that shortens its text rather than widening its panel.
+
+    A QLabel's minimum width is the full width of its text, so a label carrying
+    a user-supplied name inside a fixed-width panel does not merely overflow its
+    own line — it raises the minimum width of everything laid out beside it and
+    pushes the panel's content past the edge, where horizontal scrolling is off
+    and the whole panel clips. Word wrap is not a fix on its own: it lowers the
+    minimum only to the longest WORD, and "Kodak_Portra_400_pushed" is one word.
+
+    Eliding happens at PAINT time, against the width the layout actually handed
+    out — a label that is currently hidden has never been laid out, so its own
+    width() at setText time is stale or still the default. The full text stays
+    in the tooltip.
+    """
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        keep_out_of_minimum_width(self)
+
+    def setText(self, text):
+        # Not a virtual in Qt, so this only covers Python callers — which is all
+        # of them here. The elided form hides part of the name; the tooltip is
+        # where it stays readable.
+        super().setText(text)
+        self.setToolTip(text)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        # QPainter starts on a black pen. The QSS `color:` reaches a QLabel as
+        # its palette foreground role, so read it from there — otherwise muted
+        # text paints black on the dark theme.
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        rect = self.contentsRect()
+        painter.drawText(
+            rect, int(self.alignment()),
+            self.fontMetrics().elidedText(
+                self.text(), Qt.ElideRight, rect.width()))
 
 
 def section_separator():
