@@ -1,16 +1,17 @@
-# FreeCCRNative — Phase 3 first slice
+# FreeCCRNative — Phase 3 (M1: real image loading)
 
 A real, runnable SwiftUI app (not a CLI PoC like `swiftui_poc/`) demonstrating
 the architecture's interactive loop: a Metal preview canvas plus a sliders
-panel, both wired live to FreeCCR's actual `core.ccr_processor` through an
-embedded CPython via PythonKit.
+panel, wired live to FreeCCR's **real** `core.ccr_backend`/`core.ccr_image`
+call chain through an embedded CPython via PythonKit — the same
+`ccr_backend.set_adjustment_by_index` → `ccr_image.update_thumbnail_and_preview`
+path `sliders_panel.py` drives, not a hand-rolled reimplementation.
 
-This is a **first slice** of the migration plan's Phase 3, not a full port —
-it covers the `image_preview.py` canvas + `sliders_panel.py` pattern in
-miniature (4 sliders, a synthetic test frame, no RAW loading / thumbnails /
-crop / dust yet). See
-`/Users/seal/.claude/plans/precious-knitting-spindle.md` for the full phase
-breakdown.
+This is milestone **M1** of the Phase 3 plan
+(`/Users/seal/.claude/plans/unified-foraging-candy.md`): open a real image
+file and adjust it. Canvas pan/zoom, the rest of `sliders_panel.py`'s
+controls, curve editing, thumbnails, dust removal, etc. are later milestones
+(M2–M8) in that plan.
 
 ## Layout
 
@@ -22,10 +23,18 @@ breakdown.
     stack) — confirmed via lldb while building this. Any future PythonKit
     integration point must reuse this executor rather than a fresh
     `DispatchQueue`.
-- `Sources/FreeCCRNative/` — the SwiftUI app: `ContentView` (canvas + sliders
-  split view), `MetalCanvasView` (`NSViewRepresentable` around `MTKView`),
-  `Shaders.metal` (trivial textured-quad blit), `PreviewState` (the Phase-2-
-  flavored `ObservableObject` standing in for `ccr_backend`).
+  - `CoreBridge.swift`: `loadImage(path:)` decodes via the real
+    `core.ccr_image.CCRImage` and registers it on `ccr_backend.images`;
+    `adjustedPreview(handle:params:)` calls
+    `ccr_backend.set_adjustment_by_index` (exactly what a Qt slider does) and
+    reads back `_preview_np8` directly — not the `.thumbnail`/
+    `.resized_preview` properties, which return `QPixmap` and are `None` in a
+    no-Qt environment (see `src/core/ccr_image.py`'s `QT_AVAILABLE` guards).
+- `Sources/FreeCCRNative/` — the SwiftUI app: `ContentView` (toolbar + canvas
+  + sliders split view), `MetalCanvasView` (`NSViewRepresentable` around
+  `MTKView`), `Shaders.metal` (trivial textured-quad blit), `PreviewState`
+  (the Phase-2-flavored `ObservableObject` standing in for `ccr_backend`'s
+  role in the Qt app, holding the loaded image's `ImageHandle`).
 
 ## Running it
 
@@ -45,22 +54,37 @@ swift build
 DYLD_LIBRARY_PATH="$(pwd)/../swiftui_poc/python/lib" .build/debug/FreeCCRNative
 ```
 
-A window titled "FreeCCR Native — Phase 3 PoC" opens: a dark canvas on the
-left showing the current synthetic test frame, four sliders (Exposure,
-Contrast, Saturation, Kelvin Shift) on the right. Drag any slider — each
-change calls `core.ccr_processor.adjust_image` in the embedded interpreter
-and repaints the canvas; the panel's bottom line shows the last call's
-latency.
+A window opens with a toolbar ("Open Image…"), a dark canvas, and four
+sliders (Temperature, Exposure, Contrast, Saturation) on the right:
+
+- On launch the canvas shows a synthetic coordinate-gradient test frame (no
+  file loaded yet) — dragging sliders adjusts it via
+  `core.ccr_processor.adjust_image` directly, same as the Phase 3 first slice.
+- Click **Open Image…** and pick any file FreeCCR can decode (RAW via rawpy,
+  or a PNG/TIFF/JPEG via OpenCV/tifffile) — the canvas switches to the real
+  decoded image, and the sliders now drive it through
+  `core.ccr_image.CCRImage`'s actual adjustment pipeline. The toolbar shows
+  the loaded filename, or a red error message if decoding failed (check the
+  terminal for the Python traceback).
 
 To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
 
+## Verifying without the UI
+
+`swift test --filter loadsRealImageAndAdjustsIt` (needs the same
+`DYLD_LIBRARY_PATH`) exercises the same `loadImage`/`adjustedPreview` path
+headlessly against a generated test PNG — useful for confirming the Python
+bridge itself works before touching the UI.
+
 ## Known rough edges (expected at this stage)
 
-- The "image" is a synthetic coordinate gradient, not a loaded RAW/scan —
-  there's no file picker or thumbnail list yet (those are later in the
-  Phase 3 widget list).
-- No debouncing beyond "cancel the previous in-flight call" — fine at this
-  frame size (~12ms/call), would need real throttling for full-res frames.
+- No pan/zoom yet (M2) — the canvas always fits the current preview size.
+- Only 4 of `sliders_panel.py`'s ~30 controls are wired up (M3 adds the rest;
+  `AdjustmentParams` in `CoreBridge.swift` already carries the full parameter
+  set the UI will eventually expose).
+- No debouncing beyond "cancel the previous in-flight call" — fine at
+  preview resolution (~1080px long side, matches the Qt app's own preview
+  size), would need real throttling for full-res/export-size frames.
 - Paths in `PythonEnvironment.swift` are resolved from this source file's own
   location (`#filePath`), which works for a local dev checkout but is not
   how Phase 5's packaged app will locate its embedded Python.

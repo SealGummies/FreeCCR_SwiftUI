@@ -1,8 +1,10 @@
 import Metal
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var state: PreviewState
+    @State private var isPickingFile = false
 
     init() {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -12,19 +14,55 @@ struct ContentView: View {
     }
 
     var body: some View {
-        HSplitView {
-            MetalCanvasView(state: state)
-                .frame(minWidth: 512, minHeight: 384)
-            SlidersPanel(state: state)
-                .frame(minWidth: 260, idealWidth: 280, maxWidth: 340)
+        VStack(spacing: 0) {
+            Toolbar(state: state, isPickingFile: $isPickingFile)
+            Divider()
+            HSplitView {
+                MetalCanvasView(state: state)
+                    .frame(minWidth: 512, minHeight: 384)
+                SlidersPanel(state: state)
+                    .frame(minWidth: 260, idealWidth: 280, maxWidth: 340)
+            }
         }
         .onAppear { state.requestUpdate() }
+        .fileImporter(
+            isPresented: $isPickingFile,
+            // FreeCCR decodes RAW via rawpy and everything else via
+            // OpenCV/tifffile — .item lets any file through rather than
+            // hand-maintaining a UTType list per RAW vendor extension.
+            allowedContentTypes: [.item]
+        ) { result in
+            if case .success(let url) = result {
+                state.loadImage(url: url)
+            }
+        }
+    }
+}
+
+struct Toolbar: View {
+    @ObservedObject var state: PreviewState
+    @Binding var isPickingFile: Bool
+
+    var body: some View {
+        HStack {
+            Button("Open Image…") { isPickingFile = true }
+            if let name = state.loadedFileName {
+                Text(name).foregroundStyle(.secondary)
+            } else {
+                Text("No file loaded — showing a synthetic test frame").foregroundStyle(.tertiary)
+            }
+            if let error = state.loadError {
+                Text(error).foregroundStyle(.red)
+            }
+            Spacer()
+        }
+        .padding(8)
     }
 }
 
 /// Miniature analog of `widgets/sliders_panel.py` — four adjustment sliders
 /// wired straight to `PreviewState`, which serializes every change through
-/// PythonKit onto `core.ccr_processor.adjust_image`.
+/// PythonKit onto the real `core.ccr_backend`/`core.ccr_image` call chain.
 struct SlidersPanel: View {
     @ObservedObject var state: PreviewState
 
@@ -32,17 +70,17 @@ struct SlidersPanel: View {
         VStack(alignment: .leading, spacing: 18) {
             Text("Adjustments").font(.headline)
 
+            adjustmentSlider("Temperature", $state.temperature)
             adjustmentSlider("Exposure", $state.exposure)
             adjustmentSlider("Contrast", $state.contrast)
             adjustmentSlider("Saturation", $state.saturation)
-            adjustmentSlider("Kelvin Shift", $state.kelvinShift)
 
             Divider()
 
             HStack(spacing: 6) {
                 if state.isBusy {
                     ProgressView().controlSize(.small)
-                    Text("adjust_image running…")
+                    Text("Python running…")
                 } else {
                     Image(systemName: "checkmark.circle").foregroundStyle(.green)
                     Text(String(format: "adjust_image: %.1f ms", state.lastLatencyMs))
@@ -53,7 +91,7 @@ struct SlidersPanel: View {
 
             Spacer()
 
-            Text("Every drag calls PythonKit -> core.ccr_processor.adjust_image on FreeCCR's real color-math module, running in an embedded CPython with zero PySide6 on sys.path.")
+            Text("Every drag calls PythonKit -> core.ccr_backend/core.ccr_image on FreeCCR's real color-math module, running in an embedded CPython with zero PySide6 on sys.path.")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }

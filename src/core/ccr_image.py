@@ -939,8 +939,10 @@ class CCRImage:
         # (initial load, auto-frame-all, B/W convert-all) run this method on
         # pool/QThread workers. Off the GUI thread, stash the pixels and let
         # the first GUI-thread read of .thumbnail/.resized_preview build the
-        # pixmaps (see the property getters).
-        if self._on_gui_thread():
+        # pixmaps (see the property getters). With no Qt runtime at all
+        # (embedded/PythonKit use), there is no GUI thread to defer to —
+        # always take the numpy-only path; QPixmap must never be touched.
+        if QT_AVAILABLE and self._on_gui_thread():
             self.thumbnail = QPixmap.fromImage(
                 self.generate_qimage_from_np_array_8(thumb_img_8))
             self.resized_preview = QPixmap.fromImage(
@@ -1005,7 +1007,7 @@ class CCRImage:
     # a worker thread returns the previous pixmap untouched.
     @property
     def thumbnail(self):
-        if self._thumb_np8 is not None and self._on_gui_thread():
+        if self._thumb_np8 is not None and QT_AVAILABLE and self._on_gui_thread():
             self._thumbnail_pix = QPixmap.fromImage(
                 self.generate_qimage_from_np_array_8(self._thumb_np8))
             self._thumb_np8 = None
@@ -1018,7 +1020,7 @@ class CCRImage:
 
     @property
     def resized_preview(self):
-        if self._preview_np8 is not None and self._on_gui_thread():
+        if self._preview_np8 is not None and QT_AVAILABLE and self._on_gui_thread():
             self._preview_pix = QPixmap.fromImage(
                 self.generate_qimage_from_np_array_8(self._preview_np8))
             self._preview_np8 = None
