@@ -976,7 +976,17 @@ class CCRImage:
         qimage = QImage(
             thumb_img_8.data, w, h, bytes_per_line, QImage.Format_RGB888
         )
-        return qimage
+        # This constructor wraps thumb_img_8's buffer WITHOUT copying, so the
+        # returned QImage would go dangling the moment the caller's last
+        # reference to thumb_img_8 is dropped (both call sites do this
+        # immediately: the deferred-pixmap property getters null out
+        # _thumb_np8/_preview_np8 right after this call, and even the
+        # in-function callers' local var dies at return). .copy() detaches
+        # onto QImage's own buffer before that happens — same fix already
+        # applied at the other raw-numpy-to-QImage sites in this codebase
+        # (it8_profile_dialog._gamma_stretch_to_qimage, image_preview's
+        # hi-res QImage build).
+        return qimage.copy()
 
     @staticmethod
     def _on_gui_thread() -> bool:
