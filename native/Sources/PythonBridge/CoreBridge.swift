@@ -208,17 +208,54 @@ public final class PythonCoreBridge: @unchecked Sendable {
         }
     }
 
-    /// Runs the SAME call chain sliders_panel.py uses —
-    /// `ccr_backend.set_adjustment_by_index` (which sets
-    /// `adjustment_settings` and calls `update_thumbnail_and_preview`) — then
-    /// reads back the resulting preview pixels. If `handle` is nil, falls
-    /// back to adjusting a synthetic gradient frame (no image loaded yet).
+    /// Runs the SAME call sliders_panel.py's on_slider_changed makes —
+    /// `ccr_backend.set_adjustment_by_index` (sets `adjustment_settings`,
+    /// then `update_thumbnail_and_preview()`, whose FIXED ~1080px-long-side
+    /// cap is baked in at decode time via `CCRImage.__init__`'s own
+    /// `max_long_side=1080` — nothing this function passes can raise that;
+    /// that's what `hiResPreview` below is for) — then reads back the
+    /// resulting preview pixels. If `handle` is nil, falls back to adjusting
+    /// a synthetic gradient frame (no image loaded yet).
     public func adjustedPreview(handle: ImageHandle?, params: AdjustmentParams,
                                  colorProfile: ColorProfile = .color) async -> RGBAImage? {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(returning: self.adjustedPreviewOnQueue(
                     handle: handle, params: params, colorProfile: colorProfile))
+            }
+        }
+    }
+
+    /// The actual "hi-res on zoom" mechanism — a port of
+    /// `image_preview.py`'s `HiResDetailWorker.run()`: re-decode the source
+    /// file up to `maxLongSide` (bypassing `resized_raw`'s permanent 1080px
+    /// cap entirely — `CCRImage.render_hires_base` does its own fresh
+    /// `read_image` call), replay any negative-conversion snapshot (a
+    /// no-op — `None` — for the plain color/positive images this app loads
+    /// today; becomes relevant once a Phase 3 milestone wires up B/W-point
+    /// conversion), then apply the current slider settings on that
+    /// higher-resolution base. `nil` on failure (falls back to whatever
+    /// `adjustedPreview` already returned — see `PreviewState.runAdjustment`).
+    public func hiResPreview(handle: ImageHandle, params: AdjustmentParams,
+                              colorProfile: ColorProfile, maxLongSide: Int) async -> RGBAImage? {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                continuation.resume(returning: self.hiResPreviewOnQueue(
+                    handle: handle, params: params, colorProfile: colorProfile, maxLongSide: maxLongSide))
+            }
+        }
+    }
+
+    /// `CCRImage.original_full_size`: the real, full-resolution (height,
+    /// width) of the source file — set once by `read_image` during
+    /// `CCRImage.__init__`/`loadImage`, so this is available immediately
+    /// after `loadImage` returns a handle. This is what "100%"/"200%" zoom
+    /// are relative to, NOT whatever resolution the current preview texture
+    /// happens to be rendered at.
+    public func originalSize(handle: ImageHandle) async -> (width: Int, height: Int)? {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                continuation.resume(returning: self.originalSizeOnQueue(handle: handle))
             }
         }
     }
@@ -258,11 +295,12 @@ public final class PythonCoreBridge: @unchecked Sendable {
         let previewRGB: PythonObject
         if let handle {
             let image = ccrBackend.images[handle.index]
-            // Mirrors sliders_panel.py's on_color_profile_changed: set the
-            // attribute, THEN reprocess (set_adjustment_by_index below does
-            // the reprocess for us).
+            // Mirrors sliders_panel.py's on_color_profile_changed (set the
+            // attribute, then reprocess) + set_adjustment_by_index (set
+            // adjustment_settings, then reprocess) inlined together.
             image.color_profile = PythonObject(colorProfile.rawValue)
-            ccrBackend.set_adjustment_by_index(handle.index, params.asPythonDict)
+            image.adjustment_settings = params.asPythonDict
+            image.update_thumbnail_and_preview()
             guard let preview = numpyRGB8(image._preview_np8) else { return nil }
             previewRGB = preview
         } else {
@@ -271,11 +309,52 @@ public final class PythonCoreBridge: @unchecked Sendable {
         return rgbaImage(fromRGB: previewRGB)
     }
 
+    /// Port of `HiResDetailWorker.run()`. `render_hires_base` does its own
+    /// independent `read_image` call up to `maxLongSide` — entirely
+    /// separate from (and not capped by) `resized_raw`'s fixed 1080px
+    /// preview buffer.
+    private func hiResPreviewOnQueue(handle: ImageHandle, params: AdjustmentParams,
+                                      colorProfile: ColorProfile, maxLongSide: Int) -> RGBAImage? {
+        bootIfNeeded()
+        let image = ccrBackend.images[handle.index]
+        image.color_profile = PythonObject(colorProfile.rawValue)
+        image.adjustment_settings = params.asPythonDict
+
+        let result = image.render_hires_base(max_long_side: PythonObject(maxLongSide))
+        guard let base = numpyRGB8(result[0]) else { return nil }
+        let sprocketAlpha = numpyRGB8(result[1]) // legitimately None until B/W-point conversion exists
+
+        var display = image.apply_adjustments(base, settings: params.asPythonDict)
+        let converted = Bool(image.converted) ?? false
+        let positiveMode = Bool(ccrBackend.positive_mode) ?? false
+        if !converted && !positiveMode {
+            // Mirrors the normal preview pipeline's display-only stretch for
+            // un-converted negatives (ccr_image.py's update_thumbnail_and_preview).
+            display = image._auto_brightness_for_preview(display)
+        }
+        if let sprocketAlpha, Bool(ccrBackend.sprocket_mask_white) == true {
+            display = ccrProcessor.apply_sprocket_mask(display, sprocketAlpha)
+        }
+        let display8 = np.ascontiguousarray(cv2.convertScaleAbs(display, alpha: PythonObject(255.0 / 65535.0)))
+        return rgbaImage(fromRGB: display8)
+    }
+
     private func thumbnailOnQueue(handle: ImageHandle) -> RGBAImage? {
         bootIfNeeded()
         let image = ccrBackend.images[handle.index]
         guard let thumb = numpyRGB8(image._thumb_np8) else { return nil }
         return rgbaImage(fromRGB: thumb)
+    }
+
+    private func originalSizeOnQueue(handle: ImageHandle) -> (width: Int, height: Int)? {
+        bootIfNeeded()
+        let image = ccrBackend.images[handle.index]
+        let size = image.original_full_size
+        guard Bool(Python.isinstance(size, Python.tuple)) == true,
+              let height = Int(size[0]), let width = Int(size[1]) else {
+            return nil
+        }
+        return (width: width, height: height)
     }
 
     /// `arr != Python.None` is NOT safe here: numpy overloads `!=` to

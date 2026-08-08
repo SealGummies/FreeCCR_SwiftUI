@@ -115,29 +115,62 @@ struct Toolbar: View {
 
             Spacer()
 
-            // Pan: two-finger scroll / scroll wheel. Zoom: pinch, or the
-            // stepper buttons below. Double-click the canvas to fit.
+            // Pan: two-finger scroll / scroll wheel (or drag the trackpad).
+            // Zoom: pinch (deselects the preset below, since pinch lands on
+            // an arbitrary ratio), or tap a preset. Double-click the canvas
+            // also snaps to Full.
             Text("\(state.zoomPercent)%")
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 44, alignment: .trailing)
-            Button {
-                state.transform.zoom(
-                    by: 0.8, anchor: CGPoint(x: state.canvasViewSize.width / 2, y: state.canvasViewSize.height / 2),
-                    viewSize: state.canvasViewSize, imageSize: state.currentImageSize)
-            } label: {
-                Image(systemName: "minus.magnifyingglass")
-            }
-            Button {
-                state.transform.zoom(
-                    by: 1.25, anchor: CGPoint(x: state.canvasViewSize.width / 2, y: state.canvasViewSize.height / 2),
-                    viewSize: state.canvasViewSize, imageSize: state.currentImageSize)
-            } label: {
-                Image(systemName: "plus.magnifyingglass")
-            }
-            Button("Fit") { state.fitToView() }
+            ZoomPresetControl(selected: state.zoomPreset) { state.selectZoomPreset($0) }
         }
         .padding(8)
+    }
+}
+
+/// The zoom% is always `canvasSize / originalImageSize` (see
+/// `PreviewState.zoomPercent`/`selectZoomPreset`) — "Full" fits the image to
+/// whatever the canvas currently measures, "100%"/"200%" are relative to the
+/// image's real, full-resolution size (not the current preview render's
+/// resolution, which can be smaller — see `PreviewState.computeRequestedPreviewSize`,
+/// the mechanism that makes 100%/200% actually sharp instead of an upscaled
+/// low-res preview). A `matchedGeometryEffect` highlight slides between
+/// whichever segment is active; `selected == nil` (pinched/scrolled to a
+/// custom ratio) shows no highlight at all.
+struct ZoomPresetControl: View {
+    let selected: ZoomPreset?
+    let onSelect: (ZoomPreset) -> Void
+    @Namespace private var highlightNamespace
+
+    private static let labels: [(ZoomPreset, String)] = [
+        (.full, "Full"), (.oneHundred, "100%"), (.twoHundred, "200%"),
+    ]
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(Self.labels, id: \.0) { preset, label in
+                Text(label)
+                    .font(.callout)
+                    .foregroundStyle(selected == preset ? Color.white : Color.primary)
+                    .frame(width: 52, height: 22)
+                    .background {
+                        if selected == preset {
+                            RoundedRectangle(cornerRadius: 5)
+                                .fill(Color.accentColor)
+                                .matchedGeometryEffect(id: "zoomHighlight", in: highlightNamespace)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            onSelect(preset)
+                        }
+                    }
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.18)))
+        .padding(2)
     }
 }
 

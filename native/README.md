@@ -1,4 +1,4 @@
-# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom, M3: full sliders, M4: curves, M5: thumbnail list)
+# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom + hi-res-on-zoom, M3: full sliders, M4: curves, M5: thumbnail list)
 
 A real, runnable SwiftUI app (not a CLI PoC like `swiftui_poc/`) demonstrating
 the architecture's interactive loop: a Metal preview canvas plus a sliders
@@ -34,6 +34,20 @@ removal and the rest are later milestones (M6–M8) in that plan.
     `thumbnail(handle:)` (M5) reads `_thumb_np8` the same way, at its
     already-smaller 156px-long-side size (`CCRImage.__init__` populates both
     on construction, no extra processing needed).
+    `hiResPreview(handle:params:colorProfile:maxLongSide:)` is a separate
+    call — a port of `image_preview.py`'s `HiResDetailWorker.run()`
+    (`render_hires_base` + `apply_adjustments` + the un-converted-negative
+    auto-brightness stretch + sprocket mask). This has to be a genuinely
+    different Python call, not just a bigger number passed to
+    `adjustedPreview`: `resized_raw` (what `_preview_np8` is derived from) is
+    permanently capped at ~1080px long side *at decode time* by
+    `CCRImage.__init__`, so no `preview_size` argument to
+    `update_thumbnail_and_preview` can ever exceed it —
+    `render_hires_base` does its own independent `read_image` call instead.
+    Found this the hard way mid-implementation after an initial "just
+    request a bigger preview_size" attempt silently kept returning 1080px
+    data; see `PreviewState.needsHiRes`/`runAdjustment` for where the two
+    calls are combined.
     `AdjustmentParams` now carries the full `sliders_panel.py` `ADJUSTMENT_KEYS`
     set — main sliders, all 12 Channel Levels controls, `cineonLog`, and the
     28 per-color-band keys (`bands: [ColorBand: BandAdjustment]` +
@@ -60,13 +74,23 @@ removal and the rest are later milestones (M6–M8) in that plan.
     (`zoom(by:anchor:...)`, covered by unit tests). Every later feature that
     needs "where in the image did the user click" (crop, area layers, dust
     brush, black/white-point picking) should read through this rather than
-    reimplementing coordinate math.
+    reimplementing coordinate math. **Important**: `imageSize` passed into
+    this type's functions must always be `PreviewState.originalImageSize`
+    (the real photo's dimensions, from `CCRImage.original_full_size`) —
+    never the current preview texture's pixel size, which varies (~1080px
+    fast path vs. up to 4500px hi-res path, see below). Geometry has to be
+    computed from a stable size or the on-screen quad would jump around as
+    the requested render resolution changes with zoom.
   - `MetalCanvasView` (`NSViewRepresentable` around `ZoomPanMTKView`, a
     custom `MTKView` subclass overriding `scrollWheel`/`magnify`/`mouseDown`
     for trackpad pan/pinch-zoom/double-click-to-fit — SwiftUI has no gesture
     API for these on macOS, so they're plain AppKit overrides), `Shaders.metal`
     (draws the preview texture into whatever quad `CanvasTransform` computes,
-    not a fixed full-viewport quad anymore).
+    not a fixed full-viewport quad anymore). Note this canvas has no manual
+    tiling/viewport-cropping logic anywhere, unlike `image_preview.py`'s
+    `HiResDetailWorker` — Metal's viewport already clips an arbitrarily large
+    texture to whatever's visible, so a bigger hi-res texture "just works"
+    with the exact same quad/pan/zoom math as the small fast-path one.
   - `CurveEditorView.swift`: `CurveEditorControl` (channel buttons + canvas +
     Reset, mirrors `CurveEditor(QWidget)`) and `CurveCanvasNSView`, a plain
     `NSView` (not Metal — this is 2D vector drawing, Core Graphics is the
@@ -88,6 +112,25 @@ removal and the rest are later milestones (M6–M8) in that plan.
     image becomes current — the Swift-side equivalent of each `CCRImage`
     instance owning its own `adjustment_settings`/`color_profile` (verified
     by `perImageAdjustmentsPersistIndependently`).
+  - **Zoom model (M2 follow-up)**: `ZoomPreset` (`.full`/`.oneHundred`/
+    `.twoHundred`) plus `PreviewState.selectZoomPreset(_:)`. "100%"/"200%"
+    are defined relative to `originalImageSize` — `zoom = N /
+    fitScale(canvasViewSize, originalImageSize)` — so they mean "one/two
+    real source pixels per screen point", not "N% of whatever the preview
+    texture's resolution happens to be". `updateCanvasViewSize` re-snaps the
+    active preset's `zoom` whenever the window resizes, since `fitScale`
+    (and therefore what `zoom` value "100%" corresponds to) depends on the
+    canvas size. Pinching (`applyManualZoom`) deselects the preset (`nil` —
+    the toolbar control shows no highlight) since it lands on an arbitrary
+    ratio.
+    `PreviewState.needsHiRes` (effective scale > ~1.0, i.e. past "100%") and
+    `runAdjustment` decide whether to also call `hiResPreview` — see
+    `CoreBridge.swift`'s note above on why that's a separate Python call
+    from the fast ~1080px `adjustedPreview` path, not just a bigger number.
+    Both are always run when hi-res is needed (fast path first, to keep the
+    thumbnail fresh — see M5's bug fix above — then hi-res overwrites the
+    displayed texture if it succeeds), matching how the real app also keeps
+    its normal preview update and `HiResDetailWorker` running independently.
 
 ## Running it
 
@@ -107,9 +150,9 @@ swift build
 DYLD_LIBRARY_PATH="$(pwd)/../swiftui_poc/python/lib" .build/debug/FreeCCRNative
 ```
 
-A window opens with a toolbar ("Open Images…", zoom%, +/− buttons, Fit), a
-thumbnail list on the left, a dark canvas, and a scrollable sliders panel on
-the right: Color Profile,
+A window opens with a toolbar ("Open Images…", zoom%, a Full/100%/200%
+segmented control), a thumbnail list on the left, a dark canvas, and a
+scrollable sliders panel on the right: Color Profile,
 the 12 main sliders (Temperature, Tint, Gain/Exposure, Brightness, Gamma,
 Highlights, White Point, Shadows, Black Point, Contrast, Saturation,
 Subtracted Sat), a collapsible "Subtractive Saturations" section (7 color
@@ -139,9 +182,13 @@ x=0/x=255), and a Reset Curve button.
   traceback).
 - **Pan**: two-finger scroll on a trackpad, or a mouse scroll wheel.
 - **Zoom**: pinch on a trackpad (anchored under your fingers — the same
-  image point stays put as you zoom), or the toolbar's +/− buttons (anchored
-  at the canvas center).
-- **Fit**: the toolbar's Fit button, or double-click the canvas.
+  image point stays put as you zoom; this deselects the segmented control,
+  since a pinch lands on an arbitrary ratio), or tap **Full**/**100%**/**200%**
+  in the toolbar — a highlight slides between them with a short animation to
+  show which is active. **100%**/**200%** are relative to the photo's real
+  resolution and trigger a genuinely higher-resolution render (see "Zoom
+  model" above) — they're not just the same ~1080px preview stretched
+  bigger. Double-click the canvas also snaps to Full.
 
 To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
 
@@ -180,6 +227,17 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
   `PreviewState`'s published state to converge (`waitUntil`) rather than
   awaiting a Task, since `loadImages`/`selectImage` are deliberately
   fire-and-forget for SwiftUI's sake.
+- `originalSizeReportsTheRealSourceDimensions`: `originalSize(handle:)`
+  returns the actual source file dimensions, not the ~1080px-capped
+  `resized_raw`/preview size — what the zoom model's ratios depend on.
+- `previewTextureIsFullPreviewResolutionNotThumbnailSized`: the fast path
+  (canvas view never laid out, so `needsHiRes` is correctly `false`) is
+  exactly ~1080px, confirming the "Full" default doesn't accidentally
+  trigger the (expensive) hi-res path.
+- `oneHundredPercentZoomTriggersHiResRender`: with a real `canvasViewSize`
+  set, selecting the "100%" preset produces a texture well past 1080px (and
+  no larger than the source) — the actual fix for the original "looks like
+  a blown-up thumbnail" report.
 - `CanvasTransform`'s pure-math tests (`fitScaleFillsTheSmallerDimension`,
   `zoomAnchoredAtCenterKeepsImageCentered`,
   `zoomAnchoredAtArbitraryPointStaysUnderTheAnchor`, `zoomClampsToMinAndMax`,
@@ -188,16 +246,15 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
 
 ## Known rough edges (expected at this stage)
 
-- **No hi-res-on-zoom.** The canvas always shows the ~1080px-long-side
-  preview (`_preview_np8`), even when zoomed in — `image_preview.py`'s
-  `HiResDetailWorker` (which swaps in a higher-resolution decode of the
-  visible region once zoomed past a threshold) hasn't been ported yet. On a
-  large/Retina window this makes zoomed-in (or even just "fit" on a big
-  screen) previews look soft — reported once as "looks like a blown-up
-  thumbnail"; confirmed via
-  `previewTextureIsFullPreviewResolutionNotThumbnailSized` that the data
-  itself is correctly ~1080px (not actually thumbnail-sized), so this is a
-  missing feature, not wrong data. Tracked as a follow-up to M2.
+- The hi-res path re-renders the WHOLE frame at up to 4500px, not just the
+  visible region — `image_preview.py`'s `HiResDetailWorker` only decodes a
+  cropped tile of the visible area, which is cheaper. Metal's viewport-clips-
+  a-large-texture approach made a tile system unnecessary for *drawing*, but
+  the *Python-side render* still costs more than the real app's tile-only
+  approach would. Fine for the source sizes tested here; could matter for
+  very large (45MP+) RAWs on every slider drag while zoomed in — no
+  debouncing beyond "cancel the previous in-flight call" (see below) is
+  built on top of that yet either.
 - The thumbnail list (M5) has no remove/reorder/rename — only add and select.
   No async/background thumbnail loading either (each file is decoded and
   thumbnailed sequentially in `loadImages`' loop before the next starts).
@@ -206,7 +263,7 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
   `CanvasTransform`).
 - No debouncing beyond "cancel the previous in-flight call" — fine at
   preview resolution (~1080px long side, matches the Qt app's own preview
-  size), would need real throttling for full-res/export-size frames.
+  size), would need real throttling for full-res/export-size/hi-res frames.
 - Paths in `PythonEnvironment.swift` are resolved from this source file's own
   location (`#filePath`), which works for a local dev checkout but is not
   how Phase 5's packaged app will locate its embedded Python.

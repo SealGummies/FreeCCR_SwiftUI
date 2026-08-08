@@ -38,6 +38,20 @@ struct FreeCCRNativeTests {
         #expect(max(preview.width, preview.height) > max(thumbnail.width, thumbnail.height))
     }
 
+    /// `originalSize` must report the REAL source dimensions
+    /// (`CCRImage.original_full_size`), not whatever the ~1080px-capped
+    /// `resized_raw`/preview happens to be — this is what the Full/100%/200%
+    /// zoom model's ratios are computed against.
+    @Test func originalSizeReportsTheRealSourceDimensions() async throws {
+        let testPNGPath = NSTemporaryDirectory() + "freeccr_native_test_origsize.png"
+        try makeTestPNG(at: testPNGPath, width: 3200, height: 1800)
+        let handle = try #require(await PythonCoreBridge.shared.loadImage(path: testPNGPath))
+
+        let size = try #require(await PythonCoreBridge.shared.originalSize(handle: handle))
+        #expect(size.width == 3200)
+        #expect(size.height == 1800)
+    }
+
     /// User-reported bug: the thumbnail list stayed frozen at whatever the
     /// image looked like on load, because runAdjustment only ever updated the
     /// canvas texture — nothing re-read _thumb_np8 after a slider change, even
@@ -134,6 +148,39 @@ struct FreeCCRNativeTests {
         #expect(max(texture.width, texture.height) == 1080, "expected the ~1080px-long-side preview, not thumbnail-sized data")
         let thumbnail = try #require(state.images.first?.thumbnail)
         #expect(max(thumbnail.size.width, thumbnail.size.height) <= 156)
+    }
+
+    /// The actual fix for the "looks like a blown-up thumbnail" report:
+    /// selecting the "100%" zoom preset must trigger the hi-res path
+    /// (`PythonCoreBridge.hiResPreview`, a port of `HiResDetailWorker`) and
+    /// deliver a texture well past the fast path's fixed 1080px cap — this
+    /// is what `resized_raw`'s permanent decode-time cap made impossible
+    /// with the earlier (abandoned) "just ask for a bigger preview_size"
+    /// approach; see the CoreBridge.swift doc comments on `adjustedPreview`
+    /// vs `hiResPreview` for why those are two different Python-side calls.
+    @MainActor
+    @Test func oneHundredPercentZoomTriggersHiResRender() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("no Metal device on this machine")
+            return
+        }
+        let state = PreviewState(device: device)
+        let path = NSTemporaryDirectory() + "freeccr_native_test_hires.png"
+        try makeTestPNG(at: path, width: 3000, height: 2000)
+
+        state.loadImages(urls: [URL(fileURLWithPath: path)])
+        try await waitUntil { !state.isBusy && state.texture != nil }
+
+        state.updateCanvasViewSize(CGSize(width: 900, height: 600))
+        try await waitUntil { !state.isBusy }
+
+        state.selectZoomPreset(.oneHundred)
+        try await waitUntil(timeout: 10) { !state.isBusy }
+
+        let texture = try #require(state.texture)
+        #expect(max(texture.width, texture.height) > 1080,
+                "100% zoom should trigger the hi-res path and exceed the fast path's 1080px cap")
+        #expect(max(texture.width, texture.height) <= 3000)
     }
 
     // MARK: - M4: monotoneCubic vs. curve_editor.py's _monotone_cubic

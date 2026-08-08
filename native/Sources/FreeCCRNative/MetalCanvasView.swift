@@ -24,16 +24,13 @@ struct MetalCanvasView: NSViewRepresentable {
             state.transform.pan(by: delta)
         }
         view.onMagnify = { [weak state] magnification, anchor in
-            guard let state else { return }
-            state.transform.zoom(
-                by: 1 + magnification, anchor: anchor,
-                viewSize: state.canvasViewSize, imageSize: state.currentImageSize)
+            state?.applyManualZoom(by: 1 + magnification, anchor: anchor)
         }
         view.onDoubleClick = { [weak state] in
             state?.fitToView()
         }
         view.onBoundsChange = { [weak state] size in
-            state?.canvasViewSize = size
+            state?.updateCanvasViewSize(size)
         }
         return view
     }
@@ -41,10 +38,11 @@ struct MetalCanvasView: NSViewRepresentable {
     func updateNSView(_ nsView: ZoomPanMTKView, context: Context) {
         context.coordinator.texture = state.texture
         context.coordinator.transform = state.transform
+        context.coordinator.originalImageSize = state.originalImageSize
         if state.canvasViewSize != nsView.bounds.size {
             // First layout / SwiftUI-driven resize the AppKit callback might
             // not have observed yet.
-            DispatchQueue.main.async { state.canvasViewSize = nsView.bounds.size }
+            DispatchQueue.main.async { state.updateCanvasViewSize(nsView.bounds.size) }
         }
         nsView.needsDisplay = true
     }
@@ -102,6 +100,11 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private let pipelineState: MTLRenderPipelineState
     var texture: MTLTexture?
     var transform = CanvasTransform()
+    /// The real photo's dimensions — NOT `texture.width/height`, which can
+    /// be a lower-res render (see `PreviewState.computeRequestedPreviewSize`).
+    /// Geometry must be based on the true size so the quad doesn't jump
+    /// around as the requested render resolution changes with zoom.
+    var originalImageSize = PreviewState.syntheticImageSize
 
     init(device: MTLDevice) {
         guard let queue = device.makeCommandQueue() else {
@@ -135,8 +138,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         else { return }
 
         let viewSize = view.bounds.size // points — see MetalCanvasView's doc comment
-        let imageSize = CGSize(width: texture.width, height: texture.height)
-        let rect = transform.quadRect(viewSize: viewSize, imageSize: imageSize)
+        let rect = transform.quadRect(viewSize: viewSize, imageSize: originalImageSize)
 
         // rect is in view points (top-left origin, y down); convert to NDC
         // (x: -1...1 left-to-right, y: -1...1 bottom-to-top). Derivation is
