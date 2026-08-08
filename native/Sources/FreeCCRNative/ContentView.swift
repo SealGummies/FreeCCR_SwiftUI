@@ -19,6 +19,8 @@ struct ContentView: View {
             Toolbar(state: state, isPickingFile: $isPickingFile)
             Divider()
             HSplitView {
+                ThumbnailListView(state: state)
+                    .frame(minWidth: 140, idealWidth: 160, maxWidth: 220)
                 MetalCanvasView(state: state)
                     .frame(minWidth: 512, minHeight: 384)
                 SlidersPanel(state: state)
@@ -31,12 +33,64 @@ struct ContentView: View {
             // FreeCCR decodes RAW via rawpy and everything else via
             // OpenCV/tifffile — .item lets any file through rather than
             // hand-maintaining a UTType list per RAW vendor extension.
-            allowedContentTypes: [.item]
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
         ) { result in
-            if case .success(let url) = result {
-                state.loadImage(url: url)
+            if case .success(let urls) = result {
+                state.loadImages(urls: urls)
             }
         }
+    }
+}
+
+/// Analog of `widgets/thumbnail_list.py`: a scrollable list of every loaded
+/// image's thumbnail + filename, selecting which one the canvas/sliders
+/// show. Thumbnails come from `_thumb_np8` via `PythonCoreBridge.thumbnail`
+/// (see `PreviewState.loadImages`) — plain `NSImage`s, not `MTLTexture`s;
+/// there's no reason to involve Metal/GPU for a static ~156px icon.
+struct ThumbnailListView: View {
+    @ObservedObject var state: PreviewState
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 4) {
+                ForEach(Array(state.images.enumerated()), id: \.element.id) { index, image in
+                    row(index: index, image: image)
+                }
+            }
+            .padding(6)
+        }
+        .background(Color(nsColor: .underPageBackgroundColor))
+    }
+
+    private func row(index: Int, image: LoadedImage) -> some View {
+        let isSelected = state.currentIndex == index
+        return VStack(spacing: 4) {
+            Group {
+                if let thumbnail = image.thumbnail {
+                    Image(nsImage: thumbnail).resizable().aspectRatio(contentMode: .fit)
+                } else {
+                    Color.gray.opacity(0.3)
+                }
+            }
+            .frame(height: 90)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+            Text(image.fileName)
+                .font(.caption2)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isSelected ? Color.accentColor.opacity(0.25) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(isSelected ? Color.accentColor : .clear, lineWidth: 2)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { state.selectImage(at: index) }
     }
 }
 
@@ -46,11 +100,14 @@ struct Toolbar: View {
 
     var body: some View {
         HStack {
-            Button("Open Image…") { isPickingFile = true }
+            Button("Open Images…") { isPickingFile = true }
             if let name = state.loadedFileName {
                 Text(name).foregroundStyle(.secondary)
             } else {
                 Text("No file loaded — showing a synthetic test frame").foregroundStyle(.tertiary)
+            }
+            if !state.images.isEmpty {
+                Text("(\(state.images.count) loaded)").foregroundStyle(.tertiary)
             }
             if let error = state.loadError {
                 Text(error).foregroundStyle(.red)

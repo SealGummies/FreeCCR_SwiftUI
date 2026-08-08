@@ -1,6 +1,17 @@
+import AppKit
 import Metal
 import PythonBridge
 import SwiftUI
+
+/// One entry in the thumbnail list — analog of a `ccr_backend.images[idx]`
+/// row as `thumbnail_list.py` shows it (icon + filename).
+struct LoadedImage: Identifiable, Equatable {
+    let id: ImageHandle
+    var fileName: String
+    var thumbnail: NSImage?
+
+    static func == (lhs: LoadedImage, rhs: LoadedImage) -> Bool { lhs.id == rhs.id }
+}
 
 /// Miniature stand-in for the Phase 2 `ProjectState` — this is a SwiftUI
 /// `ObservableObject`, not `ccr_backend`'s global singleton. Every adjustment
@@ -8,11 +19,13 @@ import SwiftUI
 /// (through `PythonCoreBridge`, which owns the actual GIL-safe serial queue).
 @MainActor
 final class PreviewState: ObservableObject {
-    /// The full sliders_panel.py `ADJUSTMENT_KEYS` set (minus per-color-band
-    /// and curve keys — later milestones), plus `cineonLog`. One struct
-    /// instead of ~24 separate `@Published` fields so every slider can share
-    /// a single `didSet`-triggered update instead of wiring up its own
-    /// `onChange`.
+    /// The full sliders_panel.py `ADJUSTMENT_KEYS` set plus `curves` — one
+    /// struct instead of ~25 separate `@Published` fields so every slider
+    /// can share a single `didSet`-triggered update. This holds the
+    /// CURRENTLY SELECTED image's live settings; switching images snapshots
+    /// it into `perImageState` and loads the newly-selected image's own
+    /// snapshot back in (see `selectImage`), mirroring how each
+    /// `ccr_backend.images[idx]` carries its own `adjustment_settings`.
     @Published var params = AdjustmentParams() {
         didSet { requestUpdate() }
     }
@@ -23,8 +36,16 @@ final class PreviewState: ObservableObject {
     @Published private(set) var texture: MTLTexture?
     @Published private(set) var isBusy = false
     @Published private(set) var lastLatencyMs: Double = 0
-    @Published private(set) var loadedFileName: String?
     @Published private(set) var loadError: String?
+
+    /// M5: the thumbnail list (`thumbnail_list.py`'s analog) and which entry
+    /// is currently shown on the canvas / edited by the sliders.
+    @Published private(set) var images: [LoadedImage] = []
+    @Published private(set) var currentIndex: Int?
+
+    var loadedFileName: String? {
+        currentIndex.flatMap { images.indices.contains($0) ? images[$0].fileName : nil }
+    }
 
     // M2: pan/zoom state (CanvasTransform.swift) + the sizes it needs to turn
     // "zoom" into an actual on-screen rect. canvasViewSize is kept in sync by
@@ -49,36 +70,69 @@ final class PreviewState: ObservableObject {
     }
 
     let device: MTLDevice
-    private var imageHandle: ImageHandle?
+    private var imageHandle: ImageHandle? { currentIndex.flatMap { images.indices.contains($0) ? images[$0].id : nil } }
+    /// Snapshot of every OTHER loaded image's settings — mirrors each
+    /// `CCRImage` instance owning its own `adjustment_settings`/
+    /// `color_profile` in the real app, since here `params`/`colorProfile`
+    /// are shared @Published storage for whichever image is current.
+    private var perImageState: [ImageHandle: (params: AdjustmentParams, colorProfile: ColorProfile)] = [:]
     private var pendingTask: Task<Void, Never>?
 
     init(device: MTLDevice) {
         self.device = device
     }
 
-    func loadImage(url: URL) {
+    /// Adds every URL as a new entry (does not replace what's already
+    /// loaded — mirrors "Open Files" adding to `ccr_backend.images` rather
+    /// than starting over), decoding + thumbnailing sequentially, then
+    /// selects the last one added.
+    func loadImages(urls: [URL]) {
         pendingTask?.cancel()
         isBusy = true
         loadError = nil
-        let path = url.path
-        let device = self.device
         pendingTask = Task {
-            guard let handle = await PythonCoreBridge.shared.loadImage(path: path) else {
-                self.isBusy = false
-                self.loadError = "Could not decode \(url.lastPathComponent) — see stderr for the Python traceback."
-                return
+            var lastGoodIndex: Int?
+            for url in urls {
+                if Task.isCancelled { return }
+                guard let handle = await PythonCoreBridge.shared.loadImage(path: url.path) else {
+                    self.loadError = "Could not decode \(url.lastPathComponent) — see stderr for the Python traceback."
+                    continue
+                }
+                let thumbnail = await PythonCoreBridge.shared.thumbnail(handle: handle)
+                    .flatMap(Self.makeNSImage)
+                self.images.append(LoadedImage(id: handle, fileName: url.lastPathComponent, thumbnail: thumbnail))
+                self.perImageState[handle] = (AdjustmentParams(), ColorProfile.color)
+                lastGoodIndex = self.images.count - 1
             }
-            if Task.isCancelled { return }
-            self.imageHandle = handle
-            self.loadedFileName = url.lastPathComponent
-            self.transform.resetToFit() // new image: back to a fitted view (mirrors image_preview.py)
-            await self.runAdjustment(device: device)
+            if let lastGoodIndex {
+                self.selectImage(at: lastGoodIndex)
+            } else {
+                self.isBusy = false
+            }
         }
+    }
+
+    /// Switches which image the canvas/sliders show, snapshotting the
+    /// outgoing image's live settings and restoring the incoming one's —
+    /// the Swift-side equivalent of the Qt app reading a different
+    /// `CCRImage.adjustment_settings` when the thumbnail selection changes.
+    func selectImage(at index: Int) {
+        guard images.indices.contains(index) else { return }
+        if let previousIndex = currentIndex, images.indices.contains(previousIndex) {
+            perImageState[images[previousIndex].id] = (params, colorProfile)
+        }
+        currentIndex = index
+        let saved = perImageState[images[index].id] ?? (AdjustmentParams(), ColorProfile.color)
+        params = saved.params
+        colorProfile = saved.colorProfile
+        transform.resetToFit() // new image: back to a fitted view (mirrors image_preview.py)
+        requestUpdate()
     }
 
     /// Resets every slider (and Color Profile) to its default — mirrors
     /// sliders_panel.py's on_reset_clicked (minus curves/crop/areas, not
-    /// wired up yet).
+    /// wired up yet). Curves ARE part of `AdjustmentParams` (M4), so
+    /// `AdjustmentParams()` already resets those too.
     func resetAdjustments() {
         params = AdjustmentParams()
         colorProfile = .color
@@ -119,5 +173,16 @@ final class PreviewState: ObservableObject {
                 mipmapLevel: 0, withBytes: raw.baseAddress!, bytesPerRow: image.width * 4)
         }
         return texture
+    }
+
+    private static func makeNSImage(_ image: RGBAImage) -> NSImage? {
+        guard let provider = CGDataProvider(data: image.data as CFData),
+              let cgImage = CGImage(
+                width: image.width, height: image.height, bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return nil }
+        return NSImage(cgImage: cgImage, size: NSSize(width: image.width, height: image.height))
     }
 }

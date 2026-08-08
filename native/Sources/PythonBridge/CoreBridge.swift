@@ -156,7 +156,7 @@ public struct RGBAImage: Sendable {
 /// Opaque handle to a loaded image: an index into `ccr_backend.images`, the
 /// same indexing scheme the Qt app's widgets use throughout
 /// (`get_preview_by_index`, `set_adjustment_by_index`, etc.).
-public struct ImageHandle: Sendable, Equatable {
+public struct ImageHandle: Sendable, Equatable, Hashable {
     public let index: Int
 }
 
@@ -191,6 +191,19 @@ public final class PythonCoreBridge: @unchecked Sendable {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(returning: self.loadImageOnQueue(path: path))
+            }
+        }
+    }
+
+    /// Reads `_thumb_np8` (populated by `CCRImage.__init__`'s own
+    /// `update_thumbnail_and_preview()` call — no extra processing needed)
+    /// rather than the `.thumbnail` property, which returns `QPixmap` and is
+    /// `None` in this no-Qt environment. 156px long side, matching
+    /// `update_thumbnail_and_preview`'s default `thumbnail_size`.
+    public func thumbnail(handle: ImageHandle) async -> RGBAImage? {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                continuation.resume(returning: self.thumbnailOnQueue(handle: handle))
             }
         }
     }
@@ -250,24 +263,36 @@ public final class PythonCoreBridge: @unchecked Sendable {
             // the reprocess for us).
             image.color_profile = PythonObject(colorProfile.rawValue)
             ccrBackend.set_adjustment_by_index(handle.index, params.asPythonDict)
-            let preview = image._preview_np8
-            // NOT `preview != Python.None`: numpy overloads `!=` to compare
-            // element-wise, returning an array instead of a scalar bool, and
-            // PythonKit's operator crashes trying to coerce a multi-element
-            // array's truth value ("ambiguous", numpy's own error) — hit this
-            // for real while wiring M1 up. `isinstance` always returns a
-            // plain Python bool regardless of the checked type.
-            guard Bool(Python.isinstance(preview, np.ndarray)) == true else { return nil }
+            guard let preview = numpyRGB8(image._preview_np8) else { return nil }
             previewRGB = preview
         } else {
             previewRGB = syntheticAdjusted(params)
         }
+        return rgbaImage(fromRGB: previewRGB)
+    }
 
-        let shape = previewRGB.shape
+    private func thumbnailOnQueue(handle: ImageHandle) -> RGBAImage? {
+        bootIfNeeded()
+        let image = ccrBackend.images[handle.index]
+        guard let thumb = numpyRGB8(image._thumb_np8) else { return nil }
+        return rgbaImage(fromRGB: thumb)
+    }
+
+    /// `arr != Python.None` is NOT safe here: numpy overloads `!=` to
+    /// compare element-wise, returning an array instead of a scalar bool,
+    /// and PythonKit's operator crashes trying to coerce a multi-element
+    /// array's truth value ("ambiguous", numpy's own error) — hit this for
+    /// real while wiring M1 up. `isinstance` always returns a plain Python
+    /// bool regardless of the checked type.
+    private func numpyRGB8(_ arr: PythonObject) -> PythonObject? {
+        Bool(Python.isinstance(arr, np.ndarray)) == true ? arr : nil
+    }
+
+    private func rgbaImage(fromRGB rgb: PythonObject) -> RGBAImage? {
+        let shape = rgb.shape
         guard let height = Int(shape[0]), let width = Int(shape[1]) else { return nil }
-
         let alpha = np.full([height, width, 1], 255, dtype: np.uint8)
-        let rgba = np.ascontiguousarray(np.concatenate([previewRGB, alpha], axis: -1))
+        let rgba = np.ascontiguousarray(np.concatenate([rgb, alpha], axis: -1))
         let byteCount = width * height * 4
         guard let addr = Int(rgba.ctypes.data),
               let ptr = UnsafeRawPointer(bitPattern: addr) else {

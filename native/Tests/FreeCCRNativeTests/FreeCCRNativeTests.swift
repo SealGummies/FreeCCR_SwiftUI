@@ -1,10 +1,86 @@
 import CoreGraphics
 import Foundation
 import ImageIO
+import Metal
 import PythonBridge
 import Testing
 import UniformTypeIdentifiers
 @testable import FreeCCRNative
+
+// MARK: - M5: thumbnail_list.py analog
+
+/// `thumbnail(handle:)` must read `_thumb_np8` (the 156px-long-side
+/// thumbnail `CCRImage.__init__` already populates), not the full preview —
+/// confirms it's actually smaller than `adjustedPreview`'s ~1080px-long-side
+/// result rather than accidentally returning the same buffer twice.
+@Test func thumbnailIsSmallerThanThePreview() async throws {
+    let testPNGPath = NSTemporaryDirectory() + "freeccr_native_test_scan_thumb.png"
+    try makeTestPNG(at: testPNGPath, width: 2000, height: 1500)
+    let handle = try #require(await PythonCoreBridge.shared.loadImage(path: testPNGPath))
+
+    let thumbnail = try #require(await PythonCoreBridge.shared.thumbnail(handle: handle))
+    let preview = try #require(await PythonCoreBridge.shared.adjustedPreview(
+        handle: handle, params: AdjustmentParams()))
+
+    #expect(max(thumbnail.width, thumbnail.height) <= 156)
+    #expect(max(preview.width, preview.height) > max(thumbnail.width, thumbnail.height))
+}
+
+/// M5 regression: switching the selected image must not bleed one image's
+/// slider values into another — each `LoadedImage` keeps its own
+/// `AdjustmentParams`/`ColorProfile`, mirroring every `CCRImage` instance
+/// owning its own `adjustment_settings` in the real app.
+@MainActor
+@Test func perImageAdjustmentsPersistIndependently() async throws {
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        Issue.record("no Metal device on this machine")
+        return
+    }
+    let state = PreviewState(device: device)
+
+    let path1 = NSTemporaryDirectory() + "freeccr_native_test_multi_1.png"
+    let path2 = NSTemporaryDirectory() + "freeccr_native_test_multi_2.png"
+    try makeTestPNG(at: path1, width: 48, height: 32)
+    try makeTestPNG(at: path2, width: 48, height: 32)
+
+    state.loadImages(urls: [URL(fileURLWithPath: path1), URL(fileURLWithPath: path2)])
+    try await waitUntil { state.images.count == 2 }
+
+    // Image 0 (selected by loadImages, being the last one added... actually
+    // both get added then the LAST is selected — select 0 explicitly first).
+    state.selectImage(at: 0)
+    try await waitUntil { !state.isBusy }
+    state.params.exposure = 42
+
+    state.selectImage(at: 1)
+    try await waitUntil { !state.isBusy }
+    #expect(state.params.exposure == 0, "image 1 should start at its own default, not image 0's exposure")
+    state.params.exposure = -17
+
+    state.selectImage(at: 0)
+    try await waitUntil { !state.isBusy }
+    #expect(state.params.exposure == 42, "switching back to image 0 should restore its own exposure")
+
+    state.selectImage(at: 1)
+    try await waitUntil { !state.isBusy }
+    #expect(state.params.exposure == -17, "image 1's own exposure should have survived the round trip")
+}
+
+/// Polls a condition on the main actor with a short timeout — `PreviewState`
+/// is deliberately fire-and-forget (`Task { ... }` internally) to stay
+/// SwiftUI-friendly, so tests observe its published state converging rather
+/// than awaiting a returned Task.
+@MainActor
+private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !condition() {
+        if Date() > deadline {
+            Issue.record("condition did not become true within \(timeout)s")
+            return
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+}
 
 // MARK: - M4: monotoneCubic vs. curve_editor.py's _monotone_cubic
 

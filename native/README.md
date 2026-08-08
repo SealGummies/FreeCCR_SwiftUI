@@ -1,4 +1,4 @@
-# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom, M3: full sliders, M4: curves)
+# FreeCCRNative — Phase 3 (M1: real image loading, M2: pan/zoom, M3: full sliders, M4: curves, M5: thumbnail list)
 
 A real, runnable SwiftUI app (not a CLI PoC like `swiftui_poc/`) demonstrating
 the architecture's interactive loop: a Metal preview canvas plus a sliders
@@ -9,10 +9,10 @@ path `sliders_panel.py` drives, not a hand-rolled reimplementation.
 
 This covers milestones **M1** (real image loading), **M2** (pan/zoom + the
 coordinate-transform stack), **M3** (the full `sliders_panel.py` control set,
-including per-color-band "Subtractive Saturations" sliders), and **M4**
-(curve editing) of the Phase 3 plan
-(`/Users/seal/.claude/plans/unified-foraging-candy.md`). Thumbnails, dust
-removal, and the rest are later milestones (M5–M8) in that plan.
+including per-color-band "Subtractive Saturations" sliders), **M4** (curve
+editing), and **M5** (the thumbnail list, multi-image support) of the
+Phase 3 plan (`/Users/seal/.claude/plans/unified-foraging-candy.md`). Dust
+removal and the rest are later milestones (M6–M8) in that plan.
 
 ## Layout
 
@@ -31,6 +31,9 @@ removal, and the rest are later milestones (M5–M8) in that plan.
     reads back `_preview_np8` directly — not the `.thumbnail`/
     `.resized_preview` properties, which return `QPixmap` and are `None` in a
     no-Qt environment (see `src/core/ccr_image.py`'s `QT_AVAILABLE` guards).
+    `thumbnail(handle:)` (M5) reads `_thumb_np8` the same way, at its
+    already-smaller 156px-long-side size (`CCRImage.__init__` populates both
+    on construction, no extra processing needed).
     `AdjustmentParams` now carries the full `sliders_panel.py` `ADJUSTMENT_KEYS`
     set — main sliders, all 12 Channel Levels controls, `cineonLog`, and the
     28 per-color-band keys (`bands: [ColorBand: BandAdjustment]` +
@@ -71,10 +74,20 @@ removal, and the rest are later milestones (M5–M8) in that plan.
     hit-test constants, same click-on-line-inserts-a-point /
     click-on-point-grabs-it / right-click-deletes-an-interior-point / drag
     rules (endpoints X-locked, interior points clamped between neighbors).
-  - `ContentView` (toolbar + canvas + sliders split view), `PreviewState`
-    (the Phase-2-flavored `ObservableObject` standing in for `ccr_backend`'s
-    role in the Qt app — holds the loaded image's `ImageHandle` and the live
-    `CanvasTransform`).
+  - `ThumbnailListView` (in `ContentView.swift`): analog of
+    `widgets/thumbnail_list.py` — a scrollable list of every loaded image's
+    thumbnail + filename (plain `NSImage`s from `_thumb_np8`, not `MTLTexture`s
+    — no reason to involve the GPU for a static ~156px icon), selecting which
+    one the canvas/sliders show.
+  - `ContentView` (toolbar + thumbnail list + canvas + sliders, in one
+    `HSplitView`), `PreviewState` (the Phase-2-flavored `ObservableObject`
+    standing in for `ccr_backend`'s role in the Qt app). M5 changed its
+    shape: `images: [LoadedImage]` + `currentIndex` replace the old single
+    `imageHandle`, and `params`/`colorProfile` are snapshotted into
+    `perImageState` on every selection change and restored for whichever
+    image becomes current — the Swift-side equivalent of each `CCRImage`
+    instance owning its own `adjustment_settings`/`color_profile` (verified
+    by `perImageAdjustmentsPersistIndependently`).
 
 ## Running it
 
@@ -94,8 +107,9 @@ swift build
 DYLD_LIBRARY_PATH="$(pwd)/../swiftui_poc/python/lib" .build/debug/FreeCCRNative
 ```
 
-A window opens with a toolbar ("Open Image…", zoom%, +/− buttons, Fit), a
-dark canvas, and a scrollable sliders panel on the right: Color Profile,
+A window opens with a toolbar ("Open Images…", zoom%, +/− buttons, Fit), a
+thumbnail list on the left, a dark canvas, and a scrollable sliders panel on
+the right: Color Profile,
 the 12 main sliders (Temperature, Tint, Gain/Exposure, Brightness, Gamma,
 Highlights, White Point, Shadows, Black Point, Contrast, Saturation,
 Subtracted Sat), a collapsible "Subtractive Saturations" section (7 color
@@ -114,12 +128,15 @@ x=0/x=255), and a Reset Curve button.
 - On launch the canvas shows a synthetic coordinate-gradient test frame (no
   file loaded yet) — dragging sliders adjusts it via
   `core.ccr_processor.adjust_image` directly, same as the Phase 3 first slice.
-- Click **Open Image…** and pick any file FreeCCR can decode (RAW via rawpy,
-  or a PNG/TIFF/JPEG via OpenCV/tifffile) — the canvas switches to the real
-  decoded image (reset to a fitted view), and the sliders now drive it
-  through `core.ccr_image.CCRImage`'s actual adjustment pipeline. The toolbar
-  shows the loaded filename, or a red error message if decoding failed
-  (check the terminal for the Python traceback).
+- Click **Open Images…** and pick one or more files FreeCCR can decode (RAW
+  via rawpy, or PNG/TIFF/JPEG via OpenCV/tifffile — multi-select works) —
+  each gets thumbnailed and added to the list on the left, and the last one
+  picked becomes current (canvas + sliders switch to it, reset to a fitted
+  view). Click any thumbnail to switch — each image remembers its own
+  slider/curve/color-profile settings independently. The toolbar shows the
+  current filename, how many images are loaded, and a red error message for
+  any file that failed to decode (check the terminal for the Python
+  traceback).
 - **Pan**: two-finger scroll on a trackpad, or a mouse scroll wheel.
 - **Zoom**: pinch on a trackpad (anchored under your fingers — the same
   image point stays put as you zoom), or the toolbar's +/− buttons (anchored
@@ -154,6 +171,15 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
   output matches `curve_editor.py`'s actual `_monotone_cubic`, run on the
   same inputs, to within `1e-9`.
 - `curveSetDefaultsToIdentity`: sanity check on `CurveSet`'s default state.
+- `thumbnailIsSmallerThanThePreview`: `thumbnail(handle:)` actually returns
+  the smaller `_thumb_np8` (≤156px long side), not the same buffer as
+  `adjustedPreview`'s ~1080px preview.
+- `perImageAdjustmentsPersistIndependently`: loads two images, sets
+  different `exposure` on each via `selectImage`, and confirms switching
+  back and forth doesn't bleed one image's settings into the other. Polls
+  `PreviewState`'s published state to converge (`waitUntil`) rather than
+  awaiting a Task, since `loadImages`/`selectImage` are deliberately
+  fire-and-forget for SwiftUI's sake.
 - `CanvasTransform`'s pure-math tests (`fitScaleFillsTheSmallerDimension`,
   `zoomAnchoredAtCenterKeepsImageCentered`,
   `zoomAnchoredAtArbitraryPointStaysUnderTheAnchor`, `zoomClampsToMinAndMax`,
@@ -162,6 +188,9 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
 
 ## Known rough edges (expected at this stage)
 
+- The thumbnail list (M5) has no remove/reorder/rename — only add and select.
+  No async/background thumbnail loading either (each file is decoded and
+  thumbnailed sequentially in `loadImages`' loop before the next starts).
 - Pan/zoom (M2) has no keyboard shortcuts and no on-canvas overlays yet
   (crop box, area layers, dust brush — later milestones that build on
   `CanvasTransform`).
