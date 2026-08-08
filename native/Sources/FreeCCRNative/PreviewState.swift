@@ -149,8 +149,9 @@ final class PreviewState: ObservableObject {
 
     private func runAdjustment(device: MTLDevice) async {
         let start = DispatchTime.now()
+        let handle = imageHandle
         guard let image = await PythonCoreBridge.shared.adjustedPreview(
-            handle: imageHandle, params: params, colorProfile: colorProfile) else {
+            handle: handle, params: params, colorProfile: colorProfile) else {
             self.isBusy = false
             return
         }
@@ -159,6 +160,20 @@ final class PreviewState: ObservableObject {
         self.isBusy = false
         self.lastLatencyMs = Double(
             DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+
+        // Bug fix: the thumbnail list was frozen at whatever the image
+        // looked like on load, because nothing ever re-read _thumb_np8 after
+        // a slider/curve/color-profile change — even though
+        // set_adjustment_by_index (called by adjustedPreview above) already
+        // refreshes it on the Python side for free. Look the row up by
+        // handle, not currentIndex, in case the selection changed while this
+        // was in flight.
+        guard let handle else { return }
+        guard let thumbnailImage = await PythonCoreBridge.shared.thumbnail(handle: handle) else { return }
+        if Task.isCancelled { return }
+        guard let nsImage = Self.makeNSImage(thumbnailImage) else { return }
+        guard let row = images.firstIndex(where: { $0.id == handle }) else { return }
+        images[row].thumbnail = nsImage
     }
 
     private static func makeTexture(device: MTLDevice, image: RGBAImage) -> MTLTexture? {

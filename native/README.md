@@ -188,6 +188,16 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
 
 ## Known rough edges (expected at this stage)
 
+- **No hi-res-on-zoom.** The canvas always shows the ~1080px-long-side
+  preview (`_preview_np8`), even when zoomed in — `image_preview.py`'s
+  `HiResDetailWorker` (which swaps in a higher-resolution decode of the
+  visible region once zoomed past a threshold) hasn't been ported yet. On a
+  large/Retina window this makes zoomed-in (or even just "fit" on a big
+  screen) previews look soft — reported once as "looks like a blown-up
+  thumbnail"; confirmed via
+  `previewTextureIsFullPreviewResolutionNotThumbnailSized` that the data
+  itself is correctly ~1080px (not actually thumbnail-sized), so this is a
+  missing feature, not wrong data. Tracked as a follow-up to M2.
 - The thumbnail list (M5) has no remove/reorder/rename — only add and select.
   No async/background thumbnail loading either (each file is decoded and
   thumbnailed sequentially in `loadImages`' loop before the next starts).
