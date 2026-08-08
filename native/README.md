@@ -180,7 +180,12 @@ x=0/x=255), and a Reset Curve button.
   current filename, how many images are loaded, and a red error message for
   any file that failed to decode (check the terminal for the Python
   traceback).
-- **Pan**: two-finger scroll on a trackpad, or a mouse scroll wheel.
+- **Pan**: two-finger scroll on a trackpad, a mouse scroll wheel, or left-click
+  and drag directly on the canvas (the image follows the cursor 1:1). All
+  three share the same bounds clamp: you can never drag/scroll so far that
+  empty space shows up inside the canvas, and at **Full** zoom the image
+  already fits the canvas on both axes, so panning is a no-op there — not a
+  special case, just what the clamp resolves to.
 - **Zoom**: pinch on a trackpad (anchored under your fingers — the same
   image point stays put as you zoom; this deselects the segmented control,
   since a pinch lands on an arbitrary ratio), or tap **Full**/**100%**/**200%**
@@ -243,6 +248,14 @@ To quit: `Cmd+Q` with the window focused, or Ctrl+C in the terminal.
   `zoomAnchoredAtArbitraryPointStaysUnderTheAnchor`, `zoomClampsToMinAndMax`,
   `resetToFitClearsZoomAndPan`) — no Python/DYLD_LIBRARY_PATH actually needed
   for these specifically, but they share the test target.
+- `clampPanLocksToZeroAtFullZoom`: at Full zoom (image fits both axes) any
+  attempted `panOffset` is forced back to `.zero`.
+- `clampPanKeepsImageCoveringTheViewportWhenZoomedIn`: zoomed in past fit,
+  an extreme attempted pan in either direction still leaves the image's
+  quad covering the whole viewport (no gap on either edge).
+- `clampPanLocksOnlyTheAxisThatFits`: a wide/short image zoomed so only its
+  width exceeds the viewport — the height axis locks to 0 while width still
+  allows (clamped) panning.
 
 ## Known rough edges (expected at this stage)
 

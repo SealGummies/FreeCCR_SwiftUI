@@ -19,9 +19,8 @@ struct MetalCanvasView: NSViewRepresentable {
         view.isPaused = true
         view.clearColor = MTLClearColorMake(0.12, 0.12, 0.12, 1.0)
 
-        view.onScroll = { [weak state] delta in
-            guard let state else { return }
-            state.transform.pan(by: delta)
+        view.onPan = { [weak state] delta in
+            state?.applyPan(by: delta)
         }
         view.onMagnify = { [weak state] magnification, anchor in
             state?.applyManualZoom(by: 1 + magnification, anchor: anchor)
@@ -53,15 +52,24 @@ struct MetalCanvasView: NSViewRepresentable {
 }
 
 /// MTKView subclass owning the AppKit event overrides SwiftUI has no gesture
-/// API for: trackpad/scroll-wheel pan and pinch-to-zoom anchored at the
-/// cursor. `isFlipped == true` so its coordinate space (origin top-left, y
-/// down) matches `CanvasTransform`'s convention and ordinary screen reasoning
-/// about images.
+/// API for: trackpad/scroll-wheel pan, left-click-drag pan, and pinch-to-zoom
+/// anchored at the cursor. `isFlipped == true` so its coordinate space
+/// (origin top-left, y down) matches `CanvasTransform`'s convention and
+/// ordinary screen reasoning about images.
 final class ZoomPanMTKView: MTKView {
-    var onScroll: ((CGSize) -> Void)?
+    /// Fires for BOTH two-finger scroll and left-click-drag — both are "pan
+    /// by this many view points", and `PreviewState.applyPan` clamps either
+    /// source identically (see its doc comment for why that's also what
+    /// makes "Full zoom can't be dragged" fall out for free).
+    var onPan: ((CGSize) -> Void)?
     var onMagnify: ((CGFloat, CGPoint) -> Void)?
     var onDoubleClick: (() -> Void)?
     var onBoundsChange: ((CGSize) -> Void)?
+
+    /// Tracks the drag in progress; `nil` when the left button isn't down.
+    /// Set in `mouseDown`, updated/consumed in `mouseDragged`, cleared in
+    /// `mouseUp`.
+    private var lastDragLocation: CGPoint?
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -80,7 +88,7 @@ final class ZoomPanMTKView: MTKView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        onScroll?(CGSize(width: event.scrollingDeltaX, height: event.scrollingDeltaY))
+        onPan?(CGSize(width: event.scrollingDeltaX, height: event.scrollingDeltaY))
     }
 
     override func magnify(with event: NSEvent) {
@@ -92,6 +100,24 @@ final class ZoomPanMTKView: MTKView {
         if event.clickCount >= 2 {
             onDoubleClick?()
         }
+        lastDragLocation = convert(event.locationInWindow, from: nil)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        if let last = lastDragLocation {
+            // Direct manipulation, not "scroll" semantics: the image follows
+            // the cursor 1:1, which is what `CanvasTransform.pan`'s
+            // `panOffset += delta` already does when fed the raw cursor
+            // movement (no sign flip needed, unlike NSEvent's own
+            // scrollingDelta convention).
+            onPan?(CGSize(width: location.x - last.x, height: location.y - last.y))
+        }
+        lastDragLocation = location
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        lastDragLocation = nil
     }
 }
 

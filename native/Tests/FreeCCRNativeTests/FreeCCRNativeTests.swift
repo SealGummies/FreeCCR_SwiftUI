@@ -419,6 +419,62 @@ struct FreeCCRNativeTests {
         #expect(t.zoom == 1.0)
         #expect(t.panOffset == .zero)
     }
+
+    /// At "Full" zoom the image never exceeds the viewport on either axis
+    /// (that's what fit-to-view means), so `clampPan` must force any
+    /// attempted pan back to zero — this is the mechanism behind "can't drag
+    /// at Full zoom" from the product requirement, not a special case.
+    @Test func clampPanLocksToZeroAtFullZoom() {
+        var t = CanvasTransform()
+        let viewSize = CGSize(width: 800, height: 600)
+        let imageSize = CGSize(width: 400, height: 300) // fits exactly at zoom 1
+        t.panOffset = CGSize(width: 999, height: -999)
+        t.clampPan(viewSize: viewSize, imageSize: imageSize)
+        #expect(t.panOffset == .zero)
+    }
+
+    /// Once zoomed in past fit, the image is larger than the viewport on
+    /// both axes — panning should be allowed, but clamped so the image's
+    /// near edge never crosses the viewport edge (no gap ever shows).
+    @Test func clampPanKeepsImageCoveringTheViewportWhenZoomedIn() {
+        var t = CanvasTransform()
+        let viewSize = CGSize(width: 800, height: 600)
+        let imageSize = CGSize(width: 400, height: 300)
+        t.zoom = 4 // effective scale 4x fit -> rendered image is 1600x1200, bigger than the view
+
+        // Try to drag far past any reasonable limit.
+        t.panOffset = CGSize(width: 100_000, height: 100_000)
+        t.clampPan(viewSize: viewSize, imageSize: imageSize)
+        let rect = t.quadRect(viewSize: viewSize, imageSize: imageSize)
+        #expect(rect.minX <= 0)
+        #expect(rect.minY <= 0)
+
+        t.panOffset = CGSize(width: -100_000, height: -100_000)
+        t.clampPan(viewSize: viewSize, imageSize: imageSize)
+        let rect2 = t.quadRect(viewSize: viewSize, imageSize: imageSize)
+        #expect(rect2.maxX >= viewSize.width)
+        #expect(rect2.maxY >= viewSize.height)
+    }
+
+    /// Mixed case: a wide/short image zoomed so its width exceeds the
+    /// viewport but its height still doesn't — the height axis should lock
+    /// to centered (0) while the width axis still allows panning within its
+    /// own bounds.
+    @Test func clampPanLocksOnlyTheAxisThatFits() {
+        var t = CanvasTransform()
+        let viewSize = CGSize(width: 800, height: 600)
+        let imageSize = CGSize(width: 400, height: 100) // wide, short
+        // fitScale = min(800/400, 600/100) = 2 -> at zoom 2, effective scale
+        // 4: rendered 1600x400 — wider than the 800pt view, shorter than
+        // the 600pt view.
+        t.zoom = 2
+        t.panOffset = CGSize(width: 100_000, height: 100_000)
+        t.clampPan(viewSize: viewSize, imageSize: imageSize)
+        #expect(t.panOffset.height == 0)
+        #expect(t.panOffset.width > 0) // clamped, but still allowed to move
+        let rect = t.quadRect(viewSize: viewSize, imageSize: imageSize)
+        #expect(rect.minX <= 0) // clamped so no gap opens up on the width axis
+    }
 }
 
 /// Polls a condition on the main actor with a short timeout — `PreviewState`

@@ -120,8 +120,23 @@ final class PreviewState: ObservableObject {
     /// continuous zoom change, so it deselects whichever preset was active.
     func applyManualZoom(by factor: CGFloat, anchor: CGPoint) {
         transform.zoom(by: factor, anchor: anchor, viewSize: canvasViewSize, imageSize: originalImageSize)
+        transform.clampPan(viewSize: canvasViewSize, imageSize: originalImageSize)
         zoomPreset = nil
         requestUpdate()
+    }
+
+    /// Left-click-drag and two-finger-scroll panning (see
+    /// `MetalCanvasView`'s `onPan`) share this single entry point so both
+    /// respect the same bounds: `clampPan` pins `panOffset` to 0 on any axis
+    /// where the image doesn't exceed the viewport (which is always true at
+    /// "Full" zoom, by definition of fit-to-view — so dragging is
+    /// automatically a no-op there, no special-casing needed), and otherwise
+    /// keeps the image's near edge from crossing the viewport edge. Pure
+    /// geometry — no PythonKit call needed, since panning never changes what
+    /// pixels the current texture holds, only where it's drawn.
+    func applyPan(by delta: CGSize) {
+        transform.pan(by: delta)
+        transform.clampPan(viewSize: canvasViewSize, imageSize: originalImageSize)
     }
 
     /// Called by `MetalCanvasView` whenever the NSView's bounds change
@@ -135,6 +150,7 @@ final class PreviewState: ObservableObject {
         if let preset = zoomPreset {
             selectZoomPreset(preset)
         } else {
+            transform.clampPan(viewSize: canvasViewSize, imageSize: originalImageSize)
             requestUpdate() // resolution needed for the current custom zoom may have changed too
         }
     }

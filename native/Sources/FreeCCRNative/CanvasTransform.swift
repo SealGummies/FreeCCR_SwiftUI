@@ -85,6 +85,37 @@ struct CanvasTransform: Equatable {
         panOffset.height += delta.height
     }
 
+    /// Keeps the image quad from leaving a gap inside the viewport: on any
+    /// axis where the rendered image is smaller than the view, `panOffset`
+    /// is pinned to 0 (centered — no room to drag, which is exactly the
+    /// "Full zoom" case since fit-to-view guarantees both axes are <= the
+    /// view). On axes where the image is larger than the view, `panOffset`
+    /// is clamped so the image's near edge never crosses the view's edge.
+    mutating func clampPan(viewSize: CGSize, imageSize: CGSize) {
+        guard viewSize.width > 0, viewSize.height > 0,
+              imageSize.width > 0, imageSize.height > 0 else {
+            panOffset = .zero
+            return
+        }
+        let scale = effectiveScale(viewSize: viewSize, imageSize: imageSize)
+        let extraWidth = imageSize.width * scale - viewSize.width
+        let extraHeight = imageSize.height * scale - viewSize.height
+
+        if extraWidth > 0 {
+            let limit = extraWidth / 2
+            panOffset.width = min(max(panOffset.width, -limit), limit)
+        } else {
+            panOffset.width = 0
+        }
+
+        if extraHeight > 0 {
+            let limit = extraHeight / 2
+            panOffset.height = min(max(panOffset.height, -limit), limit)
+        } else {
+            panOffset.height = 0
+        }
+    }
+
     mutating func resetToFit() {
         zoom = 1.0
         panOffset = .zero
